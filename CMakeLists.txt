@@ -17,6 +17,23 @@ set(CAFFE2_USE_CUDNN on)
 # Uncomment the following line if you want to solve CMake Warning "Failed to compute shorthash for libnvrtc.so"
 # set(PYTHON_EXECUTABLE "/usr/bin/python3")
 
+# ------------------------------------------------------------ Python
+# 1.  Tell CMake where to look **before** the first find_package().
+#    (Conda installs everything under $CONDA_PREFIX.)
+if(DEFINED ENV{CONDA_PREFIX})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+endif()
+
+# 2.  Now ask for the interpreter **and** the dev files
+find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development)
+
+# (optional) pybind11 – only if you really use it
+find_package(pybind11 CONFIG QUIET)
+
+message(STATUS "Python exec   : ${Python3_EXECUTABLE}")
+message(STATUS "Python include: ${Python3_INCLUDE_DIRS}")
+message(STATUS "Python libs   : ${Python3_LIBRARIES}")
+
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -pthread")
 
@@ -225,6 +242,32 @@ target_link_libraries(euroc_stereo
     gaussian_viewer    
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+
+##################################################################################
+##  Build the Sparse Voxel rasterizer library to ${PROJECT_SOURCE_DIR}/lib
+##################################################################################
+file(GLOB VX_SRCS
+     cuda_voxel_rasterizer/*.cpp
+     cuda_voxel_rasterizer/*.cu)
+
+add_library(voxel_rasterizer SHARED ${VX_SRCS})
+set_target_properties(voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
+target_include_directories(voxel_rasterizer
+        PRIVATE
+        ${TORCH_INCLUDE_DIRS}
+        ${Python3_INCLUDE_DIRS})          
+add_executable(test_vox tests/test_voxel_rasterizer.cpp)
+target_include_directories(test_vox
+    PRIVATE
+    ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})  # ensure Python.h is available
+target_link_libraries(test_vox
+    PRIVATE
+    voxel_rasterizer        # your library
+    Python3::Python         # <-- this is the missing bit
+    pybind11::embed         # optional, only if you need the embed helpers
+    ${TORCH_LIBRARIES}      # whatever you already had
+    )
 
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin

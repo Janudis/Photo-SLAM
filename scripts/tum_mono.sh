@@ -6,7 +6,7 @@ do
     ../ORB-SLAM3/Vocabulary/ORBvoc.txt \
     ../cfg/ORB_SLAM3/Monocular/TUM/tum_freiburg1_desk.yaml \
     ../cfg/gaussian_mapper/Monocular/TUM/tum_mono.yaml \
-    ./rgbd_dataset_freiburg1_desk \
+    ./data/rgbd_dataset_freiburg1_desk \
     ../results/tum_mono_$i/rgbd_dataset_freiburg1_desk \
     no_viewer
 
@@ -14,7 +14,7 @@ do
     ../ORB-SLAM3/Vocabulary/ORBvoc.txt \
     ../cfg/ORB_SLAM3/Monocular/TUM/tum_freiburg2_xyz.yaml \
     ../cfg/gaussian_mapper/Monocular/TUM/tum_mono.yaml \
-    ./rgbd_dataset_freiburg2_xyz \
+    ./data/rgbd_dataset_freiburg2_xyz \
     ../results/tum_mono_$i/rgbd_dataset_freiburg2_xyz \
     no_viewer
 

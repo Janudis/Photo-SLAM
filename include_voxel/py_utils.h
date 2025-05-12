@@ -1,0 +1,64 @@
+#pragma once
+#include <pybind11/embed.h>
+#include <pybind11/cast.h>        // <-- for py::cast
+#include "mini_cam.h"
+#include <pybind11/numpy.h>
+
+namespace sv {
+
+    template <typename T>
+    pybind11::array tensor_to_numpy_typed(const torch::Tensor& t) {
+        auto t_cpu = t.contiguous().to(torch::kCPU);
+        std::vector<ssize_t> shape(t_cpu.sizes().begin(), t_cpu.sizes().end());
+        std::vector<ssize_t> strides(shape.size());
+        ssize_t stride = sizeof(T);
+        for (int i = shape.size() - 1; i >= 0; --i) {
+            strides[i] = stride;
+            stride *= shape[i];
+        }
+
+        return pybind11::array(pybind11::buffer_info(
+            t_cpu.data_ptr<T>(), sizeof(T),
+            pybind11::format_descriptor<T>::format(),
+            shape.size(), shape, strides));
+    }
+
+    inline pybind11::array tensor_to_numpy(const torch::Tensor& t) {
+        if (t.dtype() == torch::kFloat32)
+            return tensor_to_numpy_typed<float>(t);
+        else if (t.dtype() == torch::kInt64)
+            return tensor_to_numpy_typed<int64_t>(t);
+        else
+            throw std::runtime_error("Unsupported tensor dtype in tensor_to_numpy.");
+    }
+
+    inline pybind11::object MiniCam_to_py(const MiniCam& cam) {
+        namespace py = pybind11;
+        try {
+            py::module_ torch = py::module_::import("torch");
+            py::module_ m = py::module_::import("scripts_voxel.python_svraster_bridge.mini_cam");
+            py::object MiniCamClass = m.attr("MiniCam");
+            py::object w2c_py = torch.attr("from_numpy")(tensor_to_numpy(cam.w2c.cpu()));
+            py::object c2w_py = torch.attr("from_numpy")(tensor_to_numpy(cam.c2w.cpu()));
+    
+            py::object py_cam = MiniCamClass(
+                cam.width,
+                cam.height,
+                w2c_py,
+                c2w_py,
+                std::tan(cam.fovx * 0.5f),
+                std::tan(cam.fovy * 0.5f),
+                cam.cx,
+                cam.cy,
+                cam.cam_mode
+            );
+    
+            return py_cam;
+    
+        } catch (const py::error_already_set& e) {
+            std::cerr << "[ERROR] Python exception in MiniCam_to_py():\n" << e.what() << std::endl;
+            std::terminate();
+        }
+    }
+       
+} // namespace sv

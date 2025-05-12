@@ -9,6 +9,7 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
+# set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
 
@@ -25,15 +26,14 @@ if(DEFINED ENV{CONDA_PREFIX})
 endif()
 
 # 2.  Now ask for the interpreter **and** the dev files
-find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+find_package(pybind11 REQUIRED)
+add_definitions(-DPYBIND11_DETAILED_ERROR_MESSAGES)
 
-# (optional) pybind11 – only if you really use it
-find_package(pybind11 CONFIG QUIET)
-
-message(STATUS "Python exec   : ${Python3_EXECUTABLE}")
-message(STATUS "Python include: ${Python3_INCLUDE_DIRS}")
-message(STATUS "Python libs   : ${Python3_LIBRARIES}")
-
+# Path to your local LibTorch installation
+set(CMAKE_PREFIX_PATH "/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch")
+# Optional: explicitly set Torch_DIR, though not always needed with CMAKE_PREFIX_PATH
+set(Torch_DIR "/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/share/cmake/Torch")
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -pthread")
 
@@ -166,7 +166,13 @@ target_link_libraries(gaussian_mapper
     "${TORCH_LIBRARIES}"
     Eigen3::Eigen
     simple_knn
-    cuda_rasterizer)
+    cuda_rasterizer
+    ${Python3_LIBRARIES})
+
+target_include_directories(gaussian_mapper
+    PRIVATE
+        ${Python3_INCLUDE_DIRS}
+)
 
 ##################################################################################
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
@@ -204,6 +210,39 @@ target_link_libraries(view_result
     gaussian_viewer
     gaussian_mapper)
 
+###############################################################################<
+# 3.  🧱 SPARSE‑VOXEL  – new code
+###############################################################################
+
+### 3.1  CUDA rasteriser  --------------------------------------------
+file (GLOB VX_SRCS cuda_voxel_rasterizer/*.cu cuda_voxel_rasterizer/*.cpp)
+add_library (voxel_rasterizer SHARED ${VX_SRCS})
+set_target_properties (voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
+target_include_directories (voxel_rasterizer
+        PRIVATE
+            ${TORCH_INCLUDE_DIRS}
+            ${Python3_INCLUDE_DIRS})
+target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
+
+### 3.2  C++ core / optimiser  ---------------------------------------
+add_library (voxel_core
+        src_voxel/voxel_trainer.cpp
+        src_voxel/voxel_mapper.cpp)
+        
+target_include_directories (voxel_core
+        PUBLIC
+            include_voxel
+            ${Python3_INCLUDE_DIRS}
+            ${OpenCV_INCLUDE_DIRS}
+            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
+target_link_libraries (voxel_core
+        PUBLIC
+            voxel_rasterizer           # call kernels directly if needed
+            "${TORCH_LIBRARIES}"
+            Python3::Python
+            pybind11::embed
+            ${OpenCV_LIBRARIES})
+
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
@@ -229,6 +268,21 @@ target_link_libraries(tum_mono
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
+target_include_directories(tum_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel      # <‑‑ header path
+        pybind11::embed
+)
+target_link_libraries(tum_mono_voxel
+        voxel_core          # lib that implements LiveVoxelTrainer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(tum_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+    
 # TUM RGBD
 add_executable(tum_rgbd examples/tum_rgbd.cpp)
 target_link_libraries(tum_rgbd
@@ -242,32 +296,6 @@ target_link_libraries(euroc_stereo
     gaussian_viewer    
     gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-##################################################################################
-##  Build the Sparse Voxel rasterizer library to ${PROJECT_SOURCE_DIR}/lib
-##################################################################################
-file(GLOB VX_SRCS
-     cuda_voxel_rasterizer/*.cpp
-     cuda_voxel_rasterizer/*.cu)
-
-add_library(voxel_rasterizer SHARED ${VX_SRCS})
-set_target_properties(voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
-target_include_directories(voxel_rasterizer
-        PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-        ${Python3_INCLUDE_DIRS})          
-add_executable(test_vox tests/test_voxel_rasterizer.cpp)
-target_include_directories(test_vox
-    PRIVATE
-    ${TORCH_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})  # ensure Python.h is available
-target_link_libraries(test_vox
-    PRIVATE
-    voxel_rasterizer        # your library
-    Python3::Python         # <-- this is the missing bit
-    pybind11::embed         # optional, only if you need the embed helpers
-    ${TORCH_LIBRARIES}      # whatever you already had
-    )
 
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin

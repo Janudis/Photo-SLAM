@@ -7,6 +7,9 @@
 #include <string>
 #include <memory>
 #include <pybind11/numpy.h>       // for pybind11::array_t
+#include "include_voxel/voxel_config.h"
+#include "include_voxel/voxel_keyframe.h"
+#include <unordered_map>
 
 namespace sv {
     class VoxelTrainer;
@@ -15,10 +18,16 @@ namespace sv {
 class VoxelMapper {
 public:
     VoxelMapper(std::shared_ptr<ORB_SLAM3::System> slam,
-        const std::filesystem::path& voxel_cfg,
+        const std::filesystem::path& voxel_yaml,
         const std::filesystem::path& seq_dir,
         const std::filesystem::path& out_dir,
         torch::Device device);
+    // VoxelMapper(std::shared_ptr<ORB_SLAM3::System> slam,
+    //     const sv::VoxelScheduleConfig& cfg,
+    //     const std::filesystem::path& voxel_cfg,
+    //     const std::filesystem::path& seq_dir,
+    //     const std::filesystem::path& out_dir,
+    //     torch::Device device);
     ~VoxelMapper();  
     PyThreadState* m_savedState = nullptr;   // remembers the thread‑state
     void run();
@@ -37,6 +46,7 @@ private:
     std::filesystem::path mVoxelCfg;
     std::filesystem::path mOutDir;
     torch::Device mDevice;
+    sv::VoxelScheduleConfig mVoxelConfig;
 
     std::vector<std::string> mImagePaths;
     std::vector<double> mTimestamps;
@@ -49,4 +59,13 @@ private:
     int mIteration = 0;
     int getIteration() const { return mIteration; }
     std::vector<int> mKeyFrameIds;
+
+    std::unordered_map<unsigned long, int> kfs_used_times_;
+    std::vector<int> kfid_shuffle_;
+    int kfid_shuffle_idx_ = 0;
+    bool kfid_shuffled_ = false;
+    std::unordered_map<unsigned long, std::shared_ptr<VoxelKeyframe>> mSceneKeyframes;
+    std::shared_ptr<VoxelKeyframe> useOneRandomSlidingWindowKeyframe();
+    void generateKfidRandomShuffle();
+    void increaseKeyframeTimesOfUse(std::shared_ptr<VoxelKeyframe> pkf, int times);
 };

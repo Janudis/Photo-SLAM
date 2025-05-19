@@ -41,6 +41,7 @@ int main(int argc, char** argv)
         voc_path, orb_cfg, ORB_SLAM3::System::MONOCULAR, use_viewer);
 
     VoxelMapper mapper(slam, voxel_cfg, sequence, output_dir, device);
+    // VoxelMapper mapper(slam_system, voxel_cfg, voxel_yaml, sequence, output_dir, device);
     // Start the voxel training loop in the background:
     std::thread training_thd(&VoxelMapper::run, &mapper);
     // Wait until the mapper finishes its whole SLAM/mapping routine

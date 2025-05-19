@@ -82,3 +82,29 @@ GaussianViewer.image_scale_main: 1.0
 GaussianViewer.glfw_window_width: 1400
 GaussianViewer.glfw_window_height: 1050
 GaussianViewer.camera_watch_dist: 0.000001
+
+################################################################################
+# Svraster optimization parameters
+################################################################################
+lr: 1e-2
+meta_accum_lr: 0.1
+
+subdiv_from: 4
+subdiv_every: 5
+subdiv_until: 40
+subdiv_quantile: 0.8
+subdiv_gradient_threshold: 1e-4
+
+prune_from: 10
+prune_every: 5
+prune_until: 50
+prune_threshold_init: 1e-4
+prune_threshold_final: 0.05
+min_voxels: 512
+meta_warmup_iters: 10
+
+loss_weights:
+  photo: 1.0
+  ssim: 0.02
+  T_concen: 0.01
+  T_inside: 0.01

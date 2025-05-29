@@ -54,13 +54,18 @@
         dict["centers"]     = py::cast(center_.cpu());
         dict["vox_lengths"] = py::cast(size_.cpu());
         // only first 6 dims of geo
-        dict["cov3D"]       = py::cast(geo_.slice(1,0,6).contiguous().cpu());
-        dict["colors"]      = py::cast(sh0_.cpu());
-        dict["shs"]         = py::cast(shs_.cpu());
-        dict["opacities"]   = py::cast(opacity_.cpu());  //# (N,)
+        // dict["cov3D"]       = py::cast(geo_.slice(1,0,6).contiguous().cpu());
+        dict["cov3D"]       = py::cast( geo_.slice(1, 0, 6) ); // (N,6)
+        // dict["colors"]      = py::cast(sh0_.cpu());
+        // dict["shs"]         = py::cast(shs_.cpu());
+        // dict["opacities"]   = py::cast(opacity_.cpu());  //# (N,)
         dict["octlevels"]    = py::cast(oct_level_.cpu());
         dict["subdiv_meta"]  = py::cast(subdiv_meta_.cpu());    
-        dict["subdiv_p"] = py::cast(subdiv_p_.cpu());
+        // dict["subdiv_p"] = py::cast(subdiv_p_.cpu());
+        dict["subdiv_p"]     = py::cast( subdiv_p_ );
+        dict["colors"]      = py::cast( sh0_ );                         // (N,3)
+        dict["shs"]         = py::cast( shs_ );                         // (N,45)
+        dict["opacities"]   = py::cast( opacity_ );                     // (N,)
 
         // build Python cam
         py::object py_cam = MiniCam_to_py(cam);
@@ -68,34 +73,57 @@
         py::object out = py_render(py_cam, dict, rgb_image, output_dir);
         torch::Tensor rgb_t = out.attr("get")("rgb").cast<torch::Tensor>();
 
+        // std::cerr << "[DBG-C++] geo_   leaf? " << geo_.is_leaf()   << '\n';
+        // std::cerr << "[DBG-C++] sh0_   leaf? " << sh0_.is_leaf()   << '\n';
+        // std::cerr << "[DBG-C++] opacity_ leaf? "<< opacity_.is_leaf()<< '\n';
         return { {"rgb", rgb_t} };
     }
 
     void VoxelTrainer::set_voxels(torch::Tensor center,
-                                torch::Tensor size,
-                                torch::Tensor geo,
-                                torch::Tensor sh0,
-                                torch::Tensor shs,
-                                torch::Tensor opacity,
-                                torch::Tensor octpath,
-                                torch::Tensor octlevel,
-                                torch::Tensor subdiv_meta,
-                                torch::Tensor subdiv_p)
-    {
-        center_   = std::move(center) .set_requires_grad(true);   
-        size_     = std::move(size)   .set_requires_grad(true);  
-        geo_      = std::move(geo)    .set_requires_grad(true);
-        sh0_      = std::move(sh0)    .set_requires_grad(true);
-        shs_      = std::move(shs)    .set_requires_grad(true);
-        opacity_  = std::move(opacity).set_requires_grad(true);
-        oct_path_ = std::move(octpath);          // stays fixed
-        oct_level_   = std::move(octlevel);              
-        subdiv_meta_ = std::move(subdiv_meta).set_requires_grad(true);
-        subdiv_meta_.retain_grad();     
-        subdiv_p_ = std::move(subdiv_p).set_requires_grad(true);
-        subdiv_p_.retain_grad(); 
-        subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_).to(subdiv_p_.device());
-    }
+                              torch::Tensor size,
+                              torch::Tensor geo,
+                              torch::Tensor sh0,
+                              torch::Tensor shs,
+                              torch::Tensor opacity,
+                              torch::Tensor octpath,
+                              torch::Tensor octlevel,
+                              torch::Tensor subdiv_meta,
+                              torch::Tensor subdiv_p)
+{
+    oct_path_   = std::move(octpath);
+    oct_level_  = std::move(octlevel);
+    center_   = std::move(center);
+    size_     = std::move(size);
+    shs_      = std::move(shs);
+    subdiv_meta_= std::move(subdiv_meta);
+
+    // ─── trainable tensors ─────────────────────────────
+    geo_      = std::move(geo).set_requires_grad(true);
+    sh0_      = std::move(sh0).set_requires_grad(true);
+    subdiv_p_ = std::move(subdiv_p).set_requires_grad(true);
+    opacity_  = std::move(opacity).set_requires_grad(true);
+
+    // keep gradient for the ones we inspect later
+    geo_.retain_grad();
+    sh0_.retain_grad();
+    // shs_.retain_grad();
+    subdiv_p_.retain_grad();
+    opacity_.retain_grad();
+
+    // Prepare gradient buffer for subdivision
+    subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_).to(subdiv_p_.device());
+
+    // // ------------- DEBUG: verify requirements -----------------
+    // std::cerr << "[DBG-C++] geo_.requires_grad   = "
+    //         << geo_.requires_grad() << ", is_leaf = "
+    //         << geo_.is_leaf() << '\n';
+    // std::cerr << "[DBG-C++] sh0_.requires_grad   = "
+    //         << sh0_.requires_grad() << ", is_leaf = "
+    //         << sh0_.is_leaf() << '\n';
+    // std::cerr << "[DBG-C++] opacity_.requires_grad = "
+    //         << opacity_.requires_grad() << ", is_leaf = "
+    //         << opacity_.is_leaf() << '\n';
+}
 
     void VoxelTrainer::save_torch(const std::filesystem::path& p) const
     {
@@ -116,12 +144,15 @@
 
     std::vector<torch::Tensor> VoxelTrainer::parameters()
     {
-            return {
+            return { 
+            // center_,
+            // size_,
             geo_,
             sh0_,
-            shs_,
+            // shs_,
             opacity_,
-            subdiv_meta_
+            // subdiv_meta_,
+            // subdiv_p_
         };
     }
 
@@ -131,7 +162,11 @@
         else if (name == "subdiv_p") return subdiv_p_;
         else if (name == "oct_level") return oct_level_;
         else if (name == "oct_path")  return oct_path_;
-        else if (name == "size")      return size_;        
+        else if (name == "size")      return size_; 
+        else if (name == "opacities") return opacity_;  
+        else if (name == "sh0")       return sh0_;
+        else if (name == "geo")       return geo_;
+        else if (name == "shs")       return shs_;     
         throw std::runtime_error(
             "VoxelTrainer::get_tensor(): unknown tensor name \"" + name + "\"");
     }
@@ -334,5 +369,62 @@
             /*src=*/parent_grads
         );
     }
+    float VoxelTrainer::updateLearningRate(int step,
+                                       float base_lr,
+                                       int   max_steps,
+                                       float delay_mult)
+    {
+        float t        = static_cast<float>(std::min(step, max_steps));
+        float max_step = static_cast<float>(max_steps);
+        float mult     = delay_mult + (1.f - delay_mult) * (t / max_step);
+        position_lr_   = base_lr * mult;
+        return position_lr_;
+    }
 
-    } // namespace sv
+    void VoxelTrainer::increasePcd(const std::vector<Eigen::Vector3f>& pts,
+                               const std::vector<Eigen::Vector3f>& cols,
+                               int /*iter*/)
+    {
+        if (pts.empty()) return;
+
+        const int64_t P = pts.size();
+        torch::NoGradGuard _;
+
+        auto device = center_.device();
+        torch::Tensor new_centers = torch::empty({P,3}, torch::kFloat32).to(device);
+        torch::Tensor new_sizes   = torch::full({P}, 0.05f, torch::kFloat32).to(device);  // 5 cm default
+        torch::Tensor new_geo     = torch::zeros({P,8},  torch::kFloat32).to(device);
+        torch::Tensor new_sh0     = torch::empty({P,3},  torch::kFloat32).to(device);
+        torch::Tensor new_shs     = torch::zeros({P,45}, torch::kFloat32).to(device);
+        torch::Tensor new_opacity = torch::ones ({P},    torch::kFloat32).to(device) * 0.8f;
+        torch::Tensor new_oct     = torch::arange(center_.size(0), center_.size(0)+P,
+                                                torch::kLong).to(device);     // unique path id
+        torch::Tensor new_lvl     = torch::zeros({P}, torch::kInt32).to(device);
+        torch::Tensor new_meta    = torch::zeros({P}, torch::kFloat32).to(device);
+        torch::Tensor new_subdivP = torch::zeros({P}, torch::kFloat32).to(device);
+
+        // copy data
+        auto c_acc = new_centers.accessor<float,2>();
+        auto s0_acc= new_sh0.accessor<float,2>();
+        for (int64_t i=0;i<P;++i){
+            const auto& p=pts[i];   c_acc[i][0]=p.x(); c_acc[i][1]=p.y(); c_acc[i][2]=p.z();
+            const auto& c=cols[i];  s0_acc[i][0]=c.x(); s0_acc[i][1]=c.y(); s0_acc[i][2]=c.z();
+        }
+
+        // concatenate to existing tensors
+        center_      = torch::cat({center_,   new_centers}).set_requires_grad(true);
+        size_        = torch::cat({size_,     new_sizes  }).set_requires_grad(true);
+        geo_         = torch::cat({geo_,      new_geo    }).set_requires_grad(true);
+        sh0_         = torch::cat({sh0_,      new_sh0    }).set_requires_grad(true);
+        shs_         = torch::cat({shs_,      new_shs    }).set_requires_grad(true);
+        opacity_     = torch::cat({opacity_,  new_opacity}).set_requires_grad(true);
+        oct_path_    = torch::cat({oct_path_, new_oct});
+        oct_level_   = torch::cat({oct_level_,new_lvl});
+        subdiv_meta_ = torch::cat({subdiv_meta_, new_meta}).set_requires_grad(true);
+        subdiv_meta_.retain_grad();
+        subdiv_p_    = torch::cat({subdiv_p_,  new_subdivP}).set_requires_grad(true);
+        subdiv_p_.retain_grad();
+        subdiv_p_grad_buffer_ = torch::cat({subdiv_p_grad_buffer_, torch::zeros_like(new_subdivP)});
+    }
+    
+} // namespace sv

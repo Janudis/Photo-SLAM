@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <pybind11/numpy.h>
+#include <Eigen/Core>
 
 namespace sv {
     class MiniCam;
@@ -35,6 +36,10 @@ public:
                     torch::Tensor subdiv_meta,
                     torch::Tensor subdiv_p);
 
+    void increasePcd(const std::vector<Eigen::Vector3f>& points,
+                 const std::vector<Eigen::Vector3f>& colors,
+                 int iteration);
+
     // save final model
     void save_torch(const std::filesystem::path& p) const;
 
@@ -49,12 +54,18 @@ public:
     torch::Tensor get_subdiv_priority_grad() const;
     void accumulate_subdiv_gradients(const torch::Tensor& parent_idx, const torch::Tensor& parent_grads);
 
+    float updateLearningRate(int step,
+                         float base_lr,
+                         int max_steps,
+                         float delay_mult);
+
 private:
     int G_;
     torch::Tensor center_, size_, geo_, sh0_, shs_, opacity_, oct_path_;
     torch::Tensor oct_level_, subdiv_meta_;
     torch::Tensor subdiv_p_;
     torch::Tensor subdiv_p_grad_buffer_;
+    float position_lr_ = 0.0f;
 };
 
 } // namespace sv

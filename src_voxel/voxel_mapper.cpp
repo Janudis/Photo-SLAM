@@ -1,74 +1,715 @@
 #include "include_voxel/voxel_mapper.h"
-#include "include_voxel/voxel_trainer.h"
-#include "include_voxel/mini_cam.h"
-#include "include_voxel/py_utils.h"
-#include "include_voxel/voxel_constants.h"
-#include "include_voxel/voxel_config.h"
-#include "include/loss_utils.h"
-#include "include_voxel/voxel_keyframe.h"
-
-#include <pybind11/embed.h>
-#include <pybind11/numpy.h>
-#include <pybind11/gil.h>
-#include <pybind11/pybind11.h>     //  ← for gil_scoped_release
-
-#include <opencv2/opencv.hpp>
-#include <MapPoint.h>
-#include <Map.h>
-#include <fstream>
-#include <sstream>
-#include <set>
-#include <memory>   // make sure this is at the top of the file
 
 namespace py = pybind11;
 
-#define READ_OR_EXIT(node, field, target)                           \
-    if (!node[field].empty()) node[field] >> target;               \
-    else { std::cerr << "[ERROR] Missing config key: " << field    \
-                     << " in YAML.\n"; std::exit(EXIT_FAILURE); }
-static sv::VoxelScheduleConfig loadVoxelConfig(const std::filesystem::path& yaml_path)
+VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
+                         const std::filesystem::path& config_file_path,
+                         const std::filesystem::path& seq_dir,
+                         const std::filesystem::path& out_dir,
+                         torch::DeviceType device_type,
+                         int seed)
+    : mpSLAM(pSLAM),
+      initial_mapped_(false),
+      interrupt_training_(false),
+      stopped_(false),
+      iteration_(0),
+      ema_loss_for_log_(0.0f),
+      SLAM_ended_(false),
+      loop_closure_iteration_(false),
+      min_num_initial_map_kfs_(15UL),
+      large_rot_th_(1e-1f),
+      large_trans_th_(1e-2f),
+      training_report_interval_(0)
 {
-    sv::VoxelScheduleConfig cfg;
+    std::srand(seed);
+    torch::manual_seed(seed);
 
-    cv::FileStorage fs(yaml_path.string(), cv::FileStorage::READ);
-    if (!fs.isOpened()) {
-        std::cerr << "Failed to open voxel config: " << yaml_path << std::endl;
-        std::exit(1);
+    if (device_type == torch::kCUDA && torch::cuda::is_available()) {
+        std::cout << "[VoxelMapper] CUDA available! Training on GPU." << std::endl;
+        device_type_ = torch::kCUDA;
+        mDevice = torch::Device(torch::kCUDA);
+    } else {
+        std::cout << "[VoxelMapper] Training on CPU." << std::endl;
+        device_type_ = torch::kCPU;
+        mDevice = torch::Device(torch::kCPU);
     }
 
-    READ_OR_EXIT(fs, "lr", cfg.lr);
-    READ_OR_EXIT(fs, "prune_threshold_init", cfg.prune_threshold_init);
-    READ_OR_EXIT(fs, "prune_threshold_final", cfg.prune_threshold_final);
-    READ_OR_EXIT(fs, "subdiv_quantile", cfg.subdiv_quantile);
-    READ_OR_EXIT(fs, "subdiv_gradient_threshold", cfg.subdiv_gradient_threshold);
-    READ_OR_EXIT(fs, "min_voxels", cfg.min_voxels);
-    READ_OR_EXIT(fs, "meta_warmup_iters", cfg.meta_warmup_iters);
-    READ_OR_EXIT(fs, "subdiv_from", cfg.subdiv_from);
-    READ_OR_EXIT(fs, "subdiv_every", cfg.subdiv_every);
-    READ_OR_EXIT(fs, "subdiv_until", cfg.subdiv_until);
-    READ_OR_EXIT(fs, "prune_from", cfg.prune_from);
-    READ_OR_EXIT(fs, "prune_every", cfg.prune_every);
-    READ_OR_EXIT(fs, "prune_until", cfg.prune_until);
-    READ_OR_EXIT(fs, "meta_accum_lr", cfg.meta_accum_lr);
+    // Store paths
+    config_file_path_ = config_file_path;
+    mSeqDir = seq_dir;
+    mOutDir = out_dir;
 
-    if (!fs["loss_weights"].empty()) {
-        cv::FileNode weights = fs["loss_weights"];
-        if (!weights["photo"].empty())     weights["photo"]     >> cfg.lambda_photo;
-        if (!weights["ssim"].empty())      weights["ssim"]      >> cfg.lambda_ssim;
-        if (!weights["T_concen"].empty())  weights["T_concen"]  >> cfg.lambda_T_concen;
-        if (!weights["T_inside"].empty())  weights["T_inside"]  >> cfg.lambda_T_inside;
+    // Create output directory
+    result_dir_ = mOutDir;
+    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir_);
+
+    // Load YAML settings
+    readConfigFromFile(config_file_path_);
+
+    // Create trainer with grid resolution
+    mpTrainer = std::make_shared<sv::VoxelTrainer>(64);  // or mVoxelConfig.resolution
+
+    // Background & override color setup
+    std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};  // no white-background logic needed
+    background_ = torch::tensor(bg_color,
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+    override_color_ = torch::empty(0, torch::TensorOptions().device(device_type_));
+
+    switch (pSLAM->getSensorType()) {
+    case ORB_SLAM3::System::MONOCULAR:
+    case ORB_SLAM3::System::IMU_MONOCULAR:
+        sensor_type_ = MONOCULAR;
+        break;
+    case ORB_SLAM3::System::STEREO:
+    case ORB_SLAM3::System::IMU_STEREO:
+        sensor_type_ = STEREO;
+        break;
+    case ORB_SLAM3::System::RGBD:
+    case ORB_SLAM3::System::IMU_RGBD:
+        sensor_type_ = RGBD;
+        break;
+    default:
+        throw std::runtime_error("[Voxel Mapper]Unsupported sensor type!");
     }
 
-    return cfg;
+    // === Load main SLAM camera ===
+    auto vpCameras = mpSLAM->getAtlas()->GetAllCameras();
+    if (!vpCameras.empty()) {
+        mpCamera = vpCameras.front();  // ← assuming monocular, like Photo-SLAM
+        std::cout << "[VoxelMapper] Loaded SLAM camera with id: " << mpCamera->GetId() << std::endl;
+    } else {
+        std::cerr << "[VoxelMapper] Error: No cameras found in SLAM atlas!" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
+{
+    cv::FileStorage settings_file(cfg_path.string(), cv::FileStorage::READ);
+    if (!settings_file.isOpened()) {
+        std::cerr << "[VoxelMapper] Failed to open cfg: "
+                  << cfg_path << '\n';
+        std::exit(EXIT_FAILURE);
+    }
+
+    std::cout << "[VoxelMapper] Reading parameters from "
+              << cfg_path << '\n';
+    std::lock_guard<std::mutex> guard(mutex_status_);
+
+    /* ───────── OPTIMISATION ───────── */
+    mVoxelConfig.lr                    = settings_file["Optimization.lr"];
+    mVoxelConfig.meta_accum_lr         = settings_file["Optimization.meta_accum_lr"];
+
+    mVoxelConfig.subdiv_from           = settings_file["Optimization.subdiv_from"];
+    mVoxelConfig.subdiv_every          = settings_file["Optimization.subdiv_every"];
+    mVoxelConfig.subdiv_until          = settings_file["Optimization.subdiv_until"];
+    mVoxelConfig.subdiv_quantile       = settings_file["Optimization.subdiv_quantile"];
+    mVoxelConfig.subdiv_gradient_threshold
+                                       = settings_file["Optimization.subdiv_gradient_threshold"];
+
+    mVoxelConfig.prune_from            = settings_file["Optimization.prune_from"];
+    mVoxelConfig.prune_every           = settings_file["Optimization.prune_every"];
+    mVoxelConfig.prune_until           = settings_file["Optimization.prune_until"];
+    mVoxelConfig.prune_threshold_init  = settings_file["Optimization.prune_threshold_init"];
+    mVoxelConfig.prune_threshold_final = settings_file["Optimization.prune_threshold_final"];
+    mVoxelConfig.min_voxels            = settings_file["Optimization.min_voxels"];
+
+    mVoxelConfig.max_num_iterations    = settings_file["Optimization.max_num_iterations"];
+    mVoxelConfig.densification_interval_
+                                       = settings_file["Optimization.densification_interval"];
+
+    /* position-LR schedule */
+    lr_init_           = settings_file["Optimization.position_lr_init"];
+    pos_lr_delay_mult_ = settings_file["Optimization.position_lr_delay_mult"];
+    pos_lr_max_steps_  = settings_file["Optimization.position_lr_max_steps"];
+
+    /* ───────── PIPELINE FLAGS ───────── */
+    do_inactive_geo_densify_
+        = (settings_file["Mapper.inactive_geo_densify"].operator int()) != 0;
+
+    var_params_.do_inactive_geo_densify      = do_inactive_geo_densify_;
+    var_params_.new_keyframe_times_of_use    =
+        settings_file["Mapper.new_keyframe_times_of_use"];
+    min_num_initial_map_kfs_ = static_cast<std::size_t>(
+        settings_file["Mapper.min_num_initial_map_kfs"].operator int());
+
+    large_rot_th_   = settings_file["Mapper.large_rotation_threshold"];
+    large_trans_th_ = settings_file["Mapper.large_translation_threshold"];
+    cull_keyframes_ = (settings_file["Mapper.cull_keyframes"].operator int()) != 0;
+
+    /* ───────── LOGGING ───────── */
+    training_report_interval_      = settings_file["Record.training_report_interval"];
+    keyframe_record_interval_      = settings_file["Record.keyframe_record_interval"];
+    all_keyframes_record_interval_ = settings_file["Record.all_keyframes_record_interval"];
+
+    record_rendered_image_    = (settings_file["Record.record_rendered_image"].operator int()) != 0;
+    record_ground_truth_image_= (settings_file["Record.record_ground_truth_image"].operator int()) != 0;
+    record_loss_image_        = (settings_file["Record.record_loss_image"].operator int()) != 0;
+
+    mVoxelConfig.lambda_photo    = 1.f;
+    mVoxelConfig.lambda_ssim     = 0.02f;
+
+    var_params_.lambda_photo    = mVoxelConfig.lambda_photo;
+    var_params_.lambda_dssim    = mVoxelConfig.lambda_ssim;
+
+    std::cout << "\n[CFG] Parsed Optimization Parameters:" << std::endl;
+    std::cout << "  lr:                       " << mVoxelConfig.lr << std::endl;
+    std::cout << "  meta_accum_lr:           " << mVoxelConfig.meta_accum_lr << std::endl;
+    std::cout << "  position_lr_init:        " << lr_init_ << std::endl;
+    std::cout << "  position_lr_delay_mult:  " << pos_lr_delay_mult_ << std::endl;
+    std::cout << "  position_lr_max_steps:   " << pos_lr_max_steps_ << std::endl;
+    std::cout << "  max_num_iterations:      " << mVoxelConfig.max_num_iterations << std::endl;
+    std::cout << "  densification_interval:  " << mVoxelConfig.densification_interval_ << std::endl;
+
+    std::cout << "\n[CFG] Subdivision Parameters:" << std::endl;
+    std::cout << "  subdiv_from:             " << mVoxelConfig.subdiv_from << std::endl;
+    std::cout << "  subdiv_every:            " << mVoxelConfig.subdiv_every << std::endl;
+    std::cout << "  subdiv_until:            " << mVoxelConfig.subdiv_until << std::endl;
+    std::cout << "  subdiv_quantile:         " << mVoxelConfig.subdiv_quantile << std::endl;
+    std::cout << "  subdiv_gradient_threshold: " << mVoxelConfig.subdiv_gradient_threshold << std::endl;
+
+    std::cout << "\n[CFG] Pruning Parameters:" << std::endl;
+    std::cout << "  prune_from:              " << mVoxelConfig.prune_from << std::endl;
+    std::cout << "  prune_every:             " << mVoxelConfig.prune_every << std::endl;
+    std::cout << "  prune_until:             " << mVoxelConfig.prune_until << std::endl;
+    std::cout << "  prune_threshold_init:    " << mVoxelConfig.prune_threshold_init << std::endl;
+    std::cout << "  prune_threshold_final:   " << mVoxelConfig.prune_threshold_final << std::endl;
+    std::cout << "  min_voxels:              " << mVoxelConfig.min_voxels << std::endl;
+
+    std::cout << "\n[CFG] Loss Weights (hardcoded for now):" << std::endl;
+    std::cout << "  lambda_photo:            " << mVoxelConfig.lambda_photo << std::endl;
+    std::cout << "  lambda_ssim:             " << mVoxelConfig.lambda_ssim << std::endl;
+    // std::cout << "  lambda_T_concen:         " << mVoxelConfig.lambda_T_concen << std::endl;
+    std::cout << "  lambda_T_inside:         " << mVoxelConfig.lambda_T_inside << std::endl;
+
+    std::cout << "\n[CFG] Pipeline & Mapper Flags:" << std::endl;
+    std::cout << "  inactive_geo_densify:    " << do_inactive_geo_densify_ << std::endl;
+    std::cout << "  new_keyframe_times_of_use: " << var_params_.new_keyframe_times_of_use << std::endl;
+    std::cout << "  min_num_initial_map_kfs: " << min_num_initial_map_kfs_ << std::endl;
+    std::cout << "  large_rot_th:            " << large_rot_th_ << std::endl;
+    std::cout << "  large_trans_th:          " << large_trans_th_ << std::endl;
+    std::cout << "  cull_keyframes:          " << cull_keyframes_ << std::endl;
+
+    std::cout << "\n[CFG] Logging Parameters:" << std::endl;
+    std::cout << "  training_report_interval: " << training_report_interval_ << std::endl;
+    std::cout << "  keyframe_record_interval: " << keyframe_record_interval_ << std::endl;
+    std::cout << "  all_keyframes_record_interval: " << all_keyframes_record_interval_ << std::endl;
+    std::cout << "  record_rendered_image:   " << record_rendered_image_ << std::endl;
+    std::cout << "  record_ground_truth_image: " << record_ground_truth_image_ << std::endl;
+    std::cout << "  record_loss_image:       " << record_loss_image_ << std::endl;
+}
+
+void VoxelMapper::run() {
+    py::gil_scoped_acquire gil;
+    py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+
+    // ───── First loop: Initial voxel mapping ─────
+    while (!isStopped()) {
+        if (hasMetInitialMappingConditions()) {
+            mpSLAM->getAtlas()->clearMappingOperation();
+
+            // Step 1: extract initial keyframes and map points
+            buildInitialKeyframesAndPointCloud();
+
+            // Step 2: initialize voxel model
+            initializeVoxelModel();
+
+            // Step 3: first iteration
+            trainForOneIteration();
+
+            initial_mapped_ = true;
+            break;
+        } else if (mpSLAM->isShutDown()) {
+            break;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // ───── Second loop: Incremental voxel mapping ─────
+    int slam_stop_iter = 0;
+    while (!isStopped()) {
+        if (hasMetIncrementalMappingConditions()) {
+            combineMappingOperations();
+            if (cull_keyframes_) cullKeyframes();
+        }
+
+        trainForOneIteration();
+
+        if (mpSLAM->isShutDown() && !SLAM_ended_) {
+            slam_stop_iter = getIteration();
+            SLAM_ended_ = true;
+        }
+
+        if (SLAM_ended_ || getIteration() >= mVoxelConfig.max_num_iterations)
+            break;
+    }
+
+    // ───── Third loop: Tail voxel optimization ─────
+    int densify_interval = mVoxelConfig.densification_interval_;
+    int n_delay_iters = densify_interval * 0.8;
+
+    while ((getIteration() - slam_stop_iter <= n_delay_iters) ||
+           (getIteration() % densify_interval <= n_delay_iters) ||
+           keep_training_)
+    {
+        trainForOneIteration();
+
+        // Update adaptive delay
+        densify_interval = mVoxelConfig.densification_interval_;
+        n_delay_iters = densify_interval * 0.8;
+    }
+
+    // ───── Finalization ─────
+    renderAndRecordAllKeyframes("_shutdown");
+    savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
+    writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
+    finalize();
+    signalStop();
+}
+
+bool VoxelMapper::hasMetInitialMappingConditions() {
+    return !mpSLAM->isShutDown() &&
+           mpSLAM->GetNumKeyframes() >= min_num_initial_map_kfs_ &&
+           mpSLAM->getAtlas()->hasMappingOperation();
+}
+
+bool VoxelMapper::hasMetIncrementalMappingConditions() {
+    return !mpSLAM->isShutDown() &&
+           mpSLAM->getAtlas()->hasMappingOperation();
+}
+
+void VoxelMapper::buildInitialKeyframesAndPointCloud() {
+    auto *pMap = mpSLAM->getAtlas()->GetCurrentMap();
+    std::vector<ORB_SLAM3::KeyFrame*> vKFs;
+    std::vector<ORB_SLAM3::MapPoint*> vMPs;
+
+    {
+        std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
+        vKFs = pMap->GetAllKeyFrames();
+        vMPs = pMap->GetAllMapPoints();
+    }
+
+    float voxel_size = 0.05f;
+    std::set<std::vector<float>> unique_centres;
+    for (auto *mp : vMPs) {
+        if (!mp || mp->isBad()) continue;
+        Eigen::Vector3f pos = mp->GetWorldPos().cast<float>();
+        Eigen::Vector3f c   = (pos / voxel_size).array().round() * voxel_size;
+        unique_centres.insert({c[0], c[1], c[2]});
+    }
+
+    std::vector<torch::Tensor> tensor_list;
+    for (const auto& vec : unique_centres) {
+        tensor_list.push_back(torch::from_blob((void*)vec.data(), {3}, torch::kFloat32).clone());
+    }
+    voxel_centers_ = torch::stack(tensor_list);
+
+    for (auto *kf : vKFs) {
+        if (!kf || kf->isBad()) continue;
+        auto pkf = std::make_shared<VoxelKeyframe>();
+        pkf->fid_ = kf->mnId;
+        pkf->Tcw = Sophus::SE3f(kf->GetPose());
+        pkf->img_path_ = (mSeqDir / "rgb" / (std::to_string(kf->mTimeStamp) + ".png")).string();
+        pkf->remaining_times_of_use_ = 1;
+
+        // std::cout << "[DEBUG] Initialized KF " << pkf->fid_
+        //   << " with remaining uses = " << pkf->remaining_times_of_use_ << std::endl;
+        // std::cout << "[INIT] Keyframe " << pkf->fid_
+        //   << " initialized with uses = " << pkf->remaining_times_of_use_ << std::endl;
+        // std::cout << "[CONFIG] new_keyframe_times_of_use = "
+        //   << var_params_.new_keyframe_times_of_use << std::endl;
+        mSceneKeyframes[pkf->fid_] = pkf;
+        increaseKeyframeTimesOfUse(pkf, var_params_.new_keyframe_times_of_use);
+
+        kfid_shuffled_ = false; 
+    }
+}
+
+void VoxelMapper::initializeVoxelModel() {
+    float voxel_size = 0.05f;
+    const int64_t N = voxel_centers_.size(0);
+    torch::Tensor oct_paths = torch::arange(N, torch::kLong).to(mDevice);
+    torch::Tensor oct_levels = torch::zeros({N}, torch::kInt32).to(mDevice);
+    torch::Tensor subdiv_meta = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(mDevice).requires_grad(true));
+    torch::Tensor subdiv_p = torch::zeros_like(subdiv_meta, torch::kFloat32).to(mDevice).set_requires_grad(true);
+    subdiv_meta.retain_grad();
+    subdiv_p.retain_grad();  // ensure gradient is tracked
+
+    mpTrainer->set_voxels(
+        voxel_centers_.to(mDevice),
+        torch::full({N}, voxel_size, torch::kFloat32).to(mDevice),
+        torch::zeros({N,8}, torch::kFloat32).to(mDevice),
+        torch::ones({N,3}, torch::kFloat32).to(mDevice) * 0.5f,
+        torch::zeros({N,45}, torch::kFloat32).to(mDevice),
+        torch::ones({N}, torch::kFloat32).to(mDevice) * 0.8f,
+        oct_paths,
+        oct_levels,
+        subdiv_meta,
+        subdiv_p
+    );
+
+    // optimizer_ = std::make_unique<torch::optim::Adam>(
+    // mpTrainer->parameters(), torch::optim::AdamOptions(mVoxelConfig.lr));
+    build_adam_optimizer(mVoxelConfig.lr);
+    next_subdiv_iter_   = mVoxelConfig.subdiv_from;
+    next_prune_iter_    = mVoxelConfig.prune_from;
+    next_opacity_reset_ = mVoxelConfig.densification_interval_;
+    std::cout << "[INFO] Voxel model initialized from SLAM map. "
+              << "Adam groups = " << optimizer_->param_groups().size() << '\n';
+}
+
+void VoxelMapper::build_adam_optimizer(float base_lr)
+{
+    auto P = mpTrainer->parameters();   // 0:geo, 1:sh0, 2:opacity
+
+    using torch::optim::Adam;
+    using torch::optim::AdamOptions;
+    using torch::optim::OptimizerParamGroup;
+
+    AdamOptions opt(base_lr);  opt.eps(1e-15);
+    optimizer_ = std::make_unique<Adam>(std::vector<torch::Tensor>{P[0]}, opt);   // geo_
+
+    auto add = [&](torch::Tensor t, float lr)
+    {
+        OptimizerParamGroup g({t});
+        optimizer_->add_param_group(g);
+        static_cast<AdamOptions&>(optimizer_->param_groups().back().options())
+            .lr(lr).eps(1e-15);
+    };
+
+    add(P[1], base_lr * 0.10f);   // sh0
+    add(P[2], base_lr * 0.05f);   // opacity
+    std::cout << "[OPT] Adam groups = " << optimizer_->param_groups().size() << '\n';
+}
+
+void VoxelMapper::generateKfidRandomShuffle()
+{
+    if (mSceneKeyframes.empty()) return;
+
+    /* build deterministic list of KF IDs (keys of the unordered_map) */
+    kfid_index_.clear();
+    kfid_index_.reserve(mSceneKeyframes.size());
+    for (auto const& kv : mSceneKeyframes)
+        kfid_index_.push_back(kv.first);       // store the id only
+
+    /* shuffle a vector of positions 0…N-1 */
+    kfid_shuffle_.resize(kfid_index_.size());
+    std::iota(kfid_shuffle_.begin(), kfid_shuffle_.end(), 0);
+
+    std::mt19937 g{ rd_() };
+    std::shuffle(kfid_shuffle_.begin(), kfid_shuffle_.end(), g);
+
+    kfid_shuffled_    = true;
+    kfid_shuffle_idx_ = -1;   // same convention as before
+}
+
+// std::shared_ptr<VoxelKeyframe> VoxelMapper::useOneRandomSlidingWindowKeyframe() {
+//     if (mSceneKeyframes.empty()) return nullptr;
+//     if (!kfid_shuffled_) generateKfidRandomShuffle();
+
+//     int usable = 0;
+//     for (const auto& [id, kf] : mSceneKeyframes) {
+//         if (kf->remaining_times_of_use_ > 0) ++usable;
+//     }
+//     // std::cout << "[DEBUG] Keyframes with remaining_times_of_use_ > 0: " << usable << std::endl;
+
+//     const int max_attempts = static_cast<int>(mSceneKeyframes.size()) * 2;
+//     int attempts = 0;
+
+//     while (attempts++ < max_attempts)
+//     {
+//         if (kfid_shuffle_idx_ >= static_cast<int>(kfid_shuffle_.size()))
+//             kfid_shuffle_idx_ = 0;
+
+//         int idx = kfid_shuffle_[kfid_shuffle_idx_++];
+//         auto it = mSceneKeyframes.begin();
+//         std::advance(it, idx);
+//         auto viewpoint_cam = it->second;
+
+//         if (viewpoint_cam->remaining_times_of_use_ > 0) {
+//             --(viewpoint_cam->remaining_times_of_use_);
+//             kfs_used_times_[viewpoint_cam->fid_]++;
+//             return viewpoint_cam;
+//         }
+//     }
+
+//     // All keyframes exhausted. Reset with fixed count!
+//     std::cout << "[INFO] Reset keyframe usage counts.\n";
+//     for (auto& kfit : mSceneKeyframes) {
+//         kfit.second->remaining_times_of_use_ = 1;   // ← Set explicitly
+//     }
+
+//     kfid_shuffle_idx_ = 0;
+//     return useOneRandomSlidingWindowKeyframe();
+// }
+std::shared_ptr<VoxelKeyframe> VoxelMapper::useOneRandomSlidingWindowKeyframe()
+{
+    if (mSceneKeyframes.empty()) return nullptr;
+    if (!kfid_shuffled_) generateKfidRandomShuffle();
+
+    const int nkfs = static_cast<int>(kfid_shuffle_.size());
+    if (nkfs == 0) return nullptr;
+
+    // --- Photo‑SLAM algorithm ----------------------------------------------------
+    std::shared_ptr<VoxelKeyframe> viewpoint_cam = nullptr;
+
+    const int start_shuffle_idx = kfid_shuffle_idx_;   // remember where we started
+    do {
+        // advance shuffled index (wrap‑around)
+        kfid_shuffle_idx_ = (kfid_shuffle_idx_ + 1) % nkfs;
+
+        // if we wrapped around ⇒ give *every* key‑frame one extra use
+        if (kfid_shuffle_idx_ == start_shuffle_idx) {
+            for (auto &kv : mSceneKeyframes)
+                increaseKeyframeTimesOfUse(kv.second, 1); // +1 remaining_times_of_use_
+        }
+
+        // map shuffled position to actual key‑frame iterator
+        int shuffled_pos = kfid_shuffle_[kfid_shuffle_idx_];
+        unsigned long kfid = kfid_index_[shuffled_pos];
+        viewpoint_cam = mSceneKeyframes.at(kfid);
+        // auto it = mSceneKeyframes.begin();
+        // std::advance(it, shuffled_pos);
+        // viewpoint_cam = it->second;
+
+    } while (viewpoint_cam->remaining_times_of_use_ <= 0);
+
+    // ─── bookkeeping (exactly like GaussianMapper) ───
+    const unsigned long fid = viewpoint_cam->fid_;
+    if (kfs_used_times_.find(fid) == kfs_used_times_.end())
+        kfs_used_times_[fid] = 1;
+    else
+        ++kfs_used_times_[fid];
+
+    --(viewpoint_cam->remaining_times_of_use_);
+    return viewpoint_cam;
+}
+
+void VoxelMapper::cullKeyframes()
+{
+    std::unordered_set<unsigned long> live_kfids =
+        mpSLAM->getAtlas()->GetCurrentKeyFrameIds();
+
+    std::vector<unsigned long> to_erase;
+    to_erase.reserve(mSceneKeyframes.size());
+
+    for (auto const& kv : mSceneKeyframes)
+        if (live_kfids.find(kv.first) == live_kfids.end())
+            to_erase.push_back(kv.first);
+
+    for (auto id : to_erase)
+        mSceneKeyframes.erase(id);
+
+    if (!to_erase.empty())
+        kfid_shuffled_ = false;       // ✱ add this
+}
+
+// ────────────────────────────────────────────────────────────────
+//  Pull mapping operations from SLAM and update our scene
+//  Currently we only react to LocalMappingBA by inserting /
+//  updating key-frames.  Other operation types are ignored (safe).
+// ────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────
+//  Pull mapping operations from SLAM and update our scene
+// ────────────────────────────────────────────────────────────────
+void VoxelMapper::combineMappingOperations()
+{
+    while (mpSLAM->getAtlas()->hasMappingOperation())
+    {
+        ORB_SLAM3::MappingOperation opr =
+            mpSLAM->getAtlas()->getAndPopMappingOperation();
+
+        switch (opr.meOperationType)
+        {
+        // ——— LOCAL BA ————————————————————————————————
+        case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
+        {
+            auto &kfs = opr.associatedKeyFrames();
+
+            for (auto &kf_tuple : kfs)
+            {
+                unsigned long      kfid    = std::get<0>(kf_tuple);
+                /* ------------------------------------------------------
+                   Photo-SLAM puts the *original image filename* (string)
+                   in std::get<1>(kf_tuple).  Using that guarantees we
+                   never fall back to “…/rgb/0.png”.
+                   ------------------------------------------------------ */
+                const std::string &img_file = std::get<8>(kf_tuple);
+                const Sophus::SE3f &Tcw_new = std::get<2>(kf_tuple);
+
+                auto it = mSceneKeyframes.find(kfid);
+
+                if (it != mSceneKeyframes.end())
+                {   // already known → update pose only
+                    it->second->Tcw = Tcw_new;
+                }
+                else
+                {   // new key-frame → create & cache
+                    auto pkf  = std::make_shared<VoxelKeyframe>();
+                    pkf->fid_ = kfid;
+                    pkf->Tcw  = Tcw_new;
+
+                    /*  The filename coming from ORB-SLAM3 is already
+                        correct (Photo-SLAM logic).  Prepend sequence
+                        directory only if it is *relative*.            */
+                    if (std::filesystem::path(img_file).is_absolute())
+                        pkf->img_path_ = img_file;
+                    else
+                        pkf->img_path_ = (mSeqDir / img_file).string();
+
+                    pkf->remaining_times_of_use_ = 0;
+                    mSceneKeyframes[kfid] = pkf;
+
+                    increaseKeyframeTimesOfUse(
+                        pkf, var_params_.new_keyframe_times_of_use);
+                }
+            }
+        }
+        break;
+
+        default: /* other operation types not needed for mapping yet */ break;
+        }
+    }
+}
+
+bool VoxelMapper::isStopped() const {
+    return stopped_;
+}
+
+void VoxelMapper::signalStop(bool stop) {
+    stopped_ = stop;
+}
+
+inline bool is_between(int iter, int from, int until)
+{ return iter >= from && iter <= until; }
+
+// Add training with optimization loop
+void VoxelMapper::trainForOneIteration()
+{   
+    std::shared_ptr<VoxelKeyframe> pkf = useOneRandomSlidingWindowKeyframe();
+    if (!pkf) {
+        increaseIteration(-1);
+        return;
+    }
+    // bookkeeping
+    ++iteration_;
+
+    /*–––––––––––– 2.   build MiniCam & ground-truth image  –––––––––––––––*/
+    cv::Mat im = cv::imread(pkf->img_path_, cv::IMREAD_COLOR);
+    if (im.empty()) return;
+    cv::Mat imRGB;  cv::cvtColor(im, imRGB, cv::COLOR_BGR2RGB);
+
+    float fx = mpCamera->getParameter(0);
+    float fy = mpCamera->getParameter(1);
+    float cx = mpCamera->getParameter(2);
+    float cy = mpCamera->getParameter(3);
+    sv::MiniCam cam = sv::MiniCam::fromIntrinsics(
+        fx, fy, cx, cy,
+        im.cols, im.rows,
+        static_cast<int>(pkf->fid_)
+    );
+    // Eigen::Matrix4f Tcw = mTcwList[i].matrix();
+    Eigen::Matrix4f Tcw = pkf->Tcw.matrix();  // ← replace with your actual pose logic
+    Eigen::Matrix4f c2w = Tcw.inverse();
+    cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+    cam.w2c = torch::from_blob(Tcw.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+
+     /* gt tensor & mask (mask = valid-pixel region) */
+    torch::Tensor gt = torch::from_blob(imRGB.data, {static_cast<int64_t>(cam.height), static_cast<int64_t>(cam.width), 3}, torch::kUInt8)
+                            .permute({2, 0, 1})
+                            .to(torch::kFloat32)
+                            .div(255.0f)
+                            .to(mDevice)
+                            .clone();
+    torch::Tensor mask = (gt.sum(0) > 0).to(torch::kFloat32);   // (H,W)
+
+    /*–––––––––––– 3. update position LR as Photo-SLAM does ––––––––––––––*/
+    int used_times = kfs_used_times_[pkf->fid_];
+    int step       = std::min(used_times, pos_lr_max_steps_);
+    float pos_lr   = mpTrainer->updateLearningRate(
+                         step, lr_init_, pos_lr_max_steps_, pos_lr_delay_mult_);
+
+    /* geo is param-group 0 */
+    optimizer_->param_groups()[0].options().set_lr(pos_lr);
+
+    /*–––––––––––– 4. render –––––––––––––––––––––––––––––––––––––––––––––*/
+    py::array rgb_numpy = cvMatToNumpyRGB(imRGB);
+    auto out_map  = mpTrainer->render(cam, rgb_numpy, "");
+    torch::Tensor pred = out_map["rgb"].to(mDevice).squeeze(0);   // (3,H,W)
+
+    TORCH_CHECK(pred.sizes() == gt.sizes(), "pred/gt size mismatch");
+
+    /*–––––––––––– 5.   masked loss (L1 + dssim) ––––––––––––––––––––––––*/
+    torch::Tensor p_masked = pred * mask;
+    torch::Tensor g_masked = gt   * mask;
+
+    auto Ll1  = loss_utils::l1_loss(p_masked, g_masked);
+    float λ   = mVoxelConfig.lambda_ssim;                 // same as Gaussian
+    auto p_contig = p_masked.contiguous();
+    auto g_contig = g_masked.contiguous();
+    auto dssim    = 1.0f - loss_utils::ssim(p_contig, g_contig, mDevice.type());
+
+    torch::Tensor loss = (1.0f - λ) * Ll1 + λ * dssim;
+
+    /*–––––––––––– 6. backward + optimiser step –––––––––––––––––––––––––*/
+    optimizer_->zero_grad();
+    {
+        py::gil_scoped_release no_gil;  // release GIL for autograd
+        loss.backward();
+    }
+    optimizer_->step();
+
+    /*–––––––––––– 7. accumulate subdiv-priority gradient –––––––––––––––*/
+    try {
+        torch::NoGradGuard no_grad;
+
+        torch::Tensor grad          = mpTrainer->get_subdiv_priority_grad();
+        torch::Tensor grad_copy     = grad.clone();                 // safe
+        torch::Tensor subdiv_meta   = mpTrainer->get_tensor("subdiv_meta");
+        subdiv_meta += grad_copy * mVoxelConfig.meta_accum_lr;
+        subdiv_meta = torch::where(torch::isfinite(subdiv_meta),
+                                   subdiv_meta,
+                                   torch::zeros_like(subdiv_meta))
+                          .clamp(0.f, 1.f);
+
+        mpTrainer->set_subdiv_meta(subdiv_meta);   // re-attach grad
+
+        /* keep running buffer for later subdivision */
+        torch::Tensor all_idx =
+            torch::arange(grad.numel(), grad.options().dtype(torch::kLong));
+        mpTrainer->accumulate_subdiv_gradients(all_idx, grad_copy);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[WARN] subdivision-grad accumulation failed: "
+                  << e.what() << std::endl;
+    }
+
+    /*–––––––––––– 8. exponential-moving-average loss for logging –––––––*/
+    static float ema_loss = loss.item<float>();
+    ema_loss = 0.4f * loss.item<float>() + 0.6f * ema_loss;
+
+    if (iteration_ % 10 == 0) {
+        std::cout << "[TRAIN] it "   << iteration_
+                  << " | L1 "        << Ll1.item<float>()
+                  << " | SSIM "      << (1.0f - dssim.item<float>())
+                  << " | loss "      << loss.item<float>()
+                //   << " | ema "       << ema_loss
+                  << std::endl;
+    }
+
+    /*–––––––––––– 9. write usage table every 50 iters ––––––––––––––––––*/
+    if (iteration_ % 50 == 0)
+        writeKeyframeUsedTimes(result_dir_);
 }
 
 //------------------------------------------------------------
 // helper: copy Mat → NumPy (NumPy owns the memory)
 //------------------------------------------------------------
-static py::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat &img)
+py::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat &img)
 {
     if (img.empty() || img.type() != CV_8UC3)
-        throw std::runtime_error("Expected a non‑empty 3‑channel CV_8UC3 image");
+        throw std::runtime_error("Expected a non-empty 3-channel CV_8UC3 image");
 
     // allocate new NumPy array that *owns* its data
     py::array_t<uint8_t> arr({img.rows, img.cols, 3});
@@ -77,560 +718,272 @@ static py::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat &img)
     return arr;   // safe – Python holds the buffer
 }
 
-VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> slam,
-            // const sv::VoxelScheduleConfig& cfg,
-            const std::filesystem::path& voxel_yaml,
-            const std::filesystem::path& seq_dir,
-            const std::filesystem::path& out_dir,
-            torch::Device device)
-    :   mpSLAM(slam),
-        // mVoxelConfig(cfg),
-        mVoxelCfg(voxel_yaml),
-        mSeqDir(seq_dir),
-        mOutDir(out_dir),
-        mDevice(device)
+// void VoxelMapper::increaseKeyframeTimesOfUse(std::shared_ptr<VoxelKeyframe> pkf, int value)
+// {
+//     pkf->remaining_times_of_use_ += value;
+//     // kfs_used_times_[pkf->fid_] = 0;  // reset usage tracking if needed
+// }
+inline void VoxelMapper::increaseKeyframeTimesOfUse(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        int n)
 {
-    // Load config from YAML
-    mVoxelConfig = loadVoxelConfig(voxel_yaml);
-    // Create trainer
-    mpTrainer = std::make_shared<sv::VoxelTrainer>(64);  // grid resolution
+    if (!kf) return;
+    kf->remaining_times_of_use_ += n;
+    if (kf->remaining_times_of_use_ < 0)
+        kf->remaining_times_of_use_ = 0;
 }
 
-void VoxelMapper::LoadImages(const std::string& rgb_txt_path)
+void VoxelMapper::writeKeyframeUsedTimes(const std::filesystem::path& dir,
+                                         const std::string& suffix)
 {
-    std::ifstream f(rgb_txt_path);
-    std::string line;
-    // Temp list to sort
-    std::vector<std::pair<double, std::string>> entries;
+    std::filesystem::create_directories(dir);
+    std::ofstream f(dir / ("keyframe_used_times" + suffix + ".txt"),
+                    std::ios::out | std::ios::app);
 
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0]=='#') continue;
-        std::stringstream ss(line);
-        double t;
-        std::string fname;
-        ss >> t >> fname;
-        entries.emplace_back(t, (mSeqDir / fname).string());
+    f << "##[Voxel Mapper]Iteration " << getIteration()
+      << " keyframe id, used times, remaining times:\n";
+
+    for (auto const& kv : kfs_used_times_)
+    {
+        auto it = mSceneKeyframes.find(kv.first);
+        int remaining = (it != mSceneKeyframes.end())
+                        ? it->second->remaining_times_of_use_ : 0;
+        f << kv.first << ' ' << kv.second << ' ' << remaining << '\n';
     }
-    // Ensure timestamps are sorted!
-    std::sort(entries.begin(), entries.end());
-    for (const auto& e : entries) {
-        mTimestamps.push_back(e.first);
-        mImagePaths.push_back(e.second);
-    }
+    f << "##=========================================\n";
 }
 
-void VoxelMapper::run()
+void VoxelMapper::renderAndRecordKeyframe(std::shared_ptr<VoxelKeyframe> pkf,
+                                          float&  dssim,
+                                          float&  psnr,
+                                          double& render_ms,
+                                          const std::filesystem::path& img_dir,
+                                          const std::filesystem::path& gt_dir,
+                                          const std::filesystem::path& loss_dir,
+                                          const std::string& suffix)
 {
-    py::gil_scoped_acquire gil;        // ← take the interpreter lock first
-    // make our helper modules visible
-    py::module_::import("sys")
-        .attr("path").attr("insert")(0, "../scripts_voxel");
-    // std::fprintf(stderr, "[DBG]  current interp = %p\n", PyThreadState_Get()->interp);
-    LoadImages((mSeqDir / "rgb.txt").string());
- 
-    // Phase 1: Feed all images to SLAM
-    size_t kf_index = 0;          // <- new
-    for (size_t i = 0; i < mImagePaths.size(); ++i) 
-    // for (size_t i = 0; i < mKeyframeIds.size(); ++i)
-    {
-        cv::Mat im = cv::imread(mImagePaths[i], cv::IMREAD_UNCHANGED);
-        if (im.empty()) continue;
-        if (im.type() == CV_16U) {
-            double minV, maxV; cv::minMaxLoc(im, &minV, &maxV);
-            im.convertTo(im, CV_8U, 255.0 / maxV);
-        }
-        cv::Mat imGray;
-        if (im.channels() == 3) cv::cvtColor(im, imGray, cv::COLOR_BGR2GRAY);
-        else                    imGray = im;
+    // ────── intrinsics from the ORB-SLAM3 camera ──────
+    const float fx = mpCamera->getParameter(0);
+    const float fy = mpCamera->getParameter(1);
+    const float cx = mpCamera->getParameter(2);
+    const float cy = mpCamera->getParameter(3);
 
-        double dt = (i == 0) ? 0.033 : (mTimestamps[i] - mTimestamps[i - 1]);
-        if (dt > 0.0) std::this_thread::sleep_for(std::chrono::duration<double>(dt));
+    // ────── load the ground-truth frame (as RGB) ──────
+    cv::Mat im_bgr = cv::imread(pkf->img_path_, cv::IMREAD_COLOR);
+    if (im_bgr.empty()) return;
 
-        Sophus::SE3f Tcw = mpSLAM->TrackMonocular(imGray, mTimestamps[i]);
-        mTcwList.push_back(Tcw);
-        mTrackState.push_back(mpSLAM->GetTrackingState());
-    }
+    cv::Mat im_rgb;
+    cv::cvtColor(im_bgr, im_rgb, cv::COLOR_BGR2RGB);
 
-    // Phase 2: Check if SLAM initialized properly
-    int n_kfs = mpSLAM->GetNumKeyframes();
-    if (n_kfs < 15) {
-        std::cout << "[ERROR] Not enough keyframes. SLAM failed to initialize.\n";
-        return;
-    }
-    std::vector<ORB_SLAM3::KeyFrame*> keyframes = mpSLAM->getAtlas()->GetAllKeyFrames();
-    std::sort(keyframes.begin(), keyframes.end(),
-            [](ORB_SLAM3::KeyFrame* a, ORB_SLAM3::KeyFrame* b) {
-                return a->mTimeStamp < b->mTimeStamp;
-            });
+    const int width  = im_rgb.cols;
+    const int height = im_rgb.rows;
 
-    for (auto* kf : keyframes)
-    {
-        if (kf && !kf->isBad())
-        {
-            mKeyframeIds.push_back(kf->mnId);
-            mKeyframePoses.push_back(Sophus::SE3f(kf->GetPose()));
-            // Adjust this line if your filenames are different (e.g. .jpg)
-            mKeyframeImages.push_back((mSeqDir / "rgb" / (std::to_string(kf->mTimeStamp) + ".png")).string());
-        }
-    }
-    // === Create VoxelKeyframes ===
-    for (size_t i = 0; i < mKeyframeIds.size(); ++i) {
-        auto kf = std::make_shared<VoxelKeyframe>();
-        kf->fid_ = mKeyframeIds[i];
-        kf->img_path_ = mKeyframeImages[i];
-        kf->Tcw = mKeyframePoses[i];
-        kf->remaining_times_of_use_ = 1;
-        mSceneKeyframes[kf->fid_] = kf;
-    }
+    /*  NumPy array that owns its memory — the Python renderer
+        expects this.  */
+    py::array rgb_numpy = cvMatToNumpyRGB(im_rgb);
 
-    // Phase 3: Initialize voxels from SLAM map
-    float voxel_size = 0.05f;
-    torch::Tensor voxel_centers;
-    if (!initializeVoxelsFromMap(voxel_centers, voxel_size)) {
-        std::cout << "[ERROR] No valid map points after SLAM.\n";
-        return;
-    }
+    // ────── build MiniCam exactly like the Python side expects ──────
+    const float tanfovx = 0.5f * width  / fx;   // tan(FOVx/2)
+    const float tanfovy = 0.5f * height / fy;   // tan(FOVy/2)
 
-    const int64_t N = voxel_centers.size(0);
-    torch::Tensor oct_paths = torch::arange(N, torch::kLong).to(mDevice);
-    torch::Tensor oct_levels  = torch::zeros({N},  torch::kInt32 ).to(mDevice);
-    // torch::Tensor subdiv_meta = torch::zeros({N},  torch::kFloat32).to(mDevice);
-    torch::Tensor subdiv_meta = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(mDevice).requires_grad(true));
-    subdiv_meta.retain_grad();  // ← THIS is crucial for non-leaf tensors
-    torch::Tensor subdiv_p = torch::zeros_like(subdiv_meta, torch::kFloat32).to(mDevice);
-
-
-    mpTrainer->set_voxels(
-            voxel_centers.to(mDevice),                           // (N,3)
-            torch::full({N},   voxel_size, torch::kFloat32).to(mDevice),      // lengths
-            torch::zeros({N,8},  torch::kFloat32).to(mDevice),   // geo key‑pts (unused)
-            torch::ones ({N,3},  torch::kFloat32).to(mDevice)*0.5f,           // RGB
-            torch::zeros({N,45}, torch::kFloat32).to(mDevice),   // SH coeffs
-            torch::ones ({N},    torch::kFloat32).to(mDevice)*0.8f,           // opacity
-            oct_paths,
-            oct_levels,
-            subdiv_meta,
-            subdiv_p                                            
+    sv::MiniCam cam = sv::MiniCam::fromIntrinsics(
+        fx, fy, cx, cy,
+        width, height,
+        static_cast<int>(pkf->fid_)
     );
-    std::cout << "[INFO] Voxel model initialized from SLAM map.\n";
 
-    // Phase 4: Train on all frames again with optimization
-    trainLoopWithOptimization(10000);  // or any number of iterations you prefer
-    finalize();
-    mpTrainer.reset();
-}
+    Eigen::Matrix4f Tcw = pkf->Tcw.matrix();
+    Eigen::Matrix4f c2w = Tcw.inverse();
 
-bool VoxelMapper::initializeVoxelsFromMap(torch::Tensor& out_centers, float voxel_size)
-{
-    auto map = mpSLAM->getAtlas()->GetCurrentMap();
-    std::vector<ORB_SLAM3::MapPoint*> mps = map->GetAllMapPoints();
-    std::set<std::vector<float>> unique_centers;
+    cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+    cam.w2c = torch::from_blob(Tcw.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
 
-    for (auto* mp : mps) {
-        if (!mp || mp->isBad()) continue;
-        Eigen::Vector3f pos = mp->GetWorldPos().cast<float>();
-        Eigen::Vector3f center = (pos / voxel_size).array().round() * voxel_size;
-        unique_centers.insert({center[0], center[1], center[2]});
-    }
+    /* store the tangents so that the pybind converter can forward
+       them to python-MiniCam */
+    cam.fx      = fx;          // keep the usual intrinsics
+    cam.fy      = fy;
+    cam.cx      = cx;
+    cam.cy      = cy;
+    cam.width   = width;
+    cam.height  = height;
+    /* stash the tangents in the otherwise unused “near” & “frame_id”
+       slots (cleaner than extending the struct here): */
+    cam.near    = tanfovx;     // will be read in python as tanfovx
+    cam.frame_id = *reinterpret_cast<const int*>(&tanfovy); // hacky but OK
 
-    if (unique_centers.empty()) return false;
+    // ────── render ──────
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    auto out      = mpTrainer->render(cam, rgb_numpy, "");
+    const auto t1 = std::chrono::high_resolution_clock::now();
 
-    std::cout << "[INFO] Loaded " << unique_centers.size() << " unique voxel centers.\n";
+    render_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    std::vector<torch::Tensor> tensor_list;
-    for (const auto& vec : unique_centers) {
-        tensor_list.push_back(torch::from_blob((void*)vec.data(), {3}, torch::kFloat32).clone());
-    }
+    torch::Tensor rgb = out.at("rgb").cpu().squeeze(0);           // (3,H,W)
 
-    out_centers = torch::stack(tensor_list);
-    return true;
-}
-
-//------------------------------------------------------------------
-// Save a single RGB tensor to disk (expects H×W×3 uint8 NumPy)
-//------------------------------------------------------------------
-static void saveNumpyRGB(const py::array &arr,
-                         const std::filesystem::path &png_path)
-{
-    cv::Mat img(arr.shape(0),               // rows (H)
-                arr.shape(1),               // cols (W)
-                CV_8UC3,
-                (void*)arr.data());  
-    cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
-    cv::imwrite(png_path.string(), img);
-}
-
-//------------------------------------------------------------------
-// Render every cached key‑frame once and write to …/NNNN_shutdown/
-//------------------------------------------------------------------
-void VoxelMapper::renderAndDumpAllKeyframes(const std::string &tag)
-{
-    const auto dump_root = mOutDir / (tag + "_shutdown");
-    const auto img_dir   = dump_root / "image";
-    std::filesystem::create_directories(img_dir);
-
-    std::ofstream timings(dump_root / "render_time.txt",
-                          std::ios::out | std::ios::trunc);
-    timings << "## keyframe_id   time_ms\n";
-
-    for (size_t i = 0; i < mKeyframeIds.size(); ++i)
+    // ────── optional dumping of the rendered frame ──────
+    if (record_rendered_image_)
     {
-        int kfid = mKeyframeIds[i];
-        const Sophus::SE3f& Tcw = mKeyframePoses[i];
-        const std::string& path = mKeyframeImages[i];
+        torch::Tensor img_u8 = (rgb.clamp(0,1) * 255)
+                                .to(torch::kU8).permute({1,2,0}).contiguous();
+        cv::Mat cvimg(img_u8.size(0), img_u8.size(1), CV_8UC3, img_u8.data_ptr());
+        cv::cvtColor(cvimg, cvimg, cv::COLOR_RGB2BGR);
 
-        cv::Mat im = cv::imread(path, cv::IMREAD_COLOR);
-        if (im.empty()) continue;
-
-        sv::MiniCam cam;
-        cam.width   = im.cols;    cam.height = im.rows;
-        cam.cx      = cam.width * 0.5f;  cam.cy = cam.height * 0.5f;
-        cam.fovx    = 2.f * std::atan(cam.width  / (2.f * 517.306f));
-        cam.fovy    = 2.f * std::atan(cam.height / (2.f * 516.469f));
-        cam.frame_id = kfid;
-
-        Eigen::Matrix4f eig_Tcw = Tcw.matrix();
-        Eigen::Matrix4f eig_c2w = eig_Tcw.inverse();
-
-        cam.c2w = torch::from_blob(eig_c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
-        cam.w2c = torch::from_blob(eig_Tcw.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
-
-        cv::Mat imRGB;
-        cv::cvtColor(im, imRGB, cv::COLOR_BGR2RGB);
-        py::array rgb_numpy = cvMatToNumpyRGB(imRGB);
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        // std::cout << "[DBG] Rendering frame " << i << " with " << mpTrainer->num_voxels() << " voxels\n";
-        auto out_map = mpTrainer->render(cam, rgb_numpy, img_dir.string());
-        at::Tensor rgb_tensor_f32 = out_map.at("rgb").cpu();                 // (3,H,W) float32
-        // at::Tensor rgb_tensor_u8  = (rgb_tensor_f32.clamp(0,1) * 255.0f)
-        //                                 .to(torch::kU8)
-        //                                 .permute({1,2,0})        // → (H,W,3) for OpenCV
-        //                                 .contiguous();
-        at::Tensor rgb_tensor_u8 =  (rgb_tensor_f32.squeeze(0)          //  (3,H,W)
-                                        .clamp(0,1) * 255.0f)
-                                        .to(torch::kU8)
-                                        .permute({1,2,0})               //  (H,W,3) ok
-                                        .contiguous();
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::stringstream ss;
-        ss << tag << "_" << kfid << ".jpg";
-
-        cv::Mat rgb_image(rgb_tensor_u8.size(0),               // rows = H
-                        rgb_tensor_u8.size(1),               // cols = W
-                        CV_8UC3,
-                        rgb_tensor_u8.data_ptr());
-        cv::cvtColor(rgb_image, rgb_image, cv::COLOR_RGB2BGR);
-        cv::imwrite((img_dir / ss.str()).string(), rgb_image);
-
-        double t_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        timings << kfid << "  " << std::fixed << std::setprecision(3) << t_ms << "\n";
-    }
-}
-
-void VoxelMapper::generateKfidRandomShuffle() {
-    if (mSceneKeyframes.empty()) return;
-
-    size_t nkfs = mSceneKeyframes.size();
-    kfid_shuffle_.resize(nkfs);
-    std::iota(kfid_shuffle_.begin(), kfid_shuffle_.end(), 0);
-    std::mt19937 g(std::random_device{}());
-    std::shuffle(kfid_shuffle_.begin(), kfid_shuffle_.end(), g);
-    kfid_shuffled_ = true;
-}
-
-std::shared_ptr<VoxelKeyframe> VoxelMapper::useOneRandomSlidingWindowKeyframe() {
-    if (mSceneKeyframes.empty()) return nullptr;
-    if (!kfid_shuffled_) generateKfidRandomShuffle();
-
-    int usable = 0;
-    for (const auto& [id, kf] : mSceneKeyframes) {
-        if (kf->remaining_times_of_use_ > 0) ++usable;
-    }
-    std::cout << "[DEBUG] Keyframes with remaining_times_of_use_ > 0: " << usable << std::endl;
-
-    const int max_attempts = static_cast<int>(mSceneKeyframes.size()) * 2;
-    int attempts = 0;
-
-    while (attempts++ < max_attempts)
-    {
-        if (kfid_shuffle_idx_ >= static_cast<int>(kfid_shuffle_.size()))
-            kfid_shuffle_idx_ = 0;
-
-        int idx = kfid_shuffle_[kfid_shuffle_idx_++];
-        auto it = mSceneKeyframes.begin();
-        std::advance(it, idx);
-        auto viewpoint_cam = it->second;
-
-        if (viewpoint_cam->remaining_times_of_use_ > 0) {
-            --(viewpoint_cam->remaining_times_of_use_);
-            kfs_used_times_[viewpoint_cam->fid_]++;
-            return viewpoint_cam;
-        }
+        cv::imwrite(img_dir / (std::to_string(getIteration()) + "_"
+                               + std::to_string(pkf->fid_) + suffix + ".jpg"),
+                    cvimg);
     }
 
-    // 🧨 All keyframes exhausted. Reset with fixed count!
-    std::cout << "[INFO] Reset keyframe usage counts.\n";
-    for (auto& kfit : mSceneKeyframes) {
-        kfit.second->remaining_times_of_use_ = 1;   // ← Set explicitly
-    }
-
-    kfid_shuffle_idx_ = 0;
-    return useOneRandomSlidingWindowKeyframe();
-}
-
-void VoxelMapper::increaseKeyframeTimesOfUse(std::shared_ptr<VoxelKeyframe> pkf, int times) {
-    pkf->remaining_times_of_use_ += times;
-}
-
-// Add training with optimization loop
-void VoxelMapper::trainLoopWithOptimization(int num_iters)
-{
-    auto optimizer = std::make_unique<torch::optim::Adam>(
-        mpTrainer->parameters(), torch::optim::AdamOptions(mVoxelConfig.lr));
-    bool changed = false;  // tracks if subdivide/prune occurred
-
-    // Extract loss weights from config
-    float w_photo    = mVoxelConfig.lambda_photo;
-    float w_ssim     = mVoxelConfig.lambda_ssim;
-    float w_tconcen  = mVoxelConfig.lambda_T_concen;
-    float w_tinside  = mVoxelConfig.lambda_T_inside;
-
-    for (int iter = 0; iter < num_iters; ++iter)
-    {
-        int total_kfs = mSceneKeyframes.size();
-        std::cout << "[INFO] Iter " << iter << " | Total available keyframes: " << total_kfs << std::endl;
-
-        float total_loss = 0.f;
-        int frames_used = 0;
-
-        // for (size_t i = 0; i < mImagePaths.size(); ++i)
-        // {
-            // if (mTrackState[i] != 1) continue;
-            // std::cout << "[INFO] Using keyframe index " << i
-            //    << " (path = " << mImagePaths[i] << ")\n";
-            // cv::Mat im = cv::imread(mImagePaths[i], cv::IMREAD_COLOR);
-
-        std::shared_ptr<VoxelKeyframe> pkf = useOneRandomSlidingWindowKeyframe();
-        if (!pkf) continue;
-        std::cout << "[INFO] Using keyframe index " << pkf->fid_
-                << " (path = " << pkf->img_path_ << ")\n";
-        std::cout << "[INFO] Remaining uses for keyframe " << pkf->fid_
-                << ": " << pkf->remaining_times_of_use_ << std::endl;
-        cv::Mat im = cv::imread(pkf->img_path_, cv::IMREAD_COLOR);
-
-        if (im.empty()) continue;
-        cv::Mat imRGB;
-        cv::cvtColor(im, imRGB, cv::COLOR_BGR2RGB);
-        py::array rgb_numpy = cvMatToNumpyRGB(imRGB);
-
-        sv::MiniCam cam;
-        cam.width = im.cols; cam.height = im.rows;
-        cam.cx = cam.width * 0.5f; cam.cy = cam.height * 0.5f;
-        cam.fovx = 2.f * std::atan(cam.width  / (2.f * 517.306f));
-        cam.fovy = 2.f * std::atan(cam.height / (2.f * 516.469f));
-        // cam.frame_id = static_cast<int>(i);
-        cam.frame_id = static_cast<int>(pkf->fid_);
-
-        // Eigen::Matrix4f Tcw = mTcwList[i].matrix();
-        Eigen::Matrix4f Tcw = pkf->Tcw.matrix();  // ← replace with your actual pose logic
-        Eigen::Matrix4f c2w = Tcw.inverse();
-        cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
-        cam.w2c = torch::from_blob(Tcw.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
-
-        torch::Tensor gt = torch::from_blob(imRGB.data, {cam.height, cam.width, 3}, torch::kUInt8)
+    torch::Tensor pred = out.at("rgb").cpu().squeeze(0);  // (3,H,W)
+    torch::Tensor gt_tensor = torch::from_blob(im_rgb.data, {height, width, 3}, torch::kU8)
                                 .permute({2, 0, 1})
                                 .to(torch::kFloat32)
                                 .div(255.0f)
-                                .to(mDevice)
                                 .clone();
-        try {
-            auto subdiv_p = mpTrainer->get_tensor("subdiv_p");
-            // std::cout << "[DEBUG] subdiv_p.requires_grad(): " << (subdiv_p.requires_grad() ? "true" : "false") << std::endl;
-            auto out_map = mpTrainer->render(cam, rgb_numpy, "");
-            torch::Tensor pred = out_map["rgb"].to(mDevice);
-            // torch::Tensor gt_tensor = out_map["gt"].to(mDevice);  // shape (1,3,H,W)
-            torch::Tensor gt_tensor = gt.unsqueeze(0);   // (1,3,H,W)
-            
-            TORCH_CHECK(pred.sizes() == gt_tensor.sizes(), "pred and gt_tensor shapes must match");
-                // drop the interpreter lock for the heavy autograd work
-            py::gil_scoped_release no_gil;
+    gt_tensor = gt_tensor.unsqueeze(0);  // (1,3,H,W)
 
-            torch::Tensor l2   = torch::mse_loss(pred, gt_tensor);
-            torch::Tensor loss = w_photo * l2;
-            if (out_map.find("T") != out_map.end())
-            {
-                torch::Tensor T         = out_map["T"].to(mDevice);   // (1,1,H,W)
-                torch::Tensor T_concen  = (T * (1.0f - T)).mean();
-                torch::Tensor T_inside  = T.square().mean();
-                loss += w_tconcen * T_concen + w_tinside * T_inside;
-            }
-            auto pred_contig = pred.contiguous();
-            auto gt_contig   = gt_tensor.contiguous();
-            // SSIM term
-            // torch::Tensor ssim_loss = 1.0f - loss_utils::ssim(pred, gt_tensor, mDevice.type());
-            auto ssim_loss   = 1.0f - loss_utils::ssim(pred_contig, gt_contig, mDevice.type());
-            loss += w_ssim * ssim_loss;
+    torch::Tensor pred_u = pred.unsqueeze(0);
+    torch::Tensor gt_u   = gt_tensor;
 
-            // Backward pass
-            (*optimizer).zero_grad();
-            loss.backward();
-            (*optimizer).step();                // ← Applies optimizer step
+    psnr  = loss_utils::psnr(pred_u, gt_u).item<float>();
+    dssim = (1.0f - loss_utils::ssim(pred_u, gt_u)).item<float>();
+}
 
-            // === Accumulate gradient for subdivision ===
-            try {
-                torch::NoGradGuard no_grad;
-                auto grad = mpTrainer->get_subdiv_priority_grad();   // ← Safe accessor
-                // std::cout << "[DEBUG] subdiv_p.grad().max(): " << grad.max().item<float>() << std::endl;
-                
-                // auto grad_detached = grad.detach();
-                // torch::Tensor subdiv_meta = mpTrainer->get_tensor("subdiv_meta").detach();  // ← no grad needed here
-                // auto updated = subdiv_meta + grad_detached * mVoxelConfig.meta_accum_lr;
+void VoxelMapper::renderAndRecordAllKeyframes(const std::string& suffix)
+{
+    std::filesystem::path out_dir = result_dir_ /
+                                    (std::to_string(getIteration()) + suffix);
+    std::filesystem::create_directories(out_dir);
+    std::filesystem::path img_dir  = out_dir / "image";
+    std::filesystem::path gt_dir   = out_dir / "image_gt";
+    std::filesystem::path loss_dir = out_dir / "image_loss";
+    if (record_rendered_image_)        std::filesystem::create_directories(img_dir);
+    if (record_ground_truth_image_)    std::filesystem::create_directories(gt_dir);
+    if (record_loss_image_)            std::filesystem::create_directories(loss_dir);
 
-                auto grad_copy = grad.clone();
-                // grab current subdiv_meta (still a leaf)
-                auto subdiv_meta = mpTrainer->get_tensor("subdiv_meta");
-                // std::cout << "subdiv_meta_.shape = " << mpTrainer->get_tensor("subdiv_meta").sizes() << "\n";
-                // std::cout << "grad_copy.shape     = " << grad_copy.sizes() << "\n";
-                // accumulate
-                auto updated = subdiv_meta + grad_copy * mVoxelConfig.meta_accum_lr;
+    std::ofstream timings(out_dir / "render_time.txt");
+    timings << "## keyframe id, time(ms)\n";
 
-                updated = torch::where(torch::isfinite(updated), updated, torch::zeros_like(updated));
-                updated = updated.clamp(0.0f, 1.0f);
+    std::ofstream psnr_f(out_dir / "psnr.txt");
+    std::ofstream dssim_f(out_dir / "dssim.txt");
+    psnr_f << "## kfid, PSNR\n";
+    dssim_f << "## kfid, dssim\n";
 
-                mpTrainer->set_subdiv_meta(updated);  // ← retains_grad again internally
-
-                // === NEW: Accumulate for gradient-based subdivision ===
-                torch::Tensor all_indices = torch::arange(grad.numel(), grad.options().dtype(torch::kLong));
-                mpTrainer->accumulate_subdiv_gradients(all_indices, grad_copy); 
-
-            } catch (const std::exception& e) {
-                std::cerr << "[WARN] Could not accumulate subdivision gradients: " << e.what() << std::endl;
-            }
-
-            total_loss += loss.item<float>();
-            frames_used++;
-
-        } catch (const py::error_already_set& e) {
-            std::cerr << "[Python-Error] " << e.what() << std::endl;
-            continue;
-        }
-        // }
-        
-        const int subdiv_every = 5;
-        if ((iter + 1) % mVoxelConfig.subdiv_every == 0)
-        {
-            if (iter >= mVoxelConfig.subdiv_from && iter <= mVoxelConfig.subdiv_until) {
-                torch::Tensor grad;
-                try {
-                    grad = mpTrainer->get_subdiv_priority_grad();  // ← uses subdiv_p_.grad()
-                } catch (const std::exception& e) {
-                    std::cerr << "[WARN] Cannot get subdivision gradients: " << e.what() << "\n";
-                    return;
-                }
-
-                if (!grad.defined() || grad.numel() == 0) return;
-
-                torch::Tensor grad_detached = grad.detach();
-
-                if (!grad_detached.isfinite().all().item<bool>()) {
-                    std::cerr << "[WARN] subdiv_p.grad contains NaNs or infs. Skipping...\n";
-                    return;
-                }
-
-                float thresh = grad_detached.quantile(mVoxelConfig.subdiv_quantile).item<float>();
-
-                auto size_ten = mpTrainer->get_tensor("size");
-                torch::Tensor can_split = (size_ten * 0.5) >= sv::MIN_VOX_SIZE;
-
-                torch::Tensor valid_mask = mpTrainer->get_tensor("oct_level") < sv::MAX_VOXEL_LEVEL;
-
-                torch::Tensor mask = (grad_detached > thresh)
-                                & (grad_detached > mVoxelConfig.subdiv_gradient_threshold)
-                                & can_split
-                                & valid_mask;
-
-                int64_t n_sub = mask.sum().item<int64_t>();
-                // std::cout << "[DBG] Subdivision candidates: " << n_sub << "\n";
-
-                if (n_sub > 0) {
-                    std::cout << "[SUBDIV] iter " << iter << "  |  splitting " << n_sub << " voxels\n";
-                    mpTrainer->subdivide(mask);  // also resets subdiv_p_ internally
-                    auto new_meta = torch::zeros_like(mpTrainer->get_tensor("subdiv_p"));  // now subdiv_p has correct shape
-                    mpTrainer->set_subdiv_meta(new_meta);  // this will call .retain_grad() as needed
-
-                    changed = true;
-                    std::cout << "[INFO] Voxels after subdivide: " << mpTrainer->num_voxels() << "\n";
-                }
-            }
-        }
-        // === Pruning ===
-        int64_t before = 0;
-        int64_t after  = 0;
-        torch::Tensor keep_mask;
-
-        if ((iter >= mVoxelConfig.prune_from) &&
-            (iter <= mVoxelConfig.prune_until) &&
-            (iter % mVoxelConfig.prune_every == 0)) {
-
-            torch::NoGradGuard _;
-
-            auto size_ten  = mpTrainer->get_tensor("size");
-            auto meta_ten  = mpTrainer->get_tensor("subdiv_meta");
-
-            // Adaptive prune threshold
-            float prune_iter_rate = float(iter - mVoxelConfig.prune_from) /
-                                    float(mVoxelConfig.prune_until - mVoxelConfig.prune_from);
-            prune_iter_rate = std::clamp(prune_iter_rate, 0.f, 1.f);
-
-            float thresh = mVoxelConfig.prune_threshold_init +
-                        (mVoxelConfig.prune_threshold_final - mVoxelConfig.prune_threshold_init) * prune_iter_rate;
-
-            // torch::Tensor too_small = size_ten < sv::MIN_VOX_SIZE;
-            // torch::Tensor low_meta  = meta_ten < thresh;
-            // torch::Tensor keep_mask = ~(too_small | low_meta);
-
-            // 1. Remove invalid values (NaNs or infs)
-            meta_ten = torch::where(torch::isfinite(meta_ten), meta_ten, torch::zeros_like(meta_ten));
-            // 2. Compute adaptive threshold via quantile (SVRaster-style)
-            float quant = meta_ten.quantile(mVoxelConfig.subdiv_quantile).item<float>();
-            // 3. Create mask: keep voxels with meta >= quantile threshold
-            torch::Tensor keep_mask = (meta_ten >= quant) & (size_ten >= sv::MIN_VOX_SIZE);
-
-            if (keep_mask.sum().item<int64_t>() < mVoxelConfig.min_voxels)
-                keep_mask.slice(0, 0, mVoxelConfig.min_voxels).fill_(true);
-
-            int64_t before = mpTrainer->num_voxels();
-            int64_t after  = keep_mask.sum().item<int64_t>();
-
-            if (after < before) {
-                mpTrainer->prune(keep_mask);
-                std::cout << "[PRUNE] " << before << " → " << after << " voxels\n";
-                changed = true;
-            }
-
-            std::cout << "[DEBUG] After pruning: total_loss = " << total_loss
-                    << " | frames_used = " << frames_used
-                    << " | average = " << (frames_used > 0 ? total_loss / frames_used : 0.0f)
-                    << std::endl;
-
-            meta_ten.detach_().zero_();  // reset stats
-        }
-        if (changed) {
-            // optimizer = build_optimizer();   // grab fresh leaf tensors
-            optimizer = std::make_unique<torch::optim::Adam>(
-                mpTrainer->parameters(), torch::optim::AdamOptions(mVoxelConfig.lr));
-            std::cout << "[INFO] Rebuilt optimizer after topology change\n";
-            changed = false;
-        }   
-        // std::cout << "[TRAIN] Iter " << iter << "  |  Loss: "
-        //           << (frames_used > 0 ? total_loss / frames_used : 0.0) << std::endl;
-        std::cout << "[TRAIN] Iter " << iter
-          << " | Used " << frames_used << " keyframes out of " << total_kfs
-          << " | Avg Loss: " << (frames_used > 0 ? total_loss / frames_used : 0.0)
-          << std::endl;
+    for (auto& kv : mSceneKeyframes) {
+        float dssim, psnr;
+        double ms;
+        renderAndRecordKeyframe(kv.second, dssim, psnr, ms,
+                                img_dir, gt_dir, loss_dir);
+        timings << kv.first << ' ' << std::fixed << std::setprecision(6) << ms << '\n';
+        psnr_f << kv.first << ' ' << psnr << '\n';
+        dssim_f << kv.first << ' ' << dssim << '\n';
     }
+}
+
+/* --- Optional placeholders so the call-sites compile ------------------- */
+void VoxelMapper::savePly(const std::filesystem::path&){ /* TODO when trainer supports export */ }
+void VoxelMapper::keyframesToJson(const std::filesystem::path&){ }
+
+void VoxelMapper::trainingReport(int iter,
+                                 float loss,
+                                 float ema_loss,
+                                 double ms_per_iter,
+                                 int kfid)
+{
+    std::cout << "[REPORT] iter " << iter
+              << "  kf "  << kfid
+              << "  loss " << std::fixed << std::setprecision(6) << loss
+              << "  ema "  << ema_loss
+              << "  "      << ms_per_iter << " ms\n";
+
+    // dump to file (append)
+    std::filesystem::path rpt_dir = mOutDir / (std::to_string(iter) + "_report");
+    std::filesystem::create_directories(rpt_dir);
+    std::ofstream fout(rpt_dir / "loss.txt", std::ios::app);
+    fout << iter << " " << kfid << " " << loss << " " << ema_loss << "\n";
+    fout.close();
+
+    std::ofstream rt(rpt_dir / "render_time.txt", std::ios::app);
+    rt << iter << " " << ms_per_iter << "\n";
+}
+
+/* ---------------- runtime getter / setter ---------------- */
+VariableParameters VoxelMapper::getVariableParameters() const
+{
+    std::lock_guard<std::mutex> lk(mutex_status_);
+    VariableParameters p;
+    p.position_lr_init          = lr_init_;
+    p.new_keyframe_times_of_use = var_params_.new_keyframe_times_of_use;
+    p.do_inactive_geo_densify   = do_inactive_geo_densify_;
+    p.keep_training = keep_training_;
+    return p;
+}
+
+void VoxelMapper::setVariableParameters(const VariableParameters& p)
+{
+    std::lock_guard<std::mutex> lk(mutex_status_);
+    /* apply only what VoxelMapper still honours */
+    lr_init_                               = p.position_lr_init;
+    var_params_.new_keyframe_times_of_use  = p.new_keyframe_times_of_use;
+    do_inactive_geo_densify_               = p.do_inactive_geo_densify;
+    keep_training_                         = p.keep_training;
+}
+
+cv::Mat VoxelMapper::renderFromPose(
+    const Sophus::SE3f &Tcw,
+    const int width,
+    const int height,
+    const bool main_vision)
+{
+    if (!initial_mapped_ || getIteration() <= 0)
+        return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
+
+    // Create MiniCam object with camera intrinsics
+    float fx = mpCamera->getParameter(0);
+    float fy = mpCamera->getParameter(1);
+    float cx = mpCamera->getParameter(2);
+    float cy = mpCamera->getParameter(3);
+
+    const int w = (width  > 0 ? width  : 1);
+    const int h = (height > 0 ? height : 1);
+    
+    sv::MiniCam cam = sv::MiniCam::fromIntrinsics(
+        fx, fy, cx, cy,
+        width, height,
+        /*frame_id=*/0  // set to 0 or a dummy id
+    );
+
+    Eigen::Matrix4f Tcw_matrix = Tcw.matrix();
+    Eigen::Matrix4f c2w_matrix = Tcw.inverse().matrix();
+
+    cam.c2w = torch::from_blob(c2w_matrix.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+    cam.w2c = torch::from_blob(Tcw_matrix.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+
+    cv::Mat rendered_image;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+
+        try {
+            // Call voxel trainer’s render function
+            auto out_map = mpTrainer->render(cam, py::none(), "viewer");
+
+            torch::Tensor rendered_tensor = out_map["rgb"].cpu().squeeze(0);  // (3, H, W)
+            rendered_tensor = rendered_tensor.permute({1, 2, 0});             // (H, W, 3)
+
+            // Convert to OpenCV format
+            cv::Mat image(height, width, CV_32FC3, rendered_tensor.data_ptr<float>());
+            rendered_image = image.clone();  // ensure ownership
+        }
+        catch (const py::error_already_set& e) {          // <-- Python exceptions
+            std::cerr << "[renderFromPose] Python exception:\n" 
+                    << e.what() << std::endl;
+            return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0,0,0));
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[VoxelMapper::renderFromPose] Rendering failed: " << e.what() << std::endl;
+            return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
+        }
+    }
+    return rendered_image;
 }
 
 void VoxelMapper::finalize()
@@ -640,15 +993,13 @@ void VoxelMapper::finalize()
     // mpTrainer->save_torch(model_path);
     // Match GaussianMapper naming
     std::string tag = std::to_string(static_cast<int>(mImagePaths.size()));
-    renderAndDumpAllKeyframes(tag);
+    writeKeyframeUsedTimes(mOutDir, "_final");
     // Match trajectory/timing output of GaussianMapper
     const std::string out_dir_str = mOutDir.string();
     mpSLAM->SaveTrajectoryTUM(out_dir_str + "/CameraTrajectory_TUM.txt");
     mpSLAM->SaveKeyFrameTrajectoryTUM(out_dir_str + "/KeyFrameTrajectory_TUM.txt");
     mpSLAM->SaveTrajectoryEuRoC(out_dir_str + "/CameraTrajectory_EuRoC.txt");
     mpSLAM->SaveKeyFrameTrajectoryEuRoC(out_dir_str + "/KeyFrameTrajectory_EuRoC.txt");
-    // mpSLAM->SaveTrackingTimes(out_dir_str + "/TrackingTime.txt");
-    // mpSLAM->SaveGpuTime(out_dir_str + "/GpuPeakUsageMB.txt");
 }
 
 VoxelMapper::~VoxelMapper() {
@@ -662,4 +1013,20 @@ VoxelMapper::~VoxelMapper() {
     mTcwList.clear();
     mImagePaths.clear();
     mTimestamps.clear();
+}
+
+std::filesystem::path VoxelMapper::getConfigFilePath() const {
+    return config_file_path_;
+}
+
+bool VoxelMapper::isKeepingTraining() const {
+    return keep_training_;
+}
+
+void VoxelMapper::setKeepTraining(bool v) {
+    keep_training_ = v;
+}
+
+std::shared_ptr<sv::VoxelTrainer> VoxelMapper::getTrainer() const {
+    return mpTrainer;
 }

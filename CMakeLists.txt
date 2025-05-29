@@ -195,20 +195,24 @@ target_link_libraries(gaussian_viewer
     glfw
     OpenGL::GL)
 
+target_include_directories(gaussian_viewer
+    PUBLIC
+    ${Python3_INCLUDE_DIRS}          # <--  add this line
+)
 ##################################################################################
 ##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
 
 # This is a C++ libtorch implementation of gaussian-splatting (https://github.com/graphdeco-inria/gaussian-splatting)
-add_executable(train_colmap examples/train_colmap.cpp)
-target_link_libraries(train_colmap
-    gaussian_viewer
-    gaussian_mapper)
+# add_executable(train_colmap examples/train_colmap.cpp)
+# target_link_libraries(train_colmap
+#     gaussian_viewer
+#     gaussian_mapper)
 
-add_executable(view_result examples/view_result.cpp)
-target_link_libraries(view_result
-    gaussian_viewer
-    gaussian_mapper)
+# add_executable(view_result examples/view_result.cpp)
+# target_link_libraries(view_result
+#     gaussian_viewer
+#     gaussian_mapper)
 
 ###############################################################################<
 # 3.  🧱 SPARSE‑VOXEL  – new code
@@ -247,26 +251,26 @@ target_link_libraries (voxel_core
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
 
-# Replica Monocular
-add_executable(replica_mono examples/replica_mono.cpp)
-target_link_libraries(replica_mono
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# # Replica Monocular
+# add_executable(replica_mono examples/replica_mono.cpp)
+# target_link_libraries(replica_mono
+#     gaussian_viewer    
+#     gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# Replica Monocular
-add_executable(replica_rgbd examples/replica_rgbd.cpp)
-target_link_libraries(replica_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# # Replica Monocular
+# add_executable(replica_rgbd examples/replica_rgbd.cpp)
+# target_link_libraries(replica_rgbd
+#     gaussian_viewer    
+#     gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# TUM Monocular
-add_executable(tum_mono examples/tum_mono.cpp)
-target_link_libraries(tum_mono
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# # TUM Monocular
+# add_executable(tum_mono examples/tum_mono.cpp)
+# target_link_libraries(tum_mono
+#     gaussian_viewer    
+#     gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
 add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
 target_include_directories(tum_mono_voxel PRIVATE
@@ -275,6 +279,7 @@ target_include_directories(tum_mono_voxel PRIVATE
 )
 target_link_libraries(tum_mono_voxel
         voxel_core          # lib that implements LiveVoxelTrainer
+        gaussian_viewer
         ${OpenCV_LIBS}
         ${TORCH_LIBRARIES}
         torch_python
@@ -283,19 +288,19 @@ target_link_libraries(tum_mono_voxel
 )
 target_link_directories(tum_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
     
-# TUM RGBD
-add_executable(tum_rgbd examples/tum_rgbd.cpp)
-target_link_libraries(tum_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# # TUM RGBD
+# add_executable(tum_rgbd examples/tum_rgbd.cpp)
+# target_link_libraries(tum_rgbd
+#     gaussian_viewer    
+#     gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# EuRoC Stereo
-add_executable(euroc_stereo examples/euroc_stereo.cpp)
-target_link_libraries(euroc_stereo
-    gaussian_viewer    
-    gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# # EuRoC Stereo
+# add_executable(euroc_stereo examples/euroc_stereo.cpp)
+# target_link_libraries(euroc_stereo
+#     gaussian_viewer    
+#     gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin

@@ -41,10 +41,6 @@ def watchdog():
         print("[PY]  watchdog: threads =", threading.enumerate(), flush=True)
 threading.Thread(target=watchdog, daemon=True).start()
 
-# # A global optimizer, you may re-initialize it per scene
-# _optimizer = None
-# _loss_fn = torch.nn.MSELoss()
-
 def safe_stat(x, name):
     try:
         print(f"[PY] {name}: shape={x.shape}, dtype={x.dtype}, min={x.min()}, max={x.max()}, device={x.device}")
@@ -64,7 +60,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     rgb_image: ground truth RGB image from C++ as a NumPy array (H, W, 3)
     output_dir: where to save renderings
     """
-
+    # print("\n[PY-DBG] ===== ENTER render() =====")
     # os.makedirs(output_dir, exist_ok=True)
     # allow '' or None → just don’t save anything
     if output_dir not in ("", None):
@@ -78,12 +74,19 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     cam.c2w = cam.c2w.to(device)
 
     # Convert ground truth image
-    gt_image = torch.from_numpy(np.array(rgb_image)).float() / 255.0
-    gt_image = gt_image.permute(2, 0, 1).unsqueeze(0).to(device)
+    # gt_image = torch.from_numpy(np.array(rgb_image)).float() / 255.0
+    # gt_image = gt_image.permute(2, 0, 1).unsqueeze(0).to(device)
+    if rgb_image is None:                     # <<--- new guard
+        gt_image = None
+    else:
+        gt_image = torch.from_numpy(
+            np.asarray(rgb_image, dtype=np.uint8)
+        ).float().div_(255.0).permute(2, 0, 1).unsqueeze(0).to(device)
 
     if voxel_data["centers"].numel() == 0:
         print("[WARNING] No voxels to render!")
         return
+    # print("DEBUG cam.frame_id =", getattr(cam, 'frame_id', 'MISSING'))
 
     rs = svr.RasterSettings(
         color_mode='rgb',               # start simple; switch to 'sh' later
@@ -111,24 +114,63 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
         if geo.shape[1] == 6:
             pad = torch.zeros(geo.size(0), 2, device=device, dtype=geo.dtype)
             geos = torch.cat([geo, pad], dim=1)
-
+        else:
+            geos = geo
         rgbs  = voxel_data['colors']              # (N,3)
-        subdiv_p = voxel_data["subdiv_p"].view(-1,1)
-        if not torch.isfinite(subdiv_p).all():
-            print("[WARN] subdiv_p contains NaNs or infs; replacing with zeros")
-            subdiv_p = torch.where(torch.isfinite(subdiv_p), subdiv_p, torch.zeros_like(subdiv_p))
-        # Optional: clamp to [0,1]
-        subdiv_p = subdiv_p.clamp(0.0, 1.0)
-        dens = voxel_data["opacities"].view(-1, 1) * subdiv_p
-
+        dens  = voxel_data['opacities'].view(-1,1)  # (N,1)
+        subdiv = torch.zeros_like(dens)           # (N,1)
         # return dict(geos=geos, rgbs=rgbs, densities=dens, subdiv_p=subdiv)
-        return dict(geos=geos, rgbs=rgbs, densities=dens, subdiv_p=subdiv_p)
+        return dict(geos=geos, rgbs=rgbs, subdiv_p=subdiv)
 
-    # Move voxel data to device
+    # def vox_fn(idx, cam_pos, mode):
+    #     cov  = voxel_data['cov3D']                 # (N,6)
+    #     dens = voxel_data['opacities'].view(-1, 1) # (N,1)
+    #     pad  = torch.zeros_like(dens)
+    #     geos = torch.cat([cov, dens, pad], dim=1)  # (N,8)
+
+    #     return dict(
+    #         geos=geos,
+    #         rgbs=voxel_data['colors'],
+    #         densities=dens,
+    #         subdiv_p=voxel_data['subdiv_p'].view(-1,1)  # ← MUST include this key!
+    #     )
+
+    # # Move voxel data to device
+    # for k in voxel_data:
+    #     if isinstance(voxel_data[k], torch.Tensor):
+    #         voxel_data[k] = voxel_data[k].to(device, non_blocking=True).contiguous()
     for k in voxel_data:
-        if isinstance(voxel_data[k], torch.Tensor):
-            voxel_data[k] = voxel_data[k].to(device, non_blocking=True).contiguous()
+        t = voxel_data[k]
+        if isinstance(t, torch.Tensor) and t.device != device:
+            voxel_data[k] = t.to(device, non_blocking=True)    # ← keep original leaf
 
+    # print("[PY-DBG] MiniCam:",
+    #   cam.image_width, cam.image_height,
+    #   cam.cx, cam.cy,
+    #   cam.tanfovx, cam.tanfovy,
+    #   flush=True)
+    
+    # print("[DBG] image_width :", cam.image_width, type(cam.image_width))
+    # print("[DBG] image_height:", cam.image_height, type(cam.image_height))
+    # print("[DBG] tanfovx     :", cam.tanfovx, type(cam.tanfovx))
+    # print("[DBG] tanfovy     :", cam.tanfovy, type(cam.tanfovy))
+    # print("[DBG] cx          :", cam.cx, type(cam.cx))
+    # print("[DBG] cy          :", cam.cy, type(cam.cy))
+    # print("[DBG] w2c is None :", cam.w2c is None)
+    # print("[DBG] c2w is None :", cam.c2w is None)
+    # print("[DBG] need_depth  :", False)
+    # print("[DBG] need_normal :", False)
+
+    # for k, v in voxel_data.items():
+    #     if v is None:
+    #         print(f"[DBG] voxel_data[{k}] is None!")
+    #     else:
+    #         print(f"[DBG] voxel_data[{k}] type: {type(v)}, shape: {getattr(v, 'shape', 'n/a')}")
+
+    # for k, v in voxel_data.items():
+    #     if isinstance(v, torch.Tensor):
+    #         if not torch.isfinite(v).all():
+    #             print(f"[FATAL] voxel_data[{k}] contains NaN or Inf!")
     try:
         out = svr.rasterize_voxels(
             rs,
@@ -142,34 +184,17 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
         import traceback, sys
         traceback.print_exc()
         sys.exit(1)    
+
+    # if isinstance(out, torch.Tensor):
+    #     print("[PY-CHK] out is Tensor, requires_grad =", out.requires_grad, ", grad_fn =", out.grad_fn)
+    # elif isinstance(out, (list, tuple)):
+    #     for i, o in enumerate(out):
+    #         if isinstance(o, torch.Tensor):
+    #             print(f"[PY-CHK] out[{i}] shape={o.shape}, requires_grad={o.requires_grad}, grad_fn={o.grad_fn}")
+    # else:
+    #     print("[PY-CHK] out is non-tensor:", type(out))
+
     torch.cuda.synchronize()
-
-    # rgb = out[0]  # (3, H, W)
-    # depth = out[1]     # (3, H, W)
-    # normal = out[2]    # (3, H, W)
-    # T = out[3]         # (3, H, W)
-
-    # return {
-    #     "rgb": rgb,
-    #     "depth": depth,
-    #     "normal": normal,
-    #     "T": T,
-    #     "raw_T": T.clone(),  # used for T_concen or debugging
-    # }
-
-    # rgb = out[0].unsqueeze(0)  # (1, 3, H, W)
-    # gt  = gt_image.clone()               # (1, 3, H, W)
-    # depth = out[1] if len(out) > 1 else None
-    # normal = out[2] if len(out) > 2 else None
-    # T = out[3] if len(out) > 3 else None
-    # return {
-    #     "rgb": rgb,
-    #     "gt": gt,  # ground-truth used for SSIM
-    #     "depth": depth,
-    #     "normal": normal,
-    #     "T": T,
-    #     "raw_T": T.clone() if T is not None else None
-    # }
 
     rgb = out[0].unsqueeze(0)           # (1, 3, H, W)
     result = {"rgb": rgb}               # prediction

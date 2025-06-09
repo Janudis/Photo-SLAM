@@ -130,75 +130,75 @@ target_link_libraries(imgui glfw OpenGL::GL)
 ##  Build the gaussian mapper library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-add_library(gaussian_mapper SHARED
-    third_party/tinyply/tinyply.h
-    third_party/tinyply/tinyply.cpp
-    include/gaussian_keyframe.h
-    include/gaussian_model.h
-    include/gaussian_parameters.h
-    include/gaussian_rasterizer.h
-    include/gaussian_renderer.h
-    include/gaussian_scene.h
-    include/gaussian_trainer.h
-    include/gaussian_mapper.h
-    include/general_utils.h
-    include/graphics_utils.h
-    include/loss_utils.h
-    include/sh_utils.h
-    include/tensor_utils.h
-    include/camera.h
-    include/point_cloud.h
-    include/point2d.h
-    include/point3d.h
-    include/types.h
-    src/gaussian_keyframe.cpp
-    src/gaussian_model.cpp
-    src/gaussian_parameters.cpp
-    src/gaussian_rasterizer.cpp
-    src/gaussian_renderer.cpp
-    src/gaussian_scene.cpp
-    src/gaussian_trainer.cpp
-    src/gaussian_mapper.cpp)
-target_link_libraries(gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-    ${OpenCV_LIBRARIES}
-    jsoncpp_lib
-    "${TORCH_LIBRARIES}"
-    Eigen3::Eigen
-    simple_knn
-    cuda_rasterizer
-    ${Python3_LIBRARIES})
+# add_library(gaussian_mapper SHARED
+#     third_party/tinyply/tinyply.h
+#     third_party/tinyply/tinyply.cpp
+#     include/gaussian_keyframe.h
+#     include/gaussian_model.h
+#     include/gaussian_parameters.h
+#     include/gaussian_rasterizer.h
+#     include/gaussian_renderer.h
+#     include/gaussian_scene.h
+#     include/gaussian_trainer.h
+#     include/gaussian_mapper.h
+#     include/general_utils.h
+#     include/graphics_utils.h
+#     include/loss_utils.h
+#     include/sh_utils.h
+#     include/tensor_utils.h
+#     include/camera.h
+#     include/point_cloud.h
+#     include/point2d.h
+#     include/point3d.h
+#     include/types.h
+#     src/gaussian_keyframe.cpp
+#     src/gaussian_model.cpp
+#     src/gaussian_parameters.cpp
+#     src/gaussian_rasterizer.cpp
+#     src/gaussian_renderer.cpp
+#     src/gaussian_scene.cpp
+#     src/gaussian_trainer.cpp
+#     src/gaussian_mapper.cpp)
+# target_link_libraries(gaussian_mapper
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+#     ${OpenCV_LIBRARIES}
+#     jsoncpp_lib
+#     "${TORCH_LIBRARIES}"
+#     Eigen3::Eigen
+#     simple_knn
+#     cuda_rasterizer
+#     ${Python3_LIBRARIES})
 
-target_include_directories(gaussian_mapper
-    PRIVATE
-        ${Python3_INCLUDE_DIRS}
-)
+# target_include_directories(gaussian_mapper
+#     PRIVATE
+#         ${Python3_INCLUDE_DIRS}
+# )
 
 ##################################################################################
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-add_library(gaussian_viewer SHARED
-    viewer/drawer_utils.h
-    viewer/imgui_viewer.cpp
-    viewer/imgui_viewer.h
-    viewer/map_drawer.cpp
-    viewer/map_drawer.h)
-target_link_libraries(gaussian_viewer
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-    gaussian_mapper
-    imgui
-    ${OpenCV_LIBRARIES}
-    jsoncpp_lib
-    "${TORCH_LIBRARIES}"
-    glm::glm
-    glfw
-    OpenGL::GL)
+# add_library(gaussian_viewer SHARED
+#     viewer/drawer_utils.h
+#     viewer/imgui_viewer.cpp
+#     viewer/imgui_viewer.h
+#     viewer/map_drawer.cpp
+#     viewer/map_drawer.h)
+# target_link_libraries(gaussian_viewer
+#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+#     gaussian_mapper
+#     imgui
+#     ${OpenCV_LIBRARIES}
+#     jsoncpp_lib
+#     "${TORCH_LIBRARIES}"
+#     glm::glm
+#     glfw
+#     OpenGL::GL)
 
-target_include_directories(gaussian_viewer
-    PUBLIC
-    ${Python3_INCLUDE_DIRS}          # <--  add this line
-)
+# target_include_directories(gaussian_viewer
+#     PUBLIC
+#     ${Python3_INCLUDE_DIRS}          # <--  add this line
+# )
 ##################################################################################
 ##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
@@ -231,7 +231,11 @@ target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
 ### 3.2  C++ core / optimiser  ---------------------------------------
 add_library (voxel_core
         src_voxel/voxel_trainer.cpp
-        src_voxel/voxel_mapper.cpp)
+        src_voxel/voxel_mapper.cpp
+        src_voxel/voxel_parameters.cpp
+        src_voxel/voxel_scene.cpp
+        src_voxel/voxel_keyframe.cpp
+        src_voxel/voxel_model.cpp)
         
 target_include_directories (voxel_core
         PUBLIC
@@ -279,7 +283,7 @@ target_include_directories(tum_mono_voxel PRIVATE
 )
 target_link_libraries(tum_mono_voxel
         voxel_core          # lib that implements LiveVoxelTrainer
-        gaussian_viewer
+        # gaussian_viewer
         ${OpenCV_LIBS}
         ${TORCH_LIBRARIES}
         torch_python

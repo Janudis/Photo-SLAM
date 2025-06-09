@@ -71,5 +71,27 @@ namespace sv {
             std::terminate();
         }
     }
+
+    inline pybind11::array_t<uint8_t> tensorToNumpyRGB(const torch::Tensor &img) {
+        // must be H×W×3 uint8
+        TORCH_CHECK(img.dtype() == torch::kUInt8, "tensorToNumpyRGB expects uint8 tensor");
+        TORCH_CHECK(img.is_contiguous(),     "tensorToNumpyRGB expects contiguous tensor");
+        auto sizes = img.sizes();
+        ssize_t H = sizes[0];
+        ssize_t W = sizes[1];
+        ssize_t C = sizes[2];
+        TORCH_CHECK(C == 3, "tensorToNumpyRGB expects 3 channels");
+
+        // Strides in bytes
+        ssize_t stride_H = img.stride(0) * sizeof(uint8_t);
+        ssize_t stride_W = img.stride(1) * sizeof(uint8_t);
+        ssize_t stride_C = img.stride(2) * sizeof(uint8_t);
+
+        return pybind11::array_t<uint8_t>(
+            {H, W, C},                           // shape
+            {stride_H, stride_W, stride_C},     // strides
+            img.data_ptr<uint8_t>()              // data ptr
+        );
+    }
        
 } // namespace sv

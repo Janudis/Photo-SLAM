@@ -21,7 +21,7 @@
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include <c10/cuda/CUDACachingAllocator.h>
-#include "viewer/imgui_viewer.h"
+// #include "viewer/imgui_viewer.h"
 
 void LoadImages(const std::string &strFile, std::vector<std::string> &vstrImageFilenames,
                 std::vector<double> &vTimestamps)
@@ -129,13 +129,13 @@ int main(int argc, char **argv)
                                       device_type);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
-    std::thread viewer_thd;
-    std::shared_ptr<ImGuiViewer> pViewer;
-    if (use_viewer)
-    {
-        pViewer = std::make_shared<ImGuiViewer>(pSLAM, pVoxelMapper);
-        viewer_thd = std::thread(&ImGuiViewer::run, pViewer.get());
-    }
+    // std::thread viewer_thd;
+    // std::shared_ptr<ImGuiViewer> pViewer;
+    // if (use_viewer)
+    // {
+    //     pViewer = std::make_shared<ImGuiViewer>(pSLAM, pVoxelMapper);
+    //     viewer_thd = std::thread(&ImGuiViewer::run, pViewer.get());
+    // }
 
     std::vector<float> vTimesTrack(nImages);
 
@@ -194,8 +194,8 @@ int main(int argc, char **argv)
     pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
     pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
 
-    if (use_viewer)
-        viewer_thd.join();
+    // if (use_viewer)
+    //     viewer_thd.join();
 
     return 0;
 }

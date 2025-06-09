@@ -1,34 +1,63 @@
 %YAML:1.0
 
+#--------------------------------------------------------------------------------------------
+# Model Parameters
+#--------------------------------------------------------------------------------------------
+
+Model.sh_degree: 3 # maximum
+Model.resolution: 64
+Model.white_background: 0  # 0:false, 1 or other integer:true
+Model.eval: 0  # 0:false, 1 or other integer:true
+
 ##############################################################################
 # Pipeline-level parameters (only the ones VoxelMapper uses)
 ##############################################################################
 
+Camera.z_near: 0.01
+Camera.z_far: 100.0
+
 Mapper.inactive_geo_densify:           1        # keep like Gaussian
-Mapper.depth_cache:                    10       # harmless (not used yet)
-Mapper.min_num_initial_map_kfs:        20
+Mapper.min_num_initial_map_kfs:        15
 Mapper.new_keyframe_times_of_use:      2
-Mapper.local_BA_increased_times_of_use: 0       # ignored by voxel, safe
-Mapper.loop_closure_increased_times_of_use_: 2  # ignored by voxel, safe
+Mapper.local_BA_increased_times_of_use: 0       
+Mapper.loop_closure_increased_times_of_use_: 2  
 Mapper.cull_keyframes:                 0
 Mapper.large_rotation_threshold:       30.0     # deg
 Mapper.large_translation_threshold:    1.0      # m
 Mapper.stable_num_iter_existence:      1
+
+Pipeline.convert_SHs: 0  # 0:false, 1 or other integer:true
+Pipeline.compute_cov3D: 0  # 0:false, 1 or other integer:true
+
+Record.training_report_interval:       10
+Record.keyframe_record_interval:       0
+Record.all_keyframes_record_interval:  0
+Record.record_rendered_image:          1
+Record.record_ground_truth_image:      0
+Record.record_loss_image:              0
 
 ##############################################################################
 # SVRaster-style optimisation parameters
 ##############################################################################
 
 # Learning rate
-Optimization.lr:                       1.0e-2 #position_lr_final in gaussian
-Optimization.position_lr_init:         0.00032
-Optimization.position_lr_delay_mult:   0.01
-Optimization.position_lr_max_steps:    24
-Optimization.max_num_iterations:       30100     # matches Gaussian key
-Optimization.densification_interval:   100
+Optimization.max_num_iterations:       30100     
+Optimization.geo_lr_init:         0.00032
+Optimization.geo_lr_final:        0.00032
+Optimization.geo_lr_delay_mult:   0.01
+Optimization.geo_lr_max_steps:    24
+Optimization.sh0_lr:                   0.0025     
+Optimization.shs_lr:                   0.000125   
 Optimization.meta_accum_lr:            0.1
 
 # Subdivision schedule
+Optimization.percent_dense: 0.01
+Optimization.lambda_dssim: 0.2
+Optimization.densification_interval:   100
+Optimization.densify_from_iter: 800
+Optimization.densify_until_iter: 30000
+Optimization.densify_grad_threshold: 0.001
+
 Optimization.subdiv_from:              4
 Optimization.subdiv_every:             10
 Optimization.subdiv_until:             40
@@ -42,14 +71,3 @@ Optimization.prune_until:              50
 Optimization.prune_threshold_init:     1e-4
 Optimization.prune_threshold_final:    0.1
 Optimization.min_voxels:               512
-
-##############################################################################
-# Logging / recording
-##############################################################################
-
-Record.training_report_interval:       10
-Record.keyframe_record_interval:       0
-Record.all_keyframes_record_interval:  0
-Record.record_rendered_image:          1
-Record.record_ground_truth_image:      0
-Record.record_loss_image:              0

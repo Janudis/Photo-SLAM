@@ -1,71 +1,47 @@
 #pragma once
 
 #include <torch/torch.h>
-#include <filesystem>
-#include <string>
+#include <memory>
 #include <vector>
-#include <unordered_map>
-#include <pybind11/numpy.h>
-#include <Eigen/Core>
+#include <functional>
 
-namespace sv {
-    class MiniCam;
-}
+#include "include_voxel/voxel_model.h"
+#include "include_voxel/voxel_scene.h"
+#include "include/loss_utils.h"
 
 namespace sv {
 
 class VoxelTrainer {
 public:
-    explicit VoxelTrainer(int grid_res);
+    VoxelTrainer() = delete;
 
-    // render into `output_dir`; returns a map of output tensors (e.g. "rgb")
-    std::unordered_map<std::string, torch::Tensor>
-    render(const MiniCam& cam,
-           const pybind11::array_t<uint8_t>& rgb_image,
-           const std::string& output_dir);
+    static void trainingOnce(
+        std::shared_ptr<VoxelScene> scene,
+        std::shared_ptr<VoxelModel> voxels,
+        VoxelModelParams& dataset,
+        VoxelOptimizationParams& optParams,
+        VoxelPipelineParams& pipeParams,
+        torch::DeviceType device_type = torch::kCUDA,
+        std::vector<int> testing_iterations = {},
+        std::vector<int> saving_iterations = {},
+        std::vector<int> checkpoint_iterations = {}
+    );
 
-    // supply the voxel data each frame
-    void set_voxels(torch::Tensor center,
-                    torch::Tensor size,
-                    torch::Tensor geo,
-                    torch::Tensor sh0,
-                    torch::Tensor shs,
-                    torch::Tensor opacity,
-                    torch::Tensor octpath,
-                    torch::Tensor octlevel,
-                    torch::Tensor subdiv_meta,
-                    torch::Tensor subdiv_p);
-
-    void increasePcd(const std::vector<Eigen::Vector3f>& points,
-                 const std::vector<Eigen::Vector3f>& colors,
-                 int iteration);
-
-    // save final model
-    void save_torch(const std::filesystem::path& p) const;
-
-    // for optimizer if you want to train
-    std::vector<torch::Tensor> parameters();
-    
-    torch::Tensor get_tensor(const std::string& name) const;
-    void subdivide(const torch::Tensor& mask);   // mask.shape == (N,) • bool
-    void prune(const torch::Tensor& mask_keep);
-    inline int num_voxels() const { return center_.size(0); }
-    void set_subdiv_meta(const torch::Tensor& updated);
-    torch::Tensor get_subdiv_priority_grad() const;
-    void accumulate_subdiv_gradients(const torch::Tensor& parent_idx, const torch::Tensor& parent_grads);
-
-    float updateLearningRate(int step,
-                         float base_lr,
-                         int max_steps,
-                         float delay_mult);
-
-private:
-    int G_;
-    torch::Tensor center_, size_, geo_, sh0_, shs_, opacity_, oct_path_;
-    torch::Tensor oct_level_, subdiv_meta_;
-    torch::Tensor subdiv_p_;
-    torch::Tensor subdiv_p_grad_buffer_;
-    float position_lr_ = 0.0f;
+    /// After each optimization step (or at logging intervals), print a concise report:
+    ///   iteration, num_iterations, L1‐loss, total loss, EMA, elapsed_time, 
+    ///   VoxelModel state, VoxelScene state, pipeline flags, background image, etc.
+    static void trainingReport(
+        int iteration,
+        int num_iterations,
+        torch::Tensor& Ll1,
+        torch::Tensor& loss,
+        float ema_loss_for_log,
+        std::function<torch::Tensor(torch::Tensor&, torch::Tensor&)> l1_loss,
+        int64_t elapsed_time,
+        VoxelModel& voxels,
+        VoxelScene& scene,
+        VoxelPipelineParams& pipeParams,
+        torch::Tensor& background
+    );
 };
-
 } // namespace sv

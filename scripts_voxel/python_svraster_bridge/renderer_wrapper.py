@@ -20,10 +20,6 @@ import faulthandler, threading, signal
 import importlib.util
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../third_party"))
 print("=== LOADING voxel_bridge ===")
-# from third_party import svraster_cuda
-# from third_party.svraster_cuda import renderer as svr
-# import svraster_cuda.renderer as svr
-# Drop stub path if present (optional)
 THIRD_PARTY = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../third_party"))
 if THIRD_PARTY in sys.path:
     sys.path.remove(THIRD_PARTY)
@@ -35,11 +31,32 @@ svr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(svr)
 
 faulthandler.enable(file=sys.__stderr__)           # full C‑level dump on SIGUSR1
+
+# -- Watchdog thread control --
+_watchdog_thread: threading.Thread | None = None
+_watchdog_stop = False
+
 def watchdog():
-    while True:
+    while not _watchdog_stop:
         time.sleep(5)
         print("[PY]  watchdog: threads =", threading.enumerate(), flush=True)
-threading.Thread(target=watchdog, daemon=True).start()
+
+def start_watchdog():
+    global _watchdog_thread, _watchdog_stop
+    _watchdog_stop = False
+    if _watchdog_thread is None or not _watchdog_thread.is_alive():
+        _watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        _watchdog_thread.start()
+
+def stop_watchdog():
+    global _watchdog_stop, _watchdog_thread
+    _watchdog_stop = True
+    if _watchdog_thread is not None:
+        _watchdog_thread.join(timeout=1.0)
+        _watchdog_thread = None
+
+# Start it once so that any render() call can rely on it
+start_watchdog()
 
 def safe_stat(x, name):
     try:
@@ -60,6 +77,8 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     rgb_image: ground truth RGB image from C++ as a NumPy array (H, W, 3)
     output_dir: where to save renderings
     """
+    # ensure watchdog is running
+    start_watchdog()
     # print("\n[PY-DBG] ===== ENTER render() =====")
     # os.makedirs(output_dir, exist_ok=True)
     # allow '' or None → just don’t save anything
@@ -109,18 +128,18 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     if voxel_data["subdiv_p"].requires_grad is False:
         print("[WARN] voxel_data['subdiv_p'] does not require grad.")
 
-    def vox_fn(idx, cam_pos, mode):
-        geo = voxel_data['cov3D']
-        if geo.shape[1] == 6:
-            pad = torch.zeros(geo.size(0), 2, device=device, dtype=geo.dtype)
-            geos = torch.cat([geo, pad], dim=1)
-        else:
-            geos = geo
-        rgbs  = voxel_data['colors']              # (N,3)
-        dens  = voxel_data['opacities'].view(-1,1)  # (N,1)
-        subdiv = torch.zeros_like(dens)           # (N,1)
-        # return dict(geos=geos, rgbs=rgbs, densities=dens, subdiv_p=subdiv)
-        return dict(geos=geos, rgbs=rgbs, subdiv_p=subdiv)
+    # def vox_fn(idx, cam_pos, mode):
+    #     geo = voxel_data['cov3D']
+    #     if geo.shape[1] == 6:
+    #         pad = torch.zeros(geo.size(0), 2, device=device, dtype=geo.dtype)
+    #         geos = torch.cat([geo, pad], dim=1)
+    #     else:
+    #         geos = geo
+    #     rgbs  = voxel_data['colors']              # (N,3)
+    #     dens  = voxel_data['opacities'].view(-1,1)  # (N,1)
+    #     subdiv = torch.zeros_like(dens)           # (N,1)
+    #     # return dict(geos=geos, rgbs=rgbs, densities=dens, subdiv_p=subdiv)
+    #     return dict(geos=geos, rgbs=rgbs, subdiv_p=subdiv)
 
     # def vox_fn(idx, cam_pos, mode):
     #     cov  = voxel_data['cov3D']                 # (N,6)
@@ -134,6 +153,23 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     #         densities=dens,
     #         subdiv_p=voxel_data['subdiv_p'].view(-1,1)  # ← MUST include this key!
     #     )
+
+    def vox_fn(idx, cam_pos, mode):
+        geos = voxel_data['geos']                  # (N, 8), passed directly
+        rgbs = svr.SH_eval.apply(
+            2,                        # active_sh_degree   (use 2, 3, … as you like)
+            None,                     # idx  (let SH_eval create empty tensor internally)
+            voxel_data['centers'],    # vox_centers  (N,3)
+            cam_pos,                  # cam_pos (3,) #cam.c2w[:3, 3],
+            None,                        # viewdir
+            voxel_data['colors'],     # sh0  (N,3)
+            voxel_data['shs']         # shs  (N,45,3)
+        )                                     # (N, 3), computed SH colors
+        return dict(
+            geos=geos,
+            rgbs=rgbs,
+            subdiv_p=voxel_data['subdiv_p'].view(-1, 1)
+        )
 
     # # Move voxel data to device
     # for k in voxel_data:

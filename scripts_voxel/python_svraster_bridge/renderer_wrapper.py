@@ -20,6 +20,9 @@ import faulthandler, threading, signal
 import importlib.util
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../third_party"))
 print("=== LOADING voxel_bridge ===")
+print("[RENDERER_WRAPPER] sys.executable =", sys.executable)
+print("[RENDERER_WRAPPER] CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("[RENDERER_WRAPPER] torch.cuda.is_available() =", torch.cuda.is_available())
 THIRD_PARTY = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../third_party"))
 if THIRD_PARTY in sys.path:
     sys.path.remove(THIRD_PARTY)
@@ -78,7 +81,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     output_dir: where to save renderings
     """
     # ensure watchdog is running
-    start_watchdog()
+    # start_watchdog()
     # print("\n[PY-DBG] ===== ENTER render() =====")
     # os.makedirs(output_dir, exist_ok=True)
     # allow '' or None → just don’t save anything
@@ -106,6 +109,11 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
         print("[WARNING] No voxels to render!")
         return
     # print("DEBUG cam.frame_id =", getattr(cam, 'frame_id', 'MISSING'))
+    # print("[PY-DBG] Camera matrix w2c:", cam.w2c.shape, "c2w:", cam.c2w.shape)
+    # Debug the voxel data<
+    # for k, v in voxel_data.items():
+    #     if isinstance(v, torch.Tensor):
+    #         print(f"[PY-DBG] {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}")
 
     rs = svr.RasterSettings(
         color_mode='rgb',               # start simple; switch to 'sh' later
@@ -128,34 +136,11 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     if voxel_data["subdiv_p"].requires_grad is False:
         print("[WARN] voxel_data['subdiv_p'] does not require grad.")
 
-    # def vox_fn(idx, cam_pos, mode):
-    #     geo = voxel_data['cov3D']
-    #     if geo.shape[1] == 6:
-    #         pad = torch.zeros(geo.size(0), 2, device=device, dtype=geo.dtype)
-    #         geos = torch.cat([geo, pad], dim=1)
-    #     else:
-    #         geos = geo
-    #     rgbs  = voxel_data['colors']              # (N,3)
-    #     dens  = voxel_data['opacities'].view(-1,1)  # (N,1)
-    #     subdiv = torch.zeros_like(dens)           # (N,1)
-    #     # return dict(geos=geos, rgbs=rgbs, densities=dens, subdiv_p=subdiv)
-    #     return dict(geos=geos, rgbs=rgbs, subdiv_p=subdiv)
-
-    # def vox_fn(idx, cam_pos, mode):
-    #     cov  = voxel_data['cov3D']                 # (N,6)
-    #     dens = voxel_data['opacities'].view(-1, 1) # (N,1)
-    #     pad  = torch.zeros_like(dens)
-    #     geos = torch.cat([cov, dens, pad], dim=1)  # (N,8)
-
-    #     return dict(
-    #         geos=geos,
-    #         rgbs=voxel_data['colors'],
-    #         densities=dens,
-    #         subdiv_p=voxel_data['subdiv_p'].view(-1,1)  # ← MUST include this key!
-    #     )
-
     def vox_fn(idx, cam_pos, mode):
+        # print(f"[PY-DBG] Running vox_fn with mode: {mode}, idx: {idx}")
         geos = voxel_data['geos']                  # (N, 8), passed directly
+        #                                        # (they’re logit values ≈ 1.386, that’s fine)
+        # print(f"[PY-DBG] geos shape: {geos.shape}, device: {geos.device}")
         rgbs = svr.SH_eval.apply(
             2,                        # active_sh_degree   (use 2, 3, … as you like)
             None,                     # idx  (let SH_eval create empty tensor internally)
@@ -164,10 +149,12 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             None,                        # viewdir
             voxel_data['colors'],     # sh0  (N,3)
             voxel_data['shs']         # shs  (N,45,3)
-        )                                     # (N, 3), computed SH colors
+        )      
+        dens = voxel_data["opacities"].view(-1, 1);                               # (N, 3), computed SH colors
         return dict(
             geos=geos,
             rgbs=rgbs,
+            densities = dens,
             subdiv_p=voxel_data['subdiv_p'].view(-1, 1)
         )
 
@@ -178,8 +165,33 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     for k in voxel_data:
         t = voxel_data[k]
         if isinstance(t, torch.Tensor) and t.device != device:
+            # print(f"[PY-DBG] Moving {k} tensor to device: {device}")
             voxel_data[k] = t.to(device, non_blocking=True)    # ← keep original leaf
-
+    # for k, v in voxel_data.items():
+    #     if isinstance(v, torch.Tensor) and v.numel() == 0:
+    #         print(f"[PY-DBG] Warning: {k} is empty!")
+    #         continue
+    # for k, v in voxel_data.items():
+    #     if isinstance(v, torch.Tensor):
+    #         if v.numel() == 0:
+    #             print(f"[PY-DBG] {k} tensor is empty")
+    #         elif not torch.isfinite(v).all():
+    #             print(f"[PY-DBG] {k} tensor contains NaN or Inf values")
+    # for k in ["octpaths", "centers", "vox_lengths", "octlevels", "subdiv_meta"]:
+    #     t = voxel_data[k]
+    #     if isinstance(t, torch.Tensor) and t.device != device:
+    #         print(f"[PY-DBG] Moving {k} tensor to device: {device}")
+    #         voxel_data[k] = t.to(device, non_blocking=True)
+    # print("[PY-DBG] Checking voxel data...")
+    # for k, v in voxel_data.items():
+    #     if isinstance(v, torch.Tensor):
+    #         print(f"[PY-DBG] {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}")
+    #         print(f"[PY-DBG] {k}: min={v.min()}, max={v.max()}, numel={v.numel()}")
+    #         if not torch.isfinite(v).all():
+    #             print(f"[PY-DBG] Warning: {k} contains NaN or Inf")
+    # print("[PY-DBG] centers[:10]:", voxel_data['centers'][:10])
+    # print("[PY-DBG] colors[:10]:", voxel_data['colors'][:10])
+    # print("[PY-DBG] shs[:10]:", voxel_data['shs'][:10])
     # print("[PY-DBG] MiniCam:",
     #   cam.image_width, cam.image_height,
     #   cam.cx, cam.cy,
@@ -219,7 +231,8 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
         print("[FATAL] Exception in rasterize_voxels:", e)
         import traceback, sys
         traceback.print_exc()
-        sys.exit(1)    
+        raise e
+        # sys.exit(1)    
 
     # if isinstance(out, torch.Tensor):
     #     print("[PY-CHK] out is Tensor, requires_grad =", out.requires_grad, ", grad_fn =", out.grad_fn)
@@ -229,7 +242,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     #             print(f"[PY-CHK] out[{i}] shape={o.shape}, requires_grad={o.requires_grad}, grad_fn={o.grad_fn}")
     # else:
     #     print("[PY-CHK] out is non-tensor:", type(out))
-
+    # print("[PY-DBG] Rasterizer finished. Output:", out)
     torch.cuda.synchronize()
 
     rgb = out[0].unsqueeze(0)           # (1, 3, H, W)

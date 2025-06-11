@@ -3,77 +3,118 @@
 // -----------------------------------------------------------------------------
 #pragma once
 #include <opencv2/opencv.hpp>
+#include <opencv2/imgproc/types_c.h>
+#include <opencv2/cudawarping.hpp>
 #include <torch/torch.h>
 #include <array>
 #include <vector>
 #include <cassert>
+
+#include "include/types.h"
+#include "include/tensor_utils.h"
 
 namespace sv {
 
 class Camera
 {
 public:
-    enum CameraModelType { INVALID=0, PINHOLE=1 };
+    Camera() {}
 
-    Camera() = default;
+    Camera (
+        camera_id_t camera_id,
+        std::size_t width,
+        std::size_t height,
+        std::vector<double> params,
+        int model_id = 0,
+        bool prior_focal_length = true)
+        : camera_id_(camera_id),
+          width_(width),
+          height_(height),
+          params_(params),
+          model_id_(model_id),
+          prior_focal_length_(prior_focal_length)
+    {}
 
-    Camera(std::size_t width, std::size_t height,
-           float fx, float fy, float cx, float cy,
-           int cam_id = 0,
-           const std::array<float,4>& dist = {0,0,0,0})
-        : camera_id_(cam_id), width_(width), height_(height), model_id_(PINHOLE)
+    enum CameraModelType{
+        INVALID = 0,
+        PINHOLE = 1,
+        FISHEYE = 2};
+
+public:
+    /* ---------- small convenience getters (needed by mini_cam.h etc.) ----- */
+    inline float fx()  const { return static_cast<float>(params_.at(0)); }
+    inline float fy()  const { return static_cast<float>(params_.at(1)); }
+    inline float cx()  const { return static_cast<float>(params_.at(2)); }
+    inline float cy()  const { return static_cast<float>(params_.at(3)); }
+    inline int   width()  const { return static_cast<int>(width_);  }
+    inline int   height() const { return static_cast<int>(height_); }
+
+    inline void setModelId(const CameraModelType model_id)
     {
-        params_ = {fx, fy, cx, cy};
-        dist_coeff_ = (cv::Mat_<float>(1,4) <<
-                       dist[0], dist[1], dist[2], dist[3]);
+        model_id_ = model_id;
+        switch (model_id_)
+        {
+        case PINHOLE: // Pinhole
+            params_.resize(4);
+            break;
+
+        default:
+            break;
+        }
     }
 
-    /* ---------- intrinsic getters -------------------------------------- */
-    float fx() const { return params_[0]; }
-    float fy() const { return params_[1]; }
-    float cx() const { return params_[2]; }
-    float cy() const { return params_[3]; }
-    int   width()  const { return static_cast<int>(width_); }
-    int   height() const { return static_cast<int>(height_); }
-
-    /* ---------- set model id (required by old code paths) --------------- */
-    void setModelId(CameraModelType id) { model_id_ = id; }
-
-    /* ---------- once-per-camera pre-compute ----------------------------- */
-    void initUndistortRectifyMapAndMask()
+    inline void initUndistortRectifyMapAndMask(
+        cv::InputArray old_camera_matrix,
+        const cv::Size old_size,
+        cv::InputArray new_camera_matrix)
     {
-        cv::Mat K = (cv::Mat_<float>(3,3) <<
-                     fx(), 0,   cx(),
-                     0,    fy(), cy(),
-                     0,    0,    1);
         cv::initUndistortRectifyMap(
-            K, dist_coeff_,
-            cv::Mat::eye(3,3,CV_32F), K,
-            cv::Size(width(), height()),
+            old_camera_matrix,
+            dist_coeff_,
+            cv::Mat::eye(3, 3, CV_32F),
+            new_camera_matrix,
+            cv::Size(this->width_, this->height_),
             CV_32F,
-            undistort_map1_, undistort_map2_);
+            undistort_map1,
+            undistort_map2
+        );
 
-        cv::Mat white(height(), width(), CV_32FC3, cv::Scalar(1,1,1));
-        undistortImage(white, undistort_mask_);
-        cv::cvtColor(undistort_mask_, undistort_mask_, cv::COLOR_BGR2GRAY);
+        cv::Mat white(old_size, CV_32FC3, cv::Vec3f(1.0f, 1.0f, 1.0f));
+        undistortImage(white, undistort_mask);
     }
 
-    template<typename Src, typename Dst>
-    void undistortImage(const Src& src, Dst& dst) const
+    inline void undistortImage(cv::InputArray src, cv::OutputArray dst)
     {
-        cv::remap(src, dst, undistort_map1_, undistort_map2_, cv::INTER_LINEAR);
+        cv::remap(
+            src,
+            dst,
+            undistort_map1,
+            undistort_map2,
+            cv::InterpolationFlags::INTER_LINEAR
+        );
     }
 
-    /* ---------- public data -------------------------------------------- */
-    int camera_id_ = 0;
-    int model_id_  = PINHOLE;
+public:
+    camera_id_t camera_id_ = 0U;
 
-    std::size_t width_ = 0, height_ = 0;
-    std::vector<float> params_{0,0,0,0};             // fx,fy,cx,cy
+    int model_id_ = 0;
 
-    cv::Mat dist_coeff_;
-    cv::Mat undistort_map1_, undistort_map2_;
-    cv::Mat undistort_mask_;
+    std::size_t width_ = 0UL;
+    std::size_t height_ = 0UL;
+
+    std::vector<double> params_;
+
+    bool prior_focal_length_ = false;
+
+    float stereo_bf_ = 0.0f;
+
+    cv::Mat dist_coeff_ = (cv::Mat_<float>(1, 4) << 0.0f, 0.0f, 0.0f, 0.0f);
+    cv::Mat undistort_map1, undistort_map2;
+    cv::Mat undistort_mask;
+
+    float tanfovx;
+    float tanfovy;
+    std::string cam_mode = "persp";
 };
 
-} // namespace sv
+}

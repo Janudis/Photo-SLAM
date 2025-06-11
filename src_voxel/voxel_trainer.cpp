@@ -60,20 +60,24 @@ void sv::VoxelTrainer::trainingOnce(
         py::array_t<uint8_t> rgb_np = tensorToNumpyRGB(cpu_img);
 
         // 2.4) Build MiniCam
-        const auto &C = vf->getCamera();
-        MiniCam cam = MiniCam::fromIntrinsics(
-            C.fx(), C.fy(), C.cx(), C.cy(),
-            W, H,
-            static_cast<int>(vf->fid_)
-        );
-        {
-            Eigen::Matrix4f Tcw = vf->Tcw.matrix();
-            Eigen::Matrix4f c2w = Tcw.inverse();
-            cam.w2c = torch::from_blob(Tcw.data(),  {4,4}, torch::kFloat32)
-                          .clone().to(device_type);
-            cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32)
-                          .clone().to(device_type);
-        }
+        // const auto &C = vf->getCamera();
+        // MiniCam cam = MiniCam::fromIntrinsics(
+        //     C.fx(), C.fy(), C.cx(), C.cy(),
+        //     W, H,
+        //     static_cast<int>(vf->fid_)
+        // );
+        // {
+        //     Eigen::Matrix4f Tcw = vf->Tcw.matrix();
+        //     Eigen::Matrix4f c2w = Tcw.inverse();
+        //     cam.w2c = torch::from_blob(Tcw.data(),  {4,4}, torch::kFloat32)
+        //                   .clone().to(device_type);
+        //     cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32)
+        //                   .clone().to(device_type);
+        // }
+
+        sv::MiniCam cam = vf->toMiniCam();
+        cam.c2w = cam.c2w.contiguous().to(device_type);   // make sure contiguous + on CUDA
+        cam.w2c = cam.w2c.contiguous().to(device_type);        
 
         // 2.5) Render (only returns “rgb”)
         auto render_map = voxels->render(cam, rgb_np, "");
@@ -111,30 +115,30 @@ void sv::VoxelTrainer::trainingOnce(
                 background
             );
 
-            // densify & prune
-            if (iteration < optParams.densify_until_iter_) {
-                if (iteration > optParams.densify_from_iter_
-                    && iteration % optParams.densification_interval_ == 0)
-                {
-                    int sz = (iteration > optParams.opacity_reset_interval_) ? 20 : 0;
-                    voxels->densifyAndPrune(
-                        optParams.densify_grad_threshold_,
-                        0.005f,
-                        scene->cameras_extent_,
-                        sz
-                    );
-                }
-                if (iteration % optParams.opacity_reset_interval_ == 0
-                    || (dataset.white_background_ && iteration == optParams.densify_from_iter_))
-                {
-                    voxels->resetOpacity();
-                }
-            }
+            // // densify & prune
+            // if (iteration < optParams.densify_until_iter_) {
+            //     if (iteration > optParams.densify_from_iter_
+            //         && iteration % optParams.densification_interval_ == 0)
+            //     {
+            //         int sz = (iteration > optParams.opacity_reset_interval_) ? 20 : 0;
+            //         voxels->densifyAndPrune(
+            //             optParams.densify_grad_threshold_,
+            //             0.005f,
+            //             scene->cameras_extent_,
+            //             sz
+            //         );
+            //     }
+            //     if (iteration % optParams.opacity_reset_interval_ == 0
+            //         || (dataset.white_background_ && iteration == optParams.densify_from_iter_))
+            //     {
+            //         voxels->resetOpacity();
+            //     }
+            // }
 
             // optimizer
             if (iteration < optParams.iterations_) {
-                voxels->optimizer()->step();
-                voxels->optimizer()->zero_grad(true);
+                voxels->optimizer_->step();
+                voxels->optimizer_->zero_grad(true);
             }
         }
     }

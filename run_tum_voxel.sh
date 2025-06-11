@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export LD_LIBRARY_PATH="/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib:$LD_LIBRARY_PATH"
 export PYTHONPATH="$root_dir/third_party/simple-knn:$PYTHONPATH"
 

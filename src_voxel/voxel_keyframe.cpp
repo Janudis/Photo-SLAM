@@ -1,67 +1,183 @@
 #include "include_voxel/voxel_keyframe.h"
+#include "include/tensor_utils.h"              // <-- for EigenMatrix2TorchTensor
 #include <iostream>
+#include <cmath>
+
+using tensor_utils::EigenMatrix2TorchTensor;
 
 // Pose‐setter: 7‐number form
-void VoxelKeyframe::setPose(double qw, double qx, double qy, double qz,
-                            double tx, double ty, double tz)
+void VoxelKeyframe::setPose(
+    const double qw,
+    const double qx,
+    const double qy,
+    const double qz,
+    const double tx,
+    const double ty,
+    const double tz)
 {
-    // Delegate to the Eigen‐Quaternion overload to avoid duplicating logic
-    Eigen::Quaterniond q(qw, qx, qy, qz);
-    q.normalize();
-    setPose(q, Eigen::Vector3d(tx, ty, tz));
+    this->R_quaternion_.w() = qw;
+    this->R_quaternion_.x() = qx;
+    this->R_quaternion_.y() = qy;
+    this->R_quaternion_.z() = qz;
+    this->R_quaternion_.normalize();
+    this->t_.x() = tx;
+    this->t_.y() = ty;
+    this->t_.z() = tz;
+
+    this->Tcw_ = Sophus::SE3d(this->R_quaternion_, this->t_);
+
+    this->set_pose_ = true;
 }
 
-// Pose‐setter: Quaternion + translation
-void VoxelKeyframe::setPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t)
+// Pose‐setter: Eigen overload
+void VoxelKeyframe::setPose(
+    const Eigen::Quaterniond& q,
+    const Eigen::Vector3d&    t)
 {
-    Sophus::SE3d T_d(q.normalized(), t);
-    Tcw = T_d.cast<float>();
+    R_quaternion_ = q;
+    R_quaternion_.normalize();
+    t_            = t;
+    Tcw_          = Sophus::SE3d(R_quaternion_, t_);
+    set_pose_     = true;
 }
 
-// Pose getter (float)
-Sophus::SE3f VoxelKeyframe::getPosef() const
+Sophus::SE3d VoxelKeyframe::getPose()
 {
-    return Tcw;
+    return this->Tcw_;
 }
 
-// Pose getter (double)
-Sophus::SE3d VoxelKeyframe::getPose() const
+Sophus::SE3f VoxelKeyframe::getPosef()
 {
-    return Tcw.cast<double>();
+    return this->Tcw_.cast<float>();
 }
 
-// Recompute c2w and w2c tensors
+// Copy sv::Camera in
+void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
+{
+    this->cam_       = camera; 
+    this->camera_id_ = camera.camera_id_;
+    this->camera_model_id_ = camera.model_id_;
+    this->image_height_ = camera.height_;
+    this->image_width_ = camera.width_;
+
+    this->intr_.resize(camera.params_.size());
+    for (std::size_t i = 0; i < camera.params_.size(); ++i)
+        this->intr_[i] = static_cast<float>(camera.params_[i]);
+
+    switch (this->camera_model_id_)
+    {
+    case 1: // Pinhole
+    {
+        float focal_length_x = static_cast<float>(camera.params_[0]);
+        float focal_length_y = static_cast<float>(camera.params_[1]);
+        this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
+        this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
+        this->set_camera_ = true;
+    }
+    break;
+
+    default:
+    {
+        throw std::runtime_error("Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!");
+    }
+    break;
+    }
+}
+
+// Build c2w / w2c from Tcw_
 void VoxelKeyframe::computeTransformTensors()
 {
-    // Sanity check: if Tcw was never set, warn (optional)
-    if (Tcw.matrix().isZero(0))
-    {
-        std::cerr << "[VoxelKeyframe] Warning: pose Tcw is zero for frame " << fid_ << std::endl;
-    }
+    if (this->set_pose_ && this->set_camera_) {
+        this->world_view_transform_ = tensor_utils::EigenMatrix2TorchTensor(
+            this->getWorld2View2(this->trans_, this->scale_),
+            torch::kCUDA
+        ).transpose(0, 1);
 
-    Eigen::Matrix4f M = Tcw.matrix();
-    // c2w_: world→camera 4×4
-    c2w_ = torch::from_blob(M.data(), {4, 4}, torch::kFloat32).clone();
-    // w2c_: inverse
-    w2c_ = torch::linalg_inv(c2w_);
+        if (!this->set_projection_matrix_) {
+            this->projection_matrix_ = this->getProjectionMatrix(
+                this->znear_,
+                this->zfar_,
+                this->FoVx_,
+                this->FoVy_,
+                torch::kCUDA
+            ).transpose(0, 1);
+            this->set_projection_matrix_ = true;
+        }
+
+        this->full_proj_transform_ = (this->world_view_transform_.unsqueeze(0).bmm(
+            this->projection_matrix_.unsqueeze(0))).squeeze(0);
+
+        this->camera_center_ = this->world_view_transform_.inverse().index({3, torch::indexing::Slice(0, 3)});
+    }
+    else if (!this->set_pose_ && this->set_camera_) {
+        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE is not set!" << std::endl;
+    }
+    else if (!this->set_camera_) {
+        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because CAMERA is not set!" << std::endl;
+    }
+    else {
+        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE and CAMERA are not set!" << std::endl;
+    }
 }
 
-// Build a MiniCam for the rasterizer
+// exactly as Photo-SLAM
+Eigen::Matrix4f VoxelKeyframe::getWorld2View2(
+    const Eigen::Vector3f& trans,
+    float                  scale) const
+{    
+    Eigen::Matrix4f Rt;
+    Rt.setZero();
+    Eigen::Matrix3f R = this->R_quaternion_.toRotationMatrix().cast<float>();
+    Rt.topLeftCorner<3, 3>() = R;
+    Eigen::Vector3f t = this->t_.cast<float>();
+    Rt.topRightCorner<3, 1>() = t;
+    Rt(3, 3) = 1.0f;
+
+    Eigen::Matrix4f C2W = Rt.inverse();
+    Eigen::Vector3f cam_center = C2W.block<3, 1>(0, 3);
+    cam_center += trans;
+    cam_center *= scale;
+    C2W.block<3, 1>(0, 3) = cam_center;
+    Rt = C2W.inverse();
+    return Rt;
+}
+
+// exactly as Photo-SLAM
+torch::Tensor VoxelKeyframe::getProjectionMatrix(
+    float                 znear,
+    float                 zfar,
+    float                 fovX,
+    float                 fovY,
+    torch::DeviceType     device_type) const
+{
+    float tanY = std::tan(fovY/2);
+    float tanX = std::tan(fovX/2);
+    float top    = tanY * znear, bottom = -top;
+    float right  = tanX * znear, left   = -right;
+
+    torch::Tensor P = torch::zeros(
+        {4,4},
+        torch::TensorOptions().dtype(torch::kFloat32)
+                             .device(device_type)
+    );
+
+    P.index({0,0}) = 2.0f*znear/(right-left);
+    P.index({1,1}) = 2.0f*znear/(top-bottom);
+    P.index({0,2}) = (right+left)/(right-left);
+    P.index({1,2}) = (top+bottom)/(top-bottom);
+    P.index({2,2}) =  zfar/(zfar-znear);
+    P.index({2,3}) = -znear*zfar/(zfar-znear);
+    P.index({3,2}) =  1.0f;
+    return P;
+}
+
+// helper to build MiniCam
 sv::MiniCam VoxelKeyframe::toMiniCam() const
 {
-    return sv::fromCamera(cam_, c2w_, static_cast<int>(fid_));
-}
+    // pure camera pose:  Tcw_  is world→cam  ⇒  c2w = Tcw_.inverse()
+    Eigen::Matrix4f c2w_eig = Tcw_.inverse().matrix().cast<float>();
 
-// Camera remains a simple POD, so we directly assign in the header or here
-void VoxelKeyframe::setCameraParams(const sv::Camera& cam)
-{
-    cam_ = cam;
+    torch::Tensor c2w = tensor_utils::EigenMatrix2TorchTensor(
+                            c2w_eig, torch::kCPU);      // keep on CPU
+    return sv::fromCamera(cam_, c2w, static_cast<int>(fid_));
 }
-
-//------------------------------------------------------------------------------
-// Return the stored sv::Camera by reference
-const sv::Camera& VoxelKeyframe::getCamera() const
-{
-    return cam_;
-}
-

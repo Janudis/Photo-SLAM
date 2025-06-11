@@ -62,7 +62,8 @@ include_directories(
     ${ORB_SLAM3_SOURCE_DIR}/include/CameraModels
     ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus
     ${EIGEN3_INCLUDE_DIR}
-    ${OPENGL_INCLUDE_DIR})
+    ${OPENGL_INCLUDE_DIR}
+    ${TORCH_INCLUDE_DIRS})
 
 ##################################################################################
 ##  Build the gaussian splatting component libraries to ${PROJECT_SOURCE_DIR}/lib
@@ -186,7 +187,9 @@ target_link_libraries(imgui glfw OpenGL::GL)
 #     viewer/map_drawer.h)
 # target_link_libraries(gaussian_viewer
 #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-#     gaussian_mapper
+#     # gaussian_mapper
+#     voxel_core
+#     voxel_rasterizer
 #     imgui
 #     ${OpenCV_LIBRARIES}
 #     jsoncpp_lib
@@ -229,7 +232,7 @@ target_include_directories (voxel_rasterizer
 target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
 
 ### 3.2  C++ core / optimiser  ---------------------------------------
-add_library (voxel_core
+add_library(voxel_core
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
         src_voxel/voxel_parameters.cpp
@@ -250,6 +253,31 @@ target_link_libraries (voxel_core
             Python3::Python
             pybind11::embed
             ${OpenCV_LIBRARIES})
+
+            
+add_library(voxel_viewer SHARED
+    viewer/drawer_utils.h
+    viewer/imgui_viewer.cpp
+    viewer/imgui_viewer.h
+    viewer/map_drawer.cpp
+    viewer/map_drawer.h)
+
+target_link_libraries(voxel_viewer
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+    voxel_core      # <-- Make sure voxel_core is linked
+    voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
+    imgui
+    ${OpenCV_LIBRARIES}
+    jsoncpp_lib
+    "${TORCH_LIBRARIES}"
+    glm::glm
+    glfw
+    OpenGL::GL)
+
+target_include_directories(voxel_viewer
+    PUBLIC
+    ${Python3_INCLUDE_DIRS}  # <-- Keep this if needed for Python integration
+)
 
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
@@ -283,6 +311,7 @@ target_include_directories(tum_mono_voxel PRIVATE
 )
 target_link_libraries(tum_mono_voxel
         voxel_core          # lib that implements LiveVoxelTrainer
+        voxel_viewer
         # gaussian_viewer
         ${OpenCV_LIBS}
         ${TORCH_LIBRARIES}
@@ -291,7 +320,11 @@ target_link_libraries(tum_mono_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 target_link_directories(tum_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
-    
+
+set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # # TUM RGBD
 # add_executable(tum_rgbd examples/tum_rgbd.cpp)
 # target_link_libraries(tum_rgbd

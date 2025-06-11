@@ -90,7 +90,6 @@ public:
         int seed = 0);
 
     ~VoxelMapper();
-
     void readConfigFromFile(const std::filesystem::path& cfg_path);
 
     void run();

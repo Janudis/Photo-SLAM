@@ -55,7 +55,7 @@ public:
     std::map<std::size_t,std::shared_ptr<VoxelKeyframe>> keyframes_;
     std::map<point3D_id_t, Point3D>                      cached_point_cloud_;
 
-private:
+protected:
     std::mutex mutex_kfs_;
 };
 

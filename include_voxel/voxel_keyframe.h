@@ -1,6 +1,6 @@
 #pragma once
 /* -------------------------------------------------------------------------- */
-/*  Photo-SLAM-style voxel key-frame                                           */
+/*  Photo-SLAM-style voxel key-frame                                          */
 /* -------------------------------------------------------------------------- */
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/mini_cam.h"
@@ -12,61 +12,108 @@
 #include <vector>
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 
-/**
- * A light wrapper that stores exactly the fields the mapper uses, mirroring
- * Photo-SLAM’s GaussianKeyframe interface so the training / rendering code
- * can stay unchanged.
- */
-struct VoxelKeyframe
+#include "include/types.h"
+#include "include/camera.h"
+#include "include/point2d.h"
+#include "include/general_utils.h"
+#include "include/graphics_utils.h"
+#include "include/tensor_utils.h"
+
+class VoxelKeyframe
 {
+public:
+    VoxelKeyframe() {}
     /* ------------------------------------------------------------------ ctor */
     VoxelKeyframe(std::size_t fid = 0, int create_iter = 0)
-        : fid_(fid), create_iter_(create_iter) {}
+        : fid_(fid), creation_iter_(create_iter) {}
 
-    /* ---------------------------------------------------- pose setters (two) */
-    /** Raw 7-number form (kept for completeness) */
-    void setPose(double qw,double qx,double qy,double qz,
-                 double tx,double ty,double tz);
+    /* ---------------------------------------------------- pose setters */
+    void setPose(
+        const double qw,
+        const double qx,
+        const double qy,
+        const double qz,
+        const double tx,
+        const double ty,
+        const double tz);
+    
+    void setPose(
+        const Eigen::Quaterniond& q,
+        const Eigen::Vector3d& t);
 
-    /** Convenient Eigen overload (what mapper calls) */
-    void setPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t);
-
-    /* --------------------------------------------------------- pose getters */
-    Sophus::SE3f getPosef() const;
-    Sophus::SE3d getPose()  const;
+    Sophus::SE3d getPose();
+    Sophus::SE3f getPosef();
 
     /* --------------------------------------------------------- camera stuff */
-    void               setCameraParams(const sv::Camera& cam);
-    const sv::Camera&  getCamera() const;
+    void  setCameraParams(const sv::Camera& cam);
 
-    /* -------------------------------------------- build c2w / w2c 4×4 mats */
+    void setPoints2D(const std::vector<Eigen::Vector2d>& points2D);
+    void setPoint3DIdxForPoint2D(
+        const point2D_idx_t point2D_idx,
+        const point3D_id_t point3D_id);
+
+    /* -------------------------------------------- transform tensors */
     void computeTransformTensors();
-
-    /* --------------------------------------------- helper for sverte raster */
     sv::MiniCam toMiniCam() const;
 
-    /* ---------------------------------------------------------------- data */
-    std::size_t   fid_         = 0;
-    int           create_iter_ = 0;
+    Eigen::Matrix4f getWorld2View2(
+        const Eigen::Vector3f& trans = {0.0f, 0.0f, 0.0f},
+        float                  scale = 1.0f) const;
 
-    Sophus::SE3f  Tcw;                    // world→camera pose (float)
+    torch::Tensor   getProjectionMatrix(
+        float znear,
+        float zfar,
+        float fovX,
+        float fovY,
+        torch::DeviceType device_type) const;
 
-    /* near / far copied from Mapper globals for each new KF */
-    float         zfar_  = 4.f;
-    float         znear_ = 0.02f;
+public:
+    std::size_t fid_;
+    int creation_iter_;
+    int remaining_times_of_use_ = 0;
 
-    sv::Camera    cam_;                   // intrinsics + pre-built undistort maps
+    bool set_camera_ = false;
 
-    torch::Tensor c2w_, w2c_;             // 4×4 float32 matrices
-    torch::Tensor original_image_;        // (C,H,W)   – raw RGB after undistort
-    torch::Tensor img_tensor;             // copy on device for training
-    torch::Tensor mask_tensor;            // (1,H,W) float32 mask
+    camera_id_t camera_id_;
+    int camera_model_id_ = 0;
+    sv::Camera cam_;  
 
-    /* bookkeeping */
-    int           remaining_times_of_use_ = 0;
-    int           camera_id_ = 0;         // <== NEW: used to index into undistort_mask_
+    std::string img_filename_;
+    cv::Mat img_undist_, img_auxiliary_undist_;
+    torch::Tensor original_image_; ///< image
+    int image_width_;              ///< image
+    int image_height_;             ///< image
 
-    /* --------------- filenames (logger / viewer expect these fields) ------ */
-    std::string   img_filename_;          // just the basename
-    std::string   img_path_;              // absolute or relative path
+    std::vector<float> intr_; ///< intrinsics
+
+    float FoVx_; ///< intrinsics
+    float FoVy_; ///< intrinsics
+
+    bool set_pose_ = false;
+    bool set_projection_matrix_ = false;
+
+    Eigen::Quaterniond R_quaternion_;  ///< extrinsics
+    Eigen::Vector3d t_;                ///< extrinsics
+    Sophus::SE3d Tcw_;                 ///< extrinsics
+
+    torch::Tensor R_tensor_; ///< extrinsics
+    torch::Tensor t_tensor_; ///< extrinsics
+
+    float zfar_ = 100.0f;
+    float znear_ = 0.01f;
+
+    Eigen::Vector3f trans_ = {0.0f, 0.0f, 0.0f};
+    float scale_ = 1.0f;
+
+    torch::Tensor world_view_transform_;    ///< transform tensors
+    torch::Tensor projection_matrix_;       ///< transform tensors
+    torch::Tensor full_proj_transform_;     ///< transform tensors
+    torch::Tensor camera_center_;           ///< transform tensors
+
+    std::vector<Point2D> points2D_;
+    std::vector<float> kps_pixel_;
+    std::vector<float> kps_point_local_;
+
+    bool done_inactive_geo_densify_ = false;
 };
+

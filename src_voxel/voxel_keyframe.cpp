@@ -34,11 +34,13 @@ void VoxelKeyframe::setPose(
     const Eigen::Quaterniond& q,
     const Eigen::Vector3d&    t)
 {
-    R_quaternion_ = q;
-    R_quaternion_.normalize();
-    t_            = t;
-    Tcw_          = Sophus::SE3d(R_quaternion_, t_);
-    set_pose_     = true;
+    this->R_quaternion_ = q;
+    this->R_quaternion_.normalize();
+    this->t_ = t;
+
+    this->Tcw_ = Sophus::SE3d(this->R_quaternion_, this->t_);
+
+    this->set_pose_ = true;
 }
 
 Sophus::SE3d VoxelKeyframe::getPose()
@@ -83,6 +85,22 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     break;
     }
 }
+
+// void VoxelKeyframe::setPoints2D(const std::vector<Eigen::Vector2d>& points2D)
+// {
+//     this->points2D_.clear();
+//     auto num_points2D = points2D.size();
+//     this->points2D_.resize(num_points2D);
+//     for (point2D_idx_t point2D_idx = 0; point2D_idx < num_points2D; ++point2D_idx) {
+//         points2D_[point2D_idx].xy_ = points2D[point2D_idx];
+//     }
+// }
+// void VoxelKeyframe::setPoint3DIdxForPoint2D(
+//     const point2D_idx_t point2D_idx,
+//     const point3D_id_t point3D_id)
+// {
+//     points2D_.at(point2D_idx).point3D_id_ = point3D_id;
+// }
 
 // Build c2w / w2c from Tcw_
 void VoxelKeyframe::computeTransformTensors()
@@ -144,30 +162,31 @@ Eigen::Matrix4f VoxelKeyframe::getWorld2View2(
 
 // exactly as Photo-SLAM
 torch::Tensor VoxelKeyframe::getProjectionMatrix(
-    float                 znear,
-    float                 zfar,
-    float                 fovX,
-    float                 fovY,
-    torch::DeviceType     device_type) const
+    float znear,
+    float zfar,
+    float fovX,
+    float fovY,
+    torch::DeviceType device_type)
 {
-    float tanY = std::tan(fovY/2);
-    float tanX = std::tan(fovX/2);
-    float top    = tanY * znear, bottom = -top;
-    float right  = tanX * znear, left   = -right;
+    float tanHalfFovY = std::tan(fovY / 2);
+    float tanHalfFovX = std::tan(fovX / 2);
 
-    torch::Tensor P = torch::zeros(
-        {4,4},
-        torch::TensorOptions().dtype(torch::kFloat32)
-                             .device(device_type)
-    );
+    float top = tanHalfFovY * znear;
+    float bottom = -top;
+    float right = tanHalfFovX * znear;
+    float left = -right;
 
-    P.index({0,0}) = 2.0f*znear/(right-left);
-    P.index({1,1}) = 2.0f*znear/(top-bottom);
-    P.index({0,2}) = (right+left)/(right-left);
-    P.index({1,2}) = (top+bottom)/(top-bottom);
-    P.index({2,2}) =  zfar/(zfar-znear);
-    P.index({2,3}) = -znear*zfar/(zfar-znear);
-    P.index({3,2}) =  1.0f;
+    torch::Tensor P = torch::zeros({4, 4}, torch::TensorOptions().device(device_type));
+
+    float z_sign = 1.0f;
+
+    P.index({0, 0}) = 2.0 * znear / (right - left);
+    P.index({1, 1}) = 2.0 * znear / (top - bottom);
+    P.index({0, 2}) = (right + left) / (right - left);
+    P.index({1, 2}) = (top + bottom) / (top - bottom);
+    P.index({3, 2}) = z_sign;
+    P.index({2, 2}) = z_sign * zfar / (zfar - znear);
+    P.index({2, 3}) = -(zfar * znear) / (zfar - znear);
     return P;
 }
 

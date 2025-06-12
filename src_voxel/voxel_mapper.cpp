@@ -2,24 +2,6 @@
 
 namespace py = pybind11;
 
-inline py::array tensorToNumpyRGB_F32(const torch::Tensor& chw_f32_cpu)
-{
-    torch::Tensor hwc = chw_f32_cpu.permute({1,2,0}).contiguous();
-
-    return py::array(py::buffer_info(
-        hwc.data_ptr<float>(),                        // pointer
-        sizeof(float),                                // itemsize
-        py::format_descriptor<float>::format(),       // format
-        3,                                            // ndim
-        { static_cast<pybind11::ssize_t>(hwc.size(0)),
-          static_cast<pybind11::ssize_t>(hwc.size(1)),
-          static_cast<pybind11::ssize_t>(hwc.size(2)) },        // shape
-        { static_cast<pybind11::ssize_t>(hwc.stride(0) * sizeof(float)),
-          static_cast<pybind11::ssize_t>(hwc.stride(1) * sizeof(float)),
-          static_cast<pybind11::ssize_t>(hwc.stride(2) * sizeof(float)) } // strides
-    ));
-}
-
 inline void saveDebugImage(torch::Tensor tensor,
                            const std::string& path)
 {
@@ -76,10 +58,13 @@ inline void saveDebugImage(torch::Tensor tensor,
 
 VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                          const std::filesystem::path& config_file_path,
-                         const std::filesystem::path& seq_dir,
-                         const std::filesystem::path& out_dir,
-                         torch::DeviceType device_type,
-                         int seed)
+                        //  const std::filesystem::path& seq_dir,
+                        //  const std::filesystem::path& out_dir,
+                        //  torch::DeviceType device_type,
+                        //  int seed)
+                        std::filesystem::path result_dir,
+                        int seed,
+                        torch::DeviceType device_type)
     : mpSLAM(pSLAM),
       initial_mapped_(false),
       interrupt_training_(false),
@@ -108,12 +93,13 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         model_params_.data_device_ = "cpu";
     }
 
-    result_dir_ = mOutDir;
-    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir_);
+    // result_dir_ = mOutDir;
+    result_dir_ = result_dir;
+    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir);
     config_file_path_ = config_file_path;
-    readConfigFromFile(config_file_path_);
-    mSeqDir = seq_dir;
-    mOutDir = out_dir;    
+    readConfigFromFile(config_file_path);
+    // mSeqDir = seq_dir;
+    // mOutDir = out_dir;    
 
     // Background & override color setup
     std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};  // no white-background logic needed
@@ -236,6 +222,8 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
          settings_file["Mapper.local_BA_increased_times_of_use"].operator int();
     loop_closure_increased_times_of_use_ = 
          settings_file["Mapper.loop_closure_increased_times_of_use_"].operator int();
+    stable_num_iter_existence_ =
+         settings_file["Mapper.stable_num_iter_existence"].operator int();
 
     pipe_params_.convert_SHs_ =
          (settings_file["Pipeline.convert_SHs"].operator int()) != 0;
@@ -444,48 +432,249 @@ void VoxelMapper::run()
     /* ───────────────────────────────────────────────
      *  2.  INCREMENTAL   M A P P I N G  LOOP
      * ───────────────────────────────────────────── */
-    int SLAM_stop_iter = 0;
-    while (!isStopped())
-    {
-        if (hasMetIncrementalMappingConditions())
-        {
-            combineMappingOperations();
-            if (cull_keyframes_) 
-                cullKeyframes();
-        }
-
-        trainForOneIteration();
-
-        if (mpSLAM->isShutDown() && !SLAM_ended_)
-        {
-            SLAM_stop_iter = getIteration();
-            SLAM_ended_    = true;
-        }
-        if (SLAM_ended_ || getIteration() >= opt_params_.iterations_)
-            break;
-    }
+     int SLAM_stop_iter = 0;
+     while (!isStopped()) {
+         // Check conditions for incremental mapping
+         if (hasMetIncrementalMappingConditions()) {
+             combineMappingOperations();
+             if (cull_keyframes_)
+                 cullKeyframes();
+         }
+ 
+         // Invoke training once
+         trainForOneIteration();
+ 
+         if (mpSLAM->isShutDown()) {
+             SLAM_stop_iter = getIteration();
+             SLAM_ended_ = true;
+         }
+ 
+         if (SLAM_ended_ || getIteration() >= opt_params_.iterations_)
+             break;
+     }
     /* ───────────────────────────────────────────────
      *  3.  TAIL   O P T I M I S A T I O N
      * ───────────────────────────────────────────── */
-    int densify_interval = densifyInterval();
-    int n_delay_iters    = int(densify_interval * 0.8f);
+     int densify_interval = densifyInterval();
+     int n_delay_iters = densify_interval * 0.8;
+     while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
+         trainForOneIteration();
+         densify_interval = densifyInterval();
+         n_delay_iters = densify_interval * 0.8;
+     }
+ 
+     // Save and clear
+     renderAndRecordAllKeyframes("_shutdown");
+     savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
+     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
+ 
+     signalStop();
+ }
 
-    while (   getIteration() - SLAM_stop_iter <= n_delay_iters
-           || getIteration() % densify_interval <= n_delay_iters
-           || isKeepingTraining())
-    {
-        trainForOneIteration();
-        densify_interval = densifyInterval();
-        n_delay_iters    = int(densify_interval * 0.8f);
+ // Add training with optimization loop
+void VoxelMapper::trainForOneIteration()
+{
+    // 1) bump global iteration counter
+    increaseIteration(1);
+
+    // 2) pick a random keyframe from the sliding window
+    std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
+    if (!viewpoint_cam) {
+        // if none available, roll back iteration and exit
+        increaseIteration(-1);
+        return;
     }
-    /* ───────────────────────────────────────────────
-     *  4.  SAVE & SHUTDOWN
-     * ───────────────────────────────────────────── */
-    renderAndRecordAllKeyframes("_shutdown");
-    // savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
-    writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
+    writeKeyframeUsedTimes(result_dir_ / "used_times");
 
-    signalStop();
+    // 3) select ground truth image + mask tensors
+    //    (it always use the “original” resolution in our voxel case)
+    int image_height, image_width;
+    torch::Tensor gt_image, mask;
+    image_height = viewpoint_cam->image_height_;
+    image_width = viewpoint_cam->image_width_;
+    gt_image = viewpoint_cam->original_image_
+                                   .to(mDevice)          // (3,H,W)
+                                   .unsqueeze(0);        // → (1,3,H,W)
+    mask = undistort_mask_[viewpoint_cam->camera_id_]
+                                   .to(mDevice)
+                                   .to(torch::kFloat32); // (H,W)
+    // if it somehow came in as 3×H×W, just take the first (they're identical)
+    if (mask.dim() == 3 && mask.size(0) == 3) {
+        mask = mask[0];   // now (H,W)
+    }
+    // now make it 1×1×H×W
+    if (mask.dim() == 2) {
+        mask = mask.unsqueeze(0).unsqueeze(0);
+    }
+    else if (mask.dim() == 3) {
+        // if somebody gave you (1,H,W) already:
+        mask = mask.unsqueeze(1);  // (1,1,H,W)
+    }
+    // std::cerr << "[DBG] final mask dim=" << mask.dim()
+    //         << " sizes=" << mask.sizes() << "\n";
+
+    // 4) grow SH degree every 1000 iterations (locked during render)
+    std::unique_lock<std::mutex> lock_render(mutex_render_);
+    
+    if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
+        default_sh_ += 1;
+    voxel_model_->setShDegree(default_sh_);
+
+    // 5) build a MiniCam out of this keyframe
+    // const Camera& cinfo = viewpoint_cam->getCamera();
+    // sv::MiniCam cam = sv::MiniCam::fromIntrinsics(
+    //     cinfo.fx(), cinfo.fy(), cinfo.cx(), cinfo.cy(),
+    //     img_w, img_h,
+    //     static_cast<int>(viewpoint_cam->fid_)
+    // );
+    // // set c2w, w2c
+    // {
+    //     Eigen::Matrix4f pose = viewpoint_cam->pose.matrix();
+    //     Eigen::Matrix4f c2w = pose.inverse();
+    //     cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
+    //     cam.w2c = torch::from_blob(pose.data(),  {4,4}, torch::kFloat32).clone().to(mDevice);
+    // }
+    // viewpoint_cam->computeTransformTensors();            // idempotent
+    sv::MiniCam cam = viewpoint_cam->toMiniCam();
+    cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
+    cam.w2c = cam.w2c.contiguous().to(mDevice);
+
+    // 6) update all learning rates
+    if (mpSLAM) {
+        int used_times = kfs_used_times_[viewpoint_cam->fid_];
+        int step = (used_times <= opt_params_.geo_lr_max_steps_)
+                       ? used_times
+                       : opt_params_.geo_lr_max_steps_;
+        float geo_lr = voxel_model_->updateLearningRate(step);
+        // voxel_model_->setGeoLearningRate(geo_lr);
+        setGeoLearningRateInit(geo_lr);
+    } else {
+        voxel_model_->updateLearningRate(getIteration());
+    }
+    // SH-DC and higher-SH rates remain constant:
+    // voxel_model_->setSh0LearningRate(opt_params_.sh0_lr_);
+    // voxel_model_->setShsLearningRate(opt_params_.shs_lr_);
+    voxel_model_->setSh0LearningRate(sh0LearningRate());
+    voxel_model_->setShsLearningRate(shsLearningRate());
+
+    torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
+                            .mul(255.0f)
+                            .clamp(0.0f, 255.0f)
+                            .to(torch::kUInt8)            // <--- cast to U8
+                            .cpu()
+                            .contiguous();
+    torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
+    // std::cout << "hwc_u8 sizes: " << hwc_u8.sizes() << std::endl;
+    // convert CHW→HWC uint8 numpy without any CUDA involvement
+    py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
+    // if you still want a debug JPEG, bring back as float
+    saveDebugImage(chw_u8.to(torch::kFloat32).div(255.0f), (result_dir_ / "debug_gt.jpg").string());
+    // std::cout << "[DEBUG] Camera c2w matrix size: " << cam.c2w.sizes() << std::endl;
+    // std::cout << "[DEBUG] Camera w2c matrix size: " << cam.w2c.sizes() << std::endl;
+
+    // std::cout << "[DEBUG] RGB numpy shape before passing to renderer: " << rgb_numpy.shape() << std::endl;
+    auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
+    // lock_render.unlock();
+    if (render_pkg.empty() || !render_pkg.count("rgb") || !render_pkg.at("rgb").defined()) {
+        std::cout << "render pkg empty" << std::endl;
+        return;
+    }
+    // Keep the batch dimension: rendered_image is now (1,3,H,W)
+
+    torch::Tensor rendered_image = render_pkg["rgb"].to(mDevice);
+    // std::cout << "[DEBUG] gt_image size: " << gt_image.sizes() << std::endl;
+    // std::cerr << "[DBG] rendered_image dim=" << rendered_image.dim()
+    //     << " sizes=" << rendered_image.sizes() << "\n";
+    // std::cout << "[DEBUG] mask size: " << mask.sizes() << std::endl;
+    saveDebugImage(rendered_image.squeeze(0), (result_dir_ / "debug_rendered.jpg").string());
+    
+    torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
+    // std::cerr << "[DBG] masked_image dim=" << masked_image.dim()
+    //         << " sizes=" << masked_image.sizes() << "\n";        
+    saveDebugImage(masked_image.squeeze(0), (result_dir_ / "debug_mask.jpg").string());
+    
+    // 8) compute masked photometric loss
+    // py::gil_scoped_release no_gil;
+    // mask out black/invalid pixels
+    // masked_image = rendered_image * mask;   // (1,3,H,W)
+    // torch::Tensor masked_gt   = gt_image        * mask;   // (1,3,H,W)
+    
+    torch::Tensor Ll1 = loss_utils::l1_loss(masked_image, gt_image);
+    float lambda_dssim = lambdaDssim();
+    torch::Tensor loss = (1.0 - lambda_dssim) * Ll1
+            + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
+    {
+        py::gil_scoped_release no_gil;
+        loss.backward();
+        if (mDevice == torch::kCUDA)  
+            torch::cuda::synchronize();
+    }
+
+    // 10) accumulate subdivision gradients into subdiv_meta_
+    {
+        torch::NoGradGuard no_grad;
+        // update EMA
+        ema_loss_for_log_ = 0.4f * loss.item<float>() + 0.6f * ema_loss_for_log_;
+
+        if (keyframe_record_interval_ &&
+            getIteration() % keyframe_record_interval_ == 0)
+            recordKeyframeRendered(masked_image, gt_image, viewpoint_cam->fid_, result_dir_, result_dir_, result_dir_);
+
+        // // get logging gradient from subdiv_p_ → use new method name getSubdivPriorityGrad()
+        // torch::Tensor grad_p = voxel_model_->getSubdivPriorityGrad();
+        // // clamp subdiv_meta_ ← getTensor("subdiv_meta")
+        // torch::Tensor subdiv_meta = voxel_model_->getTensor("subdiv_meta");
+        // subdiv_meta = torch::clamp(subdiv_meta + grad_p * opt_params_.meta_accum_lr_, 0.0f, 1.0f);
+        // voxel_model_->setSubdivMeta(subdiv_meta);
+
+        // // scatter‐add full gradient array back into "grad buffer"
+        // torch::Tensor idx_all = torch::arange(grad_p.numel(), grad_p.options().dtype(torch::kLong));
+        // voxel_model_->accumulateSubdivGradients(idx_all, grad_p);
+
+        // every training_report_interval_ iterations, print a concise report
+        // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
+        //     sv::VoxelTrainer::trainingReport(
+        //         iteration_,
+        //         opt_params_.iterations_,
+        //         Ll1,
+        //         loss,
+        //         ema_loss_for_log_,
+        //         loss_utils::l1_loss,
+        //         // elapsed_ms,
+        //         *voxel_model_,
+        //         *scene_,
+        //         pipe_params_,
+        //         background_
+        //     );
+        // }
+
+        if (all_keyframes_record_interval_ &&
+            getIteration() % all_keyframes_record_interval_ == 0)
+        {
+            renderAndRecordAllKeyframes();
+            // savePly(result_dir_ / std::to_string(iteration_) / "ply");
+        }
+
+        if (loop_closure_iteration_)
+             loop_closure_iteration_ = false;
+
+        if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
+            std::cout << "[TRAIN] iter " << iteration_
+                    << "  L1: "    << Ll1.item<float>()
+                    << "  loss: "  << loss.item<float>()
+                    << "  ema: "   << ema_loss_for_log_ << '\n';
+        }
+        if (iteration_ % 50 == 0) {
+            writeKeyframeUsedTimes(result_dir_);
+        }
+
+        // Optimizer step   
+         if (getIteration() < opt_params_.iterations_) {
+            //  py::gil_scoped_release no_gil;
+             voxel_model_->optimizer_->step();
+             voxel_model_->optimizer_->zero_grad(true);
+         }
+    }
 }
 
 bool VoxelMapper::hasMetInitialMappingConditions() {
@@ -612,274 +801,209 @@ void VoxelMapper::cullKeyframes()
  }
 
 void VoxelMapper::combineMappingOperations()
-{
-    // Continuously consume any pending MappingOperation from ORB‐SLAM3’s Atlas
-    while (mpSLAM->getAtlas()->hasMappingOperation()) {
-        ORB_SLAM3::MappingOperation opr =
-            mpSLAM->getAtlas()->getAndPopMappingOperation();
-
-        switch (opr.meOperationType)
-        {
-            // ─────────── 1) LOCAL BUNDLE‐ADJUSTMENT ───────────
-            case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA: {
-                auto &associated_kfs = opr.associatedKeyFrames();
-
-                for (auto &kf : associated_kfs) {
-                    // Unpack the keyframe tuple
-                    unsigned long kfid = std::get<0>(kf);
-                    auto &pose        = std::get<2>(kf);
-
-                    // See if this keyframe already exists in our voxel‐scene
-                    std::shared_ptr<VoxelKeyframe> existing_kf =
-                        scene_->getKeyframe(kfid);
-
-                    if (existing_kf) {
-                        // — Keyframe already present → update its pose
-                        existing_kf->setPose(
-                            pose.unit_quaternion().cast<double>(),
-                            pose.translation().cast<double>()
-                        );
-                        existing_kf->computeTransformTensors();
-
-                        // — Give the “Local BA” keyframe extra times‐of‐use
-                        increaseKeyframeTimesOfUse(
-                            existing_kf,
-                            local_BA_increased_times_of_use_
-                        );
-                    }
-                    else {
-                        // — Brand‐new keyframe → hand off to handleNewKeyframe()
-                        handleNewKeyframe(kf);
-                    }
-                }
-
-                // ── Inject any brand‐new map‐points into the voxel model ──
-                //    (Photo‐SLAM calls gaussians_->increasePcd(...). In SVRaster,
-                //     you must call your own “add‐points” or “inactive‐geo densify”
-                //     routine here.)
-                {
-                    auto &associated_points = opr.associatedMapPoints();
-                    auto &pts              = std::get<0>(associated_points);
-                    auto &colors           = std::get<1>(associated_points);
-
-                    if (initial_mapped_ && pts.size() >= 30) {
-                        torch::NoGradGuard no_grad;
-                        std::unique_lock<std::mutex> lock_render(mutex_render_);
-
-                        // TODO: replace the following line with your SVRaster‐equivalent:
-                        //        e.g. voxel_model_->increasePointCloud(pts, colors, getIteration());
-                        //        Or scene_->addNewPoints(pts, colors, getIteration());
-                        //gaussians_->increasePcd(pts, colors, getIteration());
-                    }
-                }
-                break;
-            }
-
-            // ─────────── 2) LOOP‐CLOSING BUNDLE‐ADJUSTMENT ───────────
-            case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA: {
-                std::cout << "[VoxelMapper] Loop Closure Detected." << std::endl;
-
-                // 2.1) Pull out scale factor (if provided by ORB-SLAM3)
-                float loop_kf_scale = opr.mfScale;
-
-                // 2.2) Build a mask for “which voxels have already been corrected”
-                //      (Photo‐SLAM does: torch::full({N}, true); we simply mimic the pattern.)
-                //      In SVRaster, you may not need an exact equivalent, but keep the same shape:
-                //      number of voxels = e.g. voxel_centers_.size(0).
-                torch::Tensor point_not_transformed_flags =
-                    torch::full(
-                        { static_cast<int64_t>(voxel_centers_.size(0)) },
-                        true,
-                        torch::TensorOptions()
-                            .device(device_type_)
-                            .dtype(torch::kBool)
-                    );
-
-                int num_transformed = 0;
-
-                // 2.4) Iterate over all associated keyframes in this loop closure
-                auto &associated_kfs = opr.associatedKeyFrames();
-                for (auto &kf : associated_kfs) {
-                    unsigned long kfid = std::get<0>(kf);
-                    auto &pose        = std::get<2>(kf);
-
-                    // See if the KF already exists in our scene
-                    std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
-
-                    // (2.4.1) If pkf exists → check if its pose changed “too much”
-                    if (pkf) {
-                        Sophus::SE3f original_pose = pkf->getPosef();
-                        Sophus::SE3f inv_pose      = pose.inverse();
-                        Sophus::SE3f diff_pose     = inv_pose * original_pose;
-
-                        bool large_rot   = !diff_pose.rotationMatrix().isApprox(
-                                               Eigen::Matrix3f::Identity(),
-                                               large_rot_th_
-                                           );
-                        bool large_trans = !diff_pose.translation().isMuchSmallerThan(
-                                               1.0f,
-                                               large_trans_th_
-                                           );
-
-                        if (large_rot || large_trans) {
-                            std::cout << "[VoxelMapper] Large loop correction on KF "
-                                      << kfid << std::endl;
-
-                            // Adjust translation by scale factor
-                            diff_pose.translation()  -= inv_pose.translation();
-                            diff_pose.translation()  *= loop_kf_scale;
-                            diff_pose.translation()  += inv_pose.translation();
-
-                            // Convert to a (4×4) torch tensor for SVRaster
-                            torch::Tensor diff_pose_tensor =
-                                tensor_utils::EigenMatrix2TorchTensor(
-                                    diff_pose.matrix(),
-                                    device_type_
-                                ).transpose(0, 1);
-
-                            {
-                                // Lock while pushing transform to voxel model
-                                std::unique_lock<std::mutex> lock_render(mutex_render_);
-
-                                // TODO: call SVRaster equivalent:
-                                //        e.g. voxel_model_->applyLoopCorrection(
-                                //                point_not_transformed_flags,
-                                //                diff_pose_tensor,
-                                //                pkf->world_view_transform_,
-                                //                pkf->full_proj_transform_,
-                                //                pkf->creation_iter_,
-                                //                stableNumIterExistence(),
-                                //                num_transformed,
-                                //                loop_kf_scale);
-                                //
-                                //gaussians_->scaledTransformVisiblePointsOfKeyframe(
-                                //    point_not_transformed_flags,
-                                //    diff_pose_tensor,
-                                //    pkf->world_view_transform_,
-                                //    pkf->full_proj_transform_,
-                                //    pkf->creation_iter_,
-                                //    stableNumIterExistence(),
-                                //    num_transformed,
-                                //    loop_kf_scale);
-                            }
-
-                            // Grant extra “times of use” for this KF, per Photo‐SLAM
-                            increaseKeyframeTimesOfUse(
-                                pkf,
-                                loop_closure_increased_times_of_use_
-                            );
-                        }
-
-                        // (2.4.2) In all cases, update KF’s pose & transforms
-                        pkf->setPose(
-                            pose.unit_quaternion().cast<double>(),
-                            pose.translation().cast<double>()
-                        );
-                        pkf->computeTransformTensors();
-                    }
-                    else {
-                        // (2.4.3) KF not yet in scene → treat as brand‐new
-                        handleNewKeyframe(kf);
-                    }
-
-                    // If new points arrived in handleNewKeyframe(), extend our flag‐tensor
-                    // so that newly inserted voxels are also marked “un‐corrected”:
-                    int64_t new_pts = static_cast<int64_t>(voxel_centers_.size(0))
-                                        - point_not_transformed_flags.size(0);
-                    if (new_pts > 0) {
-                        torch::Tensor extra = torch::full(
-                            { new_pts },
-                            true,
-                            torch::TensorOptions()
-                                .device(device_type_)
-                                .dtype(torch::kBool)
-                        );
-                        point_not_transformed_flags =
-                            torch::cat({ point_not_transformed_flags, extra }, 0);
-                    }
-                }
-
-                // 2.6) Finally, ingest any brand‐new map‐points that came with this LoopClosingBA
-                {
-                    auto &assoc_pts = opr.associatedMapPoints();
-                    auto &pts       = std::get<0>(assoc_pts);
-                    auto &colors    = std::get<1>(assoc_pts);
-
-                    if (initial_mapped_ && pts.size() >= 30) {
-                        torch::NoGradGuard no_grad;
-                        std::unique_lock<std::mutex> lock_render(mutex_render_);
-
-                        // TODO: replace with SVRaster equivalent of “adding new points”:
-                        //        e.g. voxel_model_->increasePointCloud(pts, colors, getIteration());
-                        //gaussians_->increasePcd(pts, colors, getIteration());
-                    }
-                }
-
-                // Mark that we’ve processed a loop‐closure iteration
-                loop_closure_iteration_ = true;
-                break;
-            }
-
-            // ─────────── 3) SCALE REFINEMENT ───────────
-            case ORB_SLAM3::MappingOperation::OprType::ScaleRefinement: {
-                std::cout << "[VoxelMapper] Scale refinement detected. Transforming all KFs & voxels..." << std::endl;
-
-                float s       = opr.mfScale;
-                Sophus::SE3f &T = opr.mT;
-
-                if (initial_mapped_) {
-                    {
-                        // 3.1) First, apply to voxel model (SVRaster)
-                        std::unique_lock<std::mutex> lock_render(mutex_render_);
-
-                        // TODO: call SVRaster‐equivalent to scale “voxel geometry”:
-                        //        e.g. voxel_model_->applyScaledTransformation(s, T);
-                        //gaussians_->applyScaledTransformation(s, T);
-                    }
-
-                    // 3.2) Then apply to every keyframe’s pose in the scene
-                    scene_->applyScaledTransformation(s, T);
-                }
-                else {
-                    // (this branch “should not happen” once initial mapped is true,
-                    //  but we mirror Photo‐SLAM’s fallback)
-                    // 3.3) Transform any cached 3D points (not yet in scene_)
-                    for (auto &pt_pair : scene_->cached_point_cloud_) {
-                        auto &pt_xyz = pt_pair.second.xyz_;
-                        pt_xyz *= s;
-                        pt_xyz = T.cast<double>() * pt_xyz;
-                    }
-
-                    // 3.4) Also transform every VoxelKeyframe we’ve stored so far
-                    for (auto &kv : scene_->keyframes()) {
-                        std::shared_ptr<VoxelKeyframe> pkf = kv.second;
-
-                        // Convert Twc → Tyc with scale s
-                        Sophus::SE3f Twc = pkf->getPosef().inverse();
-                        Twc.translation() *= s;
-                        Sophus::SE3f Tyc = T * Twc;
-                        Sophus::SE3f Tcy = Tyc.inverse();
-
-                        pkf->setPose(
-                            Tcy.unit_quaternion().cast<double>(),
-                            Tcy.translation().cast<double>()
-                        );
-                        pkf->computeTransformTensors();
-                    }
-                }
-                break;
-            }
-
-            // ─────────── 4) ANY OTHER MAPPING‐OP TYPE ───────────
-            default: {
-                // If Photo‐SLAM would normally handle other cases, throw an error;
-                // for VoxelMapper we simply ignore everything else.
-                // (You can choose to log or assert here, if you want.)
-                break;
-            }
-        }
-    }
-}
+ {
+     // Get Mapping Operations
+     while (mpSLAM->getAtlas()->hasMappingOperation()) {
+         ORB_SLAM3::MappingOperation opr =
+             mpSLAM->getAtlas()->getAndPopMappingOperation();
+ 
+         switch (opr.meOperationType)
+         {
+         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
+         {
+             // std::cout << "[Gaussian Mapper]Local BA Detected."
+             //           << std::endl;
+ 
+             // Get new keyframes
+             auto& associated_kfs = opr.associatedKeyFrames();
+ 
+             // Add keyframes to the scene
+             for (auto& kf : associated_kfs) {
+                 // Keyframe Id
+                 auto kfid = std::get<0>(kf);
+                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
+                 // If the keyframe is already in the scene, only update the pose.
+                 // Otherwise create a new one
+                 if (pkf) {
+                     auto& pose = std::get<2>(kf);
+                     pkf->setPose(
+                         pose.unit_quaternion().cast<double>(),
+                         pose.translation().cast<double>());
+                     pkf->computeTransformTensors();
+ 
+                     // Give local BA keyframes times of use
+                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
+                 }
+                 else {
+                     handleNewKeyframe(kf);
+                 }
+             }
+ 
+             // Get new points
+             auto& associated_points = opr.associatedMapPoints();
+             auto& points = std::get<0>(associated_points);
+             auto& colors = std::get<1>(associated_points);
+ 
+             // Add new points to the model
+             if (initial_mapped_ && points.size() >= 30) {
+                 torch::NoGradGuard no_grad;
+                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                 voxel_model_->increasePcd(points, colors, getIteration());
+             }
+         }
+         break;
+ 
+         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
+         {
+             std::cout << "[Gaussian Mapper]Loop Closure Detected."
+                       << std::endl;
+ 
+             // Get the loop keyframe scale modification factor
+             float loop_kf_scale = opr.mfScale;
+ 
+             // Get new keyframes (scaled transformation applied in ORB-SLAM3)
+             auto& associated_kfs = opr.associatedKeyFrames();
+             // Mark the transformed points to avoid transforming more than once
+             torch::Tensor point_not_transformed_flags =
+                 torch::full(
+                     {voxel_model_->center_.size(0)},
+                     true,
+                     torch::TensorOptions().device(device_type_).dtype(torch::kBool));
+            //  if (record_loop_ply_)
+            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
+             int num_transformed = 0;
+             // Add keyframes to the scene
+             for (auto& kf : associated_kfs) {
+                 // Keyframe Id
+                 auto kfid = std::get<0>(kf);
+                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
+                 // In case new points are added in handleNewKeyframe()
+                 int64_t num_new_points = voxel_model_->center_.size(0) - point_not_transformed_flags.size(0);
+                 if (num_new_points > 0)
+                     point_not_transformed_flags = torch::cat({
+                         point_not_transformed_flags,
+                         torch::full({num_new_points}, true, point_not_transformed_flags.options())},
+                         /*dim=*/0);
+                 // If kf is already in the scene, evaluate the change in pose,
+                 // if too large we perform loop correction on its visible model points.
+                 // If not in the scene, create a new one.
+                 if (pkf) {
+                     auto& pose = std::get<2>(kf);
+                     // If is loop closure kf
+ // if (std::get<4>(kf)) {
+ // renderAndRecordKeyframe(pkf, result_dir_, "_0_before_loop_correction");
+                         Sophus::SE3f original_pose = pkf->getPosef(); // original_pose = old, inv_pose = new
+                         Sophus::SE3f inv_pose = pose.inverse();
+                         Sophus::SE3f diff_pose = inv_pose * original_pose;
+                         bool large_rot = !diff_pose.rotationMatrix().isApprox(
+                             Eigen::Matrix3f::Identity(), large_rot_th_);
+                         bool large_trans = !diff_pose.translation().isMuchSmallerThan(
+                             1.0, large_trans_th_);
+                         if (large_rot || large_trans) {
+                             std::cout << "[Gaussian Mapper]Large loop correction detected, transforming visible points of kf "
+                                     << kfid << std::endl;
+                             diff_pose.translation() -= inv_pose.translation(); // t = (R_new * t_old + t_new) - t_new
+                             diff_pose.translation() *= loop_kf_scale;          // t = s * (R_new * t_old)
+                             diff_pose.translation() += inv_pose.translation(); // t = (s * R_new * t_old) + t_new
+                             torch::Tensor diff_pose_tensor =
+                                 tensor_utils::EigenMatrix2TorchTensor(
+                                     diff_pose.matrix(), device_type_).transpose(0, 1);
+                             {
+                                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                                 voxel_model_->scaledTransformVisiblePointsOfKeyframe(
+                                     point_not_transformed_flags,
+                                     diff_pose_tensor,
+                                     pkf->world_view_transform_,
+                                     pkf->full_proj_transform_,
+                                     pkf->creation_iter_,
+                                     stableNumIterExistence(),
+                                     num_transformed,
+                                     loop_kf_scale); // selected xyz *= s
+                             }
+                             // Give loop keyframes times of use
+                             increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
+ // renderAndRecordKeyframe(pkf, result_dir_, "_1_after_loop_transforming_points");
+ // std::cout<<num_transformed<<std::endl;
+                         }
+ // }
+                     pkf->setPose(
+                         pose.unit_quaternion().cast<double>(),
+                         pose.translation().cast<double>());
+                     pkf->computeTransformTensors();
+ // if (std::get<4>(kf)) renderAndRecordKeyframe(pkf, result_dir_, "_2_after_pose_correction");
+                 }
+                 else {
+                     handleNewKeyframe(kf);
+                 }
+             }
+            //  if (record_loop_ply_)
+            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
+ // keyframesToJson(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
+ 
+             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
+             auto& associated_points = opr.associatedMapPoints();
+             auto& points = std::get<0>(associated_points);
+             auto& colors = std::get<1>(associated_points);
+ 
+             // Add new points to the model
+             if (initial_mapped_ && points.size() >= 30) {
+                 torch::NoGradGuard no_grad;
+                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                 voxel_model_->increasePcd(points, colors, getIteration());
+             }
+ 
+             // Mark this iteration
+             loop_closure_iteration_ = true;
+         }
+         break;
+ 
+         case ORB_SLAM3::MappingOperation::OprType::ScaleRefinement:
+         {
+             std::cout << "[Gaussian Mapper]Scale refinement Detected. Transforming all kfs and points..."
+                       << std::endl;
+ 
+             float s = opr.mfScale;
+             Sophus::SE3f& T = opr.mT;
+             if (initial_mapped_) {
+                 // Apply the scaled transformation on gaussian model points
+                 {
+                     std::unique_lock<std::mutex> lock_render(mutex_render_);
+                     voxel_model_->applyScaledTransformation(s, T);
+                 }
+                 // Apply the scaled transformation to the scene
+                 scene_->applyScaledTransformation(s, T);
+             }
+             else { // TODO: the workflow should not come here, delete this branch
+                 // Apply the scaled transformation to the cached points
+                 for (auto& pt : scene_->cached_point_cloud_) {
+                     // pt <- (s * Ryw * pt + tyw)
+                     auto& pt_xyz = pt.second.xyz_;
+                     pt_xyz *= s;
+                     pt_xyz = T.cast<double>() * pt_xyz;
+                 }
+ 
+                 // Apply the scaled transformation on gaussian keyframes
+                 for (auto& kfit : scene_->keyframes()) {
+                     std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
+                     Sophus::SE3f Twc = pkf->getPosef().inverse();
+                     Twc.translation() *= s;
+                     Sophus::SE3f Tyc = T * Twc;
+                     Sophus::SE3f Tcy = Tyc.inverse();
+                     pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
+                     pkf->computeTransformTensors();
+                 }
+             }
+         }
+         break;
+ 
+         default:
+         {
+             throw std::runtime_error("MappingOperation type not supported!");
+         }
+         break;
+         }
+     }
+ }
 
 void VoxelMapper::handleNewKeyframe(
     std::tuple<
@@ -930,10 +1054,19 @@ void VoxelMapper::handleNewKeyframe(
  
      // Give new keyframes times of use and add it to the training sliding window
      increaseKeyframeTimesOfUse(pkf, newKeyframeTimesOfUse());
+
+    // Get dense point cloud from the new keyframe to accelerate training
+     pkf->img_undist_ = imgRGB_undistorted;
+    //  pkf->img_auxiliary_undist_ = imgAux_undistorted;
+    //  pkf->kps_pixel_ = std::move(std::get<6>(kf));
+    //  pkf->kps_point_local_ = std::move(std::get<7>(kf));
+    //  if (isdoingInactiveGeoDensify())
+    //      increasePcdByKeyframeInactiveGeoDensify(pkf);
  }
 
 bool VoxelMapper::isStopped() const {
-    return stopped_;
+    std::unique_lock<std::mutex> lock_status(this->mutex_status_);
+    return this->stopped_;
 }
 
 void VoxelMapper::signalStop(const bool going_to_stop)
@@ -942,266 +1075,6 @@ void VoxelMapper::signalStop(const bool going_to_stop)
     this->stopped_ = going_to_stop;
 }
 
-inline bool is_between(int iter, int from, int until)
-{ return iter >= from && iter <= until; }
-
-// Add training with optimization loop
-void VoxelMapper::trainForOneIteration()
-{
-    // 1) bump global iteration counter
-    increaseIteration(1);
-
-    // 2) pick a random keyframe from the sliding window
-    std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
-    if (!viewpoint_cam) {
-        // if none available, roll back iteration and exit
-        increaseIteration(-1);
-        return;
-    }
-    writeKeyframeUsedTimes(result_dir_ / "used_times");
-
-    // 3) select ground truth image + mask tensors
-    //    (it always use the “original” resolution in our voxel case)
-    int image_height, image_width;
-    torch::Tensor gt_image, mask;
-    image_height = viewpoint_cam->image_height_;
-    image_width = viewpoint_cam->image_width_;
-    gt_image = viewpoint_cam->original_image_
-                                   .to(mDevice)          // (3,H,W)
-                                   .unsqueeze(0);        // → (1,3,H,W)
-    mask = undistort_mask_[viewpoint_cam->camera_id_]
-                                   .to(mDevice)
-                                   .to(torch::kFloat32); // (H,W)
-    // if it somehow came in as 3×H×W, just take the first (they're identical)
-    if (mask.dim() == 3 && mask.size(0) == 3) {
-        mask = mask[0];   // now (H,W)
-    }
-
-    // now make it 1×1×H×W
-    if (mask.dim() == 2) {
-        mask = mask.unsqueeze(0).unsqueeze(0);
-    }
-    else if (mask.dim() == 3) {
-        // if somebody gave you (1,H,W) already:
-        mask = mask.unsqueeze(1);  // (1,1,H,W)
-    }
-    // std::cerr << "[DBG] final mask dim=" << mask.dim()
-    //         << " sizes=" << mask.sizes() << "\n";
-
-    // 4) grow SH degree every 1000 iterations (locked during render)
-    std::unique_lock<std::mutex> lock_render(mutex_render_);
-    
-    if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
-        default_sh_ += 1;
-    voxel_model_->setShDegree(default_sh_);
-
-    // 5) build a MiniCam out of this keyframe
-    // const Camera& cinfo = viewpoint_cam->getCamera();
-    // sv::MiniCam cam = sv::MiniCam::fromIntrinsics(
-    //     cinfo.fx(), cinfo.fy(), cinfo.cx(), cinfo.cy(),
-    //     img_w, img_h,
-    //     static_cast<int>(viewpoint_cam->fid_)
-    // );
-    // // set c2w, w2c
-    // {
-    //     Eigen::Matrix4f pose = viewpoint_cam->pose.matrix();
-    //     Eigen::Matrix4f c2w = pose.inverse();
-    //     cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32).clone().to(mDevice);
-    //     cam.w2c = torch::from_blob(pose.data(),  {4,4}, torch::kFloat32).clone().to(mDevice);
-    // }
-    // viewpoint_cam->computeTransformTensors();            // idempotent
-    sv::MiniCam cam = viewpoint_cam->toMiniCam();
-    cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
-    cam.w2c = cam.w2c.contiguous().to(mDevice);
-
-    // 6) update all learning rates
-    if (mpSLAM) {
-        int used_times = kfs_used_times_[viewpoint_cam->fid_];
-        int step = (used_times <= opt_params_.geo_lr_max_steps_)
-                       ? used_times
-                       : opt_params_.geo_lr_max_steps_;
-        float geo_lr = voxel_model_->updateLearningRate(step);
-        voxel_model_->setGeoLearningRate(geo_lr);
-    } else {
-        voxel_model_->updateLearningRate(getIteration());
-    }
-    // SH-DC and higher-SH rates remain constant:
-    voxel_model_->setSh0LearningRate(opt_params_.sh0_lr_);
-    voxel_model_->setShsLearningRate(opt_params_.shs_lr_);
-
-    torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
-                            .mul(255.0f)
-                            .clamp(0.0f, 255.0f)
-                            .to(torch::kUInt8)            // <--- cast to U8
-                            .cpu()
-                            .contiguous();
-    torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
-    // std::cout << "hwc_u8 sizes: " << hwc_u8.sizes() << std::endl;
-    // convert CHW→HWC uint8 numpy without any CUDA involvement
-    py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
-    // if you still want a debug JPEG, bring back as float
-    saveDebugImage(chw_u8.to(torch::kFloat32).div(255.0f), (result_dir_ / "debug_gt.jpg").string());
-    // std::cout << "[DEBUG] Camera c2w matrix size: " << cam.c2w.sizes() << std::endl;
-    // std::cout << "[DEBUG] Camera w2c matrix size: " << cam.w2c.sizes() << std::endl;
-
-    // std::cout << "[DEBUG] RGB numpy shape before passing to renderer: " << rgb_numpy.shape() << std::endl;
-    auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
-    // lock_render.unlock();
-    if (render_pkg.empty() || !render_pkg.count("rgb") || !render_pkg.at("rgb").defined()) {
-        std::cout << "render pkg empty" << std::endl;
-        return;
-    }
-    // Keep the batch dimension: rendered_image is now (1,3,H,W)
-
-    torch::Tensor rendered_image = render_pkg["rgb"].to(mDevice);
-
-    // std::cout << "[DEBUG] gt_image size: " << gt_image.sizes() << std::endl;
-    // std::cerr << "[DBG] rendered_image dim=" << rendered_image.dim()
-    //     << " sizes=" << rendered_image.sizes() << "\n";
-    // std::cout << "[DEBUG] mask size: " << mask.sizes() << std::endl;
-    saveDebugImage(rendered_image.squeeze(0), (result_dir_ / "debug_rendered.jpg").string());
-    
-    torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
-    // std::cerr << "[DBG] masked_image dim=" << masked_image.dim()
-    //         << " sizes=" << masked_image.sizes() << "\n";        
-    saveDebugImage(masked_image.squeeze(0), (result_dir_ / "debug_mask.jpg").string());
-    
-    // 8) compute masked photometric loss
-    torch::Tensor Ll1, loss;
-    {
-        py::gil_scoped_release no_gil;
-        // mask out black/invalid pixels
-        // masked_image = rendered_image * mask;   // (1,3,H,W)
-        // torch::Tensor masked_gt   = gt_image        * mask;   // (1,3,H,W)
-        
-        Ll1 = loss_utils::l1_loss(masked_image, gt_image);
-        float lambda_dssim = lambdaDssim();
-        loss = (1.0 - lambda_dssim) * Ll1
-             + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
-        loss.backward();
-        if (mDevice == torch::kCUDA) {
-            torch::cuda::synchronize();
-        }
-        // === DEBUG GRADIENTS ===
-        // auto params = voxel_model_->parameters();  // or voxel_model_->getTrainableParams()
-        // for (size_t i = 0; i < params.size(); ++i) {
-        //     auto& p = params[i];
-        //     if (p.grad().defined()) {
-        //         std::cout << "[DEBUG] Param " << i
-        //                 << ": grad max = " << p.grad().abs().max().item<float>()
-        //                 << ", mean = " << p.grad().abs().mean().item<float>() << "\n";
-        //     } else {
-        //         std::cout << "[DEBUG] Param " << i << ": grad undefined\n";
-        //     }
-        // }
-    }
-    // {
-    //     // rebuild rgb_numpy (or reuse the one from above)
-    //     py::array rgb_numpy2 = tensorToNumpyRGB_F32(viewpoint_cam->img_tensor.cpu());
-    //     // re-lock for thread safety during render
-    //     std::unique_lock<std::mutex> lock2(mutex_render_);
-    //     auto render_pkg2 = voxel_model_->render(cam, rgb_numpy2, "");
-    //     lock2.unlock();
-    //     if (!render_pkg2.empty() && render_pkg2.count("rgb") && render_pkg2.at("rgb").defined()) {
-    //         torch::Tensor post_render = render_pkg2["rgb"].to(mDevice).squeeze(0); // (3,H,W)
-    //         saveDebugImage(post_render, (result_dir_ / "debug_post_update.jpg").string());
-    //     }
-    // }
-
-    // 10) accumulate subdivision gradients into subdiv_meta_
-    {
-        torch::NoGradGuard no_grad;
-        // update EMA
-        ema_loss_for_log_ = 0.4f * loss.item<float>() + 0.6f * ema_loss_for_log_;
-
-        if (keyframe_record_interval_ &&
-            getIteration() % keyframe_record_interval_ == 0)
-            recordKeyframeRendered(masked_image, gt_image, viewpoint_cam->fid_, result_dir_, result_dir_, result_dir_);
-
-        // get logging gradient from subdiv_p_ → use new method name getSubdivPriorityGrad()
-        torch::Tensor grad_p = voxel_model_->getSubdivPriorityGrad();
-        // clamp subdiv_meta_ ← getTensor("subdiv_meta")
-        torch::Tensor subdiv_meta = voxel_model_->getTensor("subdiv_meta");
-        subdiv_meta = torch::clamp(subdiv_meta + grad_p * opt_params_.meta_accum_lr_, 0.0f, 1.0f);
-        voxel_model_->setSubdivMeta(subdiv_meta);
-
-        // scatter‐add full gradient array back into "grad buffer"
-        torch::Tensor idx_all = torch::arange(grad_p.numel(), grad_p.options().dtype(torch::kLong));
-        voxel_model_->accumulateSubdivGradients(idx_all, grad_p);
-
-        // // every training_report_interval_ iterations, print a concise report
-        // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
-        //     auto iter_end_timing = std::chrono::steady_clock::now();
-        //     int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        //         iter_end_timing - start_time_  // you can store start_time_ at top if desired
-        //     ).count();
-        //     VoxelTrainer::trainingReport(
-        //         iteration_,
-        //         opt_params_.iterations_,
-        //         Ll1,
-        //         loss,
-        //         ema_loss_for_log,
-        //         loss_utils::l1_loss,
-        //         elapsed_ms,
-        //         *voxel_model_,
-        //         *scene_,
-        //         pipe_params_,
-        //         background_
-        //     );
-        // }
-
-        // // densification & pruning
-        // ...
-
-        // optionally record keyframe visuals / save PLY, etc., exactly when
-        // iteration_ % all_keyframes_record_interval_ == 0 (if you want)
-        if (all_keyframes_record_interval_ &&
-            getIteration() % all_keyframes_record_interval_ == 0)
-        {
-            renderAndRecordAllKeyframes();
-            // savePly(result_dir_ / std::to_string(iteration_) / "ply");
-        }
-
-        // 10) optimizer_ step (only geometry group is updated by updateLearningRate)
-        {
-            py::gil_scoped_release no_gil;
-            torch::NoGradGuard no_grad;
-            voxel_model_->optimizer_->step();
-            voxel_model_->optimizer_->zero_grad();
-        }
-
-        if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
-            std::cout << "[TRAIN] iter " << iteration_
-                    << "  L1: "    << Ll1.item<float>()
-                    << "  loss: "  << loss.item<float>()
-                    << "  ema: "   << ema_loss_for_log_ << '\n';
-        }
-        if (iteration_ % 50 == 0) {
-            writeKeyframeUsedTimes(result_dir_);
-        }
-    }
-}
-
-//------------------------------------------------------------
-// helper: copy Mat → NumPy (NumPy owns the memory)
-//------------------------------------------------------------
-py::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat &img)
-{
-    if (img.empty() || img.type() != CV_8UC3)
-        throw std::runtime_error("Expected a non-empty 3-channel CV_8UC3 image");
-
-    // allocate new NumPy array that *owns* its data
-    py::array_t<uint8_t> arr({img.rows, img.cols, 3});
-    std::memcpy(arr.mutable_data(), img.data,
-                static_cast<size_t>(img.rows * img.cols * 3));
-    return arr;   // safe – Python holds the buffer
-}
-
-// void VoxelMapper::increaseKeyframeTimesOfUse(std::shared_ptr<VoxelKeyframe> pkf, int value)
-// {
-//     pkf->remaining_times_of_use_ += value;
-//     // kfs_used_times_[pkf->fid_] = 0;  // reset usage tracking if needed
-// }
 void VoxelMapper::increaseKeyframeTimesOfUse(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         int times)
@@ -1494,8 +1367,38 @@ int VoxelMapper::densifyInterval()
     return opt_params_.densification_interval_;
 }
 
+ int VoxelMapper::stableNumIterExistence()
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     return stable_num_iter_existence_;
+ }
+
+ void VoxelMapper::setGeoLearningRateInit(const float lr)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     opt_params_.geo_lr_init_ = lr;
+ }
+
 float VoxelMapper::lambdaDssim()
  {
      std::unique_lock<std::mutex> lock(mutex_settings_);
      return opt_params_.lambda_dssim_;
+ }
+
+float VoxelMapper::sh0LearningRate()
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     return opt_params_.sh0_lr_;
+ }
+
+ float VoxelMapper::shsLearningRate()
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     return opt_params_.shs_lr_;
+ }
+
+  bool VoxelMapper::isdoingInactiveGeoDensify()
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     return inactive_geo_densify_;
  }

@@ -376,6 +376,43 @@ void GaussianModel::increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& n
 // std::cout << "increasePcd(tensor) postfix time: " << time << " ms" <<std::endl;
 }
 
+torch::Tensor GaussianModel::replaceTensorToOptimizer(torch::Tensor& tensor, int tensor_idx)
+{
+    auto& param = this->optimizer_->param_groups()[tensor_idx].params()[0];
+    auto& state = optimizer_->state();
+    auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
+    auto new_state = std::make_unique<torch::optim::AdamParamState>();
+    new_state->step(stored_state.step());
+    new_state->exp_avg(torch::zeros_like(tensor));
+    new_state->exp_avg_sq(torch::zeros_like(tensor));
+    // new_state->max_exp_avg_sq(stored_state.max_exp_avg_sq().clone()); // needed only when options.amsgrad(true), which is false by default
+
+    state.erase(key);
+    param = tensor.requires_grad_();
+    key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    state[key] = std::move(new_state);
+
+    auto optimizable_tensors = param;
+    return optimizable_tensors;
+}
+
+void GaussianModel::scaledTransformationPostfix(
+    torch::Tensor& new_xyz,
+    torch::Tensor& new_scaling)
+{
+    // param_groups[0] = xyz_
+    torch::Tensor optimizable_xyz = this->replaceTensorToOptimizer(new_xyz, 0);
+    // param_groups[4] = scaling_
+    torch::Tensor optimizable_scaling = this->replaceTensorToOptimizer(new_scaling, 4);
+
+    this->xyz_ = optimizable_xyz;
+    this->scaling_ = optimizable_scaling;
+
+    this->Tensor_vec_xyz_ = {this->xyz_};
+    this->Tensor_vec_scaling_ = {this->scaling_};
+}
+
 void GaussianModel::applyScaledTransformation(
     const float s,
     const Sophus::SE3f T)
@@ -395,22 +432,6 @@ void GaussianModel::applyScaledTransformation(
 // scales = scales.unsqueeze(scales_ndimension).repeat({1, 3});
     this->scaling_ *= s;
     scaledTransformationPostfix(this->xyz_, this->scaling_);
-}
-
-void GaussianModel::scaledTransformationPostfix(
-    torch::Tensor& new_xyz,
-    torch::Tensor& new_scaling)
-{
-    // param_groups[0] = xyz_
-    torch::Tensor optimizable_xyz = this->replaceTensorToOptimizer(new_xyz, 0);
-    // param_groups[4] = scaling_
-    torch::Tensor optimizable_scaling = this->replaceTensorToOptimizer(new_scaling, 4);
-
-    this->xyz_ = optimizable_xyz;
-    this->scaling_ = optimizable_scaling;
-
-    this->Tensor_vec_xyz_ = {this->xyz_};
-    this->Tensor_vec_scaling_ = {this->scaling_};
 }
 
 void GaussianModel::scaledTransformVisiblePointsOfKeyframe(
@@ -562,27 +583,6 @@ void GaussianModel::resetOpacity()
     torch::Tensor optimizable_tensors = this->replaceTensorToOptimizer(opacities_new, 3); // "opacity"
     this->opacity_ = optimizable_tensors;
     this->Tensor_vec_opacity_ = {this->opacity_};
-}
-
-torch::Tensor GaussianModel::replaceTensorToOptimizer(torch::Tensor& tensor, int tensor_idx)
-{
-    auto& param = this->optimizer_->param_groups()[tensor_idx].params()[0];
-    auto& state = optimizer_->state();
-    auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
-    auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
-    auto new_state = std::make_unique<torch::optim::AdamParamState>();
-    new_state->step(stored_state.step());
-    new_state->exp_avg(torch::zeros_like(tensor));
-    new_state->exp_avg_sq(torch::zeros_like(tensor));
-    // new_state->max_exp_avg_sq(stored_state.max_exp_avg_sq().clone()); // needed only when options.amsgrad(true), which is false by default
-
-    state.erase(key);
-    param = tensor.requires_grad_();
-    key = c10::guts::to_string(param.unsafeGetTensorImpl());
-    state[key] = std::move(new_state);
-
-    auto optimizable_tensors = param;
-    return optimizable_tensors;
 }
 
 void GaussianModel::prunePoints(torch::Tensor& mask)

@@ -50,595 +50,593 @@ void VoxelModel::setShDegree(const int sh)
 
 // void VoxelModel::createFromPcd(
 //     const std::map<point3D_id_t, Point3D>& pcd,
-//     const float spatial_lr_scale)
+//     float spatial_lr_scale)
 // {
-//     /* ------------------------------------------------------------------ 1. */
+//     // 1) Store the scene extent for later use (e.g. in LR scheduling or densification)
 //     this->spatial_lr_scale_ = spatial_lr_scale;
 
-//     /* ------------------------------------------------------------------ 2. */
-//     const int64_t num_points = static_cast<int64_t>(pcd.size());
-//     if (num_points == 0) return;
-
-//     /* ------------------------------------------------------------------ 3. */
-//     torch::Tensor fused_point_cloud = torch::zeros(
-//         {num_points, 3},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-//     torch::Tensor color = torch::zeros(
-//         {num_points, 3},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-
-//     auto pcd_it = pcd.begin();
-//     for (int64_t point_idx = 0; point_idx < num_points; ++point_idx) {
-//         const Point3D& point = (*pcd_it).second;
-//         fused_point_cloud.index({point_idx, 0}) = point.xyz_(0);
-//         fused_point_cloud.index({point_idx, 1}) = point.xyz_(1);
-//         fused_point_cloud.index({point_idx, 2}) = point.xyz_(2);
-//         color.index({point_idx, 0}) = point.color_(0) / 255.0f;
-//         color.index({point_idx, 1}) = point.color_(1) / 255.0f;
-//         color.index({point_idx, 2}) = point.color_(2) / 255.0f;
-//         ++pcd_it;
+//     // 2) Number of input 3D points = number of voxels we will create
+//     const int64_t N = static_cast<int64_t>(pcd.size());
+//     if (N == 0) {
+//         // Leave all member‐tensors as their default empty values
+//         return;
 //     }
 
-//     /* ------------------------------------------------------------------ 4. */
-//     torch::Tensor fused_color = sh_utils::RGB2SH(color);
-//     const int temp = this->max_sh_degree_ + 1;
-//     torch::Tensor features = torch::zeros(
-//         {fused_color.size(0), 3, temp * temp},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-//     features.index(
-//         {torch::indexing::Slice(),
-//          torch::indexing::Slice(0, 3),
-//          0}) = fused_color;
-//     features.index(
-//         {torch::indexing::Slice(),
-//          torch::indexing::Slice(3, features.size(1)),
-//          torch::indexing::Slice(1, features.size(2))}) = 0.0f;
+//     // 3) Allocate a CPU tensor for centers and colors, then move to device
+//     //    We will fill them row‐by‐row from the ordered map.
+//     torch::TensorOptions opts = torch::TensorOptions()
+//                                     .dtype(torch::kFloat32)
+//                                     .device(device_type_);
+//     torch::Tensor centers_cpu = torch::empty({N, 3}, opts);
+//     torch::Tensor colors_cpu  = torch::empty({N, 3}, opts);
 
-//     /* ------------------------------------------------------------------ 5.  (voxel-specific) */
-//     // sizes: initialise to constant voxel length (0.05 m here)
-//     const float default_voxel_size = 0.05f;
-//     this->size_ = torch::full(
-//         {num_points},
-//         default_voxel_size,
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-
-//     // geo_ 8-vector: (σ_xx σ_xy σ_xz σ_yy σ_yz σ_zz density pad)
-//     this->geo_ = torch::zeros({num_points, 8},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-//     const float var = 0.25f * default_voxel_size * default_voxel_size;
-//     this->geo_.index_put_({torch::indexing::Slice(), 0}, var);
-//     this->geo_.index_put_({torch::indexing::Slice(), 3}, var);
-//     this->geo_.index_put_({torch::indexing::Slice(), 5}, var);
-//     this->geo_.set_requires_grad(true);                                              // <---
-
-//     /* ------------------------------------------------------------------ 6. */
-//     this->sh0_ = features.index({torch::indexing::Slice(),
-//                                  torch::indexing::Slice(),
-//                                  torch::indexing::Slice(0, 1)})
-//                      .transpose(1, 2)
-//                      .contiguous()
-//                      .requires_grad_();
-
-//     this->shs_ = features.index({torch::indexing::Slice(),
-//                                  torch::indexing::Slice(),
-//                                  torch::indexing::Slice(1, features.size(2))})
-//                      .transpose(1, 2)
-//                      .contiguous()
-//                      .requires_grad_();
-
-//     /* ------------------------------------------------------------------ 7.  (voxel-specific) */
-//     // opacity stored in logit space – start at p = 0.8
-//     torch::Tensor opacities = general_utils::inverse_sigmoid(
-//         0.8f * torch::ones({num_points, 1},
-//                 torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)));
-//     this->opacity_ = opacities.view({num_points}).requires_grad_();
-
-//     /* ------------------------------------------------------------------ 8.  (voxel-specific bookkeeping) */
-//     this->oct_path_  = torch::arange(
-//         0, num_points,
-//         torch::TensorOptions().dtype(torch::kLong).device(this->device_type_));
-//     this->oct_level_ = torch::zeros(
-//         {num_points},
-//         torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));
-//     this->exist_since_iter_ = torch::zeros(
-//         {num_points},
-//         torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));
-//     this->subdiv_meta_ = torch::zeros(
-//         {num_points},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)).requires_grad_();
-//     this->subdiv_meta_.retain_grad();
-//     this->subdiv_p_ = torch::zeros_like(this->subdiv_meta_).requires_grad_();
-//     this->subdiv_p_.retain_grad();
-//     this->subdiv_p_grad_buffer_ = torch::zeros_like(this->subdiv_p_);
-
-//     /* ------------------------------------------------------------------ 9. */
-//     VOXEL_MODEL_TENSORS_TO_VEC
-
-//     /* ----------------------------------------------------------------- 10. */
-//     this->percent_dense_ = 0.0f;
-// }
-
-// //------------------------------------------------------------------------------
-// // “Increase” the voxel point cloud by providing a list of new points/colors.
-// // Builds exactly like GaussianModel::increasePcd, but uses SVRaster’s voxel fields.
-// //------------------------------------------------------------------------------
-// // ─────────────────────────────────────────────────────────────────────────────
-// //  VoxelModel::increasePcd   (vector-form) – mirror of GaussianModel version
-// // ─────────────────────────────────────────────────────────────────────────────
-// void VoxelModel::increasePcd(std::vector<float> points,
-//                              std::vector<float> colors,
-//                              const int iteration)
-// {
-//     /* ------------------------------------------------------------------ 0. */
-//     assert(points.size() == colors.size());
-//     assert(points.size() % 3 == 0);
-//     const int64_t num_new_points = static_cast<int64_t>(points.size() / 3);
-//     if (num_new_points == 0) return;
-
-//     /* ------------------------------------------------------------------ 1.  copy vectors → tensors (CPU → device) */
-//     torch::Tensor new_point_cloud = torch::from_blob(
-//         points.data(), {num_new_points, 3},
-//         torch::TensorOptions().dtype(torch::kFloat32)).to(this->device_type_);
-
-//     torch::Tensor new_colors = torch::from_blob(
-//         colors.data(), {num_new_points, 3},
-//         torch::TensorOptions().dtype(torch::kFloat32)).to(this->device_type_);
-
-//     /* optional cache of sparse points – unchanged from Gaussian */
-//     if (this->sparse_points_xyz_.size(0) == 0) {
-//         this->sparse_points_xyz_   = new_point_cloud;
-//         this->sparse_points_color_ = new_colors;
-//     } else {
-//         this->sparse_points_xyz_   = torch::cat({this->sparse_points_xyz_,   new_point_cloud}, 0);
-//         this->sparse_points_color_ = torch::cat({this->sparse_points_color_, new_colors},   0);
+//     {
+//         // Fill `centers_cpu` and `colors_cpu` from `pcd`
+//         auto it = pcd.begin();
+//         for (int64_t i = 0; i < N; ++i, ++it) {
+//             const Point3D& pt = it->second;
+//             centers_cpu.index_put_({i, 0}, pt.xyz_(0));
+//             centers_cpu.index_put_({i, 1}, pt.xyz_(1));
+//             centers_cpu.index_put_({i, 2}, pt.xyz_(2));
+//             // Color in [0,255], convert to float in [0,1]
+//             colors_cpu.index_put_({i, 0}, pt.color_(0) / 255.0f);
+//             colors_cpu.index_put_({i, 1}, pt.color_(1) / 255.0f);
+//             colors_cpu.index_put_({i, 2}, pt.color_(2) / 255.0f);
+//         }
 //     }
 
-//     /* ------------------------------------------------------------------ 2. SH feature construction (verbatim) */
-//     torch::Tensor new_fused_colors = sh_utils::RGB2SH(new_colors);
-//     const int temp = this->max_sh_degree_ + 1;
-//     torch::Tensor features = torch::zeros(
-//         {new_fused_colors.size(0), 3, temp * temp},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
-//     features.index(
-//         {torch::indexing::Slice(),
-//          torch::indexing::Slice(0, 3),
-//          0}) = new_fused_colors;
-//     features.index(
-//         {torch::indexing::Slice(),
-//          torch::indexing::Slice(3, features.size(1)),
-//          torch::indexing::Slice(1, features.size(2))}) = 0.0f;
+//     // 4) Move centers and colors to the correct device
+//     center_ = centers_cpu.to(device_type_);
+//     // Each voxel default size: 0.05 m (same as in mapper). 
+//     // If you want to pull from VoxelModelParams instead, replace 0.05f with model_params_.initial_voxel_size
+//     float default_voxel_size = 0.05f;
+//     size_   = torch::full({N}, default_voxel_size, opts).to(device_type_);
 
-//     /* ------------------------------------------------------------------ 3. voxel-specific attribute init */
-//     const float default_vox_size = 0.05f;                                         // <--- voxel-specific
-//     torch::Tensor new_sizes = torch::full(
-//         {num_new_points}, default_vox_size,
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
+//     // 5) Initialize "geo" = 8‐component tensor per voxel (covariance + pad) to zero.
+//     // geo_ = torch::zeros({N, 8}, opts).requires_grad_(true);
+//     geo_ = torch::zeros({N, 8}, opts);   // leaf, no grad yet
+//     float var = 0.25f * default_voxel_size * default_voxel_size;  // (l/2)^2
+//     geo_.index_put_({torch::indexing::Slice(), 0}, var);
+//     geo_.index_put_({torch::indexing::Slice(), 3}, var);
+//     geo_.index_put_({torch::indexing::Slice(), 5}, var);
+//     geo_ = geo_.requires_grad_(true);
 
-//     // geo 8-vector with diagonal cov = (l/2)^2, others zero
-//     torch::Tensor new_geo = torch::zeros(
-//         {num_new_points, 8},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
-//     const float var = 0.25f * default_vox_size * default_vox_size;                // <---
-//     new_geo.index_put_({torch::indexing::Slice(), 0}, var);                       // σ_xx
-//     new_geo.index_put_({torch::indexing::Slice(), 3}, var);                       // σ_yy
-//     new_geo.index_put_({torch::indexing::Slice(), 5}, var);                       // σ_zz
+//     // 6) Convert each color to spherical‐harmonic DC (sh_utils::RGB2SH returns [N, 3])
+//     //    Then build sh0_ = fused_color * Y₀
+//     torch::Tensor colors_device = colors_cpu.to(device_type_);
+//     torch::Tensor fused_sh       = sh_utils::RGB2SH(colors_device);
+//     // fused_sh has shape [N, 3]. We interpret that as the “SH‐DC” term.
+//     sh0_ = fused_sh.clone().requires_grad_(true);
 
-//     // SH terms
-//     torch::Tensor new_sh0 = features.index({torch::indexing::Slice(),
-//                                             torch::indexing::Slice(),
-//                                             torch::indexing::Slice(0, 1)})
-//                                 .transpose(1, 2)
-//                                 .contiguous();
-//     torch::Tensor new_shs = features.index({torch::indexing::Slice(),
-//                                             torch::indexing::Slice(),
-//                                             torch::indexing::Slice(1, features.size(2))})
-//                                 .transpose(1, 2)
-//                                 .contiguous();
+//     // 7) Initialize all higher‐degree SH coefficients to zero: [N, 45, 3] → we can zero them.
+//     shs_ = torch::zeros({N, 45, 3}, opts).requires_grad_(true);
 
-//     // opacity logits start from p = 0.8
-//     torch::Tensor new_opacity = general_utils::inverse_sigmoid(
-//         0.8f *
-//         torch::ones({num_new_points, 1},
-//             torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)))
-//             .view({num_new_points});                                              // <---
+//     // 8) Initialize opacity to 0.8 for each voxel, then invert‐sigmoid so we can train in logit‐space:
+//     //    We want initial “probability” = 0.8. inverse_sigmoid(0.8) is a logit. 
+//     //    If you don't have inverse_sigmoid, you can simply store 0.8 directly and train in “probability” space,
+//     //    so long as your loss functions expect [0,1]. Here we follow GaussianModel’s pattern and do:
+//     torch::Tensor init_prob = torch::full({N, 1}, 0.8f, opts);
+//     // general_utils::inverse_sigmoid() expects shape [N,1] → returns logits
+//     torch::Tensor opacity_logits = general_utils::inverse_sigmoid(init_prob).view({N});
+//     opacity_ = opacity_logits.clone().requires_grad_(true);
 
-//     // octree bookkeeping
-//     torch::Tensor new_oct_paths = torch::arange(
-//         this->center_.size(0),
-//         this->center_.size(0) + num_new_points,
-//         torch::TensorOptions().dtype(torch::kLong).device(this->device_type_));   // <---
-//     torch::Tensor new_oct_lvls = torch::zeros(
-//         {num_new_points},
-//         torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));  // <---
-//     torch::Tensor new_meta      = torch::zeros(
-//         {num_new_points},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
-//     torch::Tensor new_subdiv_p  = torch::zeros_like(new_meta);                     // <---
-//     torch::Tensor new_exist_iter= torch::full(
-//         {num_new_points}, iteration,
-//         torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));   // <---
+//     // 9) Build octree‐tracking tensors: path = [0..N-1], level = zeros
+//     oct_path_  = torch::arange(0, N, torch::TensorOptions().dtype(torch::kLong).device(device_type_));
+//     oct_level_ = torch::zeros({N}, torch::TensorOptions().dtype(torch::kInt32).device(device_type_));
 
-//     /* ------------------------------------------------------------------ 4. concatenate to existing tensors */
-//     this->center_      = torch::cat({this->center_,   new_point_cloud}, 0).requires_grad_(false);
-//     this->size_        = torch::cat({this->size_,     new_sizes},       0).requires_grad_(false); // <---
-//     this->geo_         = torch::cat({this->geo_,      new_geo},         0).requires_grad_(true);
-//     this->sh0_         = torch::cat({this->sh0_,      new_sh0},         0).requires_grad_(true);
-//     this->shs_         = torch::cat({this->shs_,      new_shs},         0).requires_grad_(true);
-//     this->opacity_     = torch::cat({this->opacity_,  new_opacity},     0).requires_grad_(true);  // <---
-//     this->oct_path_    = torch::cat({this->oct_path_, new_oct_paths},   0);                       // <---
-//     this->oct_level_   = torch::cat({this->oct_level_,new_oct_lvls},    0);                       // <---
-//     this->exist_since_iter_ = torch::cat({this->exist_since_iter_, new_exist_iter}, 0);           // <---
-//     this->subdiv_meta_ = torch::cat({this->subdiv_meta_, new_meta},     0).requires_grad_(true);
-//     this->subdiv_meta_.retain_grad();
-//     this->subdiv_p_    = torch::cat({this->subdiv_p_,  new_subdiv_p},   0).requires_grad_(true);
-//     this->subdiv_p_.retain_grad();
+//     // 10) exist_since_iter_ = zero for every newly‐created voxel
+//     exist_since_iter_ = torch::zeros(
+//         {N}, 
+//         torch::TensorOptions().dtype(torch::kInt32).device(device_type_)
+//     );
 
-//     /* ------------------------------------------------------------------ 5. resize gradient buffer if needed */
-//     if (this->subdiv_p_grad_buffer_.numel() != this->subdiv_p_.numel()) {
-//         torch::Tensor new_buf = torch::zeros_like(this->subdiv_p_);
-//         if (this->subdiv_p_grad_buffer_.numel() > 0)
-//             new_buf.narrow(0, 0, this->subdiv_p_grad_buffer_.numel())
-//                    .copy_(this->subdiv_p_grad_buffer_);
-//         this->subdiv_p_grad_buffer_ = std::move(new_buf);
-//     }
-//     /* ------------------------------------------------------------------ 6. update tensor vectors (optimizer replace) */
-//     VOXEL_MODEL_TENSORS_TO_VEC;
+//     // 11) subdiv_meta_ = zeros → this is a trainable “priority”‐value for each voxel
+//     subdiv_meta_ = torch::zeros({N}, opts).requires_grad_(true);
+//     subdiv_meta_.retain_grad();
+
+//     // 12) subdiv_p_ = zeros (same shape) → also trainable
+//     subdiv_p_ = torch::zeros({N}, opts).requires_grad_(true);
+//     subdiv_p_.retain_grad();
+
+//     // 13) Prepare the “gradient buffer” for subdividing later
+//     subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_).to(device_type_);
 // }
 
 void VoxelModel::createFromPcd(
     const std::map<point3D_id_t, Point3D>& pcd,
-    float spatial_lr_scale)
+    const float spatial_lr_scale)
 {
-    // 1) Store the scene extent for later use (e.g. in LR scheduling or densification)
+    /* ------------------------------------------------------------------ 1. */
     this->spatial_lr_scale_ = spatial_lr_scale;
 
-    // 2) Number of input 3D points = number of voxels we will create
-    const int64_t N = static_cast<int64_t>(pcd.size());
-    if (N == 0) {
-        // Leave all member‐tensors as their default empty values
+    /* ------------------------------------------------------------------ 2. */
+    const int64_t num_points = static_cast<int64_t>(pcd.size());
+    if (num_points == 0) return;
+
+    /* ------------------------------------------------------------------ 3. */
+    torch::Tensor fused_point_cloud = torch::zeros(
+        {num_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+    torch::Tensor color = torch::zeros(
+        {num_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+
+    auto pcd_it = pcd.begin();
+    for (int64_t point_idx = 0; point_idx < num_points; ++point_idx) {
+        const Point3D& point = (*pcd_it).second;
+        fused_point_cloud.index({point_idx, 0}) = point.xyz_(0);
+        fused_point_cloud.index({point_idx, 1}) = point.xyz_(1);
+        fused_point_cloud.index({point_idx, 2}) = point.xyz_(2);
+        color.index({point_idx, 0}) = point.color_(0) / 255.0f;
+        color.index({point_idx, 1}) = point.color_(1) / 255.0f;
+        color.index({point_idx, 2}) = point.color_(2) / 255.0f;
+        ++pcd_it;
+    }
+
+    /* ------------------------------------------------------------------ 4. */
+    torch::Tensor fused_color = sh_utils::RGB2SH(color);
+    const int temp = this->max_sh_degree_ + 1;
+    torch::Tensor features = torch::zeros(
+        {fused_color.size(0), 3, temp * temp},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(0, 3),
+         0}) = fused_color;
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(3, features.size(1)),
+         torch::indexing::Slice(1, features.size(2))}) = 0.0f;
+
+    /* ------------------------------------------------------------------ 5.  (voxel-specific) */
+    // sizes: initialise to constant voxel length (0.05 m here)
+    this->center_ = fused_point_cloud.detach();   // (num_points,3) on device_type_
+    const float default_voxel_size = 0.05f;
+    this->size_ = torch::full(
+        {num_points},
+        default_voxel_size,
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+
+    // geo_ 8-vector: (σ_xx σ_xy σ_xz σ_yy σ_yz σ_zz density pad)
+    this->geo_ = torch::zeros({num_points, 8},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+    const float var = 0.25f * default_voxel_size * default_voxel_size;
+    this->geo_.index_put_({torch::indexing::Slice(), 0}, var);
+    this->geo_.index_put_({torch::indexing::Slice(), 3}, var);
+    this->geo_.index_put_({torch::indexing::Slice(), 5}, var);
+    this->geo_.set_requires_grad(true);                                              // <---
+
+    /* ------------------------------------------------------------------ 6. */
+    this->sh0_ = features.index({torch::indexing::Slice(),
+                                 torch::indexing::Slice(),
+                                 torch::indexing::Slice(0, 1)})
+                     .transpose(1, 2)
+                     .contiguous()
+                     .requires_grad_();
+
+    this->shs_ = features.index({torch::indexing::Slice(),
+                                 torch::indexing::Slice(),
+                                 torch::indexing::Slice(1, features.size(2))})
+                     .transpose(1, 2)
+                     .contiguous()
+                     .requires_grad_();
+
+    /* ------------------------------------------------------------------ 7.  (voxel-specific) */
+    // opacity stored in logit space – start at p = 0.8
+    torch::Tensor opacities = general_utils::inverse_sigmoid(
+        0.8f * torch::ones({num_points, 1},
+                torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)));
+    this->opacity_ = opacities.view({num_points}).requires_grad_();
+
+    /* ------------------------------------------------------------------ 8.  (voxel-specific bookkeeping) */
+    this->oct_path_  = torch::arange(
+        0, num_points,
+        torch::TensorOptions().dtype(torch::kLong).device(this->device_type_));
+    this->oct_level_ = torch::zeros(
+        {num_points},
+        torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));
+    this->exist_since_iter_ = torch::zeros(
+        {num_points},
+        torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));
+    this->subdiv_meta_ = torch::zeros(
+        {num_points},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)).requires_grad_();
+    this->subdiv_meta_.retain_grad();
+    this->subdiv_p_ = torch::zeros_like(this->subdiv_meta_).requires_grad_();
+    this->subdiv_p_.retain_grad();
+    this->subdiv_p_grad_buffer_ = torch::zeros_like(this->subdiv_p_);
+
+    /* ------------------------------------------------------------------ 9. */
+    VOXEL_MODEL_TENSORS_TO_VEC
+}
+
+void VoxelModel::increasePcd(std::vector<float> points,
+                             std::vector<float> colors,
+                             const int iteration)
+{
+    /* ------------------------------------------------------------------ 0. */
+    assert(points.size() == colors.size());
+    assert(points.size() % 3 == 0);
+    auto num_new_points = static_cast<int64_t>(points.size() / 3);
+    if (num_new_points == 0) 
         return;
+
+    /* ------------------------------------------------------------------ 1.  copy vectors → tensors (CPU → device) */
+    torch::Tensor new_point_cloud = torch::from_blob(
+        points.data(), {num_new_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32)).to(this->device_type_);
+
+    torch::Tensor new_colors = torch::from_blob(
+        colors.data(), {num_new_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32)).to(this->device_type_);
+
+    /* optional cache of sparse points – unchanged from Gaussian */
+    if (this->sparse_points_xyz_.size(0) == 0) {
+        this->sparse_points_xyz_   = new_point_cloud;
+        this->sparse_points_color_ = new_colors;
+    } else {
+        this->sparse_points_xyz_   = torch::cat({this->sparse_points_xyz_,   new_point_cloud}, 0);
+        this->sparse_points_color_ = torch::cat({this->sparse_points_color_, new_colors},   0);
     }
 
-    // 3) Allocate a CPU tensor for centers and colors, then move to device
-    //    We will fill them row‐by‐row from the ordered map.
-    torch::TensorOptions opts = torch::TensorOptions()
-                                    .dtype(torch::kFloat32)
-                                    .device(device_type_);
-    torch::Tensor centers_cpu = torch::empty({N, 3}, opts);
-    torch::Tensor colors_cpu  = torch::empty({N, 3}, opts);
+    /* ------------------------------------------------------------------ 2. SH feature construction (verbatim) */
+    torch::Tensor new_fused_colors = sh_utils::RGB2SH(new_colors);
+    const int temp = this->max_sh_degree_ + 1;
+    torch::Tensor features = torch::zeros(
+        {new_fused_colors.size(0), 3, temp * temp},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_));
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(0, 3),
+         0}) = new_fused_colors;
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(3, features.size(1)),
+         torch::indexing::Slice(1, features.size(2))}) = 0.0f;
 
-    {
-        // Fill `centers_cpu` and `colors_cpu` from `pcd`
-        auto it = pcd.begin();
-        for (int64_t i = 0; i < N; ++i, ++it) {
-            const Point3D& pt = it->second;
-            centers_cpu.index_put_({i, 0}, pt.xyz_(0));
-            centers_cpu.index_put_({i, 1}, pt.xyz_(1));
-            centers_cpu.index_put_({i, 2}, pt.xyz_(2));
-            // Color in [0,255], convert to float in [0,1]
-            colors_cpu.index_put_({i, 0}, pt.color_(0) / 255.0f);
-            colors_cpu.index_put_({i, 1}, pt.color_(1) / 255.0f);
-            colors_cpu.index_put_({i, 2}, pt.color_(2) / 255.0f);
-        }
-    }
+    /* ------------------------------------------------------------------ 3. voxel-specific attribute init */
+    const float default_vox_size = 0.05f;                                         // <--- voxel-specific
+    torch::Tensor new_sizes = torch::full(
+        {num_new_points}, default_vox_size,
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
 
-    // 4) Move centers and colors to the correct device
-    center_ = centers_cpu.to(device_type_);
-    // Each voxel default size: 0.05 m (same as in mapper). 
-    // If you want to pull from VoxelModelParams instead, replace 0.05f with model_params_.initial_voxel_size
-    float default_voxel_size = 0.05f;
-    size_   = torch::full({N}, default_voxel_size, opts).to(device_type_);
+    // geo 8-vector with diagonal cov = (l/2)^2, others zero
+    torch::Tensor new_geo = torch::zeros(
+        {num_new_points, 8},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
+    const float var = 0.25f * default_vox_size * default_vox_size;                // <---
+    new_geo.index_put_({torch::indexing::Slice(), 0}, var);                       // σ_xx
+    new_geo.index_put_({torch::indexing::Slice(), 3}, var);                       // σ_yy
+    new_geo.index_put_({torch::indexing::Slice(), 5}, var);                       // σ_zz
 
-    // 5) Initialize "geo" = 8‐component tensor per voxel (covariance + pad) to zero.
-    // geo_ = torch::zeros({N, 8}, opts).requires_grad_(true);
-    geo_ = torch::zeros({N, 8}, opts);   // leaf, no grad yet
-    float var = 0.25f * default_voxel_size * default_voxel_size;  // (l/2)^2
-    geo_.index_put_({torch::indexing::Slice(), 0}, var);
-    geo_.index_put_({torch::indexing::Slice(), 3}, var);
-    geo_.index_put_({torch::indexing::Slice(), 5}, var);
-    geo_ = geo_.requires_grad_(true);
+    // SH terms
+    torch::Tensor new_sh0 = features.index({torch::indexing::Slice(),
+                                            torch::indexing::Slice(),
+                                            torch::indexing::Slice(0, 1)})
+                                .transpose(1, 2)
+                                .contiguous();
+    torch::Tensor new_shs = features.index({torch::indexing::Slice(),
+                                            torch::indexing::Slice(),
+                                            torch::indexing::Slice(1, features.size(2))})
+                                .transpose(1, 2)
+                                .contiguous();
 
-    // 6) Convert each color to spherical‐harmonic DC (sh_utils::RGB2SH returns [N, 3])
-    //    Then build sh0_ = fused_color * Y₀
-    torch::Tensor colors_device = colors_cpu.to(device_type_);
-    torch::Tensor fused_sh       = sh_utils::RGB2SH(colors_device);
-    // fused_sh has shape [N, 3]. We interpret that as the “SH‐DC” term.
-    sh0_ = fused_sh.clone().requires_grad_(true);
+    // opacity logits start from p = 0.8
+    torch::Tensor new_opacity = general_utils::inverse_sigmoid(
+        0.8f *
+        torch::ones({num_new_points, 1},
+            torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)))
+            .view({num_new_points});                                              // <---
 
-    // 7) Initialize all higher‐degree SH coefficients to zero: [N, 45, 3] → we can zero them.
-    shs_ = torch::zeros({N, 45, 3}, opts).requires_grad_(true);
+    // octree bookkeeping
+    torch::Tensor new_oct_paths = torch::arange(
+        this->center_.size(0),
+        this->center_.size(0) + num_new_points,
+        torch::TensorOptions().dtype(torch::kLong).device(this->device_type_));   // <---
+    torch::Tensor new_oct_lvls = torch::zeros(
+        {num_new_points},
+        torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));  // <---
+    torch::Tensor new_meta      = torch::zeros(
+        {num_new_points},
+        torch::TensorOptions().dtype(torch::kFloat32).device(this->device_type_)); // <---
+    torch::Tensor new_subdiv_p  = torch::zeros_like(new_meta);                     // <---
+    torch::Tensor new_exist_iter= torch::full(
+        {num_new_points}, iteration,
+        torch::TensorOptions().dtype(torch::kInt32).device(this->device_type_));   // <---
 
-    // 8) Initialize opacity to 0.8 for each voxel, then invert‐sigmoid so we can train in logit‐space:
-    //    We want initial “probability” = 0.8. inverse_sigmoid(0.8) is a logit. 
-    //    If you don't have inverse_sigmoid, you can simply store 0.8 directly and train in “probability” space,
-    //    so long as your loss functions expect [0,1]. Here we follow GaussianModel’s pattern and do:
-    torch::Tensor init_prob = torch::full({N, 1}, 0.8f, opts);
-    // general_utils::inverse_sigmoid() expects shape [N,1] → returns logits
-    torch::Tensor opacity_logits = general_utils::inverse_sigmoid(init_prob).view({N});
-    opacity_ = opacity_logits.clone().requires_grad_(true);
+    /* ------------------------------------------------------------------ 4. concatenate to existing tensors */
+    this->center_      = torch::cat({this->center_,   new_point_cloud}, 0).requires_grad_(false);
+    this->size_        = torch::cat({this->size_,     new_sizes},       0).requires_grad_(false); // <---
+    this->geo_         = torch::cat({this->geo_,      new_geo},         0).requires_grad_(true);
+    this->sh0_         = torch::cat({this->sh0_,      new_sh0},         0).requires_grad_(true);
+    this->shs_         = torch::cat({this->shs_,      new_shs},         0).requires_grad_(true);
+    this->opacity_     = torch::cat({this->opacity_,  new_opacity},     0).requires_grad_(true);  // <---
+    this->oct_path_    = torch::cat({this->oct_path_, new_oct_paths},   0);                       // <---
+    this->oct_level_   = torch::cat({this->oct_level_,new_oct_lvls},    0);                       // <---
+    this->exist_since_iter_ = torch::cat({this->exist_since_iter_, new_exist_iter}, 0);           // <---
+    this->subdiv_meta_ = torch::cat({this->subdiv_meta_, new_meta},     0).requires_grad_(true);
+    this->subdiv_meta_.retain_grad();
+    this->subdiv_p_    = torch::cat({this->subdiv_p_,  new_subdiv_p},   0).requires_grad_(true);
+    this->subdiv_p_.retain_grad();
 
-    // 9) Build octree‐tracking tensors: path = [0..N-1], level = zeros
-    oct_path_  = torch::arange(0, N, torch::TensorOptions().dtype(torch::kLong).device(device_type_));
-    oct_level_ = torch::zeros({N}, torch::TensorOptions().dtype(torch::kInt32).device(device_type_));
-
-    // 10) exist_since_iter_ = zero for every newly‐created voxel
-    exist_since_iter_ = torch::zeros(
-        {N}, 
-        torch::TensorOptions().dtype(torch::kInt32).device(device_type_)
-    );
-
-    // 11) subdiv_meta_ = zeros → this is a trainable “priority”‐value for each voxel
-    subdiv_meta_ = torch::zeros({N}, opts).requires_grad_(true);
-    subdiv_meta_.retain_grad();
-
-    // 12) subdiv_p_ = zeros (same shape) → also trainable
-    subdiv_p_ = torch::zeros({N}, opts).requires_grad_(true);
-    subdiv_p_.retain_grad();
-
-    // 13) Prepare the “gradient buffer” for subdividing later
-    subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_).to(device_type_);
-}
-
-//------------------------------------------------------------------------------
-// “Increase” the voxel point cloud by providing a list of new points/colors.
-// Builds exactly like GaussianModel::increasePcd, but uses SVRaster’s voxel fields.
-//------------------------------------------------------------------------------
-void VoxelModel::increasePcd(const std::vector<Eigen::Vector3f>& pts,
-                             const std::vector<Eigen::Vector3f>& cols,
-                             int /*iteration*/)
-{
-    if (pts.empty()) return;
-    torch::NoGradGuard no_grad;
-    auto device = center_.device();
-    const int64_t P = static_cast<int64_t>(pts.size());
-
-    // 1) Create new‐voxel attributes (centers, sizes, geo, sh0, shs, opacity, oct, lvl, meta, subdiv_p)
-    torch::Tensor new_centers  = torch::empty({P, 3},   torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_sizes    = torch::full({P}, 0.05f, torch::TensorOptions().dtype(torch::kFloat32).device(device)); 
-    torch::Tensor new_geo      = torch::zeros({P, 8},   torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_sh0      = torch::empty({P, 3},   torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_shs      = torch::zeros({P, 45, 3},torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_opacity  = torch::ones({P},       torch::TensorOptions().dtype(torch::kFloat32).device(device)) * 0.8f;
-    // Unique octree path IDs: just use increasing integers
-    torch::Tensor new_oct      = torch::arange(center_.size(0), center_.size(0) + P, torch::TensorOptions().dtype(torch::kLong).device(device));
-    torch::Tensor new_lvl      = torch::zeros({P},       torch::TensorOptions().dtype(torch::kInt32).device(device));
-    torch::Tensor new_meta     = torch::zeros({P},       torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_subdivP  = torch::zeros({P},       torch::TensorOptions().dtype(torch::kFloat32).device(device));
-
-    // Fill in new_centers and new_sh0 from pts, cols
-    {
-        auto ctr_acc = new_centers.accessor<float,2>();
-        auto col_acc = new_sh0.accessor<float,2>();
-        for (int64_t i = 0; i < P; ++i) {
-            ctr_acc[i][0] = pts[i].x();
-            ctr_acc[i][1] = pts[i].y();
-            ctr_acc[i][2] = pts[i].z();
-            col_acc[i][0] = cols[i].x();
-            col_acc[i][1] = cols[i].y();
-            col_acc[i][2] = cols[i].z();
-        }
-    }
-
-    // 2) Concatenate to existing tensors; re‐enable requires_grad on leaf
-    center_      = torch::cat({center_,   new_centers},  /*dim=*/0).requires_grad_(false);
-    size_        = torch::cat({size_,     new_sizes  },  /*dim=*/0).requires_grad_(false);
-    geo_         = torch::cat({geo_,      new_geo    },  /*dim=*/0).requires_grad_(true);
-    sh0_         = torch::cat({sh0_,      new_sh0    },  /*dim=*/0).requires_grad_(true);
-    shs_         = torch::cat({shs_,      new_shs    },  /*dim=*/0).requires_grad_(true);
-    opacity_     = torch::cat({opacity_,  new_opacity},  /*dim=*/0).requires_grad_(true);
-    oct_path_    = torch::cat({oct_path_, new_oct   },  /*dim=*/0);
-    oct_level_   = torch::cat({oct_level_,new_lvl   },  /*dim=*/0);
-    subdiv_meta_ = torch::cat({subdiv_meta_, new_meta}, /*dim=*/0).requires_grad_(true);
-    subdiv_meta_.retain_grad();
-    subdiv_p_    = torch::cat({subdiv_p_,  new_subdivP},/*dim=*/0).requires_grad_(true);
-    subdiv_p_.retain_grad();
-
-    // Extend the subdiv_p_grad_buffer_ accordingly
-    {
-        auto old_buf = subdiv_p_grad_buffer_;
-        const int64_t oldN = old_buf.numel();
-        const int64_t newN = subdiv_p_.numel();
-        if (oldN != newN) {
-            auto new_buf = torch::zeros_like(subdiv_p_);
-            if (oldN > 0) {
-                new_buf.narrow(0, 0, oldN).copy_(old_buf);
-            }
-            subdiv_p_grad_buffer_ = std::move(new_buf);
-        }
+    /* ------------------------------------------------------------------ 5. resize gradient buffer if needed */
+    if (this->subdiv_p_grad_buffer_.numel() != this->subdiv_p_.numel()) {
+        torch::Tensor new_buf = torch::zeros_like(this->subdiv_p_);
+        if (this->subdiv_p_grad_buffer_.numel() > 0)
+            new_buf.narrow(0, 0, this->subdiv_p_grad_buffer_.numel())
+                   .copy_(this->subdiv_p_grad_buffer_);
+        this->subdiv_p_grad_buffer_ = std::move(new_buf);
     }
 }
 
-//------------------------------------------------------------------------------
-// Tensor‐based increasePcd overload (if SLAM supplies Tensors directly).
-//------------------------------------------------------------------------------
-void VoxelModel::increasePcd(torch::Tensor& new_centers,
-                             torch::Tensor& new_colors,
-                             const int /*iteration*/)
+void VoxelModel::increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration)
 {
-    const int64_t P = new_centers.size(0);
-    if (P == 0) return;
-    torch::NoGradGuard no_grad;
-    auto device = center_.device();
+    auto num_new_points = new_point_cloud.size(0);
+    if (num_new_points == 0)
+        return;
 
-    // Prepare the same per‐voxel attributes as above
-    torch::Tensor new_sizes   = torch::full({P}, 0.05f, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_geo     = torch::zeros({P, 8}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_sh0     = new_colors.to(device);
-    torch::Tensor new_shs     = torch::zeros({P, 45, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_opacity = torch::ones({P}, torch::TensorOptions().dtype(torch::kFloat32).device(device)) * 0.8f;
-    torch::Tensor new_oct     = torch::arange(center_.size(0), center_.size(0) + P, torch::TensorOptions().dtype(torch::kLong).device(device));
-    torch::Tensor new_lvl     = torch::zeros({P}, torch::TensorOptions().dtype(torch::kInt32).device(device));
-    torch::Tensor new_meta    = torch::zeros({P}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    torch::Tensor new_subdivP = torch::zeros({P}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    if (sparse_points_xyz_.size(0) == 0) {
+        sparse_points_xyz_ = new_point_cloud;
+        sparse_points_color_ = new_colors;
+    }
+    else {
+        sparse_points_xyz_ = torch::cat({sparse_points_xyz_, new_point_cloud}, /*dim=*/0);
+        sparse_points_color_ = torch::cat({sparse_points_color_, new_colors}, /*dim=*/0);
+    }
 
-    float var = 0.25f * 0.05f * 0.05f;      // 0.05 m is the hard-coded voxel size
+    /* ------------------------------------------------------------------ 1 : SH colours */
+    torch::Tensor new_fused_colors = sh_utils::RGB2SH(new_colors);
+    auto temp = this->max_sh_degree_ + 1;
+    torch::Tensor features = torch::zeros(
+        {new_fused_colors.size(0), 3, temp * temp},
+        torch::TensorOptions().dtype(torch::kFloat).device(device_type_));
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(0, 3),
+         0}) = new_fused_colors;
+    features.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(3, features.size(1)),
+         torch::indexing::Slice(1, features.size(2))}) = 0.0f;
+
+    /* ------------------------------------------------------------------ 2 : default voxel attributes */
+    const float default_vox_size = 0.05f;
+    torch::Tensor new_size = torch::full(
+        {num_new_points}, default_vox_size,
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+
+    torch::Tensor new_geo = torch::zeros(
+        {num_new_points, 8}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+    const float var = 0.25f * default_vox_size * default_vox_size;
     new_geo.index_put_({torch::indexing::Slice(), 0}, var);
     new_geo.index_put_({torch::indexing::Slice(), 3}, var);
     new_geo.index_put_({torch::indexing::Slice(), 5}, var);
 
-    // Concatenate everything
-    center_      = torch::cat({center_,   new_centers.to(device)},   /*dim=*/0).requires_grad_(false);
-    size_        = torch::cat({size_,     new_sizes},               /*dim=*/0).requires_grad_(false);
-    geo_         = torch::cat({geo_,      new_geo},                 /*dim=*/0).requires_grad_(true);
-    sh0_         = torch::cat({sh0_,      new_sh0},                 /*dim=*/0).requires_grad_(true);
-    shs_         = torch::cat({shs_,      new_shs},                 /*dim=*/0).requires_grad_(true);
-    opacity_     = torch::cat({opacity_,  new_opacity},             /*dim=*/0).requires_grad_(true);
-    oct_path_    = torch::cat({oct_path_, new_oct},                 /*dim=*/0);
-    oct_level_   = torch::cat({oct_level_,new_lvl},                 /*dim=*/0);
-    subdiv_meta_ = torch::cat({subdiv_meta_, new_meta},             /*dim=*/0).requires_grad_(true);
+    torch::Tensor new_sh0 = features.index({
+        torch::indexing::Slice(),
+        torch::indexing::Slice(),
+        torch::indexing::Slice(0,1)})
+        .transpose(1,2).contiguous();                  // (P , 1 , 3) → (P ,3)
+
+    torch::Tensor new_shs = features.index({
+        torch::indexing::Slice(),
+        torch::indexing::Slice(),
+        torch::indexing::Slice(1, features.size(2))})
+        .transpose(1,2).contiguous();                  // (P ,  (M^2-1) , 3)
+
+    /* opacity logits at p = 0.8 */
+    torch::Tensor op_init = general_utils::inverse_sigmoid(
+        0.8f * torch::ones({num_new_points,1},
+            torch::TensorOptions().dtype(torch::kFloat32).device(device_type_)));
+    torch::Tensor new_opacity = op_init.view({num_new_points});
+
+    /* ------------------------------------------------------------------ 3 : book-keeping tensors */
+    torch::Tensor new_oct   = torch::arange(
+        center_.size(0), center_.size(0)+num_new_points,
+        torch::TensorOptions().dtype(torch::kLong).device(device_type_));
+
+    torch::Tensor new_lvl   = torch::zeros({num_new_points},
+        torch::TensorOptions().dtype(torch::kInt32).device(device_type_));
+
+    torch::Tensor new_meta  = torch::zeros({num_new_points},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+    torch::Tensor new_subP  = torch::zeros_like(new_meta);
+
+    torch::Tensor new_exist = torch::full(
+        {num_new_points}, iteration,
+        torch::TensorOptions().dtype(torch::kInt32).device(device_type_));
+
+    /* ------------------------------------------------------------------ 4 : concatenate into the model  */
+    center_      = torch::cat({center_,   new_point_cloud     }, 0).detach();          // (no-grad)
+    size_        = torch::cat({size_,     new_size            }, 0);
+    geo_         = torch::cat({geo_,      new_geo             }, 0).requires_grad_(true);
+    sh0_         = torch::cat({sh0_,      new_sh0             }, 0).requires_grad_(true);
+    shs_         = torch::cat({shs_,      new_shs             }, 0).requires_grad_(true);
+    opacity_     = torch::cat({opacity_,  new_opacity         }, 0).requires_grad_(true);
+    oct_path_    = torch::cat({oct_path_, new_oct             }, 0);
+    oct_level_   = torch::cat({oct_level_,new_lvl             }, 0);
+    exist_since_iter_ = torch::cat({exist_since_iter_, new_exist}, 0);
+    subdiv_meta_ = torch::cat({subdiv_meta_, new_meta }, 0).requires_grad_(true);
+    subdiv_p_    = torch::cat({subdiv_p_,    new_subP }, 0).requires_grad_(true);
     subdiv_meta_.retain_grad();
-    subdiv_p_    = torch::cat({subdiv_p_,  new_subdivP},            /*dim=*/0).requires_grad_(true);
     subdiv_p_.retain_grad();
 
-    // Extend subdiv_p_grad_buffer_
-    {
-        auto old_buf = subdiv_p_grad_buffer_;
-        const int64_t oldN = old_buf.numel();
-        const int64_t newN = subdiv_p_.numel();
-        if (oldN != newN) {
-            auto new_buf = torch::zeros_like(subdiv_p_);
-            if (oldN > 0) {
-                new_buf.narrow(0, 0, oldN).copy_(old_buf);
-            }
-            subdiv_p_grad_buffer_ = std::move(new_buf);
-        }
-    }
+    /* ------------------------------------------------------------------ 5 : keep grad-buffer sized */
+    if (subdiv_p_grad_buffer_.numel() != subdiv_p_.numel())
+        subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_);
+
 }
-//------------------------------------------------------------------------------
-// Apply a global scale + SE3 transform to ALL voxel centers (no gradient).
-// Mirrors GaussianModel::applyScaledTransformation.
-//------------------------------------------------------------------------------
-void VoxelModel::applyScaledTransformation(const float s, const Sophus::SE3f& T)
+
+torch::Tensor VoxelModel::replaceTensorToOptimizer(torch::Tensor& tensor, int tensor_idx)
+{
+    auto& param = this->optimizer_->param_groups()[tensor_idx].params()[0];
+    auto& state = optimizer_->state();
+    auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
+    auto new_state = std::make_unique<torch::optim::AdamParamState>();
+    new_state->step(stored_state.step());
+    new_state->exp_avg(torch::zeros_like(tensor));
+    new_state->exp_avg_sq(torch::zeros_like(tensor));
+    // new_state->max_exp_avg_sq(stored_state.max_exp_avg_sq().clone()); // needed only when options.amsgrad(true), which is false by default
+
+    state.erase(key);
+    param = tensor.requires_grad_();
+    key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    state[key] = std::move(new_state);
+
+    auto optimizable_tensors = param;
+    return optimizable_tensors;
+}
+
+void VoxelModel::scaledTransformationPostfix(torch::Tensor& new_geo)
+{
+    // We only need to re-wire the geometry key (geo_) back into Adam (param_group 0).
+    torch::Tensor optimizable_geo = this->replaceTensorToOptimizer(new_geo, /*group*/0);
+    this->geo_ = optimizable_geo;
+    // Update our helper vector so future replaceTensorToOptimizer calls still work:
+    this->Tensor_vec_geo_ = { this->geo_ };
+    // Note: we do *not* have a scaling tensor in the optimizer for voxels,
+    // so we omit any scaling_ logic here.
+}
+
+void VoxelModel::applyScaledTransformation(
+    const float s,
+    const Sophus::SE3f T)
 {
     torch::NoGradGuard no_grad;
-    // 1) Scale all centers
-    center_ *= s;
+    // pt <- (s * Ryw * pt + tyw)
+    this->center_ *= s;
 
-    // 2) Build a (4×4) torch Tensor from T.matrix()
-    torch::Tensor T_tensor = tensor_utils::EigenMatrix2TorchTensor(T.matrix(), device_type_).transpose(0, 1);
+    torch::Tensor T_tensor =
+        tensor_utils::EigenMatrix2TorchTensor(T.matrix(), device_type_).transpose(0, 1);
+    // use the same helper as Photo-SLAM to apply SE3
+    torch::Tensor ones = torch::ones({center_.size(0), 1},
+                                 center_.options().dtype(torch::kFloat32));
+    torch::Tensor center_h = torch::cat({center_, ones}, 1);   // (N,4)
+    center_ = (T_tensor.matmul(center_h.t())).t()
+                .index({torch::indexing::Slice(),
+                        torch::indexing::Slice(0,3)});
 
-    // 3) Convert centers to homogeneous and apply SE3: [R,t] on each (no gradient)
-    //    center_hom = (center_, 1).T  → warping
-    auto N = center_.size(0);
-    auto ones = torch::ones({N, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-    auto centers_h = torch::cat({center_, ones}, /*dim=*/1);          // (N,4)
-    auto centers_t = (T_tensor.matmul(centers_h.transpose(0,1))).transpose(0,1).index({torch::indexing::Slice(), torch::indexing::Slice(0,3)});
-    center_ = centers_t.clone();  // (N,3)
+    // we don’t have a “scaling_” tensor in Adam—our size_ lives outside—so scale size_ here
+    this->size_ *= s;
 
-    // 4) No need to touch size_, geo_, sh0_, shs_, opacity_ because they are intrinsic.
-    //    Only subdiv_meta_ and subdiv_p_ remain the same.
+    // geo_ stores variances along diag; those scale with s²
+    const float var_scale = s * s;
+    this->geo_.index_put_({torch::indexing::Slice(), 0},
+        this->geo_.index({torch::indexing::Slice(), 0}) * var_scale);
+    this->geo_.index_put_({torch::indexing::Slice(), 3},
+        this->geo_.index({torch::indexing::Slice(), 3}) * var_scale);
+    this->geo_.index_put_({torch::indexing::Slice(), 5},
+        this->geo_.index({torch::indexing::Slice(), 5}) * var_scale);
+
+    scaledTransformationPostfix(this->geo_);
 }
 
 void VoxelModel::scaledTransformVisiblePointsOfKeyframe(
-    torch::Tensor&     point_not_transformed_flags,
-    torch::Tensor&     diff_pose,                 // (4,4) homogeneous
-    torch::Tensor&     kf_world_view_transform,   // (4,4)
-    torch::Tensor&     kf_full_proj_transform,    // (4,4)
-    const int          kf_creation_iter,
-    const int          stable_num_iter_existence,
-    int&               num_transformed,
-    const float        scale)
+    torch::Tensor& point_not_transformed_flags,  // (N) bool
+    torch::Tensor& diff_pose,                    // (4×4)  SE(3) in world
+    torch::Tensor& kf_world_view_transform,      // unused (placeholder)
+    torch::Tensor& kf_full_proj_transform,       // unused (placeholder)
+    const int      kf_creation_iter,
+    const int      stable_num_iter_existence,
+    int&           num_transformed,
+    const float    scale)
 {
     torch::NoGradGuard no_grad;
-    // 1) Determine “unstable” voxels: those created too recently
-    torch::Tensor unstable = torch::abs(exist_since_iter_ - kf_creation_iter) < stable_num_iter_existence;
 
-    // 2) Compute visibility: rasterize only non‐transformed & non-unstable voxels against this keyframe
-    //    (For simplicity, we assume SVRaster’s Python wrapper does the actual frustum check.)
-    //    Here we just combine the flags:
-    torch::Tensor to_check = (point_not_transformed_flags.logical_and(~unstable));
+    // 1) grab our “points” and (no rots for voxels)
+    torch::Tensor points = this->center_;
 
-    if (!to_check.any().item<bool>()) {
-        return;
-    }
+    // 2) find “unstable” (just‐born) voxels
+    torch::Tensor point_unstable_flags = torch::abs(
+        this->exist_since_iter_ - kf_creation_iter
+    ) < stable_num_iter_existence;
 
-    // 3) Build a per-voxel “voxel_data” dict and do a single backward pass to find visible subset.
-    //    However, Photo-SLAM’s C++ GaussianModel uses a custom C++ function “scaleAndTransformThenMarkVisiblePoints(...)”.
-    //    We can cheat: call the Python wrapper with a special “visibility_only” mode to get a boolean mask H of size (N,) of visible voxels.
-    //    Let’s assume a helper function exists:
-    ///
-    ///   torch::Tensor visible_mask = getVisibleVoxelMask(
-    ///       to_check, kf_world_view_transform, kf_full_proj_transform);
-    ///
-    //    For now, we’ll pretend every “to_check” voxel is visible.
-    torch::Tensor visible_mask = to_check;  
+    // 3) those still eligible to transform
+    torch::Tensor to_check = 
+        point_not_transformed_flags.logical_and(~point_unstable_flags);
+    if (!to_check.any().item<bool>()) return;
 
-    // 4) Build a combined mask of “to_transform” = visible_mask
-    torch::Tensor to_transform = visible_mask;  // (N,) bool
+    // 4) (we cheat: treat *all* to_check as visible)
+    torch::Tensor to_transform = to_check;
+    if (!to_transform.any().item<bool>()) return;
 
-    if (!to_transform.any().item<bool>()) {
-        return;
-    }
-
-    // 5) Apply diff_pose to those voxel centers: center[to_transform] = diff_pose * [center;1]
-    auto idx = to_transform.nonzero().view(-1);  // indices of voxels to update
+    // 5) apply diff_pose to centers[to_transform]
+    torch::Tensor idx = to_transform.nonzero().view(-1);
     num_transformed += idx.numel();
 
-    auto centers_sel = center_.index({idx});  // (M,3)
-    auto ones = torch::ones({(int)idx.numel(), 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-    auto centers_h = torch::cat({centers_sel, ones}, /*dim=*/1);      // (M,4)
-    auto updated = (diff_pose.matmul(centers_h.transpose(0,1))).transpose(0,1).index({torch::indexing::Slice(), torch::indexing::Slice(0,3)});
-    center_.index_put_({idx}, updated);
+    // homogeneous
+    torch::Tensor sel_centers = points.index({idx});          // (M,3)
+    torch::Tensor ones = torch::ones(
+        {idx.size(0),1},
+        torch::TensorOptions().dtype(points.dtype()).device(points.device())
+    );
+    torch::Tensor centers_h = torch::cat({sel_centers, ones}, 1); // (M,4)
+    torch::Tensor updated = 
+        (diff_pose.matmul(centers_h.t()))
+        .t()
+        .index({torch::indexing::Slice(), torch::indexing::Slice(0,3)}); // (M,3)
 
-    // 6) Scale (if needed) is baked into diff_pose’s translation; we assume diff_pose already has scale on R,t.
+    this->center_.index_put_({idx}, updated);
 
-    // 7) Mark those voxels as “transformed”
+    // 6) scale size_ and geo_ diagonals
+    this->size_.index_put_({idx}, this->size_.index({idx}) * scale);
+    float vs = scale*scale;
+    this->geo_.index_put_({idx, 0}, this->geo_.index({idx, 0}) * vs);
+    this->geo_.index_put_({idx, 3}, this->geo_.index({idx, 3}) * vs);
+    this->geo_.index_put_({idx, 5}, this->geo_.index({idx, 5}) * vs);
+
+    // 7) mark done
     point_not_transformed_flags.index_put_({idx}, false);
 
-    // 8) No need to update geo_, sh0_, shs_, opacity_ here.
-    //    Only “center_” and, if we had scale‐dependent fields, we’d update them.
-
-    // NOTE: since this is NoGrad, we do not rewire optimizer. We assume positions are not learnable after loop closure.
+    // === Postfix: re-wire our geo_ back into Adam’s param-group[0] ===
+    torch::Tensor optimizable_geo = this->replaceTensorToOptimizer(
+        this->geo_, /*tensor_idx=*/0
+    );
+    this->geo_ = optimizable_geo;
+    this->Tensor_vec_geo_ = { this->geo_ };
 }
 
-//------------------------------------------------------------------------------
-// Prepare optimizer: mirror GaussianModel::trainingSetup.
-//   - We create an Adam optimizer with three param groups: [geo_], [sh0_], [shs_].
-//   - Adjust their initial LRs from `opt_params`.
-//------------------------------------------------------------------------------
-void VoxelModel::trainingSetup(const VoxelOptimizationParams& opt)
+void VoxelModel::trainingSetup(const VoxelOptimizationParams& training_args)
 {
-    std::lock_guard<std::mutex> lk(mutex_settings_);
+    // exactly as in Photo-SLAM:
+    setPercentDense(training_args.percent_dense_);
+    this->subdiv_p_grad_buffer_ = torch::zeros_like(this->subdiv_p_);
 
-    torch::optim::AdamOptions adam_opts(0.0);
-    adam_opts.eps(1e-15);
-    optimizer_.reset(new torch::optim::Adam({geo_}, adam_opts));
+    torch::optim::AdamOptions adam_options;
+    adam_options.set_lr(0.0);
+    adam_options.eps() = 1e-15;
 
-    // 1) geo‐group
-    optimizer_->param_groups()[0].options().set_lr(opt.geo_lr_init_);
+    // start with geometry group (analogous to xyz_ in Photo-SLAM)
+    this->optimizer_.reset(
+        new torch::optim::Adam(Tensor_vec_geo_, adam_options));
+    optimizer_->param_groups()[0]
+        .options()
+        .set_lr(training_args.geo_lr_init_ * this->spatial_lr_scale_);
 
-    // 2) sh0‐group
-    optimizer_->add_param_group(torch::optim::OptimizerParamGroup({sh0_}));
-    optimizer_->param_groups()[1].options().set_lr(opt.sh0_lr_);
+    // add SH-DC group
+    optimizer_->add_param_group(Tensor_vec_sh0_);
+    optimizer_->param_groups()[1]
+        .options()
+        .set_lr(training_args.sh0_lr_);
 
-    // 3) shs‐group
-    optimizer_->add_param_group(torch::optim::OptimizerParamGroup({shs_}));
-    optimizer_->param_groups()[2].options().set_lr(opt.shs_lr_);
+    // add higher-order SH group
+    optimizer_->add_param_group(Tensor_vec_shs_);
+    optimizer_->param_groups()[2]
+        .options()
+        .set_lr(training_args.shs_lr_);
 
-    // Save schedule parameters
-    geo_lr_init_      = opt.geo_lr_init_;
-    geo_lr_final_     = opt.geo_lr_final_;
-    lr_delay_mult_    = opt.geo_lr_delay_mult_;
-    max_steps_        = opt.geo_lr_max_steps_;
-    // If desired, we could also add opacity_ as group[3], subdiv_p_ as group[4], etc.
-}
+    // // add opacity group
+    // optimizer_->add_param_group(Tensor_vec_opacity_);
+    // optimizer_->param_groups()[3]
+    //     .options()
+    //     .set_lr(training_args.opacity_lr_);
 
-//------------------------------------------------------------------------------
-// Exponential learning‐rate schedule (mirrors GaussianModel::exponLrFunc).
-//------------------------------------------------------------------------------
-float VoxelModel::exponLrFunc(int step) 
-{
-    if (step < 0 || (geo_lr_init_ == 0.0f && geo_lr_final_ == 0.0f)) {
-        return 0.0f;
-    }
-    float delay_rate;
-    if (lr_delay_steps_ > 0) 
-        delay_rate = lr_delay_mult_ + (1.0f - lr_delay_mult_) * std::sin(M_PI_2f32 * std::clamp(static_cast<float>(step) / lr_delay_steps_, 0.0f, 1.0f));
-    else
-        delay_rate = 1.0f;
-    float t = std::clamp(static_cast<float>(step) / max_steps_, 0.0f, 1.0f);
-    float log_lerp = std::exp(std::log(geo_lr_init_) * (1.0f - t) + std::log(geo_lr_final_) * t);
-    return delay_rate * log_lerp;
+    // store schedule parameters
+    lr_init_    = training_args.geo_lr_init_  * this->spatial_lr_scale_;
+    lr_final_   = training_args.geo_lr_final_ * this->spatial_lr_scale_;
+    lr_delay_mult_  = training_args.geo_lr_delay_mult_;
+    max_steps_      = training_args.geo_lr_max_steps_;
 }
 
 //------------------------------------------------------------------------------
@@ -650,7 +648,6 @@ float VoxelModel::updateLearningRate(int step)
     optimizer_->param_groups()[0].options().set_lr(lr);
     return lr;
 }
-
 //------------------------------------------------------------------------------
 // Manually set per-group LRs at runtime (mirrors GaussianModel setters).
 //------------------------------------------------------------------------------
@@ -863,14 +860,16 @@ void VoxelModel::accumulateSubdivGradients(const torch::Tensor& parent_idx,
                                            const torch::Tensor& parent_grads)
 {
     if (!subdiv_p_grad_buffer_.defined()) {
+        // same shape and dtype as subdiv_p_  → 1-D
         subdiv_p_grad_buffer_ = torch::zeros_like(subdiv_p_);
     }
     TORCH_CHECK(subdiv_p_grad_buffer_.sizes() == subdiv_p_.sizes(),
                 "accumulateSubdivGradients: size mismatch");
+
     subdiv_p_grad_buffer_.scatter_add_(
         /*dim=*/0,
-        /*index=*/parent_idx.to(device_type_),
-        /*src=*/parent_grads.to(device_type_)
+        /*index=*/parent_idx.to(device_type_),   // (K)
+        /*src=*/parent_grads.to(device_type_)    // (K)
     );
 }
 
@@ -985,6 +984,33 @@ VoxelModel::render(
     // 6) Unpack exactly the "rgb" tensor
     torch::Tensor rgb_t = out.attr("get")("rgb").cast<torch::Tensor>();
     return { { "rgb", rgb_t } };
+}
+
+float VoxelModel::percentDense()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return percent_dense_;
+}
+
+void VoxelModel::setPercentDense(const float percent_dense)
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    percent_dense_ = percent_dense;
+}
+
+float VoxelModel::exponLrFunc(int step) 
+{
+    if (step < 0 || (lr_init_ == 0.0f && lr_final_ == 0.0f)) {
+        return 0.0f;
+    }
+    float delay_rate;
+    if (lr_delay_steps_ > 0) 
+        delay_rate = lr_delay_mult_ + (1.0f - lr_delay_mult_) * std::sin(M_PI_2f32 * std::clamp(static_cast<float>(step) / lr_delay_steps_, 0.0f, 1.0f));
+    else
+        delay_rate = 1.0f;
+    float t = std::clamp(static_cast<float>(step) / max_steps_, 0.0f, 1.0f);
+    float log_lerp = std::exp(std::log(lr_init_) * (1.0f - t) + std::log(lr_final_) * t);
+    return delay_rate * log_lerp;
 }
 
 } // namespace sv

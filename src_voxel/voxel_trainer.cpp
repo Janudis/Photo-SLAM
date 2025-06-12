@@ -59,22 +59,6 @@ void sv::VoxelTrainer::trainingOnce(
                          .contiguous();                // (H,W,3)
         py::array_t<uint8_t> rgb_np = tensorToNumpyRGB(cpu_img);
 
-        // 2.4) Build MiniCam
-        // const auto &C = vf->getCamera();
-        // MiniCam cam = MiniCam::fromIntrinsics(
-        //     C.fx(), C.fy(), C.cx(), C.cy(),
-        //     W, H,
-        //     static_cast<int>(vf->fid_)
-        // );
-        // {
-        //     Eigen::Matrix4f Tcw = vf->Tcw.matrix();
-        //     Eigen::Matrix4f c2w = Tcw.inverse();
-        //     cam.w2c = torch::from_blob(Tcw.data(),  {4,4}, torch::kFloat32)
-        //                   .clone().to(device_type);
-        //     cam.c2w = torch::from_blob(c2w.data(), {4,4}, torch::kFloat32)
-        //                   .clone().to(device_type);
-        // }
-
         sv::MiniCam cam = vf->toMiniCam();
         cam.c2w = cam.c2w.contiguous().to(device_type);   // make sure contiguous + on CUDA
         cam.w2c = cam.w2c.contiguous().to(device_type);        

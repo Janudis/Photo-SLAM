@@ -24,8 +24,8 @@ class VoxelKeyframe
 public:
     VoxelKeyframe() {}
     /* ------------------------------------------------------------------ ctor */
-    VoxelKeyframe(std::size_t fid = 0, int create_iter = 0)
-        : fid_(fid), creation_iter_(create_iter) {}
+    VoxelKeyframe(std::size_t fid = 0, int creation_iter = 0)
+        : fid_(fid), creation_iter_(creation_iter) {}
 
     /* ---------------------------------------------------- pose setters */
     void setPose(
@@ -45,7 +45,7 @@ public:
     Sophus::SE3f getPosef();
 
     /* --------------------------------------------------------- camera stuff */
-    void  setCameraParams(const sv::Camera& cam);
+    void  setCameraParams(const sv::Camera& camera);
 
     void setPoints2D(const std::vector<Eigen::Vector2d>& points2D);
     void setPoint3DIdxForPoint2D(
@@ -65,7 +65,7 @@ public:
         float zfar,
         float fovX,
         float fovY,
-        torch::DeviceType device_type) const;
+        torch::DeviceType device_type = torch::kCUDA);
 
 public:
     std::size_t fid_;

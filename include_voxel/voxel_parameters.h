@@ -95,6 +95,7 @@ public:
     float prune_threshold_init_;
     float prune_threshold_final_;
     int min_voxels_;
+    float percent_dense_;
     float lambda_dssim_;
     int opacity_reset_interval_;
     int densify_from_iter_;

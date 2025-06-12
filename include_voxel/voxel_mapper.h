@@ -84,10 +84,13 @@ public:
     VoxelMapper(
         std::shared_ptr<ORB_SLAM3::System> pSLAM,
         const std::filesystem::path& config_file_path,
-        const std::filesystem::path& seq_dir,
-        const std::filesystem::path& out_dir,
-        torch::DeviceType device_type = torch::kCUDA,
-        int seed = 0);
+        // const std::filesystem::path& seq_dir,
+        // const std::filesystem::path& out_dir,
+        // torch::DeviceType device_type = torch::kCUDA,
+        // int seed = 0);
+        std::filesystem::path result_dir = "",
+        int seed = 0,
+        torch::DeviceType device_type = torch::kCUDA);
 
     ~VoxelMapper();
     void readConfigFromFile(const std::filesystem::path& cfg_path);
@@ -97,7 +100,8 @@ public:
 
     // graceful stop
     bool isStopped() const;
-    void signalStop(bool stop = true);
+    // void signalStop(bool stop = true);
+    void signalStop(const bool going_to_stop = true);
 
     // rendering / dumping -----------------------------------------------------
     cv::Mat renderFromPose(
@@ -110,10 +114,16 @@ public:
     int  getIteration();
     void increaseIteration(int inc=1);
     
+    float sh0LearningRate();
+    float shsLearningRate();
     float lambdaDssim();
     int densifyInterval();
     int newKeyframeTimesOfUse();
     bool isKeepingTraining();
+    int stableNumIterExistence();
+    bool isdoingInactiveGeoDensify();
+
+    void setGeoLearningRateInit(const float lr);
 
     // VariableParameters getVariableParameters() const;
     // void setVariableParameters(const VariableParameters& p);
@@ -240,6 +250,7 @@ protected:
     int loop_closure_increased_times_of_use_;
 
     bool cull_keyframes_;
+    int stable_num_iter_existence_;
 
     std::filesystem::path result_dir_;
     int keyframe_record_interval_;

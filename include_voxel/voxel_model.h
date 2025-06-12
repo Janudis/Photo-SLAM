@@ -88,29 +88,18 @@ public:
         const float spatial_lr_scale
     );
     /// Insert new points/colors from std::vector
-    // void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
-    // void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
-    /// Insert new points/colors from std::vector
-    void increasePcd(const std::vector<Eigen::Vector3f>& points_xyz,
-                     const std::vector<Eigen::Vector3f>& points_rgb,
-                     int iteration);
-    /// Insert new points/colors from torch::Tensor
-    void increasePcd(torch::Tensor& new_centers,
-                     torch::Tensor& new_colors,
-                     int iteration);
+    void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
+    void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
 
     // ───────── Transformations ─────────
     /// Apply a uniform scale and rigid SE3 transform to all voxels
     void applyScaledTransformation(
-        const float s = 1.0f,
-        const Sophus::SE3f& T = Sophus::SE3f(
-            Eigen::Matrix3f::Identity(),
-            Eigen::Vector3f::Zero()
-        )
-    );
+        const float s = 1.0,
+        const Sophus::SE3f T = Sophus::SE3f(Eigen::Matrix3f::Identity(), Eigen::Vector3f::Zero()));
     void scaledTransformationPostfix(
-        torch::Tensor& new_xyz,
-        torch::Tensor& new_scaling);
+        torch::Tensor& new_xyz
+        //, torch::Tensor& new_scaling
+    );
 
     void scaledTransformVisiblePointsOfKeyframe(
         torch::Tensor&     point_not_transformed_flags,
@@ -128,7 +117,7 @@ public:
      * Once all new points have been collected for this iteration,
      * call trainingSetup() to initialize the Adam optimizer and LR schedule.
      */
-    void trainingSetup(const VoxelOptimizationParams& opt);
+    void trainingSetup(const VoxelOptimizationParams& training_args);
     float updateLearningRate(int step);
     // ───────── Individual LR setters ─────────
     void setGeoLearningRate(float geo_lr);
@@ -174,8 +163,8 @@ public:
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
     /// Percentage of voxels considered “dense”
-    float percentDense() const { return percent_dense_; }
-    void setPercentDense(float p) { percent_dense_ = p; }
+    float percentDense();
+    void setPercentDense(const float percent_dense);
 
     // ───────── Utilities ─────────
     /**
@@ -245,8 +234,8 @@ public:
 
 protected:
     /// Learning‐rate scheduling parameters
-    float geo_lr_init_;
-    float geo_lr_final_;
+    float lr_init_;
+    float lr_final_;
     int   lr_delay_steps_;
     float lr_delay_mult_;
     int   max_steps_;

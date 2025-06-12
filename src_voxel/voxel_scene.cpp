@@ -5,7 +5,8 @@
 namespace sv {
 
 /* ───────────────── constructor ─────────────────────────────────────── */
-VoxelScene::VoxelScene(VoxelModelParams& args,
+VoxelScene::VoxelScene(
+    VoxelModelParams& args,
     int load_iteration,
     bool shuffle,
     std::vector<float> resolution_scales)
@@ -20,7 +21,7 @@ VoxelScene::VoxelScene(VoxelModelParams& args,
 /* ───────────────── camera pool ─────────────────────────────────────── */
 void VoxelScene::addCamera(const Camera& camera)
 {
-    cameras_.emplace(camera.camera_id_, camera);
+    this->cameras_.emplace(camera.camera_id_, camera);
 }
 
 Camera& VoxelScene::getCamera(camera_id_t cameraId)

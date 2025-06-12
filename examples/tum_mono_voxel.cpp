@@ -135,8 +135,9 @@ int main(int argc, char **argv)
     std::shared_ptr<VoxelMapper> pVoxelMapper =
         std::make_shared<VoxelMapper>(pSLAM,
                                       std::filesystem::path(argv[3]),
-                                      std::filesystem::path(argv[4]),
+                                    //   std::filesystem::path(argv[4]),
                                       output_dir,
+                                      0,
                                       device_type);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 

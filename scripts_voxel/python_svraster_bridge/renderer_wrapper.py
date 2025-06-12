@@ -20,9 +20,7 @@ import faulthandler, threading, signal
 import importlib.util
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../third_party"))
 print("=== LOADING voxel_bridge ===")
-print("[RENDERER_WRAPPER] sys.executable =", sys.executable)
-print("[RENDERER_WRAPPER] CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
-print("[RENDERER_WRAPPER] torch.cuda.is_available() =", torch.cuda.is_available())
+
 THIRD_PARTY = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../third_party"))
 if THIRD_PARTY in sys.path:
     sys.path.remove(THIRD_PARTY)
@@ -139,22 +137,21 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     def vox_fn(idx, cam_pos, mode):
         # print(f"[PY-DBG] Running vox_fn with mode: {mode}, idx: {idx}")
         geos = voxel_data['geos']                  # (N, 8), passed directly
-        #                                        # (they’re logit values ≈ 1.386, that’s fine)
-        # print(f"[PY-DBG] geos shape: {geos.shape}, device: {geos.device}")
         rgbs = svr.SH_eval.apply(
             2,                        # active_sh_degree   (use 2, 3, … as you like)
             None,                     # idx  (let SH_eval create empty tensor internally)
-            voxel_data['centers'],    # vox_centers  (N,3)
+            voxel_data['centers'].detach(),    # vox_centers  (N,3)
             cam_pos,                  # cam_pos (3,) #cam.c2w[:3, 3],
             None,                        # viewdir
-            voxel_data['colors'],     # sh0  (N,3)
+            voxel_data['colors'].squeeze(1),     # sh0  (N,3)
             voxel_data['shs']         # shs  (N,45,3)
         )      
-        dens = voxel_data["opacities"].view(-1, 1);                               # (N, 3), computed SH colors
+        # rgbs = voxel_data['colors']
+        # dens = voxel_data["opacities"].view(-1, 1);                               # (N, 3), computed SH colors
         return dict(
             geos=geos,
             rgbs=rgbs,
-            densities = dens,
+            # densities = dens,
             subdiv_p=voxel_data['subdiv_p'].view(-1, 1)
         )
 

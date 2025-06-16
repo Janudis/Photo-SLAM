@@ -38,7 +38,7 @@
     this->Tensor_vec_geo_       = { this->geo_ };       \
     this->Tensor_vec_sh0_       = { this->sh0_ };       \
     this->Tensor_vec_shs_       = { this->shs_ };       \
-    this->Tensor_vec_opacity_   = { this->opacity_ };
+    // this->Tensor_vec_opacity_   = { this->opacity_ };
 
 #define VOXEL_MODEL_INIT_TENSORS(device_type)                                 \
     this->center_               = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
@@ -46,13 +46,13 @@
     this->geo_                  = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->sh0_                  = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->shs_                  = torch::empty({0, 45, 3},torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->opacity_              = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->oct_path_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
     this->oct_level_            = torch::empty({0},       torch::TensorOptions().dtype(torch::kInt32  ).device(device_type)); \
     this->subdiv_meta_          = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->subdiv_p_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->subdiv_p_grad_buffer_ = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     VOXEL_MODEL_TENSORS_TO_VEC
+// this->opacity_              = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
 
 namespace py = pybind11;
 namespace sv {
@@ -71,12 +71,11 @@ public:
     torch::Tensor getGeo()               { return this->geo_; }
     torch::Tensor getSh0()               { return this->sh0_; }
     torch::Tensor getShs()               { return this->shs_; }
-    torch::Tensor getOpacity()           { return this->opacity_; }
+    // torch::Tensor getOpacity()           { return this->opacity_; }
     torch::Tensor getOctreePaths()       { return this->oct_path_; }
     torch::Tensor getOctreeLevels()      { return this->oct_level_; }
     torch::Tensor getSubdivMeta()        { return this->subdiv_meta_; }
     torch::Tensor getSubdivPriority()    { return this->subdiv_p_; }
-    torch::Tensor getDensity()           { return opacity_.sigmoid();}
 
     /// SH degree controls which spherical harmonics are active
     void oneUpShDegree();
@@ -123,10 +122,10 @@ public:
     void setGeoLearningRate(float geo_lr);
     void setSh0LearningRate(float sh0_lr);
     void setShsLearningRate(float shs_lr);
-    void setOpacityLearningRate(float opacity_lr);
+    // void setOpacityLearningRate(float opacity_lr);
 
     /// Optionally: reset opacity to very low values, mirror GaussianModel::resetOpacity()
-    void resetOpacity();
+    // void resetOpacity();
     torch::Tensor replaceTensorToOptimizer(torch::Tensor& t, int tensor_idx);
 
     // ───────── Pruning & Densification ─────────
@@ -207,7 +206,7 @@ public:
     torch::Tensor geo_;                // [N, 8] (covariance and pad)
     torch::Tensor sh0_;                // [N, 3]
     torch::Tensor shs_;                // [N, 45, 3]
-    torch::Tensor opacity_;            // [N]
+    // torch::Tensor opacity_;            // [N]
     /// Octree / subdivision tracking
     torch::Tensor oct_path_;           // [N]
     torch::Tensor oct_level_;          // [N]
@@ -217,11 +216,12 @@ public:
     torch::Tensor exist_since_iter_;   // [N] (iteration when created)
 
     /// Vectors of tensors for replacing into optimizer
-    std::vector<torch::Tensor> Tensor_vec_center_,
-                               Tensor_vec_geo_,
-                               Tensor_vec_sh0_,
-                               Tensor_vec_shs_,
-                               Tensor_vec_opacity_;                               
+    std::vector<torch::Tensor> 
+    Tensor_vec_center_,
+    Tensor_vec_geo_,
+    Tensor_vec_sh0_,
+    Tensor_vec_shs_;
+    // Tensor_vec_opacity_;                               
 
     /// The Adam optimizer
     std::shared_ptr<torch::optim::Adam> optimizer_;

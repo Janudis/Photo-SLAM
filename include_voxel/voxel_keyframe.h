@@ -24,7 +24,7 @@ class VoxelKeyframe
 public:
     VoxelKeyframe() {}
     /* ------------------------------------------------------------------ ctor */
-    VoxelKeyframe(std::size_t fid = 0, int creation_iter = 0)
+    VoxelKeyframe(std::size_t fid, int creation_iter = 0)
         : fid_(fid), creation_iter_(creation_iter) {}
 
     /* ---------------------------------------------------- pose setters */

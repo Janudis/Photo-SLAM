@@ -50,8 +50,8 @@ public:
         float geo_lr_delay_mult = 0.01f,
         float geo_lr_max_steps = 30'000,
         float meta_accum_lr = 0.1f,
-        float sh0_lr = 0.00016f,
-        float shs_lr = 0.00016f,
+        float sh0_lr = 0.0025f,
+        float shs_lr = 0.000125f,
         float lambda_dssim = 0.2f,
         int densification_interval = 100,
         int subdiv_from = 4,
@@ -64,7 +64,7 @@ public:
         int prune_until = 30000,
         float prune_threshold_init = 1e-4f,
         float prune_threshold_final = 0.05f,
-        int min_voxels = 512,
+        // int min_voxels = 512,
         int opacity_reset_interval = 3000,
         int densify_from_iter = 500,
         int densify_until_iter = 15'000,
@@ -94,7 +94,7 @@ public:
     int prune_until_;
     float prune_threshold_init_;
     float prune_threshold_final_;
-    int min_voxels_;
+    // int min_voxels_;
     float percent_dense_;
     float lambda_dssim_;
     int opacity_reset_interval_;

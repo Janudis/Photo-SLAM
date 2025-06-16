@@ -16,8 +16,8 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 Camera.z_near: 0.01
 Camera.z_far: 100.0
 
-Mapper.inactive_geo_densify:           1        # keep like Gaussian
-Mapper.min_num_initial_map_kfs:        15
+Mapper.inactive_geo_densify:           1        # keep like Voxel
+Mapper.min_num_initial_map_kfs:        20
 Mapper.new_keyframe_times_of_use:      2
 Mapper.local_BA_increased_times_of_use: 0       
 Mapper.loop_closure_increased_times_of_use_: 2  
@@ -29,12 +29,13 @@ Mapper.stable_num_iter_existence:      1
 Pipeline.convert_SHs: 0  # 0:false, 1 or other integer:true
 Pipeline.compute_cov3D: 0  # 0:false, 1 or other integer:true
 
-Record.training_report_interval:       10
-Record.keyframe_record_interval:       0
-Record.all_keyframes_record_interval:  0
-Record.record_rendered_image:          1
-Record.record_ground_truth_image:      0
-Record.record_loss_image:              0
+Record.keyframe_record_interval: 0 # 0:never, 1:always, others:periodically
+Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
+Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
+Record.record_ground_truth_image: 0 # 0:false, 1 or other integer:true
+Record.record_loss_image: 0 # 0:false, 1 or other integer:true
+Record.training_report_interval: 10 # 0:never, 1:always, others:periodically
+Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
 ##############################################################################
 # SVRaster-style optimisation parameters
@@ -46,7 +47,7 @@ Optimization.geo_lr_init:         0.00032
 Optimization.geo_lr_final:        0.00032
 Optimization.geo_lr_delay_mult:   0.01
 Optimization.geo_lr_max_steps:    24
-Optimization.sh0_lr:                   0.0025     
+Optimization.sh0_lr:                   0.0025   
 Optimization.shs_lr:                   0.000125   
 Optimization.meta_accum_lr:            0.1
 
@@ -71,3 +72,13 @@ Optimization.prune_until:              50
 Optimization.prune_threshold_init:     1e-4
 Optimization.prune_threshold_final:    0.1
 Optimization.min_voxels:               512
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+
+VoxelViewer.glfw_window_width: 1400
+VoxelViewer.glfw_window_height: 1050
+VoxelViewer.image_scale: 0.5
+VoxelViewer.image_scale_main: 1.0
+VoxelViewer.camera_watch_dist: 0.000001

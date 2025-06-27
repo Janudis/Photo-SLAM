@@ -28,6 +28,9 @@ struct MiniCam {
         m.cx = cx;    m.cy = cy;
         m.tanfovx = (fx > 1e-6f) ? 0.5f * w / fx : 1.f;
         m.tanfovy = (fy > 1e-6f) ? 0.5f * h / fy : 1.f;
+        // m.tanfovx = std::tan(fx * 0.5f);
+        // m.tanfovy = std::tan(fy * 0.5f);
+
         m.frame_id = frame_id;
         return m;
     }
@@ -45,6 +48,9 @@ inline MiniCam fromCamera(const Camera& cam,
     m.cx = cam.cx();  m.cy = cam.cy();
     m.tanfovx = (cam.fx() > 1e-6f) ? 0.5f * cam.width()  / cam.fx() : 1.f;
     m.tanfovy = (cam.fy() > 1e-6f) ? 0.5f * cam.height() / cam.fy() : 1.f;
+    // m.tanfovx = std::tan(cam.fx() * 0.5f);
+    // m.tanfovy = std::tan(cam.fy() * 0.5f);
+
     m.c2w = c2w.clone();
     m.w2c = torch::linalg_inv(c2w);
     m.frame_id = frame_id;

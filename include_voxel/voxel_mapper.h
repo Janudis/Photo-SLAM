@@ -84,10 +84,6 @@ public:
     VoxelMapper(
         std::shared_ptr<ORB_SLAM3::System> pSLAM,
         const std::filesystem::path& config_file_path,
-        // const std::filesystem::path& seq_dir,
-        // const std::filesystem::path& out_dir,
-        // torch::DeviceType device_type = torch::kCUDA,
-        // int seed = 0);
         std::filesystem::path result_dir = "",
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
@@ -112,7 +108,7 @@ public:
 
     // misc helpers
     int  getIteration();
-    void increaseIteration(int inc=1);
+    void increaseIteration(const int inc=1);
     
     float sh0LearningRate();
     float shsLearningRate();
@@ -122,6 +118,7 @@ public:
     bool isKeepingTraining();
     int stableNumIterExistence();
     bool isdoingInactiveGeoDensify();
+    int subdivideInterval();
 
     void setGeoLearningRateInit(const float lr);
 
@@ -241,7 +238,7 @@ protected:
     // voxel state -------------------------------------------------------------
     torch::Tensor                       voxel_centers_;    
 
-    bool inactive_geo_densify_ = true;
+    bool do_inactive_geo_densify = true;
 
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;

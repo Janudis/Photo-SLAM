@@ -14,6 +14,7 @@
 #include <torch/extension.h>
 #include <iostream>
 #include <cstdlib>
+#include <ATen/ATen.h>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 #include "third_party/simple-knn/spatial.h"
@@ -35,15 +36,14 @@
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
     this->Tensor_vec_center_    = { this->center_ };    \
-    this->Tensor_vec_geo_       = { this->geo_ };       \
+    this->Tensor_vec_geo_       = { this->_geo_grid_pts };       \
     this->Tensor_vec_sh0_       = { this->sh0_ };       \
     this->Tensor_vec_shs_       = { this->shs_ };       \
-    // this->Tensor_vec_opacity_   = { this->opacity_ };
 
 #define VOXEL_MODEL_INIT_TENSORS(device_type)                                 \
     this->center_               = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->size_                 = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->geo_                  = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+    this->_geo_grid_pts         = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->sh0_                  = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->shs_                  = torch::empty({0, 45, 3},torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->oct_path_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
@@ -149,10 +149,6 @@ public:
         const torch::Tensor& parent_idx,
         const torch::Tensor& parent_grads
     );
-    // void addDensificationStats(
-    //     torch::Tensor& viewspace_point_tensor,
-    //     torch::Tensor& update_filter
-    // );
 
     /// Load all voxel fields from a PLY file (structure matches savePly).
     void loadPly(const std::filesystem::path& ply_file);
@@ -200,6 +196,9 @@ public:
     int active_sh_degree_;
     int max_sh_degree_;
 
+    int outside_level_ = 5;    // match svraster default
+    int inside_level_  = 6;    // number of “dense” levels inside the bound
+
     /// Main voxel tensors
     torch::Tensor center_;             // [N, 3]
     torch::Tensor size_;               // [N]
@@ -213,7 +212,13 @@ public:
     torch::Tensor subdiv_meta_;        // [N]
     torch::Tensor subdiv_p_;           // [N]
     torch::Tensor subdiv_p_grad_buffer_;// [N]
-    torch::Tensor exist_since_iter_;   // [N] (iteration when created)
+
+    torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
+    torch::Tensor _geo_grid_pts;    // [M]  float32 learnable density at each grid-point
+    /// How each of the N leaf-voxels maps into that grid:
+    torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
+    /// Inverse of the voxel size, needed for interpolation:
+    torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
 
     /// Vectors of tensors for replacing into optimizer
     std::vector<torch::Tensor> 
@@ -231,6 +236,9 @@ public:
 
     torch::Tensor sparse_points_xyz_;
     torch::Tensor sparse_points_color_;
+
+    torch::Tensor xyz_gradient_accum_;   // [N,1]  ∑ |grad|
+    torch::Tensor denom_;                // [N,1]  counter
 
 protected:
     /// Learning‐rate scheduling parameters

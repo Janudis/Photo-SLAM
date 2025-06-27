@@ -1,7 +1,7 @@
 #include "include_voxel/voxel_mapper.h"
 
 namespace py = pybind11;
-
+std::ofstream loss_log_;
 inline void saveDebugImage(torch::Tensor tensor,
                            const std::string& path)
 {
@@ -78,6 +78,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
       large_trans_th_(1e-2f),
       training_report_interval_(0)
 {
+    loss_log_.open("loss.csv", std::ios::out);
     std::srand(seed);
     torch::manual_seed(seed);
 
@@ -110,7 +111,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     voxel_model_ = std::make_shared<sv::VoxelModel>(model_params_);
     scene_       = std::make_shared<sv::VoxelScene>(model_params_);
     
-    switch (mpSLAM->getSensorType()) {
+    switch (pSLAM->getSensorType()) {
     case ORB_SLAM3::System::MONOCULAR:
     case ORB_SLAM3::System::IMU_MONOCULAR:
         sensor_type_ = MONOCULAR;
@@ -128,13 +129,13 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     }
 
     // /* Load every ORB-SLAM3 camera, convert to Camera, pre–compute            */
-    auto settings = mpSLAM->getSettings();   
+    auto settings = pSLAM->getSettings();   
     cv::Size SLAM_im_size = settings->newImSize();
     UndistortParams undistort_params(
         SLAM_im_size,
         settings->camera1DistortionCoef()
     );
-    auto vpCameras = mpSLAM->getAtlas()->GetAllCameras();
+    auto vpCameras = pSLAM->getAtlas()->GetAllCameras();
     for (auto& SLAM_camera : vpCameras) {
         sv::Camera camera;
         camera.camera_id_ = SLAM_camera->GetId();
@@ -224,8 +225,8 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     std::lock_guard<std::mutex> guard(mutex_status_);
 
     /* ───────── PIPELINE FLAGS ───────── */
-    inactive_geo_densify_ =
-        (settings_file["Mapper.inactive_geo_densify"].operator int()) != 0;
+    // inactive_geo_densify_ =
+    //     (settings_file["Mapper.inactive_geo_densify"].operator int()) != 0;
     cull_keyframes_ =
         (settings_file["Mapper.cull_keyframes"].operator int()) != 0;
     min_num_initial_map_kfs_ =
@@ -253,14 +254,14 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         settings_file["Optimization.max_num_iterations"].operator int();
     opt_params_.geo_lr_init_ =
         settings_file["Optimization.geo_lr_init"].operator float();
-    opt_params_.geo_lr_final_ =
-        settings_file["Optimization.geo_lr_final"].operator float();
+    // opt_params_.geo_lr_final_ =
+    //     settings_file["Optimization.geo_lr_final"].operator float();
     opt_params_.geo_lr_delay_mult_ =
         settings_file["Optimization.geo_lr_delay_mult"].operator float();
     opt_params_.geo_lr_max_steps_ =
         settings_file["Optimization.geo_lr_max_steps"].operator int();
-    opt_params_.meta_accum_lr_ =
-        settings_file["Optimization.meta_accum_lr"].operator float();
+    // opt_params_.meta_accum_lr_ =
+    //     settings_file["Optimization.meta_accum_lr"].operator float();
     opt_params_.sh0_lr_ =
         settings_file["Optimization.sh0_lr"].operator float();
     opt_params_.shs_lr_ =
@@ -272,10 +273,10 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         settings_file["Optimization.subdiv_every"].operator int();
     opt_params_.subdiv_until_ =
         settings_file["Optimization.subdiv_until"].operator int();
-    opt_params_.subdiv_quantile_ =
-        settings_file["Optimization.subdiv_quantile"].operator float();
-    opt_params_.subdiv_gradient_threshold_ =
-        settings_file["Optimization.subdiv_gradient_threshold"].operator float();
+    // opt_params_.subdiv_quantile_ =
+    //     settings_file["Optimization.subdiv_quantile"].operator float();
+    // opt_params_.subdiv_gradient_threshold_ =
+    //     settings_file["Optimization.subdiv_gradient_threshold"].operator float();
 
     opt_params_.prune_from_ =
         settings_file["Optimization.prune_from"].operator int();
@@ -315,41 +316,41 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
      rendered_image_viewer_scale_main_ =
          settings_file["VoxelViewer.image_scale_main"].operator float();
 
-    std::cout << "\n[CFG] Parsed Optimization Parameters:" << std::endl;
-    // std::cout << "  lr:                       " << opt_params_.position_lr_final_ << std::endl;
-    std::cout << "  meta_accum_lr:           " << opt_params_.meta_accum_lr_ << std::endl;
-    // std::cout << "  position_lr_init:        " << opt_params_.position_lr_init_ << std::endl;
-    // std::cout << "  position_lr_delay_mult:  " << opt_params_.position_lr_delay_mult_ << std::endl;
-    // std::cout << "  position_lr_max_steps:   " << opt_params_.position_lr_max_steps_ << std::endl;
-    std::cout << "  iterations_:      " << opt_params_.iterations_ << std::endl;
-    std::cout << "  densification_interval:  " << opt_params_.densification_interval_ << std::endl;
-    std::cout << "\n[CFG] Subdivision Parameters:" << std::endl;
-    std::cout << "  subdiv_from:             " << opt_params_.subdiv_from_ << std::endl;
-    std::cout << "  subdiv_every:            " << opt_params_.subdiv_every_ << std::endl;
-    std::cout << "  subdiv_until:            " << opt_params_.subdiv_until_ << std::endl;
-    std::cout << "  subdiv_quantile:         " << opt_params_.subdiv_quantile_ << std::endl;
-    std::cout << "  subdiv_gradient_threshold: " << opt_params_.subdiv_gradient_threshold_ << std::endl;
-    std::cout << "\n[CFG] Pruning Parameters:" << std::endl;
-    std::cout << "  prune_from:              " << opt_params_.prune_from_ << std::endl;
-    std::cout << "  prune_every:             " << opt_params_.prune_every_ << std::endl;
-    std::cout << "  prune_until:             " << opt_params_.prune_until_ << std::endl;
-    std::cout << "  prune_threshold_init:    " << opt_params_.prune_threshold_init_ << std::endl;
-    std::cout << "  prune_threshold_final:   " << opt_params_.prune_threshold_final_ << std::endl;
-    // std::cout << "  min_voxels:              " << opt_params_.min_voxels_ << std::endl;
-    std::cout << "\n[CFG] Pipeline & Mapper Flags:" << std::endl;
-    std::cout << "  inactive_geo_densify:    " << inactive_geo_densify_ << std::endl;
-    std::cout << "  new_keyframe_times_of_use_: " << new_keyframe_times_of_use_<< std::endl;
-    std::cout << "  min_num_initial_map_kfs: " << min_num_initial_map_kfs_ << std::endl;
-    std::cout << "  large_rot_th:            " << large_rot_th_ << std::endl;
-    std::cout << "  large_trans_th:          " << large_trans_th_ << std::endl;
-    std::cout << "  cull_keyframes:          " << cull_keyframes_ << std::endl;
-    std::cout << "\n[CFG] Logging Parameters:" << std::endl;
-    std::cout << "  training_report_interval: " << training_report_interval_ << std::endl;
-    std::cout << "  keyframe_record_interval: " << keyframe_record_interval_ << std::endl;
-    std::cout << "  all_keyframes_record_interval: " << all_keyframes_record_interval_ << std::endl;
-    std::cout << "  record_rendered_image:   " << record_rendered_image_ << std::endl;
-    std::cout << "  record_ground_truth_image: " << record_ground_truth_image_ << std::endl;
-    std::cout << "  record_loss_image:       " << record_loss_image_ << std::endl;
+    // std::cout << "\n[CFG] Parsed Optimization Parameters:" << std::endl;
+    // // std::cout << "  lr:                       " << opt_params_.position_lr_final_ << std::endl;
+    // std::cout << "  meta_accum_lr:           " << opt_params_.meta_accum_lr_ << std::endl;
+    // // std::cout << "  position_lr_init:        " << opt_params_.position_lr_init_ << std::endl;
+    // // std::cout << "  position_lr_delay_mult:  " << opt_params_.position_lr_delay_mult_ << std::endl;
+    // // std::cout << "  position_lr_max_steps:   " << opt_params_.position_lr_max_steps_ << std::endl;
+    // std::cout << "  iterations_:      " << opt_params_.iterations_ << std::endl;
+    // std::cout << "  densification_interval:  " << opt_params_.densification_interval_ << std::endl;
+    // std::cout << "\n[CFG] Subdivision Parameters:" << std::endl;
+    // std::cout << "  subdiv_from:             " << opt_params_.subdiv_from_ << std::endl;
+    // std::cout << "  subdiv_every:            " << opt_params_.subdiv_every_ << std::endl;
+    // std::cout << "  subdiv_until:            " << opt_params_.subdiv_until_ << std::endl;
+    // std::cout << "  subdiv_quantile:         " << opt_params_.subdiv_quantile_ << std::endl;
+    // std::cout << "  subdiv_gradient_threshold: " << opt_params_.subdiv_gradient_threshold_ << std::endl;
+    // std::cout << "\n[CFG] Pruning Parameters:" << std::endl;
+    // std::cout << "  prune_from:              " << opt_params_.prune_from_ << std::endl;
+    // std::cout << "  prune_every:             " << opt_params_.prune_every_ << std::endl;
+    // std::cout << "  prune_until:             " << opt_params_.prune_until_ << std::endl;
+    // std::cout << "  prune_threshold_init:    " << opt_params_.prune_threshold_init_ << std::endl;
+    // std::cout << "  prune_threshold_final:   " << opt_params_.prune_threshold_final_ << std::endl;
+    // // std::cout << "  min_voxels:              " << opt_params_.min_voxels_ << std::endl;
+    // std::cout << "\n[CFG] Pipeline & Mapper Flags:" << std::endl;
+    // // std::cout << "  inactive_geo_densify:    " << inactive_geo_densify_ << std::endl;
+    // std::cout << "  new_keyframe_times_of_use_: " << new_keyframe_times_of_use_<< std::endl;
+    // std::cout << "  min_num_initial_map_kfs: " << min_num_initial_map_kfs_ << std::endl;
+    // std::cout << "  large_rot_th:            " << large_rot_th_ << std::endl;
+    // std::cout << "  large_trans_th:          " << large_trans_th_ << std::endl;
+    // std::cout << "  cull_keyframes:          " << cull_keyframes_ << std::endl;
+    // std::cout << "\n[CFG] Logging Parameters:" << std::endl;
+    // std::cout << "  training_report_interval: " << training_report_interval_ << std::endl;
+    // std::cout << "  keyframe_record_interval: " << keyframe_record_interval_ << std::endl;
+    // std::cout << "  all_keyframes_record_interval: " << all_keyframes_record_interval_ << std::endl;
+    // std::cout << "  record_rendered_image:   " << record_rendered_image_ << std::endl;
+    // std::cout << "  record_ground_truth_image: " << record_ground_truth_image_ << std::endl;
+    // std::cout << "  record_loss_image:       " << record_loss_image_ << std::endl;
 }
 
 void VoxelMapper::run()
@@ -376,25 +377,24 @@ void VoxelMapper::run()
                 vKFs = pMap->GetAllKeyFrames();
                 vMPs = pMap->GetAllMapPoints();
 
-                for (auto *pMP : vMPs)
+                for (const auto& pMP : vMPs)
                 {
-                    Point3D pt;
-                    const auto pos = pMP->GetWorldPos();
-                    const auto color = pMP->GetColorRGB();
-                    // Debug: Print RGB color and position for each MapPoint
-                    // std::cout << "[DEBUG] MapPoint ID: " << pMP->mnId 
-                    //           << " Position: (" << pos.x() << ", " << pos.y() << ", " << pos.z() << ")"
-                    //           << " Color: (" << color(0) << ", " << color(1) << ", " << color(2) << ")\n";
-                    pt.xyz_ << pos.x(), pos.y(), pos.z();
-                    pt.color_ << color(0), color(1), color(2);
-                    // Cache the point in the scene
-                    scene_->cachePoint3D(pMP->mnId, pt);
-                }
+                     Point3D point3D;
+                     auto pos = pMP->GetWorldPos();
+                     point3D.xyz_(0) = pos.x();
+                     point3D.xyz_(1) = pos.y();
+                     point3D.xyz_(2) = pos.z();
+                     auto color = pMP->GetColorRGB();
+                     point3D.color_(0) = color(0);
+                     point3D.color_(1) = color(1);
+                     point3D.color_(2) = color(2);
+                     scene_->cachePoint3D(pMP->mnId, point3D);
+                 }
                 // B) Create VoxelKeyframes from each SLAM KeyFrame
                 // std::cout << "[DEBUG] Creating VoxelKeyframes..." << std::endl;
-                for (auto *pKF : vKFs)
+                for (const auto& pKF : vKFs)
                 {
-                    auto new_kf = std::make_shared<VoxelKeyframe>(pKF->mnId, getIteration());
+                    std::shared_ptr<VoxelKeyframe> new_kf = std::make_shared<VoxelKeyframe>(pKF->mnId, getIteration());
                     new_kf->zfar_  = z_far_;
                     new_kf->znear_ = z_near_;
                     // Pose
@@ -475,17 +475,21 @@ void VoxelMapper::run()
     /* ───────────────────────────────────────────────
      *  3.  TAIL   O P T I M I S A T I O N
      * ───────────────────────────────────────────── */
-     int densify_interval = densifyInterval();
-     int n_delay_iters = densify_interval * 0.8;
-     while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
+    //  int densify_interval = densifyInterval();
+    //  int n_delay_iters = densify_interval * 0.8;
+    int subdiv_interval = opt_params_.subdiv_every_;
+    int n_delay_iters   = int(subdiv_interval * 0.8f);
+    //  while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
+        while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % subdiv_interval <= n_delay_iters || isKeepingTraining()) {
          trainForOneIteration();
-         densify_interval = densifyInterval();
-         n_delay_iters = densify_interval * 0.8;
+        //  densify_interval = densifyInterval();
+        //  n_delay_iters = densify_interval * 0.8;
+        subdiv_interval = opt_params_.subdiv_every_;
+        n_delay_iters   = int(subdiv_interval * 0.8f);
      }
- 
      // Save and clear
      renderAndRecordAllKeyframes("_shutdown");
-     savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
+    //  savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
      writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
  
      signalStop();
@@ -553,14 +557,37 @@ void VoxelMapper::trainForOneIteration()
                        ? used_times
                        : opt_params_.geo_lr_max_steps_;
         float geo_lr = voxel_model_->updateLearningRate(step);
-        // voxel_model_->setGeoLearningRate(geo_lr);
-        setGeoLearningRateInit(geo_lr);
+        voxel_model_->setGeoLearningRate(geo_lr);
+        // setGeoLearningRateInit(geo_lr);
     } else {
         voxel_model_->updateLearningRate(getIteration());
     }
     // SH-DC and higher-SH rates remain constant:
     voxel_model_->setSh0LearningRate(sh0LearningRate());
     voxel_model_->setShsLearningRate(shsLearningRate());
+
+    // const int iter = getIteration();
+    // const auto &opt = opt_params_;
+    // if (iter < opt.geo_warmup_iters_) {
+    //     // --- geometry only ---
+    //     float geo_lr = voxel_model_->updateLearningRate(iter);
+    //     voxel_model_->setGeoLearningRate(geo_lr);
+    //     voxel_model_->setSh0LearningRate(0.0f);
+    //     voxel_model_->setShsLearningRate(0.0f);
+    // }
+    // else if (iter < opt.geo_warmup_iters_ + opt.sh0_warmup_iters_) {
+    //     // --- freeze geo, train SH₀ only ---
+    //     voxel_model_->setGeoLearningRate(0.0f);
+    //     voxel_model_->setSh0LearningRate(sh0LearningRate());
+    //     voxel_model_->setShsLearningRate(0.0f);
+    // }
+    // else {
+    //     // --- full joint training ---
+    //     float geo_lr = voxel_model_->updateLearningRate(iter);
+    //     voxel_model_->setGeoLearningRate(geo_lr);
+    //     voxel_model_->setSh0LearningRate(sh0LearningRate());
+    //     voxel_model_->setShsLearningRate(shsLearningRate());
+    // }
 
     torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
                             .mul(255.0f)
@@ -572,50 +599,89 @@ void VoxelMapper::trainForOneIteration()
     py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
     auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
     // lock_render.unlock();
-    if (render_pkg.empty() || !render_pkg.count("rgb") || !render_pkg.at("rgb").defined()) {
+    if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
         std::cout << "render pkg empty" << std::endl;
         return;
     }
-    torch::Tensor rendered_image = render_pkg["rgb"].to(mDevice);
+    torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
     torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
     
     // 8) compute masked photometric loss
-    // py::gil_scoped_release no_gil;
-    // mask out black/invalid pixels
-    // masked_image = rendered_image * mask;   // (1,3,H,W)
-    // torch::Tensor masked_gt   = gt_image        * mask;   // (1,3,H,W)
     
     torch::Tensor Ll1 = loss_utils::l1_loss(masked_image, gt_image);
     float lambda_dssim = lambdaDssim();
     torch::Tensor loss = (1.0 - lambda_dssim) * Ll1
             + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
+
     {
         py::gil_scoped_release no_gil;
         loss.backward();
+
         if (mDevice == torch::kCUDA)  
             torch::cuda::synchronize();
     }
 
     // 10) accumulate subdivision gradients into subdiv_meta_
     {
+        /* ------------------------------------------------ 0. bookkeeping */
         torch::NoGradGuard no_grad;
-        // update EMA
+        // 0) bookkeeping
         ema_loss_for_log_ = 0.4f * loss.item<float>() + 0.6f * ema_loss_for_log_;
-
         if (keyframe_record_interval_ &&
             getIteration() % keyframe_record_interval_ == 0)
-            recordKeyframeRendered(masked_image, gt_image, viewpoint_cam->fid_, result_dir_, result_dir_, result_dir_);
+        {
+            recordKeyframeRendered(masked_image,
+                                    gt_image,
+                                    viewpoint_cam->fid_,
+                                    result_dir_, result_dir_, result_dir_);
+        }
 
-        // // get logging gradient from subdiv_p_ → use new method name getSubdivPriorityGrad()
-        // torch::Tensor grad_p = voxel_model_->getSubdivPriorityGrad();
-        // // clamp subdiv_meta_ ← getTensor("subdiv_meta")
-        // torch::Tensor subdiv_meta = voxel_model_->getTensor("subdiv_meta");
-        // subdiv_meta = torch::clamp(subdiv_meta + grad_p * opt_params_.meta_accum_lr_, 0.0f, 1.0f);
-        // voxel_model_->setSubdivMeta(subdiv_meta);
+        // 1) grab the raw ∂L/∂subdiv_p_ from the last backward pass
+        auto grad_p = voxel_model_->getSubdivPriorityGrad()  // [M,1]
+                            .view(-1);                      // [M]
 
-        // // scatter‐add full gradient array back into "grad buffer"
-        // torch::Tensor idx_all = torch::arange(grad_p.numel(), grad_p.options().dtype(torch::kLong));
-        // voxel_model_->accumulateSubdivGradients(idx_all, grad_p);
+        // 2) restrict to just those voxels that actually contributed
+        torch::Tensor vis_idx = render_pkg["idx"]
+                                    .to(mDevice, /*non_blocking=*/true)
+                                    .contiguous();      // (K,)
+        voxel_model_->accumulateSubdivGradients(vis_idx,
+                                                grad_p.index({vis_idx}));
+
+        // 3) PRUNE
+        if (getIteration() >= opt_params_.prune_from_
+            && getIteration() % opt_params_.prune_every_ == 0)
+        {
+            auto buf = voxel_model_->subdiv_p_grad_buffer_.view(-1);  // (N)
+            // linearly ramp the threshold
+            float alpha = float(getIteration() - opt_params_.prune_from_) /
+                            std::max(1.f,
+                                    float(opt_params_.prune_until_ -
+                                            opt_params_.prune_from_));
+            alpha = std::clamp(alpha, 0.f, 1.f);
+            float th = (1.f - alpha) * opt_params_.prune_threshold_init_ +
+                            alpha * opt_params_.prune_threshold_final_;
+            torch::Tensor keep_mask = buf >= th;  // bool[N]
+            voxel_model_->prune(keep_mask);
+        }
+
+        // 4) SUBDIVIDE
+        if (getIteration() >= opt_params_.subdiv_from_
+            && getIteration() % opt_params_.subdiv_every_ == 0)
+        {
+            auto buf = voxel_model_->subdiv_p_grad_buffer_.view(-1);
+            // pick the top (subdiv_quantile) fraction
+            int64_t k = std::max<int64_t>(
+                1,
+                int64_t(buf.numel() *
+                        (1.0f - opt_params_.subdiv_quantile_))
+            );
+            float split_thr = std::get<0>(buf.kthvalue(k)).item<float>();
+            torch::Tensor split_mask = buf >= split_thr;
+            voxel_model_->subdivide(split_mask);
+
+            // reset so that next window’s gradients start fresh
+            voxel_model_->subdiv_p_grad_buffer_.zero_();
+        }
 
         // every training_report_interval_ iterations, print a concise report
         // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
@@ -634,15 +700,12 @@ void VoxelMapper::trainForOneIteration()
         //     );
         // }
 
-        if (all_keyframes_record_interval_ &&
-            getIteration() % all_keyframes_record_interval_ == 0)
+        if ((all_keyframes_record_interval_ && getIteration() % all_keyframes_record_interval_ == 0)
+            )
         {
             renderAndRecordAllKeyframes();
             // savePly(result_dir_ / std::to_string(iteration_) / "ply");
         }
-
-        if (loop_closure_iteration_)
-             loop_closure_iteration_ = false;
 
         if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
             std::cout << "[TRAIN] iter " << iteration_
@@ -650,16 +713,22 @@ void VoxelMapper::trainForOneIteration()
                     << "  loss: "  << loss.item<float>()
                     << "  ema: "   << ema_loss_for_log_ << '\n';
         }
+        float loss_val = loss.item<float>();
+        loss_log_ << iteration_ << "," << loss_val << "\n";
+        
         if (iteration_ % 50 == 0) {
             writeKeyframeUsedTimes(result_dir_);
         }
 
+        if (loop_closure_iteration_)
+            loop_closure_iteration_ = false;
+
         // Optimizer step   
-         if (getIteration() < opt_params_.iterations_) {
-            //  py::gil_scoped_release no_gil;
-             voxel_model_->optimizer_->step();
-             voxel_model_->optimizer_->zero_grad(true);
-         }
+        if (getIteration() < opt_params_.iterations_) {
+        //  py::gil_scoped_release no_gil;
+            voxel_model_->optimizer_->step();
+            voxel_model_->optimizer_->zero_grad(true);
+        }
     }
 }
 
@@ -830,7 +899,7 @@ void VoxelMapper::combineMappingOperations()
              auto& points = std::get<0>(associated_points);
              auto& colors = std::get<1>(associated_points);
  
-             // Add new points to the model
+            //  // Add new points to the model
             //  if (initial_mapped_ && points.size() >= 30) {
             //      torch::NoGradGuard no_grad;
             //      std::unique_lock<std::mutex> lock_render(mutex_render_);
@@ -841,7 +910,7 @@ void VoxelMapper::combineMappingOperations()
  
          case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
          {
-             std::cout << "[Gaussian Mapper]Loop Closure Detected."
+             std::cout << "[Voxel Mapper]Loop Closure Detected."
                        << std::endl;
  
              // Get the loop keyframe scale modification factor
@@ -886,7 +955,7 @@ void VoxelMapper::combineMappingOperations()
                          bool large_trans = !diff_pose.translation().isMuchSmallerThan(
                              1.0, large_trans_th_);
                          if (large_rot || large_trans) {
-                             std::cout << "[Gaussian Mapper]Large loop correction detected, transforming visible points of kf "
+                             std::cout << "[Voxel Mapper]Large loop correction detected, transforming visible points of kf "
                                      << kfid << std::endl;
                              diff_pose.translation() -= inv_pose.translation(); // t = (R_new * t_old + t_new) - t_new
                              diff_pose.translation() *= loop_kf_scale;          // t = s * (R_new * t_old)
@@ -894,18 +963,18 @@ void VoxelMapper::combineMappingOperations()
                              torch::Tensor diff_pose_tensor =
                                  tensor_utils::EigenMatrix2TorchTensor(
                                      diff_pose.matrix(), device_type_).transpose(0, 1);
-                             {
-                                 std::unique_lock<std::mutex> lock_render(mutex_render_);
-                                 voxel_model_->scaledTransformVisiblePointsOfKeyframe(
-                                     point_not_transformed_flags,
-                                     diff_pose_tensor,
-                                     pkf->world_view_transform_,
-                                     pkf->full_proj_transform_,
-                                     pkf->creation_iter_,
-                                     stableNumIterExistence(),
-                                     num_transformed,
-                                     loop_kf_scale); // selected xyz *= s
-                             }
+                            //  {
+                            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
+                            //      voxel_model_->scaledTransformVisiblePointsOfKeyframe(
+                            //          point_not_transformed_flags,
+                            //          diff_pose_tensor,
+                            //          pkf->world_view_transform_,
+                            //          pkf->full_proj_transform_,
+                            //          pkf->creation_iter_,
+                            //          stableNumIterExistence(),
+                            //          num_transformed,
+                            //          loop_kf_scale); // selected xyz *= s
+                            //  }
                              // Give loop keyframes times of use
                              increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
  // renderAndRecordKeyframe(pkf, result_dir_, "_1_after_loop_transforming_points");
@@ -933,9 +1002,10 @@ void VoxelMapper::combineMappingOperations()
  
              // Add new points to the model
             //  if (initial_mapped_ && points.size() >= 30) {
-            //      torch::NoGradGuard no_grad;
-            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
-            //      voxel_model_->increasePcd(points, colors, getIteration());
+            //     std::cout << "adds new points" << std::endl;
+            //     torch::NoGradGuard no_grad;
+            //     std::unique_lock<std::mutex> lock_render(mutex_render_);
+            //     voxel_model_->increasePcd(points, colors, getIteration());
             //  }
  
              // Mark this iteration
@@ -945,7 +1015,7 @@ void VoxelMapper::combineMappingOperations()
  
          case ORB_SLAM3::MappingOperation::OprType::ScaleRefinement:
          {
-             std::cout << "[Gaussian Mapper]Scale refinement Detected. Transforming all kfs and points..."
+             std::cout << "[Voxel Mapper]Scale refinement Detected. Transforming all kfs and points..."
                        << std::endl;
  
              float s = opr.mfScale;
@@ -954,10 +1024,10 @@ void VoxelMapper::combineMappingOperations()
                  // Apply the scaled transformation on gaussian model points
                  {
                      std::unique_lock<std::mutex> lock_render(mutex_render_);
-                     voxel_model_->applyScaledTransformation(s, T);
+                    //  voxel_model_->applyScaledTransformation(s, T);
                  }
                  // Apply the scaled transformation to the scene
-                 scene_->applyScaledTransformation(s, T);
+                //  scene_->applyScaledTransformation(s, T);
              }
              else { // TODO: the workflow should not come here, delete this branch
                  // Apply the scaled transformation to the cached points
@@ -1157,8 +1227,8 @@ void VoxelMapper::renderAndRecordKeyframe(
     cam.w2c = cam.w2c.contiguous().to(mDevice);
     /* ------------------------------------------------ 2. GT → NumPy  */
     torch::Tensor chw_u8 = pkf->original_image_    // (3,H,W) in [0,1]
-                            // .mul(255.0f)
-                            // .clamp(0.0f, 255.0f)
+                            .mul(255.0f)
+                            .clamp(0.0f, 255.0f)
                             .to(torch::kUInt8)            // <--- cast to U8
                             .cpu()
                             .contiguous();
@@ -1171,11 +1241,11 @@ void VoxelMapper::renderAndRecordKeyframe(
     auto t1 = std::chrono::steady_clock::now();
     render_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
 
-    if (render_pkg.empty() || !render_pkg.count("rgb") || !render_pkg.at("rgb").defined()) {
+    if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
         std::cout << "render pkg empty" << std::endl;
         return;
     }
-    torch::Tensor rendered_image = render_pkg.at("rgb").to(mDevice);          // (1,3,H,W)
+    torch::Tensor rendered_image = render_pkg.at("color").to(mDevice);          // (1,3,H,W)
 
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
     masked_image = masked_image.squeeze(0);   
@@ -1308,11 +1378,11 @@ cv::Mat VoxelMapper::renderFromPose(
     }
 
     // 4) extract the “rgb” tensor (batch of 1×3×H×W)
-    if (!render_pkg.count("rgb") || !render_pkg["rgb"].defined()) {
+    if (!render_pkg.count("color") || !render_pkg["color"].defined()) {
         // if rendering failed, return a black image
         return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
     }
-    at::Tensor rgb = render_pkg["rgb"];          // (1,3,H,W)
+    at::Tensor rgb = render_pkg["color"];          // (1,3,H,W)
     rgb = rgb.to(torch::kCPU);
     rgb = rgb.squeeze(0);                        // → (3,H,W)
 
@@ -1366,10 +1436,16 @@ int VoxelMapper::newKeyframeTimesOfUse()
     return new_keyframe_times_of_use_;
 }
 
-int VoxelMapper::densifyInterval()
+// int VoxelMapper::densifyInterval()
+// {
+//     std::unique_lock<std::mutex> lock(mutex_settings_);
+//     return opt_params_.densification_interval_;
+// }
+
+int VoxelMapper::subdivideInterval()
 {
     std::unique_lock<std::mutex> lock(mutex_settings_);
-    return opt_params_.densification_interval_;
+    return opt_params_.subdiv_every_;
 }
 
  int VoxelMapper::stableNumIterExistence()
@@ -1402,8 +1478,8 @@ float VoxelMapper::sh0LearningRate()
      return opt_params_.shs_lr_;
  }
 
-  bool VoxelMapper::isdoingInactiveGeoDensify()
- {
-     std::unique_lock<std::mutex> lock(mutex_settings_);
-     return inactive_geo_densify_;
- }
+//   bool VoxelMapper::isdoingInactiveGeoDensify()
+//  {
+//      std::unique_lock<std::mutex> lock(mutex_settings_);
+//      return inactive_geo_densify_;
+//  }

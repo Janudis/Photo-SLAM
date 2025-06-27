@@ -45,36 +45,40 @@ class VoxelOptimizationParams
 public:
     VoxelOptimizationParams(
         int iterations = 30'000,
-        float geo_lr_init = 0.00016f,
-        float geo_lr_final = 0.0000016f,
+        float geo_lr_init = 0.0001f,
+        // float geo_lr_final = 0.0000016f,
         float geo_lr_delay_mult = 0.01f,
         float geo_lr_max_steps = 30'000,
-        float meta_accum_lr = 0.1f,
-        float sh0_lr = 0.0025f,
+        // float meta_accum_lr = 0.1f,
+        float sh0_lr = 0.00125f,
         float shs_lr = 0.000125f,
         float lambda_dssim = 0.2f,
         int densification_interval = 100,
-        int subdiv_from = 4,
-        int subdiv_every = 10,
-        int subdiv_until = 30000,
+        int subdiv_from = 1000,
+        int subdiv_every = 100,
+        int subdiv_until = 15000,
         float subdiv_quantile = 0.8f,
         float subdiv_gradient_threshold = 1e-4f,
-        int prune_from = 10,
-        int prune_every = 5,
-        int prune_until = 30000,
-        float prune_threshold_init = 1e-4f,
+        int prune_from = 1000,
+        int prune_every = 100,
+        int prune_until = 18000,
+        float prune_threshold_init = 0.0001f,
         float prune_threshold_final = 0.05f,
         // int min_voxels = 512,
         int opacity_reset_interval = 3000,
         int densify_from_iter = 500,
         int densify_until_iter = 15'000,
-        float densify_grad_threshold = 0.0002f
+        float densify_grad_threshold = 0.0002f,
+
+        int geo_warmup_iters = 1000,
+        int sh0_warmup_iters = 1000,
+        float geo_weight_decay = 1e-4f
     );
 
 public:
     int iterations_;
     float geo_lr_init_;
-    float geo_lr_final_;
+    // float geo_lr_final_;
     float geo_lr_delay_mult_;
     int geo_lr_max_steps_;
     float meta_accum_lr_;
@@ -101,4 +105,8 @@ public:
     int densify_from_iter_;
     int densify_until_iter_;
     float densify_grad_threshold_;
+
+    int geo_warmup_iters_;      // how many iters to train geometry only
+    int sh0_warmup_iters_;      // after that, train SH₀ only
+    float geo_weight_decay_;    // small L2 on geo to stabilize
 };

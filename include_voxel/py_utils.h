@@ -48,6 +48,8 @@ namespace sv {
     
             float tanfovx = (0.5f * cam.width) / cam.fx;
             float tanfovy = (0.5f * cam.height) / cam.fy;
+            // float tanfovx = std::tan(cam.fx * 0.5f);
+            // float tanfovy = std::tan(cam.fy * 0.5f);
 
             // std::cout << "cx: " << cam.cx << ", cy: " << cam.cy << std::endl;
 

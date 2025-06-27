@@ -44,34 +44,35 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 # Learning rate
 Optimization.max_num_iterations:       30100     
 Optimization.geo_lr_init:         0.00032
-Optimization.geo_lr_final:        0.00032
+# Optimization.geo_lr_final:        0.00032
 Optimization.geo_lr_delay_mult:   0.01
 Optimization.geo_lr_max_steps:    24
 Optimization.sh0_lr:                   0.0025   
 Optimization.shs_lr:                   0.000125   
-Optimization.meta_accum_lr:            0.1
+# Optimization.meta_accum_lr:            0.1
 
 # Subdivision schedule
 Optimization.percent_dense: 0.01
 Optimization.lambda_dssim: 0.2
-Optimization.densification_interval:   100
-Optimization.densify_from_iter: 800
-Optimization.densify_until_iter: 30000
-Optimization.densify_grad_threshold: 0.001
 
-Optimization.subdiv_from:              4
-Optimization.subdiv_every:             10
-Optimization.subdiv_until:             40
-Optimization.subdiv_quantile:          0.25
-Optimization.subdiv_gradient_threshold: 1e-8
+Optimization.densification_interval:   100
+# Optimization.densify_from_iter: 800
+# Optimization.densify_until_iter: 30000
+# Optimization.densify_grad_threshold: 0.001
 
 # Pruning schedule
-Optimization.prune_from:               10
-Optimization.prune_every:              5
-Optimization.prune_until:              50
-Optimization.prune_threshold_init:     1e-4
-Optimization.prune_threshold_final:    0.1
-Optimization.min_voxels:               512
+Optimization.prune_from:               1000
+Optimization.prune_every:              100
+Optimization.prune_until:              18000
+Optimization.prune_threshold_init:     0.0001
+Optimization.prune_threshold_final:    0.05
+# Optimization.min_voxels:               512
+
+Optimization.subdiv_from:              1000
+Optimization.subdiv_every:             100
+Optimization.subdiv_until:             15000
+# Optimization.subdiv_quantile:          0.25
+# Optimization.subdiv_gradient_threshold: 1e-8
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

@@ -37,10 +37,10 @@ VoxelPipelineParams::VoxelPipelineParams(bool convert_SHs, bool compute_cov3D)
 VoxelOptimizationParams::VoxelOptimizationParams(
     int iterations,
     float geo_lr_init,
-    float geo_lr_final,
+    // float geo_lr_final,
     float geo_lr_delay_mult,
     float geo_lr_max_steps,
-    float meta_accum_lr,
+    // float meta_accum_lr,
     float sh0_lr,
     float shs_lr,
     float lambda_dssim,
@@ -59,13 +59,18 @@ VoxelOptimizationParams::VoxelOptimizationParams(
     int opacity_reset_interval,
     int densify_from_iter,
     int densify_until_iter,
-    float densify_grad_threshold)
+    float densify_grad_threshold,
+    
+    int geo_warmup_iters,
+    int sh0_warmup_iters,
+    float geo_weight_decay
+)
     :   iterations_(iterations),
         geo_lr_init_(geo_lr_init),
-        geo_lr_final_(geo_lr_final),
+        // geo_lr_final_(geo_lr_final),
         geo_lr_delay_mult_(geo_lr_delay_mult),
         geo_lr_max_steps_(geo_lr_max_steps),  // default value, can be adjusted later
-        meta_accum_lr_(meta_accum_lr),
+        // meta_accum_lr_(meta_accum_lr),
         sh0_lr_(sh0_lr),
         shs_lr_(shs_lr),
         lambda_dssim_(lambda_dssim),
@@ -84,5 +89,9 @@ VoxelOptimizationParams::VoxelOptimizationParams(
         opacity_reset_interval_(opacity_reset_interval),
         densify_from_iter_(densify_from_iter),
         densify_until_iter_(densify_until_iter),
-        densify_grad_threshold_(densify_grad_threshold)
+        densify_grad_threshold_(densify_grad_threshold),
+
+        geo_warmup_iters_(geo_warmup_iters),
+        sh0_warmup_iters_(sh0_warmup_iters),
+        geo_weight_decay_(geo_weight_decay)
 {}

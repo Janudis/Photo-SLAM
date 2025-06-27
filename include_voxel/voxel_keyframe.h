@@ -22,7 +22,9 @@
 class VoxelKeyframe
 {
 public:
-    VoxelKeyframe() {}
+    VoxelKeyframe() {
+    visible_voxel_indices_ = torch::empty({0}, torch::dtype(torch::kLong).device(torch::kCUDA));
+    }
     /* ------------------------------------------------------------------ ctor */
     VoxelKeyframe(std::size_t fid, int creation_iter = 0)
         : fid_(fid), creation_iter_(creation_iter) {}
@@ -100,7 +102,7 @@ public:
     torch::Tensor t_tensor_; ///< extrinsics
 
     float zfar_ = 100.0f;
-    float znear_ = 0.01f;
+    float znear_ = 0.02f;
 
     Eigen::Vector3f trans_ = {0.0f, 0.0f, 0.0f};
     float scale_ = 1.0f;
@@ -115,5 +117,6 @@ public:
     std::vector<float> kps_point_local_;
 
     bool done_inactive_geo_densify_ = false;
+    torch::Tensor visible_voxel_indices_;
 };
 

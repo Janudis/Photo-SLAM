@@ -9,8 +9,8 @@ class MiniCam:
         self.c2w = c2w
         self.tanfovx = tanfovx
         self.tanfovy = tanfovy
-        self.fovx = 2 * math.atan(tanfovx)  
-        self.fovy = 2 * math.atan(tanfovy)  
+        # self.fovx = 2 * math.atan(tanfovx)  
+        # self.fovy = 2 * math.atan(tanfovy)  
         self.cx = cx
         self.cy = cy
         self.cam_mode = cam_mode

@@ -221,15 +221,15 @@ target_link_libraries(imgui glfw OpenGL::GL)
 # 3.  🧱 SPARSE‑VOXEL  – new code
 ###############################################################################
 
-### 3.1  CUDA rasteriser  --------------------------------------------
-file (GLOB VX_SRCS cuda_voxel_rasterizer/*.cu cuda_voxel_rasterizer/*.cpp)
-add_library (voxel_rasterizer SHARED ${VX_SRCS})
-set_target_properties (voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
-target_include_directories (voxel_rasterizer
-        PRIVATE
-            ${TORCH_INCLUDE_DIRS}
-            ${Python3_INCLUDE_DIRS})
-target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
+# ### 3.1  CUDA rasteriser  --------------------------------------------
+# file (GLOB VX_SRCS cuda_voxel_rasterizer/*.cu cuda_voxel_rasterizer/*.cpp)
+# add_library (voxel_rasterizer SHARED ${VX_SRCS})
+# set_target_properties (voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
+# target_include_directories (voxel_rasterizer
+#         PRIVATE
+#             ${TORCH_INCLUDE_DIRS}
+#             ${Python3_INCLUDE_DIRS})
+# target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
 
 ### 3.2  C++ core / optimiser  ---------------------------------------
 add_library(voxel_core
@@ -248,13 +248,12 @@ target_include_directories (voxel_core
             ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
 target_link_libraries (voxel_core
         PUBLIC
-            voxel_rasterizer           # call kernels directly if needed
+            # voxel_rasterizer           # call kernels directly if needed
             "${TORCH_LIBRARIES}"
             Python3::Python
             pybind11::embed
             ${OpenCV_LIBRARIES})
 
-            
 add_library(voxel_viewer SHARED
     viewer/drawer_utils.h
     viewer/imgui_viewer.cpp
@@ -265,7 +264,7 @@ add_library(voxel_viewer SHARED
 target_link_libraries(voxel_viewer
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
     voxel_core      # <-- Make sure voxel_core is linked
-    voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
+    # voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
     imgui
     ${OpenCV_LIBRARIES}
     jsoncpp_lib

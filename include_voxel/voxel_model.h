@@ -50,9 +50,9 @@
     this->oct_level_            = torch::empty({0},       torch::TensorOptions().dtype(torch::kInt32  ).device(device_type)); \
     this->subdiv_meta_          = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->subdiv_p_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->subdiv_p_grad_buffer_ = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     VOXEL_MODEL_TENSORS_TO_VEC
 // this->opacity_              = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+// this->subdiv_p_grad_buffer_ = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
 
 namespace py = pybind11;
 namespace sv {
@@ -183,6 +183,12 @@ public:
         const std::string&               output_dir = ""
     ) const;
 
+    torch::Tensor errorNormalized() const;
+    void accumulateError(const torch::Tensor& vis_idx,
+                        const torch::Tensor& err);
+    void rebuildOptimizer();
+    torch::Tensor validMask(float size_mul) const;
+
 protected:
     float exponLrFunc(int step);
 
@@ -211,7 +217,7 @@ public:
     torch::Tensor oct_level_;          // [N]
     torch::Tensor subdiv_meta_;        // [N]
     torch::Tensor subdiv_p_;           // [N]
-    torch::Tensor subdiv_p_grad_buffer_;// [N]
+    // torch::Tensor subdiv_p_grad_buffer_;// [N]
 
     torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
     torch::Tensor _geo_grid_pts;    // [M]  float32 learnable density at each grid-point
@@ -239,6 +245,9 @@ public:
 
     torch::Tensor xyz_gradient_accum_;   // [N,1]  ∑ |grad|
     torch::Tensor denom_;                // [N,1]  counter
+    
+    torch::Tensor voxel_error_sum_;    // (M,1)
+    torch::Tensor voxel_hit_count_;    // (M,1)
 
 protected:
     /// Learning‐rate scheduling parameters

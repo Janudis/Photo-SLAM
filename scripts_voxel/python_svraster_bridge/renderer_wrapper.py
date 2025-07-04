@@ -89,6 +89,12 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     if voxel_data["centers"].numel() == 0:
         print("[WARNING] No voxels to render!")
         return
+    
+    N = voxel_data["centers"].size(0)
+    vox_feats = torch.arange(
+        1, N + 1,
+        device=device, dtype=torch.float32
+    ).unsqueeze(1).contiguous()                 #  →  [N,1]
 
     rs = svr.RasterSettings(
             color_mode = 'sh',
@@ -107,9 +113,10 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             need_depth = False,
             need_normal = False,
             track_max_w = True,
+            vox_feats  = vox_feats 
             # --------------- NEW ---------------
-            lambda_R_concen = 1e-2,        # same value as stock code
-            gt_color = gt_image,           # (3,H,W) float32
+            # lambda_R_concen = 1e-2,        # same value as stock code
+            # gt_color = gt_image,           # (3,H,W) float32
     )
 
     def vox_fn(idx, cam_pos, mode):
@@ -179,8 +186,11 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
 
     # ---------- hand the visibility set back to C++ ----------
     idx = torch.where(ndup > 0)[0]                  # (K,)
-    # unpack
+    # geom = geom_buf.view(cam.image_height, cam.image_width).long()    
     color, depth, normal, T, max_w, feat = out
+
+    vox_id_map = feat.squeeze(0).long() - 1       # back to 0-based
+    vox_id_map[vox_id_map < 0] = -1           # background sentinel
     # SVRaster gives (H,W,3) color → make (1,3,H,W)
     color  = color .unsqueeze(0)
     depth  = depth .unsqueeze(0) if depth is not None  else None
@@ -196,6 +206,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
       "max_w":  max_w,
       "feat":   feat,
       "idx":    idx,
+      "geom":   vox_id_map,
     }
 
     # rgb = out[0].unsqueeze(0)           # (1, 3, H, W)

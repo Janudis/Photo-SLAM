@@ -71,6 +71,10 @@ Optimization.prune_threshold_final:    0.05
 Optimization.subdiv_from:              1000
 Optimization.subdiv_every:             100
 Optimization.subdiv_until:             15000
+Optimization.subdivide_samp_thres:    0.01
+Optimization.subdivide_max_num:       1000
+Optimization.subdivide_target_scale: 90.0
+Optimization.subdivide_all_until:     0 # 0:never, others:until
 # Optimization.subdiv_quantile:          0.25
 # Optimization.subdiv_gradient_threshold: 1e-8
 

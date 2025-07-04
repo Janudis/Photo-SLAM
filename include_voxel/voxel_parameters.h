@@ -45,13 +45,13 @@ class VoxelOptimizationParams
 public:
     VoxelOptimizationParams(
         int iterations = 30'000,
-        float geo_lr_init = 0.0001f,
-        // float geo_lr_final = 0.0000016f,
+        float geo_lr_init = 0.00016f,
+        float geo_lr_final = 0.0000016f,
         float geo_lr_delay_mult = 0.01f,
         float geo_lr_max_steps = 30'000,
         // float meta_accum_lr = 0.1f,
         float sh0_lr = 0.00125f,
-        float shs_lr = 0.000125f,
+        float shs_lr = 0.0000625f, // 1/20 of SH₀
         float lambda_dssim = 0.2f,
         int densification_interval = 100,
         int subdiv_from = 1000,
@@ -59,6 +59,10 @@ public:
         int subdiv_until = 15000,
         float subdiv_quantile = 0.8f,
         float subdiv_gradient_threshold = 1e-4f,
+        float subdivide_samp_thres = 1.0f,
+        int   subdivide_max_num    = 10'000'000,
+        float subdivide_target_scale_ = 90.f,
+        int   subdivide_all_until_    = 0,
         int prune_from = 1000,
         int prune_every = 100,
         int prune_until = 18000,
@@ -78,7 +82,7 @@ public:
 public:
     int iterations_;
     float geo_lr_init_;
-    // float geo_lr_final_;
+    float geo_lr_final_;
     float geo_lr_delay_mult_;
     int geo_lr_max_steps_;
     float meta_accum_lr_;
@@ -92,7 +96,10 @@ public:
     int subdiv_until_;
     float subdiv_quantile_;
     float subdiv_gradient_threshold_;
-
+    float subdivide_samp_thres_;
+    int subdivide_max_num_;
+    float subdivide_target_scale_;
+    int subdivide_all_until_;
     int prune_from_;
     int prune_every_;
     int prune_until_;

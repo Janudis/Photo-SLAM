@@ -2,6 +2,8 @@
 
 namespace py = pybind11;
 std::ofstream loss_log_;
+std::ofstream loss_l1_log_;
+std::ofstream loss_ssim_log_;
 inline void saveDebugImage(torch::Tensor tensor,
                            const std::string& path)
 {
@@ -56,6 +58,83 @@ inline void saveDebugImage(torch::Tensor tensor,
     cv::imwrite(path, bgr);
 }
 
+// helper to show a 1×3×H×W float tensor in [0,1]
+inline void showTensor(const torch::Tensor &t, const std::string &winName)
+{
+    // squeeze batch, CHW→HWC, [0,1]→[0,255], uint8
+    auto img = t.squeeze(0)                      
+                 .permute({1,2,0})               
+                 .mul(255.0f).clamp(0.0f,255.0f)
+                 .to(torch::kUInt8)
+                 .contiguous()
+                 .cpu();
+
+    int H = img.size(0), W = img.size(1);
+    // wrap the data as an RGB mat
+    cv::Mat mat_rgb(H, W, CV_8UC3, img.data_ptr());
+
+    // convert to BGR for OpenCV
+    cv::Mat mat_bgr;
+    cv::cvtColor(mat_rgb, mat_bgr, cv::COLOR_RGB2BGR);
+
+    cv::imshow(winName, mat_bgr);
+    cv::waitKey(1);
+}
+
+inline bool tensor_defined(const py::dict& pkg, const char* key,
+                           torch::Tensor& out) {
+    auto it = pkg.contains(key) ? pkg[key] : py::none();
+    if (!it.is_none()) {
+        torch::Tensor t = it.cast<torch::Tensor>();
+        if (t.defined()) {         // real tensor found
+            out = t;
+            return true;
+        }
+    }
+    return false;                  // key missing or undefined
+}
+
+static inline int64_t ceil_div(int64_t x, int64_t y)
+{ return (x + y - 1) / y; }
+
+// use *existing* field names:  subdiv_until_  /  subdiv_every_
+static inline int remaining_subdiv_times(
+        int iter,
+        const VoxelOptimizationParams& p)
+{
+    if (iter > p.subdiv_until_) return 0;
+    return ceil_div(p.subdiv_until_ - iter, p.subdiv_every_) + 1;
+}
+
+void saveTensor(const torch::Tensor &t,
+                const std::string &tag,
+                const std::string &dbg_dir,
+                int iter,
+                int image_id)
+{
+    auto img = t.squeeze(0)
+                 .permute({1,2,0})
+               // optional gamma:
+               // .clamp(0.0f, 1.0f).pow(1.0f/2.2f)
+                 .mul(255.0f).clamp(0.0f,255.0f)
+                 .to(torch::kUInt8)
+                 .contiguous()
+                 .cpu();
+
+    int H = img.size(0), W = img.size(1);
+    cv::Mat rgb(H, W, CV_8UC3, img.data_ptr());
+    cv::Mat bgr;
+    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+
+    std::ostringstream ss;
+    ss << dbg_dir << "/" 
+       << tag 
+       << "_iter" << std::setw(6) << std::setfill('0') << iter
+       << "_img"  << std::setw(3) << std::setfill('0') << image_id
+       << ".png";
+    cv::imwrite(ss.str(), bgr);
+}
+
 VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                          const std::filesystem::path& config_file_path,
                         //  const std::filesystem::path& seq_dir,
@@ -78,9 +157,11 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
       large_trans_th_(1e-2f),
       training_report_interval_(0)
 {
-    loss_log_.open("loss.csv", std::ios::out);
     std::srand(seed);
     torch::manual_seed(seed);
+    loss_log_.open("loss.csv", std::ios::out);
+    loss_ssim_log_.open("loss_ssim.csv", std::ios::out);
+    loss_l1_log_.open("loss_l1.csv", std::ios::out);
 
     if (device_type == torch::kCUDA && torch::cuda::is_available()) {
         std::cout << "[VoxelMapper] CUDA available! Training on GPU." << std::endl;
@@ -111,6 +192,12 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     voxel_model_ = std::make_shared<sv::VoxelModel>(model_params_);
     scene_       = std::make_shared<sv::VoxelScene>(model_params_);
     
+    size_t N = scene_->keyframes().size();
+    best_loss_per_kf_.assign(N,  std::numeric_limits<float>::infinity());
+    worst_loss_per_kf_.assign(N, -std::numeric_limits<float>::infinity());
+    extrema_dir_ = result_dir_ / "extrema";
+    std::filesystem::create_directories(extrema_dir_);
+
     switch (pSLAM->getSensorType()) {
     case ORB_SLAM3::System::MONOCULAR:
     case ORB_SLAM3::System::IMU_MONOCULAR:
@@ -495,230 +582,388 @@ void VoxelMapper::run()
      signalStop();
  }
 
- // Add training with optimization loop
-void VoxelMapper::trainForOneIteration()
-{
-    // 1) bump global iteration counter
-    increaseIteration(1);
-
-    // 2) pick a random keyframe from the sliding window
-    std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
-    if (!viewpoint_cam) {
-        // if none available, roll back iteration and exit
-        increaseIteration(-1);
-        return;
-    }
-    writeKeyframeUsedTimes(result_dir_ / "used_times");
-
-    // 3) select ground truth image + mask tensors
-    //    (it always use the “original” resolution in our voxel case)
-    int image_height, image_width;
-    torch::Tensor gt_image, mask;
-    image_height = viewpoint_cam->image_height_;
-    image_width = viewpoint_cam->image_width_;
-    gt_image = viewpoint_cam->original_image_
-                                   .to(mDevice)          // (3,H,W)
-                                   .unsqueeze(0);        // → (1,3,H,W)
-    mask = undistort_mask_[viewpoint_cam->camera_id_]
-                                   .to(mDevice)
-                                   .to(torch::kFloat32); // (H,W)
-    // saveDebugImage(gt_image, (result_dir_ / "debug_gt.jpg").string());
-
-    // if it somehow came in as 3×H×W, just take the first (they're identical)
-    if (mask.dim() == 3 && mask.size(0) == 3) {
-        mask = mask[0];   // now (H,W)
-    }
-    // now make it 1×1×H×W
-    if (mask.dim() == 2) {
-        mask = mask.unsqueeze(0).unsqueeze(0);
-    }
-    else if (mask.dim() == 3) {
-        // if somebody gave you (1,H,W) already:
-        mask = mask.unsqueeze(1);  // (1,1,H,W)
-    }
-
-    // 4) grow SH degree every 1000 iterations (locked during render)
-    std::unique_lock<std::mutex> lock_render(mutex_render_);
-    
-    if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
-        default_sh_ += 1;
-    voxel_model_->setShDegree(default_sh_);
-
-    // 5) build a MiniCam out of this keyframe
-    // viewpoint_cam->computeTransformTensors();            // idempotent
-    sv::MiniCam cam = viewpoint_cam->toMiniCam();
-    cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
-    cam.w2c = cam.w2c.contiguous().to(mDevice);
-
-    // 6) update all learning rates
-    if (mpSLAM) {
-        int used_times = kfs_used_times_[viewpoint_cam->fid_];
-        int step = (used_times <= opt_params_.geo_lr_max_steps_)
-                       ? used_times
-                       : opt_params_.geo_lr_max_steps_;
-        float geo_lr = voxel_model_->updateLearningRate(step);
-        voxel_model_->setGeoLearningRate(geo_lr);
-        // setGeoLearningRateInit(geo_lr);
-    } else {
-        voxel_model_->updateLearningRate(getIteration());
-    }
-    // SH-DC and higher-SH rates remain constant:
-    voxel_model_->setSh0LearningRate(sh0LearningRate());
-    voxel_model_->setShsLearningRate(shsLearningRate());
-
-    // const int iter = getIteration();
-    // const auto &opt = opt_params_;
-    // if (iter < opt.geo_warmup_iters_) {
-    //     // --- geometry only ---
-    //     float geo_lr = voxel_model_->updateLearningRate(iter);
-    //     voxel_model_->setGeoLearningRate(geo_lr);
-    //     voxel_model_->setSh0LearningRate(0.0f);
-    //     voxel_model_->setShsLearningRate(0.0f);
-    // }
-    // else if (iter < opt.geo_warmup_iters_ + opt.sh0_warmup_iters_) {
-    //     // --- freeze geo, train SH₀ only ---
-    //     voxel_model_->setGeoLearningRate(0.0f);
-    //     voxel_model_->setSh0LearningRate(sh0LearningRate());
-    //     voxel_model_->setShsLearningRate(0.0f);
-    // }
-    // else {
-    //     // --- full joint training ---
-    //     float geo_lr = voxel_model_->updateLearningRate(iter);
-    //     voxel_model_->setGeoLearningRate(geo_lr);
-    //     voxel_model_->setSh0LearningRate(sh0LearningRate());
-    //     voxel_model_->setShsLearningRate(shsLearningRate());
-    // }
-
-    torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
-                            .mul(255.0f)
-                            .clamp(0.0f, 255.0f)
-                            .to(torch::kUInt8)            // <--- cast to U8
-                            .cpu()
-                            .contiguous();
-    torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
-    py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
-    auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
-    // lock_render.unlock();
-    if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
-        std::cout << "render pkg empty" << std::endl;
-        return;
-    }
-    torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
-    torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
-    
-    // 8) compute masked photometric loss
-    
-    torch::Tensor Ll1 = loss_utils::l1_loss(masked_image, gt_image);
-    float lambda_dssim = lambdaDssim();
-    torch::Tensor loss = (1.0 - lambda_dssim) * Ll1
-            + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
-
+// Add training with optimization loop
+    void VoxelMapper::trainForOneIteration()
     {
-        py::gil_scoped_release no_gil;
-        loss.backward();
+        // 1) bump global iteration counter
+        increaseIteration(1);
 
-        if (mDevice == torch::kCUDA)  
-            torch::cuda::synchronize();
-    }
+        // 2) pick a random keyframe from the sliding window
+        std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
+        if (!viewpoint_cam) {
+            // if none available, roll back iteration and exit
+            increaseIteration(-1);
+            return;
+        }
+        writeKeyframeUsedTimes(result_dir_ / "used_times");
 
-    // 10) accumulate subdivision gradients into subdiv_meta_
-    {
-        /* ------------------------------------------------ 0. bookkeeping */
-        torch::NoGradGuard no_grad;
-        // 0) bookkeeping
-        ema_loss_for_log_ = 0.4f * loss.item<float>() + 0.6f * ema_loss_for_log_;
-        if (keyframe_record_interval_ &&
-            getIteration() % keyframe_record_interval_ == 0)
-        {
-            recordKeyframeRendered(masked_image,
-                                    gt_image,
-                                    viewpoint_cam->fid_,
-                                    result_dir_, result_dir_, result_dir_);
+        // 3) select ground truth image + mask tensors
+        //    (it always use the “original” resolution in our voxel case)
+        int image_height, image_width;
+        torch::Tensor gt_image, mask;
+        image_height = viewpoint_cam->image_height_;
+        image_width = viewpoint_cam->image_width_;
+        gt_image = viewpoint_cam->original_image_
+                                    .to(mDevice)          // (3,H,W)
+                                    .unsqueeze(0);        // → (1,3,H,W)
+        mask = undistort_mask_[viewpoint_cam->camera_id_]
+                                    .to(mDevice)
+                                    .to(torch::kFloat32); // (H,W)
+        // saveDebugImage(gt_image, (result_dir_ / "debug_gt.jpg").string());
+
+        // if it somehow came in as 3×H×W, just take the first (they're identical)
+        if (mask.dim() == 3 && mask.size(0) == 3) {
+            mask = mask[0];   // now (H,W)
+        }
+        // now make it 1×1×H×W
+        if (mask.dim() == 2) {
+            mask = mask.unsqueeze(0).unsqueeze(0);
+        }
+        else if (mask.dim() == 3) {
+            // if somebody gave you (1,H,W) already:
+            mask = mask.unsqueeze(1);  // (1,1,H,W)
         }
 
-        // 1) grab the raw ∂L/∂subdiv_p_ from the last backward pass
-        auto grad_p = voxel_model_->getSubdivPriorityGrad()  // [M,1]
-                            .view(-1);                      // [M]
-
-        // 2) restrict to just those voxels that actually contributed
-        torch::Tensor vis_idx = render_pkg["idx"]
-                                    .to(mDevice, /*non_blocking=*/true)
-                                    .contiguous();      // (K,)
-        voxel_model_->accumulateSubdivGradients(vis_idx,
-                                                grad_p.index({vis_idx}));
-
-        // 3) PRUNE
-        if (getIteration() >= opt_params_.prune_from_
-            && getIteration() % opt_params_.prune_every_ == 0)
-        {
-            auto buf = voxel_model_->subdiv_p_grad_buffer_.view(-1);  // (N)
-            // linearly ramp the threshold
-            float alpha = float(getIteration() - opt_params_.prune_from_) /
-                            std::max(1.f,
-                                    float(opt_params_.prune_until_ -
-                                            opt_params_.prune_from_));
-            alpha = std::clamp(alpha, 0.f, 1.f);
-            float th = (1.f - alpha) * opt_params_.prune_threshold_init_ +
-                            alpha * opt_params_.prune_threshold_final_;
-            torch::Tensor keep_mask = buf >= th;  // bool[N]
-            voxel_model_->prune(keep_mask);
-        }
-
-        // 4) SUBDIVIDE
-        if (getIteration() >= opt_params_.subdiv_from_
-            && getIteration() % opt_params_.subdiv_every_ == 0)
-        {
-            auto buf = voxel_model_->subdiv_p_grad_buffer_.view(-1);
-            // pick the top (subdiv_quantile) fraction
-            int64_t k = std::max<int64_t>(
-                1,
-                int64_t(buf.numel() *
-                        (1.0f - opt_params_.subdiv_quantile_))
-            );
-            float split_thr = std::get<0>(buf.kthvalue(k)).item<float>();
-            torch::Tensor split_mask = buf >= split_thr;
-            voxel_model_->subdivide(split_mask);
-
-            // reset so that next window’s gradients start fresh
-            voxel_model_->subdiv_p_grad_buffer_.zero_();
-        }
-
-        // every training_report_interval_ iterations, print a concise report
-        // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
-        //     sv::VoxelTrainer::trainingReport(
-        //         iteration_,
-        //         opt_params_.iterations_,
-        //         Ll1,
-        //         loss,
-        //         ema_loss_for_log_,
-        //         loss_utils::l1_loss,
-        //         // elapsed_ms,
-        //         *voxel_model_,
-        //         *scene_,
-        //         pipe_params_,
-        //         background_
-        //     );
-        // }
-
-        if ((all_keyframes_record_interval_ && getIteration() % all_keyframes_record_interval_ == 0)
-            )
-        {
-            renderAndRecordAllKeyframes();
-            // savePly(result_dir_ / std::to_string(iteration_) / "ply");
-        }
-
-        if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
-            std::cout << "[TRAIN] iter " << iteration_
-                    << "  L1: "    << Ll1.item<float>()
-                    << "  loss: "  << loss.item<float>()
-                    << "  ema: "   << ema_loss_for_log_ << '\n';
-        }
-        float loss_val = loss.item<float>();
-        loss_log_ << iteration_ << "," << loss_val << "\n";
+        // 4) grow SH degree every 1000 iterations (locked during render)
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
         
-        if (iteration_ % 50 == 0) {
-            writeKeyframeUsedTimes(result_dir_);
+        if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
+            default_sh_ += 1;
+        voxel_model_->setShDegree(default_sh_);
+
+        // 5) build a MiniCam out of this keyframe
+        // viewpoint_cam->computeTransformTensors();            // idempotent
+        sv::MiniCam cam = viewpoint_cam->toMiniCam();
+        cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
+        cam.w2c = cam.w2c.contiguous().to(mDevice);
+
+        // 6) update all learning rates
+        if (mpSLAM) {
+            int used_times = kfs_used_times_[viewpoint_cam->fid_];
+            int step = (used_times <= opt_params_.geo_lr_max_steps_)
+                        ? used_times
+                        : opt_params_.geo_lr_max_steps_;
+            float geo_lr = voxel_model_->updateLearningRate(step);
+            // voxel_model_->setGeoLearningRate(geo_lr);
+            setGeoLearningRateInit(geo_lr);
+        } else {
+            voxel_model_->updateLearningRate(getIteration());
         }
+        // SH-DC and higher-SH rates remain constant:
+        voxel_model_->setSh0LearningRate(sh0LearningRate());
+        voxel_model_->setShsLearningRate(shsLearningRate());
+
+        torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
+                                .mul(255.0f)
+                                .clamp(0.0f, 255.0f)
+                                .to(torch::kUInt8)            // <--- cast to U8
+                                .cpu()
+                                .contiguous();
+        torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
+        py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
+        auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
+        // lock_render.unlock();
+        if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
+            std::cout << "render pkg empty" << std::endl;
+            return;
+        }
+        torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
+        torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
+        
+        // 8) compute masked photometric loss
+        // showTensor(gt_image,     "GT Image");
+        // showTensor(masked_image, "Masked Render");
+        // saveTensor(gt_image,     "gt",    "/home/dimitris/Photo-SLAM/debug", getIteration(), viewpoint_cam->fid_);
+        // saveTensor(masked_image, "masked", "/home/dimitris/Photo-SLAM/debug", getIteration(), viewpoint_cam->fid_);
+        auto Ll1 = loss_utils::l1_loss(masked_image, gt_image);
+        float lambda_dssim = lambdaDssim();
+        auto loss = (1.0 - lambda_dssim) * Ll1
+                + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
+
+        {
+            py::gil_scoped_release no_gil;
+            loss.backward();
+
+            if (mDevice == torch::kCUDA)  
+                torch::cuda::synchronize();
+        }
+
+        // 10) accumulate subdivision gradients into subdiv_meta_
+        {
+            /* ------------------------------------------------ 0. bookkeeping */
+            torch::NoGradGuard no_grad;
+            // 0) bookkeeping
+            ema_loss_for_log_ = 0.4f * loss.item<float>() + 0.6f * ema_loss_for_log_;
+            if (keyframe_record_interval_ &&
+                getIteration() % keyframe_record_interval_ == 0)
+                recordKeyframeRendered(masked_image,
+                                        gt_image,
+                                        viewpoint_cam->fid_,
+                                        result_dir_, result_dir_, result_dir_);
+
+            // 1) grab the raw ∂L/∂subdiv_p_ from the last backward pass
+            auto grad_p = voxel_model_->getSubdivPriorityGrad()  // [M,1]
+                                .view(-1);                      // [M]
+
+            // 2) restrict to just those voxels that actually contributed
+            auto idx_tensor = render_pkg["idx"];
+            if (!idx_tensor.defined()) {
+                // nothing visible this iteration – skip optimisation step
+                voxel_model_->optimizer_->zero_grad(true);
+                return;
+            }
+            torch::Tensor vis_idx = idx_tensor.to(mDevice, /*non_blocking=*/true)
+                                            .contiguous();
+            if (vis_idx.numel() == 0) {
+                // no voxel hit: just zero-out grads and continue
+                voxel_model_->optimizer_->zero_grad(true);
+                return;
+            }
+            voxel_model_->accumulateSubdivGradients(vis_idx,
+                                                    grad_p.index({vis_idx}));
+            // std::cout << "[DBG]  max|grad_buf| = "
+            //         << voxel_model_->subdiv_p_grad_buffer_.abs().max().item<float>()
+            //         << '\n';
+
+            {
+                // std::cout << "\n[DBG] iter " << iteration_
+                //         << "  render_pkg contains:\n";
+                // for (const auto& kv : render_pkg)              // std::pair<std::string,Tensor>
+                // {
+                //     const std::string& name = kv.first;
+                //     const torch::Tensor& t  = kv.second;
+                //     bool defined = t.defined();
+                //     std::string dtype = defined ? std::string(t.dtype().name()) : "n/a";
+                //     std::cout << "    • " << name
+                //             << "  | defined=" << std::boolalpha << defined
+                //             << "  | dtype="   << dtype
+                //             << "  | sizes=";
+                //     if (!defined || t.dim() == 0) {
+                //         std::cout << "[]";
+                //     } else {
+                //         std::cout << '[';
+                //         for (int i = 0; i < t.dim(); ++i) {
+                //             std::cout << t.size(i) << (i + 1 == t.dim() ? "" : ",");
+                //         }
+                //         std::cout << ']';
+                //     }
+                //     std::cout << '\n';
+                // }
+                auto it = render_pkg.find("geom");
+                if (it != render_pkg.end() && it->second.defined())
+                {
+                    /* ---------------- geometry buffer ------------------------- */
+                    torch::Tensor geom = it->second.to(mDevice, /*non_blocking=*/true)
+                                                    .contiguous();          // (H,W)  int64
+
+                    /*  PER-PIXEL L1 error ..................................... */
+                    torch::Tensor per_pix_err =
+                        (rendered_image - gt_image).abs()   // (1,3,H,W)
+                                                    .mean(1)   // → (1,H,W)
+                                                    .squeeze(0);            // (H,W)
+
+                    /*  gather only fg pixels .................................. */
+                    torch::Tensor mask_fg  = geom >= 0;                      // bool(H,W)
+                    torch::Tensor vox_ids  = geom.masked_select(mask_fg)
+                                                    .to(torch::kLong);       // (K,)
+                    torch::Tensor pix_err  = per_pix_err.masked_select(mask_fg)
+                                                    .unsqueeze(1);         // (K,1)
+
+                    voxel_model_->voxel_error_sum_ .index_add_(0, vox_ids, pix_err);
+                    voxel_model_->voxel_hit_count_.index_add_(0, vox_ids,
+                                                            torch::ones_like(pix_err));
+
+
+                    float loss_val = loss.item<float>();
+                    int fid = viewpoint_cam->fid_;                 // key-frame ID being trained
+                    // --- 1) ensure our vectors are big enough ---
+                    if (fid >= static_cast<int>(best_loss_per_kf_.size())) {
+                        size_t newSize = fid + 1;
+                        best_loss_per_kf_.resize(newSize,
+                                                std::numeric_limits<float>::infinity());
+                        worst_loss_per_kf_.resize(newSize,
+                                                -std::numeric_limits<float>::infinity());
+                    }
+                    // references into the right slot
+                    float &best  = best_loss_per_kf_[fid];
+                    float &worst = worst_loss_per_kf_[fid];
+                    // --- 2) update “best” for this KF ---
+                    if (loss_val < best) {
+                        best = loss_val;
+                        auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+                        std::filesystem::create_directories(kf_dir);
+                        saveTensor(gt_image,     "best_gt",     kf_dir.string(), iteration_, fid);
+                        saveTensor(masked_image, "best_masked", kf_dir.string(), iteration_, fid);
+                        saveVoxelErrorHeatmap(cam,
+                            geom,
+                            gt_image,
+                            viewpoint_cam->fid_,                              // <- key-frame id
+                            (result_dir_ / "heatmaps").string());
+                    }
+                    // --- 3) update “worst” for this KF ---
+                    if (loss_val > worst) {
+                        worst = loss_val;
+                        auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+                        std::filesystem::create_directories(kf_dir);
+                        saveTensor(gt_image,     "worst_gt",     kf_dir.string(), iteration_, fid);
+                        saveTensor(masked_image, "worst_masked", kf_dir.string(), iteration_, fid);
+                        saveVoxelErrorHeatmap(cam,
+                            geom,
+                            gt_image,
+                            viewpoint_cam->fid_,                              // <- key-frame id
+                            (result_dir_ / "heatmaps").string());
+                    }
+                    loss_log_ << iteration_ << "," << loss_val << "\n";
+                    loss_l1_log_ << iteration_ << "," << Ll1.item<float>() << "\n";
+                    loss_ssim_log_ << iteration_ << "," 
+                        << (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()).item<float>()) << "\n";
+
+                    /* --------------------------------------------------------- */
+                    /*  DEBUG: print per-voxel mean error (top-k or full)        */
+                    if (iteration_ % 50 == 0) {                         // -- every 50 iters
+                        torch::Tensor mean_err =
+                            voxel_model_->voxel_error_sum_
+                            / voxel_model_->voxel_hit_count_.clamp_min(1);  // (N,1)
+                        mean_err = mean_err.squeeze(1);                     // (N)
+
+                        // print worst 10 voxels
+                        auto top = std::get<1>(mean_err.topk(/*k=*/10));    // indices
+                        // std::cout << "[DBG] iter " << iteration_
+                        //         << "  worst-10 voxel errors:\n";
+                        for (int i = 0; i < top.size(0); ++i) {
+                            int64_t id  = top[i].item<int64_t>();
+                            float    err = mean_err[id].item<float>();
+                            // std::cout << "    id " << id << " : " << err << '\n';
+                        }
+                    }
+                } // if geom defined
+            }
+
+            // // 3) PRUNE
+            // if (getIteration() >= opt_params_.prune_from_ &&
+            //     getIteration() % opt_params_.prune_every_ == 0)
+            // {
+            //     // Try to use SVRaster’s max_w; if it wasn’t produced, fall back to grad-threshold
+            //     auto it = render_pkg.find("max_w");
+            //     if (it != render_pkg.end() && it->second.defined()) {
+            //         // 3a) compute linear threshold ramp exactly as Python does
+            //         torch::Tensor max_w = it->second.to(mDevice);     // (M,1)
+            //         float alpha = float(getIteration() - opt_params_.prune_from_) /
+            //                     std::max(1.f,
+            //                             float(opt_params_.prune_until_ -
+            //                                     opt_params_.prune_from_));
+            //         alpha = std::clamp(alpha, 0.f, 1.f);
+            //         float prune_thres = (1.f - alpha) * opt_params_.prune_threshold_init_ +
+            //                             alpha        * opt_params_.prune_threshold_final_;
+            //         // 3b) build keep mask and prune
+            //         torch::Tensor keep_mask = (max_w >= prune_thres).view(-1);  // bool[M]
+            //         voxel_model_->prune(keep_mask);
+            //     } else {
+            //         // Fallback: SVAdaptive’s old gradient rule
+            //         torch::Tensor buf = voxel_model_->subdiv_meta_.view(-1);  // accumulated grads
+            //         torch::Tensor keep_mask =
+            //             (buf >= opt_params_.subdiv_gradient_threshold_);      // bool[M]
+            //         voxel_model_->prune(keep_mask);
+            //     }
+            // }
+
+            // // 4) SUBDIVIDE
+            // if (getIteration() >= opt_params_.subdiv_from_ &&
+            //     getIteration() %  opt_params_.subdiv_every_ == 0)
+            // {
+            //     // ------------------------------------------------------------ (a) compute subdivide_prop on-the-fly
+            //     int rem_times = remaining_subdiv_times(getIteration(), opt_params_);
+            //     // scale factor such that repeated ×scale eventually reaches target
+            //     float scale_each = std::pow(opt_params_.subdivide_target_scale_, 1.f / rem_times);
+            //     float subdivide_prop = std::max(0.f, (scale_each - 1.f) / 7.f);   // identical to Python
+
+            //     // ------------------------------------------------------------ (b) validity gate (size + octree level)
+            //     torch::Tensor valid =
+            //         voxel_model_->validMask(opt_params_.subdivide_samp_thres_);
+
+            //     // ------------------------------------------------------------ (c) priority   (= accumulated grad)
+            //     torch::Tensor priority =
+            //         voxel_model_->subdiv_meta_.view(-1) * valid;               // (M)
+
+
+            //     torch::Tensor rank = torch::zeros_like(priority);
+            //     rank.index_put_(
+            //         {priority.argsort(/*dim=*/0, /*descending=*/false)},           // ← modified
+            //         torch::arange(
+            //             priority.numel(),
+            //             torch::TensorOptions()
+            //                 .dtype(priority.dtype())
+            //                 .device(priority.device())));                          // ← modified
+
+            //     // ------------------------------------------------------------ (d) pick threshold so that
+            //     //                            top `subdivide_prop` fraction will split
+            //     float th;
+            //     if (getIteration() <= opt_params_.subdivide_all_until_) {
+            //         th = -1.f;                          // split everything valid (boot-strap phase)
+            //     } else {
+            //         th = rank.quantile(1.f - subdivide_prop)
+            //                 .template item<float>();
+            //     }
+
+            //     torch::Tensor subdivide_mask = (rank > th) & valid;
+
+            //     // ------------------------------------------------------------ (e) respect global voxel cap
+            //     int64_t max_n_subdiv = std::max<int64_t>(
+            //         1,
+            //         (opt_params_.subdivide_max_num_ -
+            //         static_cast<int64_t>(voxel_model_->center_.size(0))) / 7);
+
+            //     if (subdivide_mask.sum().item<int64_t>() > max_n_subdiv)
+            //     {
+            //         // keep only the highest-rank `max_n_subdiv` parents
+            //         auto sel_rank = rank.index({subdivide_mask});
+            //         float cutoff  = std::get<0>(sel_rank.sort(/*descending=*/true))
+            //                             [max_n_subdiv - 1]
+            //                             .template item<float>();
+            //         subdivide_mask &= (rank >= cutoff);
+            //     }
+
+            //     // ------------------------------------------------------------ (f) split and reset accumulator
+            //     if (subdivide_mask.any().item<bool>())
+            //         voxel_model_->subdivide(subdivide_mask);
+
+            //     voxel_model_->subdiv_meta_.zero_();
+            // }
+
+            // every training_report_interval_ iterations, print a concise report
+            // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
+            //     sv::VoxelTrainer::trainingReport(
+            //         iteration_,
+            //         opt_params_.iterations_,
+            //         Ll1,
+            //         loss,
+            //         ema_loss_for_log_,
+            //         loss_utils::l1_loss,
+            //         // elapsed_ms,
+            //         *voxel_model_,
+            //         *scene_,
+            //         pipe_params_,
+            //         background_
+            //     );
+            // }
+
+            if ((all_keyframes_record_interval_ && getIteration() % all_keyframes_record_interval_ == 0)
+                )
+            {
+                renderAndRecordAllKeyframes();
+                // savePly(result_dir_ / std::to_string(iteration_) / "ply");
+            }
+
+            if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
+                std::cout << "[TRAIN] iter " << iteration_
+                        << "  L1: "    << Ll1.item<float>()
+                        << "  loss: "  << loss.item<float>()
+                        << "  ema: "   << ema_loss_for_log_ << '\n';
+            }
+            
+            if (iteration_ % 50 == 0) {
+                writeKeyframeUsedTimes(result_dir_);
+            }
 
         if (loop_closure_iteration_)
             loop_closure_iteration_ = false;
@@ -1138,41 +1383,23 @@ void VoxelMapper::increaseKeyframeTimesOfUse(
      pkf->remaining_times_of_use_ += times;
  }
 
-void VoxelMapper::writeKeyframeUsedTimes(
-    const std::filesystem::path& dir,
-    const std::string& suffix)
+void VoxelMapper::writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix)
 {
-    // Ensure the output directory exists
-    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(dir);
+    CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir)
+    std::filesystem::path result_path = result_dir / ("keyframe_used_times" + name_suffix + ".txt");
+    std::ofstream out_stream;
+    out_stream.open(result_path, std::ios::app);
+    if (!out_stream.is_open())
+        throw std::runtime_error("Cannot open json at " + result_path.string());
 
-    // Build the full path and open for appending
-    std::filesystem::path result_path =
-        dir / ("keyframe_used_times" + suffix + ".txt");
-    std::ofstream out_stream(result_path, std::ios::app);
-    if (!out_stream.is_open()) {
-        throw std::runtime_error(
-            "Cannot open keyframe‐used‐times file at " + result_path.string());
-    }
+    out_stream << "##[Voxel Mapper]Iteration " << getIteration() << " keyframe id, used times, remaining times:\n";
+    for (const auto& used_times_it : kfs_used_times_)
+        out_stream << used_times_it.first << " "
+                   << used_times_it.second << " "
+                   << scene_->keyframes().at(used_times_it.first)->remaining_times_of_use_
+                   << "\n";
+    out_stream << "##=========================================" <<std::endl;
 
-    // Header line (mirrors GaussianMapper)
-    out_stream << "##[Voxel Mapper]Iteration "
-               << getIteration()
-               << " keyframe id, used times, remaining times:\n";
-
-    // For each entry in kfs_used_times_, look up the remaining‐use count
-    // in scene_->keyframes(). If a keyframe has been culled, its remaining
-    // is reported as zero.
-    for (const auto& [kf_id, used_count] : kfs_used_times_) {
-        int remaining = 0;
-        auto it = scene_->keyframes().find(kf_id);
-        if (it != scene_->keyframes().end()) {
-            remaining = it->second->remaining_times_of_use_;
-        }
-        out_stream << kf_id << ' '
-                   << used_count << ' '
-                   << remaining << '\n';
-    }
-    out_stream << "##=========================================\n";
     out_stream.close();
 }
 
@@ -1248,8 +1475,10 @@ void VoxelMapper::renderAndRecordKeyframe(
     torch::Tensor rendered_image = render_pkg.at("color").to(mDevice);          // (1,3,H,W)
 
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
+    // saveTensor(masked_image,     "masked_image",    "/home/dimitris/Photo-SLAM/debug", getIteration(), pkf->fid_);
     masked_image = masked_image.squeeze(0);   
     auto gt_image = pkf->original_image_;
+    // saveTensor(gt_image,     "gt_image",    "/home/dimitris/Photo-SLAM/debug", getIteration(), pkf->fid_);
 
     dssim = loss_utils::ssim(masked_image, gt_image, device_type_).item().toFloat();
     psnr = loss_utils::psnr(masked_image, gt_image).item().toFloat();
@@ -1483,3 +1712,133 @@ float VoxelMapper::sh0LearningRate()
 //      std::unique_lock<std::mutex> lock(mutex_settings_);
 //      return inactive_geo_densify_;
 //  }
+
+
+void VoxelMapper::saveVoxelErrorHeatmap(const sv::MiniCam&  /*cam*/,
+                                        const torch::Tensor& geom,
+                                        const torch::Tensor&  gt_img,
+                                        int                 fid,          // NEW
+                                        const std::string&  base_dir)     // ← e.g. result_dir_/heatmaps
+{
+    namespace fs = std::filesystem;
+    const fs::path dir_kf = fs::path(base_dir) / ("kf" + std::to_string(fid));
+    fs::create_directories(dir_kf);       // <-- makes .../heatmaps/kf<i>
+    torch::NoGradGuard no_grad;
+
+    /* ------------------------------------------------------------------ *
+     * ❶  error per voxel  →  per-pixel array  (H,W) in [vmin,vmax]        *
+     * ------------------------------------------------------------------ */
+    torch::Tensor vox_err = (voxel_model_->voxel_error_sum_
+                            / voxel_model_->voxel_hit_count_.clamp_min(1))
+                                .squeeze(1);                                 // (N)
+
+    const int H = geom.size(0), W = geom.size(1);
+
+    torch::Tensor idx_flat = geom.view(-1).to(torch::kLong);
+    torch::Tensor valid    = idx_flat >= 0;
+    torch::Tensor safe_idx = idx_flat.clone().masked_fill(~valid, 0);
+
+    torch::Tensor pix_err  = vox_err.index_select(0, safe_idx)
+                                   .view({H, W});
+    pix_err.masked_fill_(~valid.view({H, W}), 0);
+
+    float vmin = pix_err.min().item<float>(),
+          vmax = pix_err.max().item<float>(),
+          range= std::max(1e-6f, vmax - vmin);
+
+    torch::Tensor H01 = (pix_err - vmin) / range;            // → [0,1]
+
+    /* ------------------------------------------------------------------ *
+     * ❷  Jet colour-map  (same formula as before)                         *
+     * ------------------------------------------------------------------ */
+    auto R = (1.5f * H01 - 0.5f).clamp(0, 1);
+    auto G = (1.5f - (2 * H01 - 1).abs()).clamp(0, 1);
+    auto B = (0.5f - 1.5f * H01).clamp(0, 1);
+    torch::Tensor rgb = torch::stack({B, G, R}, -1) * 255.0f;  // BGR for OpenCV
+    rgb = rgb.to(torch::kUInt8).cpu().contiguous();            // (H,W,3)
+
+    /* ------------------------------------------------------------------ *
+     * ❸  convert to cv::Mat                                              *
+     * ------------------------------------------------------------------ */
+    cv::Mat img(H, W, CV_8UC3, rgb.data_ptr<uint8_t>());
+
+    /* ------------------------------------------------------------------ *
+     * ❹  legend bar  (32 px wide)                                         *
+     * ------------------------------------------------------------------ */
+    const int LWIDTH = 32;
+    cv::Mat legend(H, LWIDTH, CV_8UC3);
+
+    for (int y = 0; y < H; ++y)
+    {
+        float val = 1.f - float(y) / float(H - 1);   // top=max (red), bottom=min (blue)
+        float r = std::clamp( 1.5f*val - 0.5f , 0.f, 1.f),
+              g = std::clamp( 1.5f - std::abs(2*val -1) , 0.f, 1.f),
+              b = std::clamp( 0.5f - 1.5f*val , 0.f, 1.f);
+        cv::Vec3b col{ uint8_t(255*b), uint8_t(255*g), uint8_t(255*r) };
+        legend.row(y).setTo(col);
+    }
+
+    const std::string lbl_hi = "high loss (red)";
+    const std::string lbl_lo = "low loss (blue)";
+    // near the top of the legend bar:
+    cv::putText(legend, lbl_hi, {2, 14},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(255,255,255), 1, cv::LINE_AA);
+    // near the bottom of the legend bar:
+    cv::putText(legend, lbl_lo, {2, H - 6},
+                cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(255,255,255), 1, cv::LINE_AA);
+
+    /* ------------------------------------------------------------------ *
+     * ❺  stack data + legend & annotate tick labels                       *
+     * ------------------------------------------------------------------ */
+    cv::Mat out;
+    cv::hconcat(img, legend, out);
+
+    const int x0 = W + LWIDTH + 4;        // text anchor (pixels from left)
+    auto put = [&](float frac, const std::string& txt)
+    {
+        int y = int((1.f - frac) * (H - 1));
+        cv::putText(out, txt, {x0, y},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(255,255,255), 1, cv::LINE_AA);
+        cv::line(out,
+                 {W, y}, {W + LWIDTH - 1, y},
+                 cv::Scalar(255,255,255), 1, cv::LINE_AA);
+    };
+
+    std::ostringstream ss; ss.setf(std::ios::fixed); ss.precision(3);
+    ss << vmax; put(1.f, ss.str());  ss.str(""); ss.clear();
+    ss << vmax - 0.25f*range; put(0.75f, ss.str()); ss.str(""); ss.clear();
+    ss << vmin + 0.50f*range; put(0.50f, ss.str()); ss.str(""); ss.clear();
+    ss << vmin + 0.25f*range; put(0.25f, ss.str()); ss.str(""); ss.clear();
+    ss << vmin;  put(0.f, ss.str());
+
+    /* ------------------------------------------------------------------ *
+     * ❻  write png                                                       *
+     * ------------------------------------------------------------------ */
+    std::ostringstream fn;
+    fn << "kf"   << std::setw(4) << std::setfill('0') << fid
+       << "_iter"<< std::setw(6) << std::setfill('0') << iteration_
+       << ".png";
+
+    cv::imwrite((dir_kf / fn.str()).string(), out);
+
+        // ————————————— ❼ convert & write GT image —————————————
+    // assume gt_img is (1,3,H,W) float in [0,1]
+    auto gt = (gt_img.squeeze(0).mul(255.0f)
+                   .clamp(0.0f,255.0f)
+                   .to(torch::kUInt8)
+                   .permute({1,2,0})            // H,W,3 RGB
+                   .cpu()
+                   .contiguous());
+    // convert to BGR for OpenCV:
+    cv::Mat gt_mat(H, W, CV_8UC3, gt.data_ptr<uint8_t>());
+    cv::cvtColor(gt_mat, gt_mat, cv::COLOR_RGB2BGR);
+
+    std::ostringstream fn2;
+    fn2<< "kf"<<std::setw(4)<<std::setfill('0')<<fid
+       << "_iter"<<std::setw(6)<<std::setfill('0')<<iteration_
+       << "_gt.png";
+    cv::imwrite((dir_kf / fn2.str()).string(), gt_mat);
+}

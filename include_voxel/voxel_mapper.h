@@ -176,9 +176,20 @@ protected:
 
     void savePly (const std::filesystem::path& dir);            
     void keyframesToJson(const std::filesystem::path& dir);   
-    void writeKeyframeUsedTimes(const std::filesystem::path& dir, const std::string& suffix = "");
-    
+    void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
+
+    void saveVoxelErrorHeatmap(
+        const sv::MiniCam& cam,
+        const torch::Tensor& geom,
+        const torch::Tensor&  gt_img,
+        int fid,          // key-frame id
+        const std::string& base_dir); // e.g. result_dir_/heatmaps
+
 public:
+    std::vector<float> best_loss_per_kf_;          // size == #key-frames
+    std::vector<float> worst_loss_per_kf_;
+    std::filesystem::path extrema_dir_;            // …/result/extrema
+    
     // Parameters
     std::filesystem::path config_file_path_;
 

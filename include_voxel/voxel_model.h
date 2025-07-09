@@ -57,6 +57,12 @@
 namespace py = pybind11;
 namespace sv {
 
+struct TrainingStat {
+  torch::Tensor max_w;             // (N,1)
+  torch::Tensor min_samp_interval; // (N,1)
+  torch::Tensor view_cnt;          // (N,1)
+};
+
 class VoxelModel 
 {
 public:
@@ -188,6 +194,11 @@ public:
                         const torch::Tensor& err);
     void rebuildOptimizer();
     torch::Tensor validMask(float size_mul) const;
+
+    TrainingStat computeTrainingStat(
+        const std::vector<MiniCam>& cameras,
+        const py::array_t<uint8_t>& rgb_image
+    );
 
 protected:
     float exponLrFunc(int step);

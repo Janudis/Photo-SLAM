@@ -54,7 +54,7 @@ public:
         float shs_lr = 0.0000625f, // 1/20 of SH₀
         float lambda_dssim = 0.2f,
         int densification_interval = 100,
-        int subdiv_from = 1000,
+        int subdiv_from = 500,
         int subdiv_every = 100,
         int subdiv_until = 15000,
         float subdiv_quantile = 0.8f,
@@ -63,7 +63,7 @@ public:
         int   subdivide_max_num    = 10'000'000,
         float subdivide_target_scale_ = 90.f,
         int   subdivide_all_until_    = 0,
-        int prune_from = 1000,
+        int prune_from = 500,
         int prune_every = 100,
         int prune_until = 18000,
         float prune_threshold_init = 0.0001f,

@@ -583,7 +583,7 @@ void VoxelMapper::run()
  }
 
 // Add training with optimization loop
-    void VoxelMapper::trainForOneIteration()
+void VoxelMapper::trainForOneIteration()
     {
         // 1) bump global iteration counter
         increaseIteration(1);
@@ -637,6 +637,66 @@ void VoxelMapper::run()
         cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
         cam.w2c = cam.w2c.contiguous().to(mDevice);
 
+        py::module_ np = py::module_::import("numpy");
+        // {
+        //     namespace fs = std::filesystem;
+        //     // build per-KF directory: result_dir_/kf0000, kf0001, etc.
+        //     std::ostringstream kf_ss;
+        //     kf_ss << result_dir_.string() << "/kf"
+        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_;
+        //     fs::create_directories(kf_ss.str());
+        //     const fs::path kf_dir = kf_ss.str();
+
+        //     // iteration number padded
+        //     std::ostringstream it_ss;
+        //     it_ss << std::setw(6) << std::setfill('0') << getIteration();
+        //     const std::string iter_str = it_ss.str();
+
+        //     // 1) dump GT image
+        //     {
+        //         std::ostringstream fn;
+        //         fn << kf_dir.string() << "/gt_kf"
+        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
+        //         << "_iter" << iter_str << ".png";
+        //         saveDebugImage(gt_image, fn.str());
+        //     }
+
+        //     // 2) dump intrinsics K
+        //     {
+        //         auto opts = torch::TensorOptions()
+        //                         .dtype(torch::kFloat32)   // <-- 32-bit
+        //                         .device(torch::kCPU);
+        //         torch::Tensor K = torch::tensor(
+        //             {{static_cast<float>(cam.fx), 0.f, static_cast<float>(cam.cx)},
+        //             {0.f, static_cast<float>(cam.fy), static_cast<float>(cam.cy)},
+        //             {0.f, 0.f, 1.f}},
+        //             opts);
+        //         std::ostringstream fn;
+        //         fn << kf_dir.string() << "/K_kf"
+        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
+        //         << "_iter" << iter_str << ".npy";
+        //         py::module_::import("numpy").attr("save")(fn.str(), K);
+        //     }
+
+        //     // 3) dump world → camera
+        //     {
+        //         std::ostringstream fn;
+        //         fn << kf_dir.string() << "/w2c_kf"
+        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
+        //         << "_iter" << iter_str << ".npy";
+        //         py::module_::import("numpy").attr("save")(fn.str(), cam.w2c.cpu());
+        //     }
+
+        //     // 4) dump camera → world
+        //     {
+        //         std::ostringstream fn;
+        //         fn << kf_dir.string() << "/c2w_kf"
+        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
+        //         << "_iter" << iter_str << ".npy";
+        //         py::module_::import("numpy").attr("save")(fn.str(), cam.c2w.cpu());
+        //     }
+        // }
+
         // 6) update all learning rates
         if (mpSLAM) {
             int used_times = kfs_used_times_[viewpoint_cam->fid_];
@@ -661,6 +721,7 @@ void VoxelMapper::run()
                                 .contiguous();
         torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
         py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
+        // np.attr("save")("/home/dimitris/Photo-SLAM/gt_image.npy", rgb_numpy);
         auto render_pkg = voxel_model_->render(cam, rgb_numpy, "");
         // lock_render.unlock();
         if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
@@ -838,97 +899,121 @@ void VoxelMapper::run()
                     }
                 } // if geom defined
             }
+            // 3) PRUNE
+            if (getIteration() >= opt_params_.prune_from_ &&
+                getIteration() % opt_params_.prune_every_ == 0)
+            {
+                std::cout << "PRUNE" << std::endl;
+                // Try to use SVRaster’s max_w; if it wasn’t produced, fall back to grad-threshold
+                auto it = render_pkg.find("max_w");
+                if (it != render_pkg.end() && it->second.defined()) {
+                    // 3a) compute linear threshold ramp exactly as Python does
+                    torch::Tensor max_w = it->second.to(mDevice);     // (M,1)
+                    float alpha = float(getIteration() - opt_params_.prune_from_) /
+                                std::max(1.f,
+                                        float(opt_params_.prune_until_ -
+                                                opt_params_.prune_from_));
+                    alpha = std::clamp(alpha, 0.f, 1.f);
+                    float prune_thres = (1.f - alpha) * opt_params_.prune_threshold_init_ +
+                                        alpha        * opt_params_.prune_threshold_final_;
+                    // 3b) build keep mask and prune
+                    torch::Tensor keep_mask = (max_w >= prune_thres).view(-1);  // bool[M]
+                    voxel_model_->prune(keep_mask);
+                } else {
+                    // Fallback: SVAdaptive’s old gradient rule
+                    torch::Tensor buf = voxel_model_->subdiv_meta_.view(-1);  // accumulated grads
+                    torch::Tensor keep_mask =
+                        (buf >= opt_params_.subdiv_gradient_threshold_);      // bool[M]
+                    voxel_model_->prune(keep_mask);
+                }
+            }
+            // 4) SUBDIVIDE
+            if (getIteration() >= opt_params_.subdiv_from_ &&
+                getIteration() %  opt_params_.subdiv_every_ == 0)
+            {
+                std::cout << "SUBDIVIDE" << std::endl;
+                // ------------------------------------------------------------ (a) compute subdivide_prop on-the-fly
+                int rem_times = remaining_subdiv_times(getIteration(), opt_params_);
+                // scale factor such that repeated ×scale eventually reaches target
+                float scale_each = std::pow(opt_params_.subdivide_target_scale_, 1.f / rem_times);
+                float subdivide_prop = std::max(0.f, (scale_each - 1.f) / 7.f);   // identical to Python
 
-            // // 3) PRUNE
-            // if (getIteration() >= opt_params_.prune_from_ &&
-            //     getIteration() % opt_params_.prune_every_ == 0)
-            // {
-            //     // Try to use SVRaster’s max_w; if it wasn’t produced, fall back to grad-threshold
-            //     auto it = render_pkg.find("max_w");
-            //     if (it != render_pkg.end() && it->second.defined()) {
-            //         // 3a) compute linear threshold ramp exactly as Python does
-            //         torch::Tensor max_w = it->second.to(mDevice);     // (M,1)
-            //         float alpha = float(getIteration() - opt_params_.prune_from_) /
-            //                     std::max(1.f,
-            //                             float(opt_params_.prune_until_ -
-            //                                     opt_params_.prune_from_));
-            //         alpha = std::clamp(alpha, 0.f, 1.f);
-            //         float prune_thres = (1.f - alpha) * opt_params_.prune_threshold_init_ +
-            //                             alpha        * opt_params_.prune_threshold_final_;
-            //         // 3b) build keep mask and prune
-            //         torch::Tensor keep_mask = (max_w >= prune_thres).view(-1);  // bool[M]
-            //         voxel_model_->prune(keep_mask);
-            //     } else {
-            //         // Fallback: SVAdaptive’s old gradient rule
-            //         torch::Tensor buf = voxel_model_->subdiv_meta_.view(-1);  // accumulated grads
-            //         torch::Tensor keep_mask =
-            //             (buf >= opt_params_.subdiv_gradient_threshold_);      // bool[M]
-            //         voxel_model_->prune(keep_mask);
-            //     }
-            // }
+                auto stat = voxel_model_->computeTrainingStat({cam}, rgb_numpy);
 
-            // // 4) SUBDIVIDE
-            // if (getIteration() >= opt_params_.subdiv_from_ &&
-            //     getIteration() %  opt_params_.subdiv_every_ == 0)
-            // {
-            //     // ------------------------------------------------------------ (a) compute subdivide_prop on-the-fly
-            //     int rem_times = remaining_subdiv_times(getIteration(), opt_params_);
-            //     // scale factor such that repeated ×scale eventually reaches target
-            //     float scale_each = std::pow(opt_params_.subdivide_target_scale_, 1.f / rem_times);
-            //     float subdivide_prop = std::max(0.f, (scale_each - 1.f) / 7.f);   // identical to Python
+                /*  guard: nothing visible → nothing to split  */
+                if (stat.min_samp_interval.numel() == 0) {
+                    voxel_model_->subdiv_meta_.zero_();
+                } else {
+                    // torch::Tensor size_thres =
+                    //     stat.min_samp_interval * opt_params_.subdivide_samp_thres_;
+                    // /*  make  ‖size_thres‖ match device & shape of size_ */
+                    // size_thres = size_thres.to(voxel_model_->size_.device())
+                    //                     .expand_as(voxel_model_->size_);
+                    auto size_thres = stat.min_samp_interval.squeeze(1) * opt_params_.subdivide_samp_thres_;
+                    size_thres = size_thres.to(voxel_model_->size_.device());
 
-            //     // ------------------------------------------------------------ (b) validity gate (size + octree level)
-            //     torch::Tensor valid =
-            //         voxel_model_->validMask(opt_params_.subdivide_samp_thres_);
+                    // ------------------------------------------------------------ (b) validity gate (size + octree level)
+                    torch::Tensor valid =
+                        (voxel_model_->size_ * 0.5 > size_thres).view(-1) &           // per-voxel
+                        (voxel_model_->oct_level_ < sv::MAX_OCT_LEVEL).view(-1);
 
-            //     // ------------------------------------------------------------ (c) priority   (= accumulated grad)
-            //     torch::Tensor priority =
-            //         voxel_model_->subdiv_meta_.view(-1) * valid;               // (M)
+                    // ------------------------------------------------------------ (c) priority   (= accumulated grad)
+                    torch::Tensor priority =
+                        voxel_model_->subdiv_meta_.view(-1) * valid;               // (M)
 
+                    torch::Tensor rank = torch::zeros_like(priority);
+                    rank.index_put_(
+                        {priority.argsort(/*dim=*/0, /*descending=*/false)},           // ← modified
+                        torch::arange(
+                            priority.numel(),
+                            torch::TensorOptions()
+                                .dtype(priority.dtype())
+                                .device(priority.device())));                          // ← modified
+    
+                    // ------------------------------------------------------------ (d) pick threshold so that
+                    //                            top `subdivide_prop` fraction will split
+                    float th;
+                    if (getIteration() <= opt_params_.subdivide_all_until_) {
+                        th = -1.f;                          // split everything valid (boot-strap phase)
+                    } else {
+                        th = rank.quantile(1.f - subdivide_prop)
+                                .template item<float>();
+                    }
 
-            //     torch::Tensor rank = torch::zeros_like(priority);
-            //     rank.index_put_(
-            //         {priority.argsort(/*dim=*/0, /*descending=*/false)},           // ← modified
-            //         torch::arange(
-            //             priority.numel(),
-            //             torch::TensorOptions()
-            //                 .dtype(priority.dtype())
-            //                 .device(priority.device())));                          // ← modified
+                    torch::Tensor subdivide_mask = (rank > th) & valid;
 
-            //     // ------------------------------------------------------------ (d) pick threshold so that
-            //     //                            top `subdivide_prop` fraction will split
-            //     float th;
-            //     if (getIteration() <= opt_params_.subdivide_all_until_) {
-            //         th = -1.f;                          // split everything valid (boot-strap phase)
-            //     } else {
-            //         th = rank.quantile(1.f - subdivide_prop)
-            //                 .template item<float>();
-            //     }
+                    // ------------------------------------------------------------ (e) respect global voxel cap
+                    int64_t max_n_subdiv = std::max<int64_t>(
+                        1,
+                        (opt_params_.subdivide_max_num_ -
+                        static_cast<int64_t>(voxel_model_->center_.size(0))) / 7);
 
-            //     torch::Tensor subdivide_mask = (rank > th) & valid;
+                    if (subdivide_mask.sum().item<int64_t>() > max_n_subdiv)
+                    {
+                        // keep only the highest-rank `max_n_subdiv` parents
+                        auto sel_rank = rank.index({subdivide_mask});
+                        float cutoff  = std::get<0>(sel_rank.sort(/*descending=*/true))
+                                            [max_n_subdiv - 1]
+                                            .template item<float>();
+                        subdivide_mask &= (rank >= cutoff);
+                    }
 
-            //     // ------------------------------------------------------------ (e) respect global voxel cap
-            //     int64_t max_n_subdiv = std::max<int64_t>(
-            //         1,
-            //         (opt_params_.subdivide_max_num_ -
-            //         static_cast<int64_t>(voxel_model_->center_.size(0))) / 7);
+                    // ------------------------------------------------------------ (f) split and reset accumulator
+                    if (subdivide_mask.any().item<bool>())
+                        voxel_model_->subdivide(subdivide_mask);
 
-            //     if (subdivide_mask.sum().item<int64_t>() > max_n_subdiv)
-            //     {
-            //         // keep only the highest-rank `max_n_subdiv` parents
-            //         auto sel_rank = rank.index({subdivide_mask});
-            //         float cutoff  = std::get<0>(sel_rank.sort(/*descending=*/true))
-            //                             [max_n_subdiv - 1]
-            //                             .template item<float>();
-            //         subdivide_mask &= (rank >= cutoff);
-            //     }
-
-            //     // ------------------------------------------------------------ (f) split and reset accumulator
-            //     if (subdivide_mask.any().item<bool>())
-            //         voxel_model_->subdivide(subdivide_mask);
-
-            //     voxel_model_->subdiv_meta_.zero_();
-            // }
+                    if (iteration_ % 100 == 0) {
+                        int64_t n_valid  = valid.sum().item<int64_t>();
+                        int64_t n_ranked = (priority > 0).sum().item<int64_t>();
+                        int64_t n_split  = subdivide_mask.sum().item<int64_t>();
+                        std::cout << "[DBG] it " << iteration_
+                                << " valid="  << n_valid
+                                << "  ranked="<< n_ranked
+                                << "  split=" << n_split << '\n';
+                    }
+                    voxel_model_->subdiv_meta_.zero_();
+                }
+            }
 
             // every training_report_interval_ iterations, print a concise report
             // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {

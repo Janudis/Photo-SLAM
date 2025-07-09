@@ -61,14 +61,14 @@ Optimization.densification_interval:   100
 # Optimization.densify_grad_threshold: 0.001
 
 # Pruning schedule
-Optimization.prune_from:               1000
+Optimization.prune_from:               500
 Optimization.prune_every:              100
 Optimization.prune_until:              18000
 Optimization.prune_threshold_init:     0.0001
 Optimization.prune_threshold_final:    0.05
 # Optimization.min_voxels:               512
 
-Optimization.subdiv_from:              1000
+Optimization.subdiv_from:              500
 Optimization.subdiv_every:             100
 Optimization.subdiv_until:             15000
 Optimization.subdivide_samp_thres:    0.01

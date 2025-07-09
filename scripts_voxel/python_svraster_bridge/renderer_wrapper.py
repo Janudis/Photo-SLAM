@@ -66,7 +66,7 @@ print("=== LOADING voxel_bridge!!! ===")
 
 def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     # ensure watchdog is running
-    # start_watchdog()
+    start_watchdog()
     # print("\n[PY-DBG] ===== ENTER render() =====")
     if output_dir not in ("", None):
         os.makedirs(output_dir, exist_ok=True)
@@ -78,13 +78,18 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     cam.c2w = cam.c2w.to(device)
 
     # Convert ground truth image
-    if rgb_image is None:                   
+    # if rgb_image is None:                   
+    #     gt_image = None
+    # else:
+    #     gt_image = torch.from_numpy(
+    #         np.asarray(rgb_image, dtype=np.uint8)
+    #     ).float().div_(255.0).permute(2, 0, 1).to(device)
+    # imageio.imwrite("debug_input.png", rgb_image)
+    if rgb_image is None or (isinstance(rgb_image, np.ndarray) and rgb_image.size == 0):
         gt_image = None
     else:
-        gt_image = torch.from_numpy(
-            np.asarray(rgb_image, dtype=np.uint8)
-        ).float().div_(255.0).permute(2, 0, 1).to(device)
-    # imageio.imwrite("debug_input.png", rgb_image)
+        gt_image = (torch.from_numpy(np.asarray(rgb_image, dtype=np.uint8))
+                        .float().div_(255.0).permute(2,0,1).to(device))
     
     if voxel_data["centers"].numel() == 0:
         print("[WARNING] No voxels to render!")
@@ -114,7 +119,6 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             need_normal = False,
             track_max_w = True,
             vox_feats  = vox_feats 
-            # --------------- NEW ---------------
             # lambda_R_concen = 1e-2,        # same value as stock code
             # gt_color = gt_image,           # (3,H,W) float32
     )
@@ -142,7 +146,6 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             voxel_data['shs']         # shs  (N,45,3)
         )      
         # rgbs = voxel_data['colors'].squeeze(1)
-        # dens = voxel_data["opacities"].view(-1, 1)                        # (N, 3), computed SH colors
 
         return dict(
             geos=geos,
@@ -188,7 +191,6 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     idx = torch.where(ndup > 0)[0]                  # (K,)
     # geom = geom_buf.view(cam.image_height, cam.image_width).long()    
     color, depth, normal, T, max_w, feat = out
-
     vox_id_map = feat.squeeze(0).long() - 1       # back to 0-based
     vox_id_map[vox_id_map < 0] = -1           # background sentinel
     # SVRaster gives (H,W,3) color → make (1,3,H,W)

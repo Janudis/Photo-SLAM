@@ -924,11 +924,11 @@ void VoxelModel::subdivide(const torch::Tensor& mask_parent)
     // concat keep + children
     center_      = torch::cat({center_k,   c_child},    0).detach();
     size_        = torch::cat({size_k,     s_child},    0).detach();
-    sh0_         = torch::cat({sh0_k,      sh0_child},  0).requires_grad_(true);
-    shs_         = torch::cat({shs_k,      shs_child},  0).requires_grad_(true);
+    sh0_         = torch::cat({sh0_k,      sh0_child},  0).contiguous().requires_grad_(true);
+    shs_         = torch::cat({shs_k,      shs_child},  0).contiguous().requires_grad_(true);
     oct_path_    = torch::cat({path_k,     path_child}, 0);
     oct_level_   = torch::cat({lvl_k,      lvl_child},  0);
-    subdiv_meta_ = torch::cat({meta_k,     meta_child}, 0).requires_grad_(true);
+    subdiv_meta_ = torch::cat({meta_k,     meta_child}, 0).contiguous().requires_grad_(true);
 
     subdiv_p_            = torch::zeros_like(subdiv_meta_).requires_grad_(true);
     // subdiv_p_grad_buffer_= torch::zeros_like(subdiv_p_);
@@ -1003,14 +1003,57 @@ void VoxelModel::accumulateSubdivGradients(const torch::Tensor& parent_idx,
         parent_grads.to(device_type_));
 }
 
-torch::Tensor VoxelModel::validMask(float size_thres) const
+TrainingStat VoxelModel::computeTrainingStat(
+        const std::vector<MiniCam>& cameras,
+        const py::array_t<uint8_t>& rgb_image)
 {
-    torch::Tensor not_finest = (oct_level_ < MAX_OCT_LEVEL).view(-1);
-    if (size_thres <= 0.f)            // 0 → ignore size test
-        return not_finest;
-    torch::Tensor size_ok =
-        (size_ * 0.5f > size_thres).view(-1);
-    return size_ok & not_finest;
+    const int64_t N = center_.size(0);
+    torch::Tensor max_w            = torch::zeros({N,1}, torch::kFloat32).to(device_type_);
+    torch::Tensor min_samp_interval= torch::full({N,1}, 1e30f, torch::kFloat32).to(device_type_);
+    torch::Tensor view_cnt         = torch::zeros({N,1}, torch::kFloat32).to(device_type_);
+
+    bool rg_backup = _geo_grid_pts.requires_grad();
+    _geo_grid_pts.set_requires_grad(false);
+
+    for (const MiniCam& cam_in : cameras)
+    {
+        //–– prepare camera on correct device
+        MiniCam cam = cam_in;
+        cam.c2w = cam.c2w.to(device_type_);
+        cam.w2c = cam.w2c.to(device_type_);
+
+        //–– render only max_w
+        auto pkg = render(cam, rgb_image, "");
+        torch::cuda::synchronize();
+        torch::Tensor mw_i = pkg["max_w"].to(device_type_);      // (N,1)
+        max_w = torch::maximum(max_w, mw_i);
+
+        //–– derive visibility directly from max_w
+        auto vis_mask = (mw_i.view(-1) > 0);                    // bool[N]
+        auto vis_idx  = vis_mask.nonzero().squeeze(1);          // (K,)
+        if (vis_idx.numel() == 0) continue;
+
+        //–– sample-interval as before
+        auto cam_pos = cam.c2w.index({torch::indexing::Slice(0,3),3}).to(device_type_);
+        auto lookat  = cam.c2w.index({torch::indexing::Slice(0,3),2}).to(device_type_).neg();
+        lookat = lookat / lookat.norm();
+        float pix_size = 2.0f * cam.tanfovy / float(cam.height);
+
+        auto zdist = ((center_.index({vis_idx}) - cam_pos) * lookat)
+                         .sum(-1, /*keepdim=*/true);           // (K,1)
+        auto samp_interval = zdist * pix_size;                  // (K,1)
+
+        min_samp_interval.index_put_(
+            {vis_idx},
+            torch::minimum(min_samp_interval.index({vis_idx}),
+                           samp_interval));
+
+        view_cnt.index_put_({vis_idx},
+                            view_cnt.index({vis_idx}) + 1);
+    }
+
+    _geo_grid_pts.set_requires_grad(rg_backup);
+    return {max_w, min_samp_interval, view_cnt};
 }
 
 void VoxelModel::rebuildOptimizer()
@@ -1178,6 +1221,12 @@ VoxelModel::render(const MiniCam&              cam,
                      "\"color\" tensor – skipping frame.\n";
         pkg.clear();                  // signal failure to caller
     }
+
+    // 7) Build visibility index from max_w directly
+    auto max_w = pkg["max_w"].view(-1);
+    auto vis_idx = (max_w > 0).nonzero().squeeze(1);
+    pkg["idx"] = vis_idx;
+    
     return pkg;                       // may be empty on error
 }
 

@@ -75,6 +75,8 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
         this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
         this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
         this->set_camera_ = true;
+        // std::cout << "voxel_keyframe.cpp: setCameraParams() Pinhole camera model with FoVx: "
+        //           << this->FoVx_ << " and FoVy: " << this->FoVy_ << std::endl;
     }
     break;
 
@@ -102,43 +104,41 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
 //     points2D_.at(point2D_idx).point3D_id_ = point3D_id;
 // }
 
-// Build c2w / w2c from Tcw_
-void VoxelKeyframe::computeTransformTensors()
-{
-    if (this->set_pose_ && this->set_camera_) {
-        this->world_view_transform_ = tensor_utils::EigenMatrix2TorchTensor(
-            this->getWorld2View2(this->trans_, this->scale_),
-            torch::kCUDA
-        ).transpose(0, 1);
+// void VoxelKeyframe::computeTransformTensors()
+// {
+//     if (this->set_pose_ && this->set_camera_) {
+//         this->world_view_transform_ = tensor_utils::EigenMatrix2TorchTensor(
+//             this->getWorld2View2(this->trans_, this->scale_),
+//             torch::kCUDA
+//         ).transpose(0, 1);
 
-        if (!this->set_projection_matrix_) {
-            this->projection_matrix_ = this->getProjectionMatrix(
-                this->znear_,
-                this->zfar_,
-                this->FoVx_,
-                this->FoVy_,
-                torch::kCUDA
-            ).transpose(0, 1);
-            this->set_projection_matrix_ = true;
-        }
+//         if (!this->set_projection_matrix_) {
+//             this->projection_matrix_ = this->getProjectionMatrix(
+//                 this->znear_,
+//                 this->zfar_,
+//                 this->FoVx_,
+//                 this->FoVy_,
+//                 torch::kCUDA
+//             ).transpose(0, 1);
+//             this->set_projection_matrix_ = true;
+//         }
 
-        this->full_proj_transform_ = (this->world_view_transform_.unsqueeze(0).bmm(
-            this->projection_matrix_.unsqueeze(0))).squeeze(0);
+//         this->full_proj_transform_ = (this->world_view_transform_.unsqueeze(0).bmm(
+//             this->projection_matrix_.unsqueeze(0))).squeeze(0);
 
-        this->camera_center_ = this->world_view_transform_.inverse().index({3, torch::indexing::Slice(0, 3)});
-    }
-    else if (!this->set_pose_ && this->set_camera_) {
-        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE is not set!" << std::endl;
-    }
-    else if (!this->set_camera_) {
-        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because CAMERA is not set!" << std::endl;
-    }
-    else {
-        std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE and CAMERA are not set!" << std::endl;
-    }
-}
+//         this->camera_center_ = this->world_view_transform_.inverse().index({3, torch::indexing::Slice(0, 3)});
+//     }
+//     else if (!this->set_pose_ && this->set_camera_) {
+//         std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE is not set!" << std::endl;
+//     }
+//     else if (!this->set_camera_) {
+//         std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because CAMERA is not set!" << std::endl;
+//     }
+//     else {
+//         std::cerr << "Could not compute transform tensors for keyframe " << this->fid_ << " because POSE and CAMERA are not set!" << std::endl;
+//     }
+// }
 
-// exactly as Photo-SLAM
 Eigen::Matrix4f VoxelKeyframe::getWorld2View2(
     const Eigen::Vector3f& trans,
     float                  scale) const
@@ -153,6 +153,7 @@ Eigen::Matrix4f VoxelKeyframe::getWorld2View2(
 
     Eigen::Matrix4f C2W = Rt.inverse();
     Eigen::Vector3f cam_center = C2W.block<3, 1>(0, 3);
+    // std::cout << "VoxelKeyframe::getWorld2 trans " << trans << " scale" << scale << std::endl;
     cam_center += trans;
     cam_center *= scale;
     C2W.block<3, 1>(0, 3) = cam_center;
@@ -160,43 +161,47 @@ Eigen::Matrix4f VoxelKeyframe::getWorld2View2(
     return Rt;
 }
 
-// exactly as Photo-SLAM
-torch::Tensor VoxelKeyframe::getProjectionMatrix(
-    float znear,
-    float zfar,
-    float fovX,
-    float fovY,
-    torch::DeviceType device_type)
-{
-    float tanHalfFovY = std::tan(fovY / 2);
-    float tanHalfFovX = std::tan(fovX / 2);
+// torch::Tensor VoxelKeyframe::getProjectionMatrix(
+//     float znear,
+//     float zfar,
+//     float fovX,
+//     float fovY,
+//     torch::DeviceType device_type)
+// {
+//     float tanHalfFovY = std::tan(fovY / 2);
+//     float tanHalfFovX = std::tan(fovX / 2);
 
-    float top = tanHalfFovY * znear;
-    float bottom = -top;
-    float right = tanHalfFovX * znear;
-    float left = -right;
+//     float top = tanHalfFovY * znear;
+//     float bottom = -top;
+//     float right = tanHalfFovX * znear;
+//     float left = -right;
 
-    torch::Tensor P = torch::zeros({4, 4}, torch::TensorOptions().device(device_type));
+//     torch::Tensor P = torch::zeros({4, 4}, torch::TensorOptions().device(device_type));
 
-    float z_sign = 1.0f;
+//     float z_sign = 1.0f;
 
-    P.index({0, 0}) = 2.0 * znear / (right - left);
-    P.index({1, 1}) = 2.0 * znear / (top - bottom);
-    P.index({0, 2}) = (right + left) / (right - left);
-    P.index({1, 2}) = (top + bottom) / (top - bottom);
-    P.index({3, 2}) = z_sign;
-    P.index({2, 2}) = z_sign * zfar / (zfar - znear);
-    P.index({2, 3}) = -(zfar * znear) / (zfar - znear);
-    return P;
-}
+//     P.index({0, 0}) = 2.0 * znear / (right - left);
+//     P.index({1, 1}) = 2.0 * znear / (top - bottom);
+//     P.index({0, 2}) = (right + left) / (right - left);
+//     P.index({1, 2}) = (top + bottom) / (top - bottom);
+//     P.index({3, 2}) = z_sign;
+//     P.index({2, 2}) = z_sign * zfar / (zfar - znear);
+//     P.index({2, 3}) = -(zfar * znear) / (zfar - znear);
+//     return P;
+// }
 
 // helper to build MiniCam
 sv::MiniCam VoxelKeyframe::toMiniCam() const
 {
     // pure camera pose:  Tcw_  is world→cam  ⇒  c2w = Tcw_.inverse()
+    Eigen::Matrix4f w2c_eig = Tcw_.matrix().cast<float>();
     Eigen::Matrix4f c2w_eig = Tcw_.inverse().matrix().cast<float>();
-
     torch::Tensor c2w = tensor_utils::EigenMatrix2TorchTensor(
                             c2w_eig, torch::kCPU);      // keep on CPU
+    torch::Tensor w2c = tensor_utils::EigenMatrix2TorchTensor(
+                            w2c_eig, torch::kCPU);      // keep on CPU
+
+    // std::cout << "voxel_keyframe.cpp: toMiniCam() FoVx_ = " << FoVx_ << std::endl;
+
     return sv::fromCamera(cam_, c2w, static_cast<int>(fid_));
 }

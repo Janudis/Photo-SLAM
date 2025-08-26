@@ -72,11 +72,9 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
         os.makedirs(output_dir, exist_ok=True)
     # Determine proper CUDA device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # Move camera matrices to CUDA if needed
     cam.w2c = cam.w2c.to(device)
     cam.c2w = cam.c2w.to(device)
-
     # Convert ground truth image
     # if rgb_image is None:                   
     #     gt_image = None
@@ -103,8 +101,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
 
     rs = svr.RasterSettings(
             color_mode = 'sh',
-            vox_geo_mode = 'triinterp1',
-            density_mode = 'exp_linear_11',
+            n_samp_per_vox = 1,  
             image_width = cam.image_width,
             image_height = cam.image_height,
             tanfovx = cam.tanfovx,
@@ -113,29 +110,26 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             cy = cam.cy,
             w2c_matrix = cam.w2c.to(device),
             c2w_matrix = cam.c2w.to(device),
-            background = torch.zeros(3, device=device),
-            cam_mode = "persp",
-            need_depth = False,
-            need_normal = False,
+            bg_color = 0.0,
+            near = 0.02,
             track_max_w = True,
-            vox_feats  = vox_feats 
-            # lambda_R_concen = 1e-2,        # same value as stock code
-            # gt_color = gt_image,           # (3,H,W) float32
     )
+
+    # print(f"renderer_wrapper.py: cam.tanfovx = {cam.tanfovx}, "
+    #       f"cam.cx = {cam.cx}")
 
     def vox_fn(idx, cam_pos, mode):
         # print(f"[PY-DBG] Running vox_fn with mode: {mode}, idx: {idx}")
         centers = voxel_data['centers']
         # geos = voxel_data['geos']                  # (N, 8), passed directly
         geos = svr.GatherGeoParams.apply(          # build it on-the-fly
-         'triinterp1',
           voxel_data['vox_key'],
-          voxel_data['vox_size_inv'],
           idx,
           voxel_data['_geo_grid_pts'])
 
-        viewdirs = cam_pos.unsqueeze(0) - centers  # (N,3)
-        viewdirs = viewdirs / viewdirs.norm(dim=1, keepdim=True)  # normalize
+        # viewdirs = cam_pos.unsqueeze(0) - centers  # (N,3)
+        # viewdirs = viewdirs / viewdirs.norm(dim=1, keepdim=True)  # normalize
+        viewdirs = None
         rgbs = svr.SH_eval.apply(
             voxel_data['sh_degree'],                        # active_sh_degree   (use 2, 3, … as you like)
             idx,                     # idx  (let SH_eval create empty tensor internally)
@@ -161,6 +155,30 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             voxel_data[k] = t.to(device, non_blocking=True).contiguous()    # ← keep original leaf
 
     try:
+        # print("[DEBUG rasterize] center.shape      =", voxel_data["centers"].shape)
+        # print("                 size.shape        =", voxel_data["vox_lengths"].shape)
+        # print("                 color (sh0).shape =", voxel_data["colors"].shape)
+        # print("                 shs.shape          =", voxel_data["shs"].shape)
+        # print("                 subdiv_p.shape     =", voxel_data["subdiv_p"].shape)
+        # print("                 grid_pts_key.shape=", voxel_data["_geo_grid_pts"].shape)
+        # # optionally also print the first few keys:
+        # print("                 vox_key.shape      =", voxel_data["vox_key"].shape)
+        # print("                 #voxels            =", voxel_data["centers"].numel()//3)
+        # print("                 #grid_points       =", voxel_data["_geo_grid_pts"].numel()//3)
+        # print("—— now calling rasterize_voxels() ——————————————————")
+    
+        # # --- DEBUG SANITY CHECKS ---
+        # for k in ["octpaths","centers","vox_lengths","vox_key","_geo_grid_pts"]:
+        #     t = voxel_data[k]
+        #     print(f"[DBG RAST] {k:12s} shape={tuple(t.shape)}, "
+        #           f"dtype={t.dtype}, device={t.device}, contig={t.is_contiguous()}")
+        #     if t.dtype == torch.int64 or t.dtype == torch.int32:
+        #         print(f"            {k:12s} min={t.min().item()}, max={t.max().item()}")
+        #     elif t.dtype.is_floating_point:
+        #         print(f"            {k:12s} min={t.min().item():.4f}, max={t.max().item():.4f}")
+        # lengths = voxel_data["vox_lengths"].view(-1,1)
+        # print(f"[DBG RAST] vox_lengths.view(-1,1) shape={tuple(lengths.shape)}")
+
         out = svr.rasterize_voxels(
             rs,
             voxel_data["octpaths"],
@@ -168,17 +186,17 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
             voxel_data["vox_lengths"].view(-1, 1),
             vox_fn
         )
-        ndup, _ = svr.mark_n_duplicates(
-            image_width=cam.image_width, image_height=cam.image_height,
-            tanfovx=cam.tanfovx, tanfovy=cam.tanfovy,
-            cx=cam.cx, cy=cam.cy,
-            w2c_matrix=cam.w2c, c2w_matrix=cam.c2w,
-            near=rs.near,                                # <<< required
-            octree_paths=voxel_data["octpaths"],
-            vox_centers=voxel_data["centers"],
-            vox_lengths=voxel_data["vox_lengths"].view(-1, 1),
-            return_buffer=True                           # <<< get (ndup, geom) pair
-        )
+        # ndup, _ = svr.mark_n_duplicates(
+        #     image_width=cam.image_width, image_height=cam.image_height,
+        #     tanfovx=cam.tanfovx, tanfovy=cam.tanfovy,
+        #     cx=cam.cx, cy=cam.cy,
+        #     w2c_matrix=cam.w2c, c2w_matrix=cam.c2w,
+        #     near=rs.near,                                # <<< required
+        #     octree_paths=voxel_data["octpaths"],
+        #     vox_centers=voxel_data["centers"],
+        #     vox_lengths=voxel_data["vox_lengths"].view(-1, 1),
+        #     return_buffer=True                           # <<< get (ndup, geom) pair
+        # )
     except Exception as e:
         print("[FATAL] Exception in rasterize_voxels:", e)
         import traceback, sys
@@ -188,11 +206,9 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
     torch.cuda.synchronize()
 
     # ---------- hand the visibility set back to C++ ----------
-    idx = torch.where(ndup > 0)[0]                  # (K,)
+    # idx = torch.where(ndup > 0)[0]                  # (K,)
     # geom = geom_buf.view(cam.image_height, cam.image_width).long()    
-    color, depth, normal, T, max_w, feat = out
-    vox_id_map = feat.squeeze(0).long() - 1       # back to 0-based
-    vox_id_map[vox_id_map < 0] = -1           # background sentinel
+    color, depth, normal, T, max_w = out
     # SVRaster gives (H,W,3) color → make (1,3,H,W)
     color  = color .unsqueeze(0)
     depth  = depth .unsqueeze(0) if depth is not None  else None
@@ -206,9 +222,7 @@ def render(cam, voxel_data, rgb_image, output_dir="results/rendered"):
       "normal": normal,
       "T":      T,
       "max_w":  max_w,
-      "feat":   feat,
-      "idx":    idx,
-      "geom":   vox_id_map,
+    #   "idx":    idx,
     }
 
     # rgb = out[0].unsqueeze(0)           # (1, 3, H, W)

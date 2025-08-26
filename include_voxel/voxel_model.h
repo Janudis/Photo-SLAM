@@ -35,15 +35,14 @@
 #include "include_voxel/voxel_constants.h"
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
-    this->Tensor_vec_center_    = { this->center_ };    \
-    this->Tensor_vec_geo_       = { this->_geo_grid_pts };       \
+    this->Tensor_vec_geo_       = { this->_geo_grid_pts_ };       \
     this->Tensor_vec_sh0_       = { this->sh0_ };       \
     this->Tensor_vec_shs_       = { this->shs_ };       \
 
 #define VOXEL_MODEL_INIT_TENSORS(device_type)                                 \
     this->center_               = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->size_                 = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->_geo_grid_pts         = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+    this->_geo_grid_pts_         = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->sh0_                  = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->shs_                  = torch::empty({0, 45, 3},torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->oct_path_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
@@ -89,12 +88,15 @@ public:
 
     // ───────── Incremental insertion ─────────
     void createFromPcd(
-        const std::map<point3D_id_t, Point3D>& pcd,
-        const float spatial_lr_scale
+        const std::map<point3D_id_t, Point3D>& pcd
+        // const float spatial_lr_scale
+        // const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes,
+        // const std::string& cam_pose_txt_path
     );
     /// Insert new points/colors from std::vector
+    // void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration, const std::vector<std::shared_ptr<VoxelKeyframe>>& kfs);
     void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
-    void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
+    // void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
 
     // ───────── Transformations ─────────
     /// Apply a uniform scale and rigid SE3 transform to all voxels
@@ -167,21 +169,6 @@ public:
     float percentDense();
     void setPercentDense(const float percent_dense);
 
-    // ───────── Utilities ─────────
-    /**
-     * Return all trainable parameters for the outer training loop
-     * (mirrors GaussianModel::parameters()).
-     */
-    std::vector<torch::Tensor> parameters() const;
-    /**
-     * Lookup any named tensor by string (for debugging).
-     * Supported names:
-     *   "center", "size", "geo", "sh0", "shs", "opacity",
-     *   "octpath", "octlevel", "exist_since", "subdiv_meta", "subdiv_p"
-     */
-    torch::Tensor getTensor(const std::string& name) const;
-    void saveTorch(const std::filesystem::path& result_path) const;
-
     std::unordered_map<std::string, torch::Tensor>
     render(
         const MiniCam&                   cam,
@@ -199,6 +186,16 @@ public:
         const std::vector<MiniCam>& cameras,
         const py::array_t<uint8_t>& rgb_image
     );
+
+    void densificationPostfix(
+        torch::Tensor& geo_new,   
+        torch::Tensor& sh0_new,
+        torch::Tensor& shs_new,
+        torch::Tensor& subdiv_p_new);
+
+    void check_consistency(int where) const;
+
+    void transformPoints(torch::Tensor& points, const torch::Tensor& transformmatrix);
 
 protected:
     float exponLrFunc(int step);
@@ -231,7 +228,7 @@ public:
     // torch::Tensor subdiv_p_grad_buffer_;// [N]
 
     torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
-    torch::Tensor _geo_grid_pts;    // [M]  float32 learnable density at each grid-point
+    torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
     /// How each of the N leaf-voxels maps into that grid:
     torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
     /// Inverse of the voxel size, needed for interpolation:
@@ -239,11 +236,9 @@ public:
 
     /// Vectors of tensors for replacing into optimizer
     std::vector<torch::Tensor> 
-    Tensor_vec_center_,
     Tensor_vec_geo_,
     Tensor_vec_sh0_,
     Tensor_vec_shs_;
-    // Tensor_vec_opacity_;                               
 
     /// The Adam optimizer
     std::shared_ptr<torch::optim::Adam> optimizer_;
@@ -260,6 +255,11 @@ public:
     torch::Tensor voxel_error_sum_;    // (M,1)
     torch::Tensor voxel_hit_count_;    // (M,1)
 
+    torch::Tensor sh0_accum_;   // [V,3], sum of all SH0‑colors so far
+    torch::Tensor hit_count_;   // [V,1], number of points per voxel
+
+    torch::Tensor scene_center, scene_extent, bb_min_eff_, bb_max_eff_;
+
 protected:
     /// Learning‐rate scheduling parameters
     float lr_init_;
@@ -270,6 +270,14 @@ protected:
 
     /// Mutex to protect runtime hyperparameter changes
     std::mutex mutex_settings_;
+
+    int                     leaf_level_{1};
+    std::unordered_map<int64_t,int> voxel_hash_;
+    float kPadding     = 0.05f;
+    float kTargetVoxel = 0.05f;
+    float kGeoInit     = 4.0f;
+    float kSh0Init     = 0.5f;
+    float kShsInit     = 0.0f;
 };
 
 } // namespace sv

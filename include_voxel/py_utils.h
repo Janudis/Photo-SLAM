@@ -42,25 +42,13 @@ namespace sv {
             py::object w2c_py = torch.attr("from_numpy")(tensor_to_numpy(cam.w2c.cpu()));
             py::object c2w_py = torch.attr("from_numpy")(tensor_to_numpy(cam.c2w.cpu()));
 
-            // ---- make absolutely sure we pass real ints ----
-            const int w = static_cast<int>(cam.width  > 0 ? cam.width  : 1);
-            const int h = static_cast<int>(cam.height > 0 ? cam.height : 1);
-    
-            float tanfovx = (0.5f * cam.width) / cam.fx;
-            float tanfovy = (0.5f * cam.height) / cam.fy;
-            // float tanfovx = std::tan(cam.fx * 0.5f);
-            // float tanfovy = std::tan(cam.fy * 0.5f);
-
-            // std::cout << "cx: " << cam.cx << ", cy: " << cam.cy << std::endl;
-
             py::object py_cam = MiniCamClass(
-                // cam.width,
-                // cam.height,
-                w, h,
+                cam.width,
+                cam.height,
                 w2c_py,
                 c2w_py,
-                tanfovx,
-                tanfovy,
+                cam.tanfovx,
+                cam.tanfovy,
                 cam.cx,
                 cam.cy,
                 cam.cam_mode

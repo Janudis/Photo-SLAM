@@ -112,9 +112,9 @@ public:
     cv::Mat undistort_map1, undistort_map2;
     cv::Mat undistort_mask;
 
-    float tanfovx;
-    float tanfovy;
-    std::string cam_mode = "persp";
+    // float tanfovx;
+    // float tanfovy;
+    // std::string cam_mode = "persp";
 };
 
 }

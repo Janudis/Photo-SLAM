@@ -217,6 +217,17 @@ public:
      std::map<camera_id_t, torch::Tensor> viewer_main_undistort_mask_;
      std::map<camera_id_t, torch::Tensor> viewer_sub_undistort_mask_; 
 
+    std::ofstream pose_dump_stream_;
+    bool poses_header_written_ = false;
+
+    Eigen::Vector3f aabb_min_{ std::numeric_limits<float>::infinity(),
+                            std::numeric_limits<float>::infinity(),
+                            std::numeric_limits<float>::infinity() };
+    Eigen::Vector3f aabb_max_{ -std::numeric_limits<float>::infinity(),
+                            -std::numeric_limits<float>::infinity(),
+                            -std::numeric_limits<float>::infinity() };
+    bool have_bounds_ = false;
+
 protected:
     VoxelModelParams model_params_;
     VoxelOptimizationParams opt_params_;

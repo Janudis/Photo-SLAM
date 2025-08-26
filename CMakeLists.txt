@@ -69,40 +69,40 @@ include_directories(
 ##  Build the gaussian splatting component libraries to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-add_library(simple_knn SHARED
-    third_party/simple-knn/simple_knn.cu
-    third_party/simple-knn/simple_knn.h
-    third_party/simple-knn/spatial.cu
-    third_party/simple-knn/spatial.h)
-# target_compile_features(simple_knn PUBLIC cxx_std_17)
-target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
+# add_library(simple_knn SHARED
+#     third_party/simple-knn/simple_knn.cu
+#     third_party/simple-knn/simple_knn.h
+#     third_party/simple-knn/spatial.cu
+#     third_party/simple-knn/spatial.h)
+# # target_compile_features(simple_knn PUBLIC cxx_std_17)
+# target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
 
-add_library(cuda_rasterizer SHARED
-    include/operate_points.h
-    src/operate_points.cu
-    include/rasterize_points.h
-    src/rasterize_points.cu
-    include/stereo_vision.h
-    src/stereo_vision.cu
-    cuda_rasterizer/auxiliary.h
-    cuda_rasterizer/backward.cu
-    cuda_rasterizer/backward.h
-    cuda_rasterizer/config.h
-    cuda_rasterizer/forward.cu
-    cuda_rasterizer/forward.h
-    cuda_rasterizer/operate_points.h
-    cuda_rasterizer/rasterizer.h
-    cuda_rasterizer/rasterizer_impl.cu
-    cuda_rasterizer/rasterizer_impl.h
-    cuda_rasterizer/stereo_vision.h)
-set_target_properties(cuda_rasterizer PROPERTIES CUDA_ARCHITECTURES "75;86")
-# target_compile_features(cuda_rasterizer PUBLIC cxx_std_17)
-target_include_directories(cuda_rasterizer PRIVATE
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-target_link_libraries(cuda_rasterizer
-    glm::glm
-    "${TORCH_LIBRARIES}"
-    Eigen3::Eigen)
+# add_library(cuda_rasterizer SHARED
+#     include/operate_points.h
+#     src/operate_points.cu
+#     include/rasterize_points.h
+#     src/rasterize_points.cu
+#     include/stereo_vision.h
+#     src/stereo_vision.cu
+#     cuda_rasterizer/auxiliary.h
+#     cuda_rasterizer/backward.cu
+#     cuda_rasterizer/backward.h
+#     cuda_rasterizer/config.h
+#     cuda_rasterizer/forward.cu
+#     cuda_rasterizer/forward.h
+#     cuda_rasterizer/operate_points.h
+#     cuda_rasterizer/rasterizer.h
+#     cuda_rasterizer/rasterizer_impl.cu
+#     cuda_rasterizer/rasterizer_impl.h
+#     cuda_rasterizer/stereo_vision.h)
+# set_target_properties(cuda_rasterizer PROPERTIES CUDA_ARCHITECTURES "75;86")
+# # target_compile_features(cuda_rasterizer PUBLIC cxx_std_17)
+# target_include_directories(cuda_rasterizer PRIVATE
+#     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+# target_link_libraries(cuda_rasterizer
+#     glm::glm
+#     "${TORCH_LIBRARIES}"
+#     Eigen3::Eigen)
 
 ##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
@@ -321,8 +321,8 @@ target_link_libraries(tum_mono_voxel
 target_link_directories(tum_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # # TUM RGBD
 # add_executable(tum_rgbd examples/tum_rgbd.cpp)

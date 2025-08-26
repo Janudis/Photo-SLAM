@@ -9,9 +9,13 @@ class MiniCam:
         self.c2w = c2w
         self.tanfovx = tanfovx
         self.tanfovy = tanfovy
-        self.fovx = 2 * math.atan(tanfovx)  
-        self.fovy = 2 * math.atan(tanfovy)  
         self.cx = cx
         self.cy = cy
         self.cam_mode = cam_mode
         self.frame_id = -1
+        # ---------- NEW ----------
+        # world‑space camera centre ⟵ 4th column of c2w
+        self.position = self.c2w[:3, 3]
+        # **+Z** column of c2w is the *forward* (look‑at) direction
+        self.lookat   = self.c2w[:3, 2]
+        self.pix_size = 2 * self.tanfovx / self.image_width

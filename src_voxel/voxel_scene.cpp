@@ -78,20 +78,19 @@ void VoxelScene::clearCachedPoint3D()
     this->cached_point_cloud_.clear();
 }
 
-/* ───────────────── helper transforms ───────────────────────────────── */
-void VoxelScene::applyScaledTransformation(float s, const Sophus::SE3f T)
-{
-    // Apply the scaled transformation on gaussian keyframes
-    for (auto& kfit : keyframes_) {
-        std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
-        Sophus::SE3f Twc = pkf->getPosef().inverse();
-        Twc.translation() *= s;
-        Sophus::SE3f Tyc = T * Twc;
-        Sophus::SE3f Tcy = Tyc.inverse();
-        pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
-        pkf->computeTransformTensors();
-    }
-}
+// void VoxelScene::applyScaledTransformation(float s, const Sophus::SE3f T)
+// {
+//     // Apply the scaled transformation on gaussian keyframes
+//     for (auto& kfit : keyframes_) {
+//         std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
+//         Sophus::SE3f Twc = pkf->getPosef().inverse();
+//         Twc.translation() *= s;
+//         Sophus::SE3f Tyc = T * Twc;
+//         Sophus::SE3f Tcy = Tyc.inverse();
+//         pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
+//         pkf->computeTransformTensors();
+//     }
+// }
 
 std::tuple<Eigen::Vector3f,float> VoxelScene::getNerfppNorm()
 {

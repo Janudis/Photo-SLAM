@@ -9,7 +9,7 @@ BIN=$root_dir/bin/tum_mono_voxel
 VOC=$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt
 ORB_CFG=$root_dir/cfg/ORB_SLAM3/Monocular/TUM/tum_freiburg1_desk.yaml
 VOX_CFG=$root_dir/cfg/voxel_mapper/Monocular/TUM/tum_mono_voxel.yaml
-SEQ=$root_dir/scripts/data/rgbd_dataset_freiburg1_desk
+SEQ=$root_dir/scripts/data/rgbd_dataset_freiburg1_desk_firsthalf
 OUT=$root_dir/results/tum_voxel/rgbd_dataset_freiburg1_desk
 mkdir -p "$OUT"
 "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$OUT" no_viewer

@@ -1,9 +1,14 @@
 #include "include_voxel/voxel_mapper.h"
+#include <limits>
+#include <cmath>
+#include <iomanip>
+#include <mutex>
 
 namespace py = pybind11;
 std::ofstream loss_log_;
 std::ofstream loss_l1_log_;
 std::ofstream loss_ssim_log_;
+
 inline void saveDebugImage(torch::Tensor tensor,
                            const std::string& path)
 {
@@ -134,6 +139,108 @@ void saveTensor(const torch::Tensor &t,
        << ".png";
     cv::imwrite(ss.str(), bgr);
 }
+
+static inline void extendAABB(Eigen::Vector3f& mn, Eigen::Vector3f& mx,
+                              const Eigen::Vector3f& p) {
+    mn = mn.cwiseMin(p);
+    mx = mx.cwiseMax(p);
+}
+
+static inline void extendAABB_with_flat_xyz(Eigen::Vector3f& mn, Eigen::Vector3f& mx,
+                                            const std::vector<float>& flat_xyz) {
+    const size_t n = flat_xyz.size();
+    if (n < 3) return;
+
+    // If mn is not initialized yet, seed from the first triplet
+    if (!std::isfinite(mn.x())) {
+        mn = Eigen::Vector3f(flat_xyz[0], flat_xyz[1], flat_xyz[2]);
+        mx = mn;
+    }
+
+    for (size_t i = 0; i + 2 < n; i += 3) {
+        Eigen::Vector3f p(flat_xyz[i+0], flat_xyz[i+1], flat_xyz[i+2]);
+        extendAABB(mn, mx, p);
+    }
+}
+
+namespace {
+
+std::mutex g_dumpkf_mutex;
+
+static void saveKfPng_fromFloatRGB(const cv::Mat& im_float_rgb,   // CV_32FC3 in [0..1] RGB
+                                   int fid,
+                                   const std::filesystem::path& imgs_dir)
+{
+    // convert float[0..1] RGB -> 8-bit BGR
+    cv::Mat tmp8, bgr8;
+    im_float_rgb.convertTo(tmp8, CV_8UC3, 255.0);
+    cv::cvtColor(tmp8, bgr8, cv::COLOR_RGB2BGR);
+
+    std::ostringstream oss;
+    oss << "kf_" << fid << ".png";
+    const auto img_path = (imgs_dir / oss.str()).string();
+    bool ok = cv::imwrite(img_path, bgr8);
+    // std::cout << "[saveKfPng] " << img_path << " ok=" << std::boolalpha << ok
+    //           << " mean(BGR)=" << cv::mean(bgr8) << std::endl;
+}
+
+template<typename KFMap, typename CamContainer>
+void dumpKeyframesForProjectionFile(const KFMap& kfmap,
+                                    const CamContainer& cameras,
+                                    const std::filesystem::path& out_dir)
+{
+    std::lock_guard<std::mutex> lk(g_dumpkf_mutex);
+
+    std::filesystem::create_directories(out_dir);
+    std::filesystem::create_directories(out_dir / "imgs");
+
+    const auto tmp_file = out_dir / "keyframes_proj.tmp";
+    const auto out_file = out_dir / "keyframes_proj.txt";
+
+    std::ofstream os(tmp_file, std::ios::trunc);
+    if (!os) { std::cerr << "[dumpKF] cannot open " << tmp_file << '\n'; return; }
+
+    size_t n_lines = 0;
+    for (const auto& kv : kfmap) {
+        const auto& kf_ptr = kv.second;
+        if (!kf_ptr) continue;
+
+        const auto cam_id = kf_ptr->camera_id_;
+        auto cam_it = cameras.find(cam_id);
+        if (cam_it == cameras.end()) continue;
+        const sv::Camera& cam = cam_it->second;
+
+        const int   W  = kf_ptr->image_width_;
+        const int   H  = kf_ptr->image_height_;
+        const float fx = cam.fx(), fy = cam.fy(), cx = cam.cx(), cy = cam.cy();
+
+        const Eigen::Matrix4f Tcw = kf_ptr->getWorld2View2(kf_ptr->trans_, kf_ptr->scale_);
+
+        std::ostringstream oss;
+        oss << "imgs/kf_" << kf_ptr->fid_ << ".png";
+        const std::string rel_img = oss.str();
+
+        os << kf_ptr->fid_ << ' '
+           << W << ' ' << H << ' '
+           << std::setprecision(9) << fx << ' ' << fy << ' ' << cx << ' ' << cy << ' ';
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                os << Tcw(r,c) << ' ';
+        os << rel_img << '\n';
+        ++n_lines;
+    }
+    os.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_file, out_file, ec);
+    if (ec) {
+        std::filesystem::copy_file(tmp_file, out_file,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(tmp_file);
+    }
+    // std::cout << "[dumpKF] wrote " << out_file << " (" << n_lines << " lines)\n";
+}
+} // namespace
 
 VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                          const std::filesystem::path& config_file_path,
@@ -309,7 +416,17 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     }
 
     std::cout << "[VoxelMapper] Reading parameters from " << cfg_path << '\n';
-    std::lock_guard<std::mutex> guard(mutex_status_);
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+
+    // Model parameters
+     model_params_.sh_degree_ =
+         settings_file["Model.sh_degree"].operator int();
+     model_params_.resolution_ =
+         settings_file["Model.resolution"].operator float();
+     model_params_.white_background_ =
+         (settings_file["Model.white_background"].operator int()) != 0;
+     model_params_.eval_ =
+         (settings_file["Model.eval"].operator int()) != 0;
 
     /* ───────── PIPELINE FLAGS ───────── */
     // inactive_geo_densify_ =
@@ -445,6 +562,7 @@ void VoxelMapper::run()
     /* expose our helper scripts to the embedded Python side */
     py::gil_scoped_acquire gil;
     py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+
     /* ───────────────────────────────────────────────
      *  1.  INITIAL VOXEL   M A P P I N G  LOOP
      * ─────────────────────────────────────────────── */
@@ -459,6 +577,9 @@ void VoxelMapper::run()
             auto pMap = mpSLAM->getAtlas()->GetCurrentMap();
             std::vector<ORB_SLAM3::KeyFrame*> vKFs;
             std::vector<ORB_SLAM3::MapPoint*> vMPs;
+
+            // std::vector<std::shared_ptr<VoxelKeyframe>> keyframes_for_bounding;
+            
             {
                 std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
                 vKFs = pMap->GetAllKeyFrames();
@@ -482,7 +603,7 @@ void VoxelMapper::run()
                 for (const auto& pKF : vKFs)
                 {
                     std::shared_ptr<VoxelKeyframe> new_kf = std::make_shared<VoxelKeyframe>(pKF->mnId, getIteration());
-                    new_kf->zfar_  = z_far_;
+                    // new_kf->zfar_  = z_far_;
                     new_kf->znear_ = z_near_;
                     // Pose
                     auto pose = pKF->GetPose();
@@ -500,22 +621,66 @@ void VoxelMapper::run()
                     // Image (left if STEREO)
                     cv::Mat imgRGB = pKF->imgLeftRGB;
                     camera.undistortImage(imgRGB, imgRGB_undistorted);
+
+                    {
+                        static const auto proj_dir = result_dir_ / "proj_debug";
+                        static const auto imgs_dir = proj_dir / "imgs";
+                        std::filesystem::create_directories(imgs_dir);
+
+                        // imgRGB_undistorted is CV_32FC3 RGB in [0..1] (in Photo-SLAM). If it’s 8U, convert first:
+                        cv::Mat img_float;
+                        if (imgRGB_undistorted.type() == CV_32FC3) {
+                            img_float = imgRGB_undistorted;
+                        } else {
+                            imgRGB_undistorted.convertTo(img_float, CV_32FC3, 1.0/255.0);
+                        }
+                        saveKfPng_fromFloatRGB(img_float, pKF->mnId, imgs_dir);
+                    }
+
                     new_kf->original_image_ =
                         tensor_utils::cvMat2TorchTensor_Float32(imgRGB_undistorted, device_type_);
                     new_kf->img_filename_ = pKF->mNameFile;
 
                     // Compute transformations
-                    new_kf->computeTransformTensors();
+                    // new_kf->computeTransformTensors();
                     scene_->addKeyframe(new_kf, &kfid_shuffled_);
 
                     increaseKeyframeTimesOfUse(new_kf, newKeyframeTimesOfUse());
                 }
             }   // Mutex released
+
+                aabb_min_.setConstant( std::numeric_limits<float>::infinity());
+                aabb_max_.setConstant(-std::numeric_limits<float>::infinity());
+                have_bounds_ = false;
+
+                for (const auto& kv : scene_->cached_point_cloud_) {
+                    // cast<float>() returns a temporary → store as a VALUE, not a const&
+                    Eigen::Vector3f P = kv.second.xyz_.cast<float>();
+                    extendAABB(aabb_min_, aabb_max_, P);
+                    have_bounds_ = true;
+                }
+
+                if (have_bounds_) {
+                    std::cout.setf(std::ios::fixed);
+                    // std::cout << std::setprecision(6)
+                    //         << "[AABB:init] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
+                    //         << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
+                }
+
+                dumpKeyframesForProjectionFile(
+                    scene_->keyframes(),        // all KFs currently in the scene
+                    scene_->cameras_,           // intrinsics you already use
+                    result_dir_ / "proj_debug"  // output folder
+                );
+
                 // D) Create voxel model & trainer setup
                 {
                     std::unique_lock<std::mutex> lock_render(mutex_render_);
                     scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
-                    voxel_model_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_);
+                    std::cout << "[VoxelMapper] Scene extent: " 
+                              << scene_->cameras_extent_ << std::endl;
+                    // voxel_model_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_, keyframes_for_bounding, (result_dir_ / "training_camera_poses.txt").string());
+                    voxel_model_->createFromPcd(scene_->cached_point_cloud_);
                     std::unique_lock<std::mutex> lock(mutex_settings_);
                     voxel_model_->trainingSetup(opt_params_);
                 }
@@ -574,11 +739,19 @@ void VoxelMapper::run()
         subdiv_interval = opt_params_.subdiv_every_;
         n_delay_iters   = int(subdiv_interval * 0.8f);
      }
+
+    if (have_bounds_) {
+        std::cout.setf(std::ios::fixed);
+        std::cout << std::setprecision(6)
+                << "[AABB:final] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
+                << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
+    }
+
      // Save and clear
      renderAndRecordAllKeyframes("_shutdown");
     //  savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
      writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
- 
+    //  pose_dump_stream_.close();
      signalStop();
  }
 
@@ -628,75 +801,18 @@ void VoxelMapper::trainForOneIteration()
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         
         if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
+        {
             default_sh_ += 1;
+            std::cout << "[VoxelMapper] SH degree: " << default_sh_ << std::endl;
+        }    
         voxel_model_->setShDegree(default_sh_);
 
         // 5) build a MiniCam out of this keyframe
-        // viewpoint_cam->computeTransformTensors();            // idempotent
         sv::MiniCam cam = viewpoint_cam->toMiniCam();
-        cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
-        cam.w2c = cam.w2c.contiguous().to(mDevice);
+        // cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
+        // cam.w2c = cam.w2c.contiguous().to(mDevice);
 
         py::module_ np = py::module_::import("numpy");
-        // {
-        //     namespace fs = std::filesystem;
-        //     // build per-KF directory: result_dir_/kf0000, kf0001, etc.
-        //     std::ostringstream kf_ss;
-        //     kf_ss << result_dir_.string() << "/kf"
-        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_;
-        //     fs::create_directories(kf_ss.str());
-        //     const fs::path kf_dir = kf_ss.str();
-
-        //     // iteration number padded
-        //     std::ostringstream it_ss;
-        //     it_ss << std::setw(6) << std::setfill('0') << getIteration();
-        //     const std::string iter_str = it_ss.str();
-
-        //     // 1) dump GT image
-        //     {
-        //         std::ostringstream fn;
-        //         fn << kf_dir.string() << "/gt_kf"
-        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
-        //         << "_iter" << iter_str << ".png";
-        //         saveDebugImage(gt_image, fn.str());
-        //     }
-
-        //     // 2) dump intrinsics K
-        //     {
-        //         auto opts = torch::TensorOptions()
-        //                         .dtype(torch::kFloat32)   // <-- 32-bit
-        //                         .device(torch::kCPU);
-        //         torch::Tensor K = torch::tensor(
-        //             {{static_cast<float>(cam.fx), 0.f, static_cast<float>(cam.cx)},
-        //             {0.f, static_cast<float>(cam.fy), static_cast<float>(cam.cy)},
-        //             {0.f, 0.f, 1.f}},
-        //             opts);
-        //         std::ostringstream fn;
-        //         fn << kf_dir.string() << "/K_kf"
-        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
-        //         << "_iter" << iter_str << ".npy";
-        //         py::module_::import("numpy").attr("save")(fn.str(), K);
-        //     }
-
-        //     // 3) dump world → camera
-        //     {
-        //         std::ostringstream fn;
-        //         fn << kf_dir.string() << "/w2c_kf"
-        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
-        //         << "_iter" << iter_str << ".npy";
-        //         py::module_::import("numpy").attr("save")(fn.str(), cam.w2c.cpu());
-        //     }
-
-        //     // 4) dump camera → world
-        //     {
-        //         std::ostringstream fn;
-        //         fn << kf_dir.string() << "/c2w_kf"
-        //         << std::setw(4) << std::setfill('0') << viewpoint_cam->fid_
-        //         << "_iter" << iter_str << ".npy";
-        //         py::module_::import("numpy").attr("save")(fn.str(), cam.c2w.cpu());
-        //     }
-        // }
-
         // 6) update all learning rates
         if (mpSLAM) {
             int used_times = kfs_used_times_[viewpoint_cam->fid_];
@@ -762,258 +878,257 @@ void VoxelMapper::trainForOneIteration()
                                         viewpoint_cam->fid_,
                                         result_dir_, result_dir_, result_dir_);
 
-            // 1) grab the raw ∂L/∂subdiv_p_ from the last backward pass
-            auto grad_p = voxel_model_->getSubdivPriorityGrad()  // [M,1]
-                                .view(-1);                      // [M]
+            // // 1) grab the raw ∂L/∂subdiv_p_ from the last backward pass
+            // auto grad_p = voxel_model_->getSubdivPriorityGrad()  // [M,1]
+            //                     .view(-1);                      // [M]
 
-            // 2) restrict to just those voxels that actually contributed
-            auto idx_tensor = render_pkg["idx"];
-            if (!idx_tensor.defined()) {
-                // nothing visible this iteration – skip optimisation step
-                voxel_model_->optimizer_->zero_grad(true);
-                return;
-            }
-            torch::Tensor vis_idx = idx_tensor.to(mDevice, /*non_blocking=*/true)
-                                            .contiguous();
-            if (vis_idx.numel() == 0) {
-                // no voxel hit: just zero-out grads and continue
-                voxel_model_->optimizer_->zero_grad(true);
-                return;
-            }
-            voxel_model_->accumulateSubdivGradients(vis_idx,
-                                                    grad_p.index({vis_idx}));
+            // // 2) restrict to just those voxels that actually contributed
+            // auto idx_tensor = render_pkg["idx"];
+            // if (!idx_tensor.defined()) {
+            //     // nothing visible this iteration – skip optimisation step
+            //     voxel_model_->optimizer_->zero_grad(true);
+            //     return;
+            // }
+            // torch::Tensor vis_idx = idx_tensor.to(mDevice, /*non_blocking=*/true)
+            //                                 .contiguous();
+            // if (vis_idx.numel() == 0) {
+            //     // no voxel hit: just zero-out grads and continue
+            //     voxel_model_->optimizer_->zero_grad(true);
+            //     return;
+            // }
+            // voxel_model_->accumulateSubdivGradients(vis_idx,
+            //                                         grad_p.index({vis_idx}));
             // std::cout << "[DBG]  max|grad_buf| = "
             //         << voxel_model_->subdiv_p_grad_buffer_.abs().max().item<float>()
             //         << '\n';
+            // {
+            //     // std::cout << "\n[DBG] iter " << iteration_
+            //     //         << "  render_pkg contains:\n";
+            //     // for (const auto& kv : render_pkg)              // std::pair<std::string,Tensor>
+            //     // {
+            //     //     const std::string& name = kv.first;
+            //     //     const torch::Tensor& t  = kv.second;
+            //     //     bool defined = t.defined();
+            //     //     std::string dtype = defined ? std::string(t.dtype().name()) : "n/a";
+            //     //     std::cout << "    • " << name
+            //     //             << "  | defined=" << std::boolalpha << defined
+            //     //             << "  | dtype="   << dtype
+            //     //             << "  | sizes=";
+            //     //     if (!defined || t.dim() == 0) {
+            //     //         std::cout << "[]";
+            //     //     } else {
+            //     //         std::cout << '[';
+            //     //         for (int i = 0; i < t.dim(); ++i) {
+            //     //             std::cout << t.size(i) << (i + 1 == t.dim() ? "" : ",");
+            //     //         }
+            //     //         std::cout << ']';
+            //     //     }
+            //     //     std::cout << '\n';
+            //     // }
+            //     auto it = render_pkg.find("geom");
+            //     if (it != render_pkg.end() && it->second.defined())
+            //     {
+            //         /* ---------------- geometry buffer ------------------------- */
+            //         torch::Tensor geom = it->second.to(mDevice, /*non_blocking=*/true)
+            //                                         .contiguous();          // (H,W)  int64
 
-            {
-                // std::cout << "\n[DBG] iter " << iteration_
-                //         << "  render_pkg contains:\n";
-                // for (const auto& kv : render_pkg)              // std::pair<std::string,Tensor>
-                // {
-                //     const std::string& name = kv.first;
-                //     const torch::Tensor& t  = kv.second;
-                //     bool defined = t.defined();
-                //     std::string dtype = defined ? std::string(t.dtype().name()) : "n/a";
-                //     std::cout << "    • " << name
-                //             << "  | defined=" << std::boolalpha << defined
-                //             << "  | dtype="   << dtype
-                //             << "  | sizes=";
-                //     if (!defined || t.dim() == 0) {
-                //         std::cout << "[]";
-                //     } else {
-                //         std::cout << '[';
-                //         for (int i = 0; i < t.dim(); ++i) {
-                //             std::cout << t.size(i) << (i + 1 == t.dim() ? "" : ",");
-                //         }
-                //         std::cout << ']';
-                //     }
-                //     std::cout << '\n';
-                // }
-                auto it = render_pkg.find("geom");
-                if (it != render_pkg.end() && it->second.defined())
-                {
-                    /* ---------------- geometry buffer ------------------------- */
-                    torch::Tensor geom = it->second.to(mDevice, /*non_blocking=*/true)
-                                                    .contiguous();          // (H,W)  int64
+            //         /*  PER-PIXEL L1 error ..................................... */
+            //         torch::Tensor per_pix_err =
+            //             (rendered_image - gt_image).abs()   // (1,3,H,W)
+            //                                         .mean(1)   // → (1,H,W)
+            //                                         .squeeze(0);            // (H,W)
 
-                    /*  PER-PIXEL L1 error ..................................... */
-                    torch::Tensor per_pix_err =
-                        (rendered_image - gt_image).abs()   // (1,3,H,W)
-                                                    .mean(1)   // → (1,H,W)
-                                                    .squeeze(0);            // (H,W)
+            //         /*  gather only fg pixels .................................. */
+            //         torch::Tensor mask_fg  = geom >= 0;                      // bool(H,W)
+            //         torch::Tensor vox_ids  = geom.masked_select(mask_fg)
+            //                                         .to(torch::kLong);       // (K,)
+            //         torch::Tensor pix_err  = per_pix_err.masked_select(mask_fg)
+            //                                         .unsqueeze(1);         // (K,1)
 
-                    /*  gather only fg pixels .................................. */
-                    torch::Tensor mask_fg  = geom >= 0;                      // bool(H,W)
-                    torch::Tensor vox_ids  = geom.masked_select(mask_fg)
-                                                    .to(torch::kLong);       // (K,)
-                    torch::Tensor pix_err  = per_pix_err.masked_select(mask_fg)
-                                                    .unsqueeze(1);         // (K,1)
-
-                    voxel_model_->voxel_error_sum_ .index_add_(0, vox_ids, pix_err);
-                    voxel_model_->voxel_hit_count_.index_add_(0, vox_ids,
-                                                            torch::ones_like(pix_err));
+            //         voxel_model_->voxel_error_sum_ .index_add_(0, vox_ids, pix_err);
+            //         voxel_model_->voxel_hit_count_.index_add_(0, vox_ids,
+            //                                                 torch::ones_like(pix_err));
 
 
-                    float loss_val = loss.item<float>();
-                    int fid = viewpoint_cam->fid_;                 // key-frame ID being trained
-                    // --- 1) ensure our vectors are big enough ---
-                    if (fid >= static_cast<int>(best_loss_per_kf_.size())) {
-                        size_t newSize = fid + 1;
-                        best_loss_per_kf_.resize(newSize,
-                                                std::numeric_limits<float>::infinity());
-                        worst_loss_per_kf_.resize(newSize,
-                                                -std::numeric_limits<float>::infinity());
-                    }
-                    // references into the right slot
-                    float &best  = best_loss_per_kf_[fid];
-                    float &worst = worst_loss_per_kf_[fid];
-                    // --- 2) update “best” for this KF ---
-                    if (loss_val < best) {
-                        best = loss_val;
-                        auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
-                        std::filesystem::create_directories(kf_dir);
-                        saveTensor(gt_image,     "best_gt",     kf_dir.string(), iteration_, fid);
-                        saveTensor(masked_image, "best_masked", kf_dir.string(), iteration_, fid);
-                        saveVoxelErrorHeatmap(cam,
-                            geom,
-                            gt_image,
-                            viewpoint_cam->fid_,                              // <- key-frame id
-                            (result_dir_ / "heatmaps").string());
-                    }
-                    // --- 3) update “worst” for this KF ---
-                    if (loss_val > worst) {
-                        worst = loss_val;
-                        auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
-                        std::filesystem::create_directories(kf_dir);
-                        saveTensor(gt_image,     "worst_gt",     kf_dir.string(), iteration_, fid);
-                        saveTensor(masked_image, "worst_masked", kf_dir.string(), iteration_, fid);
-                        saveVoxelErrorHeatmap(cam,
-                            geom,
-                            gt_image,
-                            viewpoint_cam->fid_,                              // <- key-frame id
-                            (result_dir_ / "heatmaps").string());
-                    }
-                    loss_log_ << iteration_ << "," << loss_val << "\n";
-                    loss_l1_log_ << iteration_ << "," << Ll1.item<float>() << "\n";
-                    loss_ssim_log_ << iteration_ << "," 
-                        << (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()).item<float>()) << "\n";
+            //         float loss_val = loss.item<float>();
+            //         int fid = viewpoint_cam->fid_;                 // key-frame ID being trained
+            //         // --- 1) ensure our vectors are big enough ---
+            //         if (fid >= static_cast<int>(best_loss_per_kf_.size())) {
+            //             size_t newSize = fid + 1;
+            //             best_loss_per_kf_.resize(newSize,
+            //                                     std::numeric_limits<float>::infinity());
+            //             worst_loss_per_kf_.resize(newSize,
+            //                                     -std::numeric_limits<float>::infinity());
+            //         }
+            //         // references into the right slot
+            //         float &best  = best_loss_per_kf_[fid];
+            //         float &worst = worst_loss_per_kf_[fid];
+            //         // --- 2) update “best” for this KF ---
+            //         if (loss_val < best) {
+            //             best = loss_val;
+            //             auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+            //             std::filesystem::create_directories(kf_dir);
+            //             saveTensor(gt_image,     "best_gt",     kf_dir.string(), iteration_, fid);
+            //             saveTensor(masked_image, "best_masked", kf_dir.string(), iteration_, fid);
+            //             saveVoxelErrorHeatmap(cam,
+            //                 geom,
+            //                 gt_image,
+            //                 viewpoint_cam->fid_,                              // <- key-frame id
+            //                 (result_dir_ / "heatmaps").string());
+            //         }
+            //         // --- 3) update “worst” for this KF ---
+            //         if (loss_val > worst) {
+            //             worst = loss_val;
+            //             auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+            //             std::filesystem::create_directories(kf_dir);
+            //             saveTensor(gt_image,     "worst_gt",     kf_dir.string(), iteration_, fid);
+            //             saveTensor(masked_image, "worst_masked", kf_dir.string(), iteration_, fid);
+            //             saveVoxelErrorHeatmap(cam,
+            //                 geom,
+            //                 gt_image,
+            //                 viewpoint_cam->fid_,                              // <- key-frame id
+            //                 (result_dir_ / "heatmaps").string());
+            //         }
+            //         loss_log_ << iteration_ << "," << loss_val << "\n";
+            //         loss_l1_log_ << iteration_ << "," << Ll1.item<float>() << "\n";
+            //         loss_ssim_log_ << iteration_ << "," 
+            //             << (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()).item<float>()) << "\n";
 
-                    /* --------------------------------------------------------- */
-                    /*  DEBUG: print per-voxel mean error (top-k or full)        */
-                    if (iteration_ % 50 == 0) {                         // -- every 50 iters
-                        torch::Tensor mean_err =
-                            voxel_model_->voxel_error_sum_
-                            / voxel_model_->voxel_hit_count_.clamp_min(1);  // (N,1)
-                        mean_err = mean_err.squeeze(1);                     // (N)
+            //         /* --------------------------------------------------------- */
+            //         /*  DEBUG: print per-voxel mean error (top-k or full)        */
+            //         if (iteration_ % 50 == 0) {                         // -- every 50 iters
+            //             torch::Tensor mean_err =
+            //                 voxel_model_->voxel_error_sum_
+            //                 / voxel_model_->voxel_hit_count_.clamp_min(1);  // (N,1)
+            //             mean_err = mean_err.squeeze(1);                     // (N)
 
-                        // print worst 10 voxels
-                        auto top = std::get<1>(mean_err.topk(/*k=*/10));    // indices
-                        // std::cout << "[DBG] iter " << iteration_
-                        //         << "  worst-10 voxel errors:\n";
-                        for (int i = 0; i < top.size(0); ++i) {
-                            int64_t id  = top[i].item<int64_t>();
-                            float    err = mean_err[id].item<float>();
-                            // std::cout << "    id " << id << " : " << err << '\n';
-                        }
-                    }
-                } // if geom defined
-            }
-            // 3) PRUNE
-            if (getIteration() >= opt_params_.prune_from_ &&
-                getIteration() % opt_params_.prune_every_ == 0)
-            {
-                std::cout << "PRUNE" << std::endl;
-                // Try to use SVRaster’s max_w; if it wasn’t produced, fall back to grad-threshold
-                auto it = render_pkg.find("max_w");
-                if (it != render_pkg.end() && it->second.defined()) {
-                    // 3a) compute linear threshold ramp exactly as Python does
-                    torch::Tensor max_w = it->second.to(mDevice);     // (M,1)
-                    float alpha = float(getIteration() - opt_params_.prune_from_) /
-                                std::max(1.f,
-                                        float(opt_params_.prune_until_ -
-                                                opt_params_.prune_from_));
-                    alpha = std::clamp(alpha, 0.f, 1.f);
-                    float prune_thres = (1.f - alpha) * opt_params_.prune_threshold_init_ +
-                                        alpha        * opt_params_.prune_threshold_final_;
-                    // 3b) build keep mask and prune
-                    torch::Tensor keep_mask = (max_w >= prune_thres).view(-1);  // bool[M]
-                    voxel_model_->prune(keep_mask);
-                } else {
-                    // Fallback: SVAdaptive’s old gradient rule
-                    torch::Tensor buf = voxel_model_->subdiv_meta_.view(-1);  // accumulated grads
-                    torch::Tensor keep_mask =
-                        (buf >= opt_params_.subdiv_gradient_threshold_);      // bool[M]
-                    voxel_model_->prune(keep_mask);
-                }
-            }
-            // 4) SUBDIVIDE
-            if (getIteration() >= opt_params_.subdiv_from_ &&
-                getIteration() %  opt_params_.subdiv_every_ == 0)
-            {
-                std::cout << "SUBDIVIDE" << std::endl;
-                // ------------------------------------------------------------ (a) compute subdivide_prop on-the-fly
-                int rem_times = remaining_subdiv_times(getIteration(), opt_params_);
-                // scale factor such that repeated ×scale eventually reaches target
-                float scale_each = std::pow(opt_params_.subdivide_target_scale_, 1.f / rem_times);
-                float subdivide_prop = std::max(0.f, (scale_each - 1.f) / 7.f);   // identical to Python
+            //             // print worst 10 voxels
+            //             auto top = std::get<1>(mean_err.topk(/*k=*/10));    // indices
+            //             // std::cout << "[DBG] iter " << iteration_
+            //             //         << "  worst-10 voxel errors:\n";
+            //             for (int i = 0; i < top.size(0); ++i) {
+            //                 int64_t id  = top[i].item<int64_t>();
+            //                 float    err = mean_err[id].item<float>();
+            //                 // std::cout << "    id " << id << " : " << err << '\n';
+            //             }
+            //         }
+            //     } // if geom defined
+            // }
+            // // 3) PRUNE
+            // if (getIteration() >= opt_params_.prune_from_ &&
+            //     getIteration() % opt_params_.prune_every_ == 0)
+            // {
+            //     std::cout << "PRUNE" << std::endl;
+            //     // Try to use SVRaster’s max_w; if it wasn’t produced, fall back to grad-threshold
+            //     auto it = render_pkg.find("max_w");
+            //     if (it != render_pkg.end() && it->second.defined()) {
+            //         // 3a) compute linear threshold ramp exactly as Python does
+            //         torch::Tensor max_w = it->second.to(mDevice);     // (M,1)
+            //         float alpha = float(getIteration() - opt_params_.prune_from_) /
+            //                     std::max(1.f,
+            //                             float(opt_params_.prune_until_ -
+            //                                     opt_params_.prune_from_));
+            //         alpha = std::clamp(alpha, 0.f, 1.f);
+            //         float prune_thres = (1.f - alpha) * opt_params_.prune_threshold_init_ +
+            //                             alpha        * opt_params_.prune_threshold_final_;
+            //         // 3b) build keep mask and prune
+            //         torch::Tensor keep_mask = (max_w >= prune_thres).view(-1);  // bool[M]
+            //         voxel_model_->prune(keep_mask);
+            //     } else {
+            //         // Fallback: SVAdaptive’s old gradient rule
+            //         torch::Tensor buf = voxel_model_->subdiv_meta_.view(-1);  // accumulated grads
+            //         torch::Tensor keep_mask =
+            //             (buf >= opt_params_.subdiv_gradient_threshold_);      // bool[M]
+            //         voxel_model_->prune(keep_mask);
+            //     }
+            // }
+            // // 4) SUBDIVIDE
+            // if (getIteration() >= opt_params_.subdiv_from_ &&
+            //     getIteration() %  opt_params_.subdiv_every_ == 0)
+            // {
+            //     std::cout << "SUBDIVIDE" << std::endl;
+            //     // ------------------------------------------------------------ (a) compute subdivide_prop on-the-fly
+            //     int rem_times = remaining_subdiv_times(getIteration(), opt_params_);
+            //     // scale factor such that repeated ×scale eventually reaches target
+            //     float scale_each = std::pow(opt_params_.subdivide_target_scale_, 1.f / rem_times);
+            //     float subdivide_prop = std::max(0.f, (scale_each - 1.f) / 7.f);   // identical to Python
 
-                auto stat = voxel_model_->computeTrainingStat({cam}, rgb_numpy);
+            //     auto stat = voxel_model_->computeTrainingStat({cam}, rgb_numpy);
 
-                /*  guard: nothing visible → nothing to split  */
-                if (stat.min_samp_interval.numel() == 0) {
-                    voxel_model_->subdiv_meta_.zero_();
-                } else {
-                    // torch::Tensor size_thres =
-                    //     stat.min_samp_interval * opt_params_.subdivide_samp_thres_;
-                    // /*  make  ‖size_thres‖ match device & shape of size_ */
-                    // size_thres = size_thres.to(voxel_model_->size_.device())
-                    //                     .expand_as(voxel_model_->size_);
-                    auto size_thres = stat.min_samp_interval.squeeze(1) * opt_params_.subdivide_samp_thres_;
-                    size_thres = size_thres.to(voxel_model_->size_.device());
+            //     /*  guard: nothing visible → nothing to split  */
+            //     if (stat.min_samp_interval.numel() == 0) {
+            //         voxel_model_->subdiv_meta_.zero_();
+            //     } else {
+            //         // torch::Tensor size_thres =
+            //         //     stat.min_samp_interval * opt_params_.subdivide_samp_thres_;
+            //         // /*  make  ‖size_thres‖ match device & shape of size_ */
+            //         // size_thres = size_thres.to(voxel_model_->size_.device())
+            //         //                     .expand_as(voxel_model_->size_);
+            //         auto size_thres = stat.min_samp_interval.squeeze(1) * opt_params_.subdivide_samp_thres_;
+            //         size_thres = size_thres.to(voxel_model_->size_.device());
 
-                    // ------------------------------------------------------------ (b) validity gate (size + octree level)
-                    torch::Tensor valid =
-                        (voxel_model_->size_ * 0.5 > size_thres).view(-1) &           // per-voxel
-                        (voxel_model_->oct_level_ < sv::MAX_OCT_LEVEL).view(-1);
+            //         // ------------------------------------------------------------ (b) validity gate (size + octree level)
+            //         torch::Tensor valid =
+            //             (voxel_model_->size_ * 0.5 > size_thres).view(-1) &           // per-voxel
+            //             (voxel_model_->oct_level_ < sv::MAX_OCT_LEVEL).view(-1);
 
-                    // ------------------------------------------------------------ (c) priority   (= accumulated grad)
-                    torch::Tensor priority =
-                        voxel_model_->subdiv_meta_.view(-1) * valid;               // (M)
+            //         // ------------------------------------------------------------ (c) priority   (= accumulated grad)
+            //         torch::Tensor priority =
+            //             voxel_model_->subdiv_meta_.view(-1) * valid;               // (M)
 
-                    torch::Tensor rank = torch::zeros_like(priority);
-                    rank.index_put_(
-                        {priority.argsort(/*dim=*/0, /*descending=*/false)},           // ← modified
-                        torch::arange(
-                            priority.numel(),
-                            torch::TensorOptions()
-                                .dtype(priority.dtype())
-                                .device(priority.device())));                          // ← modified
+            //         torch::Tensor rank = torch::zeros_like(priority);
+            //         rank.index_put_(
+            //             {priority.argsort(/*dim=*/0, /*descending=*/false)},           // ← modified
+            //             torch::arange(
+            //                 priority.numel(),
+            //                 torch::TensorOptions()
+            //                     .dtype(priority.dtype())
+            //                     .device(priority.device())));                          // ← modified
     
-                    // ------------------------------------------------------------ (d) pick threshold so that
-                    //                            top `subdivide_prop` fraction will split
-                    float th;
-                    if (getIteration() <= opt_params_.subdivide_all_until_) {
-                        th = -1.f;                          // split everything valid (boot-strap phase)
-                    } else {
-                        th = rank.quantile(1.f - subdivide_prop)
-                                .template item<float>();
-                    }
+            //         // ------------------------------------------------------------ (d) pick threshold so that
+            //         //                            top `subdivide_prop` fraction will split
+            //         float th;
+            //         if (getIteration() <= opt_params_.subdivide_all_until_) {
+            //             th = -1.f;                          // split everything valid (boot-strap phase)
+            //         } else {
+            //             th = rank.quantile(1.f - subdivide_prop)
+            //                     .template item<float>();
+            //         }
 
-                    torch::Tensor subdivide_mask = (rank > th) & valid;
+            //         torch::Tensor subdivide_mask = (rank > th) & valid;
 
-                    // ------------------------------------------------------------ (e) respect global voxel cap
-                    int64_t max_n_subdiv = std::max<int64_t>(
-                        1,
-                        (opt_params_.subdivide_max_num_ -
-                        static_cast<int64_t>(voxel_model_->center_.size(0))) / 7);
+            //         // ------------------------------------------------------------ (e) respect global voxel cap
+            //         int64_t max_n_subdiv = std::max<int64_t>(
+            //             1,
+            //             (opt_params_.subdivide_max_num_ -
+            //             static_cast<int64_t>(voxel_model_->center_.size(0))) / 7);
 
-                    if (subdivide_mask.sum().item<int64_t>() > max_n_subdiv)
-                    {
-                        // keep only the highest-rank `max_n_subdiv` parents
-                        auto sel_rank = rank.index({subdivide_mask});
-                        float cutoff  = std::get<0>(sel_rank.sort(/*descending=*/true))
-                                            [max_n_subdiv - 1]
-                                            .template item<float>();
-                        subdivide_mask &= (rank >= cutoff);
-                    }
+            //         if (subdivide_mask.sum().item<int64_t>() > max_n_subdiv)
+            //         {
+            //             // keep only the highest-rank `max_n_subdiv` parents
+            //             auto sel_rank = rank.index({subdivide_mask});
+            //             float cutoff  = std::get<0>(sel_rank.sort(/*descending=*/true))
+            //                                 [max_n_subdiv - 1]
+            //                                 .template item<float>();
+            //             subdivide_mask &= (rank >= cutoff);
+            //         }
 
-                    // ------------------------------------------------------------ (f) split and reset accumulator
-                    if (subdivide_mask.any().item<bool>())
-                        voxel_model_->subdivide(subdivide_mask);
+            //         // ------------------------------------------------------------ (f) split and reset accumulator
+            //         if (subdivide_mask.any().item<bool>())
+            //             voxel_model_->subdivide(subdivide_mask);
 
-                    if (iteration_ % 100 == 0) {
-                        int64_t n_valid  = valid.sum().item<int64_t>();
-                        int64_t n_ranked = (priority > 0).sum().item<int64_t>();
-                        int64_t n_split  = subdivide_mask.sum().item<int64_t>();
-                        std::cout << "[DBG] it " << iteration_
-                                << " valid="  << n_valid
-                                << "  ranked="<< n_ranked
-                                << "  split=" << n_split << '\n';
-                    }
-                    voxel_model_->subdiv_meta_.zero_();
-                }
-            }
+            //         if (iteration_ % 100 == 0) {
+            //             int64_t n_valid  = valid.sum().item<int64_t>();
+            //             int64_t n_ranked = (priority > 0).sum().item<int64_t>();
+            //             int64_t n_split  = subdivide_mask.sum().item<int64_t>();
+            //             std::cout << "[DBG] it " << iteration_
+            //                     << " valid="  << n_valid
+            //                     << "  ranked="<< n_ranked
+            //                     << "  split=" << n_split << '\n';
+            //         }
+            //         voxel_model_->subdiv_meta_.zero_();
+            //     }
+            // }
 
             // every training_report_interval_ iterations, print a concise report
             // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
@@ -1062,7 +1177,258 @@ void VoxelMapper::trainForOneIteration()
     }
 }
 
-bool VoxelMapper::hasMetInitialMappingConditions() {
+void VoxelMapper::combineMappingOperations()
+ {
+     // Get Mapping Operations
+     while (mpSLAM->getAtlas()->hasMappingOperation()) {
+         ORB_SLAM3::MappingOperation opr =
+             mpSLAM->getAtlas()->getAndPopMappingOperation();
+ 
+         switch (opr.meOperationType)
+         {
+         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
+         {
+            bool kf_changed = false;
+             // std::cout << "[Gaussian Mapper]Local BA Detected."
+             //           << std::endl;
+ 
+             // Get new keyframes
+             auto& associated_kfs = opr.associatedKeyFrames();
+
+             // Add keyframes to the scene
+             for (auto& kf : associated_kfs) {
+                 // Keyframe Id
+                 auto kfid = std::get<0>(kf);
+                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
+                 // If the keyframe is already in the scene, only update the pose.
+                 // Otherwise create a new one
+                 if (pkf) {
+                    //  std::cout << "if pkf" << std::endl;
+                     auto& pose = std::get<2>(kf);
+                     pkf->setPose(
+                         pose.unit_quaternion().cast<double>(),
+                         pose.translation().cast<double>());
+                    //  pkf->computeTransformTensors();
+                     // Give local BA keyframes times of use
+                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
+                     
+                     kf_changed = true;
+                 }
+                 else {
+                    // std::cout << "no pkf" << std::endl;
+                    handleNewKeyframe(kf);                   // still void
+
+                    if (pkf) {
+                        // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
+                        torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
+                        torch::Tensor hwc = chw.permute({1,2,0}).contiguous(); // (H,W,3), float32
+                        // Copy into a CV_32FC3 Mat (RGB)
+                        const int H = hwc.size(0);
+                        const int W = hwc.size(1);
+                        cv::Mat img_float(H, W, CV_32FC3);
+                        std::memcpy(img_float.data, hwc.data_ptr<float>(), H*W*3*sizeof(float));
+                        static const auto proj_dir = result_dir_ / "proj_debug";
+                        static const auto imgs_dir = proj_dir / "imgs";
+                        std::filesystem::create_directories(imgs_dir);
+                        saveKfPng_fromFloatRGB(img_float, kfid, imgs_dir);
+                    }
+                 }
+             }
+             
+             // Get new points
+             auto& associated_points = opr.associatedMapPoints();
+             auto& points = std::get<0>(associated_points);
+             auto& colors = std::get<1>(associated_points);
+
+            //  // Add new points to the model
+             if (initial_mapped_ && points.size() >= 30) {
+                extendAABB_with_flat_xyz(aabb_min_, aabb_max_, points);  // points = std::vector<float>
+                have_bounds_ = true;
+
+                 torch::NoGradGuard no_grad;
+                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                //  std::cout << "first increasePcd" << std::endl;
+                //  voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
+                voxel_model_->increasePcd(points, colors, getIteration());
+             }
+
+            if (kf_changed) {
+                dumpKeyframesForProjectionFile(scene_->keyframes(), scene_->cameras_,
+                                            result_dir_ / "proj_debug");
+            }
+         }
+         break;
+ 
+         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
+         {
+            bool kf_changed = false;
+            std::cout << "[Voxel Mapper]Loop Closure Detected."
+                    << std::endl;
+
+            // Get the loop keyframe scale modification factor
+            float loop_kf_scale = opr.mfScale;
+
+            // Get new keyframes (scaled transformation applied in ORB-SLAM3)
+            auto& associated_kfs = opr.associatedKeyFrames();
+
+            std::vector<std::shared_ptr<VoxelKeyframe>> kfs_for_bounding;
+
+             // Mark the transformed points to avoid transforming more than once
+             torch::Tensor point_not_transformed_flags =
+                 torch::full(
+                     {voxel_model_->center_.size(0)},
+                     true,
+                     torch::TensorOptions().device(device_type_).dtype(torch::kBool));
+            //  if (record_loop_ply_)
+            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
+             int num_transformed = 0;
+             // Add keyframes to the scene
+             for (auto& kf : associated_kfs) {
+                 // Keyframe Id
+                 auto kfid = std::get<0>(kf);
+                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
+                 // In case new points are added in handleNewKeyframe()
+                 int64_t num_new_points = voxel_model_->center_.size(0) - point_not_transformed_flags.size(0);
+                 if (num_new_points > 0)
+                     point_not_transformed_flags = torch::cat({
+                         point_not_transformed_flags,
+                         torch::full({num_new_points}, true, point_not_transformed_flags.options())},
+                         /*dim=*/0);
+                 // If kf is already in the scene, evaluate the change in pose,
+                 // if too large we perform loop correction on its visible model points.
+                 // If not in the scene, create a new one.
+                 if (pkf) {
+                     auto& pose = std::get<2>(kf);
+                     // If is loop closure kf
+ // if (std::get<4>(kf)) {
+ // renderAndRecordKeyframe(pkf, result_dir_, "_0_before_loop_correction");
+                         Sophus::SE3f original_pose = pkf->getPosef(); // original_pose = old, inv_pose = new
+                         Sophus::SE3f inv_pose = pose.inverse();
+                         Sophus::SE3f diff_pose = inv_pose * original_pose;
+                         bool large_rot = !diff_pose.rotationMatrix().isApprox(
+                             Eigen::Matrix3f::Identity(), large_rot_th_);
+                         bool large_trans = !diff_pose.translation().isMuchSmallerThan(
+                             1.0, large_trans_th_);
+                         if (large_rot || large_trans) {
+                             std::cout << "[Voxel Mapper]Large loop correction detected, transforming visible points of kf "
+                                     << kfid << std::endl;
+                             diff_pose.translation() -= inv_pose.translation(); // t = (R_new * t_old + t_new) - t_new
+                             diff_pose.translation() *= loop_kf_scale;          // t = s * (R_new * t_old)
+                             diff_pose.translation() += inv_pose.translation(); // t = (s * R_new * t_old) + t_new
+                             torch::Tensor diff_pose_tensor =
+                                 tensor_utils::EigenMatrix2TorchTensor(
+                                     diff_pose.matrix(), device_type_).transpose(0, 1);
+                            //  {
+                            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
+                            //      voxel_model_->scaledTransformVisiblePointsOfKeyframe(
+                            //          point_not_transformed_flags,
+                            //          diff_pose_tensor,
+                            //          pkf->world_view_transform_,
+                            //          pkf->full_proj_transform_,
+                            //          pkf->creation_iter_,
+                            //          stableNumIterExistence(),
+                            //          num_transformed,
+                            //          loop_kf_scale); // selected xyz *= s
+                            //  }
+                             // Give loop keyframes times of use
+                             increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
+ // renderAndRecordKeyframe(pkf, result_dir_, "_1_after_loop_transforming_points");
+ // std::cout<<num_transformed<<std::endl;
+                         }
+ // }
+                     pkf->setPose(
+                         pose.unit_quaternion().cast<double>(),
+                         pose.translation().cast<double>());
+                    //  pkf->computeTransformTensors();
+
+                     kf_changed = true;
+
+ // if (std::get<4>(kf)) renderAndRecordKeyframe(pkf, result_dir_, "_2_after_pose_correction");
+                 }
+                 else {
+                     std::cout << "no pkf again" << std::endl;
+                     handleNewKeyframe(kf);
+                 }
+             }
+            //  if (record_loop_ply_)
+            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
+ // keyframesToJson(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
+ 
+             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
+             auto& associated_points = opr.associatedMapPoints();
+             auto& points = std::get<0>(associated_points);
+             auto& colors = std::get<1>(associated_points);
+
+             // Add new points to the model
+             if (initial_mapped_ && points.size() >= 30) {
+                std::cout << "adds new points" << std::endl;
+                extendAABB_with_flat_xyz(aabb_min_, aabb_max_, points);  // points = std::vector<float>
+                have_bounds_ = true;
+
+                torch::NoGradGuard no_grad;
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
+                // voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
+                voxel_model_->increasePcd(points, colors, getIteration());
+             }
+ 
+             // Mark this iteration
+             loop_closure_iteration_ = true;
+            if (kf_changed) {
+                dumpKeyframesForProjectionFile(scene_->keyframes(), scene_->cameras_,
+                                            result_dir_ / "proj_debug");
+            }
+         }
+         break;
+ 
+         case ORB_SLAM3::MappingOperation::OprType::ScaleRefinement:
+         {
+             std::cout << "[Voxel Mapper]Scale refinement Detected. Transforming all kfs and points..."
+                       << std::endl;
+ 
+             float s = opr.mfScale;
+             Sophus::SE3f& T = opr.mT;
+             if (initial_mapped_) {
+                 // Apply the scaled transformation on gaussian model points
+                 {
+                     std::unique_lock<std::mutex> lock_render(mutex_render_);
+                    //  voxel_model_->applyScaledTransformation(s, T);
+                 }
+                 // Apply the scaled transformation to the scene
+                //  scene_->applyScaledTransformation(s, T);
+             }
+             else { // TODO: the workflow should not come here, delete this branch
+                 // Apply the scaled transformation to the cached points
+                 for (auto& pt : scene_->cached_point_cloud_) {
+                     // pt <- (s * Ryw * pt + tyw)
+                     auto& pt_xyz = pt.second.xyz_;
+                     pt_xyz *= s;
+                     pt_xyz = T.cast<double>() * pt_xyz;
+                 }
+ 
+                 // Apply the scaled transformation on gaussian keyframes
+                 for (auto& kfit : scene_->keyframes()) {
+                     std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
+                     Sophus::SE3f Twc = pkf->getPosef().inverse();
+                     Twc.translation() *= s;
+                     Sophus::SE3f Tyc = T * Twc;
+                     Sophus::SE3f Tcy = Tyc.inverse();
+                     pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
+                    //  pkf->computeTransformTensors();
+                 }
+             }
+         }
+         break;
+ 
+         default:
+         {
+             throw std::runtime_error("MappingOperation type not supported!");
+         }
+         break;
+         }
+     }
+ }
+
+ bool VoxelMapper::hasMetInitialMappingConditions() {
      if (!mpSLAM->isShutDown() &&
          mpSLAM->GetNumKeyframes() >= min_num_initial_map_kfs_ &&
          mpSLAM->getAtlas()->hasMappingOperation())
@@ -1185,211 +1551,6 @@ void VoxelMapper::cullKeyframes()
      }
  }
 
-void VoxelMapper::combineMappingOperations()
- {
-     // Get Mapping Operations
-     while (mpSLAM->getAtlas()->hasMappingOperation()) {
-         ORB_SLAM3::MappingOperation opr =
-             mpSLAM->getAtlas()->getAndPopMappingOperation();
- 
-         switch (opr.meOperationType)
-         {
-         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
-         {
-             // std::cout << "[Gaussian Mapper]Local BA Detected."
-             //           << std::endl;
- 
-             // Get new keyframes
-             auto& associated_kfs = opr.associatedKeyFrames();
- 
-             // Add keyframes to the scene
-             for (auto& kf : associated_kfs) {
-                 // Keyframe Id
-                 auto kfid = std::get<0>(kf);
-                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
-                 // If the keyframe is already in the scene, only update the pose.
-                 // Otherwise create a new one
-                 if (pkf) {
-                     auto& pose = std::get<2>(kf);
-                     pkf->setPose(
-                         pose.unit_quaternion().cast<double>(),
-                         pose.translation().cast<double>());
-                     pkf->computeTransformTensors();
- 
-                     // Give local BA keyframes times of use
-                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
-                 }
-                 else {
-                     handleNewKeyframe(kf);
-                 }
-             }
- 
-             // Get new points
-             auto& associated_points = opr.associatedMapPoints();
-             auto& points = std::get<0>(associated_points);
-             auto& colors = std::get<1>(associated_points);
- 
-            //  // Add new points to the model
-            //  if (initial_mapped_ && points.size() >= 30) {
-            //      torch::NoGradGuard no_grad;
-            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
-            //      voxel_model_->increasePcd(points, colors, getIteration());
-            //  }
-         }
-         break;
- 
-         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
-         {
-             std::cout << "[Voxel Mapper]Loop Closure Detected."
-                       << std::endl;
- 
-             // Get the loop keyframe scale modification factor
-             float loop_kf_scale = opr.mfScale;
- 
-             // Get new keyframes (scaled transformation applied in ORB-SLAM3)
-             auto& associated_kfs = opr.associatedKeyFrames();
-             // Mark the transformed points to avoid transforming more than once
-             torch::Tensor point_not_transformed_flags =
-                 torch::full(
-                     {voxel_model_->center_.size(0)},
-                     true,
-                     torch::TensorOptions().device(device_type_).dtype(torch::kBool));
-            //  if (record_loop_ply_)
-            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
-             int num_transformed = 0;
-             // Add keyframes to the scene
-             for (auto& kf : associated_kfs) {
-                 // Keyframe Id
-                 auto kfid = std::get<0>(kf);
-                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
-                 // In case new points are added in handleNewKeyframe()
-                 int64_t num_new_points = voxel_model_->center_.size(0) - point_not_transformed_flags.size(0);
-                 if (num_new_points > 0)
-                     point_not_transformed_flags = torch::cat({
-                         point_not_transformed_flags,
-                         torch::full({num_new_points}, true, point_not_transformed_flags.options())},
-                         /*dim=*/0);
-                 // If kf is already in the scene, evaluate the change in pose,
-                 // if too large we perform loop correction on its visible model points.
-                 // If not in the scene, create a new one.
-                 if (pkf) {
-                     auto& pose = std::get<2>(kf);
-                     // If is loop closure kf
- // if (std::get<4>(kf)) {
- // renderAndRecordKeyframe(pkf, result_dir_, "_0_before_loop_correction");
-                         Sophus::SE3f original_pose = pkf->getPosef(); // original_pose = old, inv_pose = new
-                         Sophus::SE3f inv_pose = pose.inverse();
-                         Sophus::SE3f diff_pose = inv_pose * original_pose;
-                         bool large_rot = !diff_pose.rotationMatrix().isApprox(
-                             Eigen::Matrix3f::Identity(), large_rot_th_);
-                         bool large_trans = !diff_pose.translation().isMuchSmallerThan(
-                             1.0, large_trans_th_);
-                         if (large_rot || large_trans) {
-                             std::cout << "[Voxel Mapper]Large loop correction detected, transforming visible points of kf "
-                                     << kfid << std::endl;
-                             diff_pose.translation() -= inv_pose.translation(); // t = (R_new * t_old + t_new) - t_new
-                             diff_pose.translation() *= loop_kf_scale;          // t = s * (R_new * t_old)
-                             diff_pose.translation() += inv_pose.translation(); // t = (s * R_new * t_old) + t_new
-                             torch::Tensor diff_pose_tensor =
-                                 tensor_utils::EigenMatrix2TorchTensor(
-                                     diff_pose.matrix(), device_type_).transpose(0, 1);
-                            //  {
-                            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
-                            //      voxel_model_->scaledTransformVisiblePointsOfKeyframe(
-                            //          point_not_transformed_flags,
-                            //          diff_pose_tensor,
-                            //          pkf->world_view_transform_,
-                            //          pkf->full_proj_transform_,
-                            //          pkf->creation_iter_,
-                            //          stableNumIterExistence(),
-                            //          num_transformed,
-                            //          loop_kf_scale); // selected xyz *= s
-                            //  }
-                             // Give loop keyframes times of use
-                             increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
- // renderAndRecordKeyframe(pkf, result_dir_, "_1_after_loop_transforming_points");
- // std::cout<<num_transformed<<std::endl;
-                         }
- // }
-                     pkf->setPose(
-                         pose.unit_quaternion().cast<double>(),
-                         pose.translation().cast<double>());
-                     pkf->computeTransformTensors();
- // if (std::get<4>(kf)) renderAndRecordKeyframe(pkf, result_dir_, "_2_after_pose_correction");
-                 }
-                 else {
-                     handleNewKeyframe(kf);
-                 }
-             }
-            //  if (record_loop_ply_)
-            //      savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
- // keyframesToJson(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
- 
-             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
-             auto& associated_points = opr.associatedMapPoints();
-             auto& points = std::get<0>(associated_points);
-             auto& colors = std::get<1>(associated_points);
- 
-             // Add new points to the model
-            //  if (initial_mapped_ && points.size() >= 30) {
-            //     std::cout << "adds new points" << std::endl;
-            //     torch::NoGradGuard no_grad;
-            //     std::unique_lock<std::mutex> lock_render(mutex_render_);
-            //     voxel_model_->increasePcd(points, colors, getIteration());
-            //  }
- 
-             // Mark this iteration
-             loop_closure_iteration_ = true;
-         }
-         break;
- 
-         case ORB_SLAM3::MappingOperation::OprType::ScaleRefinement:
-         {
-             std::cout << "[Voxel Mapper]Scale refinement Detected. Transforming all kfs and points..."
-                       << std::endl;
- 
-             float s = opr.mfScale;
-             Sophus::SE3f& T = opr.mT;
-             if (initial_mapped_) {
-                 // Apply the scaled transformation on gaussian model points
-                 {
-                     std::unique_lock<std::mutex> lock_render(mutex_render_);
-                    //  voxel_model_->applyScaledTransformation(s, T);
-                 }
-                 // Apply the scaled transformation to the scene
-                //  scene_->applyScaledTransformation(s, T);
-             }
-             else { // TODO: the workflow should not come here, delete this branch
-                 // Apply the scaled transformation to the cached points
-                 for (auto& pt : scene_->cached_point_cloud_) {
-                     // pt <- (s * Ryw * pt + tyw)
-                     auto& pt_xyz = pt.second.xyz_;
-                     pt_xyz *= s;
-                     pt_xyz = T.cast<double>() * pt_xyz;
-                 }
- 
-                 // Apply the scaled transformation on gaussian keyframes
-                 for (auto& kfit : scene_->keyframes()) {
-                     std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
-                     Sophus::SE3f Twc = pkf->getPosef().inverse();
-                     Twc.translation() *= s;
-                     Sophus::SE3f Tyc = T * Twc;
-                     Sophus::SE3f Tcy = Tyc.inverse();
-                     pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
-                     pkf->computeTransformTensors();
-                 }
-             }
-         }
-         break;
- 
-         default:
-         {
-             throw std::runtime_error("MappingOperation type not supported!");
-         }
-         break;
-         }
-     }
- }
 
 void VoxelMapper::handleNewKeyframe(
     std::tuple<
@@ -1414,7 +1575,7 @@ void VoxelMapper::handleNewKeyframe(
 
     // ─── 2) Create a new VoxelKeyframe, exactly like Photo-SLAM’s Gaussian case ─
     auto pkf = std::make_shared<VoxelKeyframe>(std::get<0>(kf), getIteration());
-    pkf->zfar_  = z_far_;
+    // pkf->zfar_  = z_far_;
     pkf->znear_ = z_near_;
     auto& pose = std::get<2>(kf);
     // ─── 3) Set its pose ───────────────────────────────────────────────────────
@@ -1435,7 +1596,7 @@ void VoxelMapper::handleNewKeyframe(
     pkf->img_filename_ = std::get<8>(kf);
      
      // Add the new keyframe to the scene
-     pkf->computeTransformTensors();
+    //  pkf->computeTransformTensors();
      scene_->addKeyframe(pkf, &kfid_shuffled_);
  
      // Give new keyframes times of use and add it to the training sliding window
@@ -1535,8 +1696,8 @@ void VoxelMapper::renderAndRecordKeyframe(
 
     /* ------------------------------------------------ 1. camera  */
     sv::MiniCam cam = pkf->toMiniCam();
-    cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
-    cam.w2c = cam.w2c.contiguous().to(mDevice);
+    // cam.c2w = cam.c2w.contiguous().to(mDevice);   // make sure contiguous + on CUDA
+    // cam.w2c = cam.w2c.contiguous().to(mDevice);
     /* ------------------------------------------------ 2. GT → NumPy  */
     torch::Tensor chw_u8 = pkf->original_image_    // (3,H,W) in [0,1]
                             .mul(255.0f)
@@ -1654,7 +1815,7 @@ cv::Mat VoxelMapper::renderFromPose(
     if (!initial_mapped_ || getIteration() <= 0)
         return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
     std::shared_ptr<VoxelKeyframe> pkf = std::make_shared<VoxelKeyframe>();
-    pkf->zfar_ = z_far_;
+    // pkf->zfar_ = z_far_;
     pkf->znear_ = z_near_;
     // Pose
     pkf->setPose(
@@ -1665,7 +1826,7 @@ cv::Mat VoxelMapper::renderFromPose(
         sv::Camera& camera = scene_->cameras_.at(viewer_camera_id_);
         pkf->setCameraParams(camera);
         // Transformations
-        pkf->computeTransformTensors();
+        // pkf->computeTransformTensors();
     }
     catch (std::out_of_range) {
         throw std::runtime_error("[Mapper::renderFromPose]KeyFrame Camera not found!");

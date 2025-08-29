@@ -59,7 +59,6 @@ struct UndistortParams
     cv::Size old_size_;
     cv::Mat dist_coeff_;
 };
-
  
 enum SystemSensorType {
     INVALID = 0,
@@ -88,7 +87,7 @@ public:
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
 
-    ~VoxelMapper();
+    // ~VoxelMapper();
     void readConfigFromFile(const std::filesystem::path& cfg_path);
 
     void run();
@@ -227,6 +226,7 @@ public:
                             -std::numeric_limits<float>::infinity(),
                             -std::numeric_limits<float>::infinity() };
     bool have_bounds_ = false;
+    int next_batch_index_ = 0;
 
 protected:
     VoxelModelParams model_params_;

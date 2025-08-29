@@ -2,6 +2,7 @@
 
 #include <string>
 #include <filesystem>
+#include <vector>   
 
 class VoxelModelParams 
 {
@@ -32,88 +33,62 @@ class VoxelPipelineParams
 {
 public:
     VoxelPipelineParams(
-        bool convert_SHs = false,
-        bool compute_cov3D = false);
+        bool convert_SHs = false);
 
 public:
     bool convert_SHs_;
-    bool compute_cov3D_;
 };
 
 class VoxelOptimizationParams 
 {
 public:
     VoxelOptimizationParams(
-        int iterations = 30'000,
-        float geo_lr_init = 0.00016f,
-        float geo_lr_final = 0.0000016f,
-        float geo_lr_delay_mult = 0.01f,
-        float geo_lr_max_steps = 30'000,
-        // float meta_accum_lr = 0.1f,
-        float sh0_lr = 0.00125f,
-        float shs_lr = 0.0000625f, // 1/20 of SH₀
-        float lambda_dssim = 0.2f,
-        int densification_interval = 100,
-        int subdiv_from = 500,
-        int subdiv_every = 100,
-        int subdiv_until = 15000,
-        float subdiv_quantile = 0.8f,
-        float subdiv_gradient_threshold = 1e-4f,
-        float subdivide_samp_thres = 1.0f,
-        int   subdivide_max_num    = 10'000'000,
-        float subdivide_target_scale_ = 90.f,
-        int   subdivide_all_until_    = 0,
-        int prune_from = 500,
-        int prune_every = 100,
-        int prune_until = 18000,
-        float prune_threshold_init = 0.0001f,
-        float prune_threshold_final = 0.05f,
-        // int min_voxels = 512,
-        int opacity_reset_interval = 3000,
-        int densify_from_iter = 500,
-        int densify_until_iter = 15'000,
-        float densify_grad_threshold = 0.0002f,
-
-        int geo_warmup_iters = 1000,
-        int sh0_warmup_iters = 1000,
-        float geo_weight_decay = 1e-4f
+        int iterations = 20000,
+        float geo_lr      = 0.025f,    // cfg.optimizer.geo_lr
+        float sh0_lr      = 0.010f,    // cfg.optimizer.sh0_lr
+        float shs_lr      = 0.00025f,  // cfg.optimizer.shs_lr
+        // Adam hyper-params (match SVRaster)
+        float optim_beta1 = 0.1f,
+        float optim_beta2 = 0.999f,
+        float optim_eps   = 1e-15f,
+        // MultiStep decay (same pattern as cfg.optimizer.lr_decay_ckpt & lr_decay_mult)
+        std::vector<int> lr_decay_ckpt = {19000}, // milestones in iterations
+        float lr_decay_mult = 0.1f,                            // gamma
+        // --- Adaptive procedure (SV style) ---
+        int   adapt_from_            = 1000,
+        int   adapt_every_           = 1000,
+        // Pruning
+        int   prune_until_           = 18000,
+        float prune_thres_init_      = 1e-4f,
+        float prune_thres_final_     = 5e-2f,
+        // Subdivision
+        int   subdivide_until_       = 15000,
+        int   subdivide_all_until_   = 0,
+        float subdivide_samp_thres_  = 1.0f,
+        float subdivide_prop_        = 0.05f,        // top 5% by priority
+        int   subdivide_max_num_     = 10000000,   // hard cap
+        float lambda_dssim = 0.2f
     );
 
 public:
     int iterations_;
-    float geo_lr_init_;
-    float geo_lr_final_;
-    float geo_lr_delay_mult_;
-    int geo_lr_max_steps_;
-    float meta_accum_lr_;
     float geo_lr_;
     float sh0_lr_;
     float shs_lr_;
-
-    int densification_interval_;
-    int subdiv_from_;
-    int subdiv_every_;
-    int subdiv_until_;
-    float subdiv_quantile_;
-    float subdiv_gradient_threshold_;
-    float subdivide_samp_thres_;
-    int subdivide_max_num_;
-    float subdivide_target_scale_;
-    int subdivide_all_until_;
-    int prune_from_;
-    int prune_every_;
+    float optim_beta1_;
+    float optim_beta2_;
+    float optim_eps_;
+    std::vector<int> lr_decay_ckpt_;
+    float lr_decay_mult_;
+    int adapt_from_;
+    int adapt_every_;
     int prune_until_;
-    float prune_threshold_init_;
-    float prune_threshold_final_;
-    // int min_voxels_;
-    float percent_dense_;
-    float lambda_dssim_;
-    int opacity_reset_interval_;
-    int densify_from_iter_;
-    int densify_until_iter_;
-    float densify_grad_threshold_;
-
-    int geo_warmup_iters_;      // how many iters to train geometry only
-    int sh0_warmup_iters_;      // after that, train SH₀ only
-    float geo_weight_decay_;    // small L2 on geo to stabilize
+    float prune_thres_init_;
+    float prune_thres_final_;
+    int subdivide_until_;
+    int subdivide_all_until_;
+    float subdivide_samp_thres_;
+    float subdivide_prop_;
+    int subdivide_max_num_;     
+    float lambda_dssim_;              
 };

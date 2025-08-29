@@ -141,12 +141,12 @@ void VoxelTrainer::trainingReport(
     VoxelPipelineParams& pipeParams,
     torch::Tensor& background
 ) {
-    std::cout << std::fixed << std::setprecision(8)
-              << "Training iteration " << iteration << "/" << num_iterations
-              << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
-              << ", ema_loss: " << ema_loss_for_log
-              << ", num_voxels: " << voxels.getCenters().size(0)
-              << std::endl;
+    // std::cout << std::fixed << std::setprecision(8)
+    //           << "Training iteration " << iteration << "/" << num_iterations
+    //           << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
+    //           << ", ema_loss: " << ema_loss_for_log
+    //           << ", num_voxels: " << voxels.getCenters().size(0)
+    //           << std::endl;
 }
 
 } // namespace sv

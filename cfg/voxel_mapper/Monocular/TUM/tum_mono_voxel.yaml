@@ -13,21 +13,17 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 # Pipeline-level parameters (only the ones VoxelMapper uses)
 ##############################################################################
 
-Camera.z_near: 0.01
-Camera.z_far: 100.0
+Camera.z_near: 0.02
 
-Mapper.inactive_geo_densify:           1        # keep like Voxel
 Mapper.min_num_initial_map_kfs:        20
 Mapper.new_keyframe_times_of_use:      2
 Mapper.local_BA_increased_times_of_use: 0       
 Mapper.loop_closure_increased_times_of_use_: 2  
 Mapper.cull_keyframes:                 0
-Mapper.large_rotation_threshold:       30.0     # deg
-Mapper.large_translation_threshold:    1.0      # m
-Mapper.stable_num_iter_existence:      1
+Mapper.large_rotation_threshold: 30.0 #10.0 #
+Mapper.large_translation_threshold: 1.0 #0.1 #
 
 Pipeline.convert_SHs: 0  # 0:false, 1 or other integer:true
-Pipeline.compute_cov3D: 0  # 0:false, 1 or other integer:true
 
 Record.keyframe_record_interval: 0 # 0:never, 1:always, others:periodically
 Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
@@ -40,43 +36,44 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 ##############################################################################
 # SVRaster-style optimisation parameters
 ##############################################################################
+# Training length
+Optimization.max_num_iterations: 20000
 
-# Learning rate
-Optimization.max_num_iterations:       30100     
-Optimization.geo_lr_init:         0.00032
-# Optimization.geo_lr_final:        0.00032
-Optimization.geo_lr_delay_mult:   0.01
-Optimization.geo_lr_max_steps:    24
-Optimization.sh0_lr:                   0.0025   
-Optimization.shs_lr:                   0.000125   
-# Optimization.meta_accum_lr:            0.1
+# SparseAdam param groups (match train.py)
+Optimization.geo_lr: 0.025
+Optimization.sh0_lr: 0.010
+Optimization.shs_lr: 0.00025
 
-# Subdivision schedule
-Optimization.percent_dense: 0.01
-Optimization.lambda_dssim: 0.2
+# Optimizer hyper-params (match svraster cfg.optimizer)
+Optimization.optim_beta1: 0.1
+Optimization.optim_beta2: 0.99
+Optimization.optim_eps: 1e-15
 
-Optimization.densification_interval:   100
-# Optimization.densify_from_iter: 800
-# Optimization.densify_until_iter: 30000
-# Optimization.densify_grad_threshold: 0.001
+# MultiStep LR decay (like torch.optim.lr_scheduler.MultiStepLR)
+# Use a YAML sequence for OpenCV FileStorage compatibility.
+Optimization.lr_decay_ckpt: [19000]
+Optimization.lr_decay_mult: 0.1
 
-# Pruning schedule
-Optimization.prune_from:               500
-Optimization.prune_every:              100
-Optimization.prune_until:              18000
-Optimization.prune_threshold_init:     0.0001
-Optimization.prune_threshold_final:    0.05
-# Optimization.min_voxels:               512
+# Photometric loss blend used in your mapper (L1 + DSSIM)
+Optimization.lambda_dssim: 0.20
 
-Optimization.subdiv_from:              500
-Optimization.subdiv_every:             100
-Optimization.subdiv_until:             15000
-Optimization.subdivide_samp_thres:    0.01
-Optimization.subdivide_max_num:       1000
-Optimization.subdivide_target_scale: 90.0
-Optimization.subdivide_all_until:     0 # 0:never, others:until
-# Optimization.subdiv_quantile:          0.25
-# Optimization.subdiv_gradient_threshold: 1e-8
+# --------------------------------------------------------------------------------------------
+# Adaptive prune/subdivide (SVRaster schedule)
+# --------------------------------------------------------------------------------------------
+Optimization.adapt_from: 500
+Optimization.adapt_every: 500
+
+# Pruning
+Optimization.prune_until: 18000
+Optimization.prune_thres_init: 0.0001
+Optimization.prune_thres_final: 0.05
+
+# Subdivision
+Optimization.subdivide_until: 15000
+Optimization.subdivide_all_until: 0
+Optimization.subdivide_samp_thres: 1.0
+Optimization.subdivide_prop: 0.05
+Optimization.subdivide_max_num: 10000000
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

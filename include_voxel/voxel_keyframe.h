@@ -99,7 +99,7 @@ public:
     torch::Tensor R_tensor_; ///< extrinsics
     torch::Tensor t_tensor_; ///< extrinsics
 
-    // float zfar_ = 100.0f;
+    float zfar_ = 100.0f;
     float znear_ = 0.01f;
 
     Eigen::Vector3f trans_ = {0.0f, 0.0f, 0.0f};

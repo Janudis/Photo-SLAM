@@ -54,7 +54,10 @@ VoxelOptimizationParams::VoxelOptimizationParams(
     float subdivide_samp_thres,
     float subdivide_prop,
     int subdivide_max_num,
-    float lambda_dssim
+    float lambda_dssim,
+    float lambda_tv_density,
+    int   tv_from,
+    int   tv_until
 )
     :   iterations_(iterations),
         geo_lr_(geo_lr),
@@ -75,5 +78,8 @@ VoxelOptimizationParams::VoxelOptimizationParams(
         subdivide_samp_thres_(subdivide_samp_thres),
         subdivide_prop_(subdivide_prop),
         subdivide_max_num_(subdivide_max_num),
-        lambda_dssim_(lambda_dssim)
+        lambda_dssim_(lambda_dssim),
+        lambda_tv_density_(lambda_tv_density),
+        tv_from_(tv_from),
+        tv_until_(tv_until)
 {}

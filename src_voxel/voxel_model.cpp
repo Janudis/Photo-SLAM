@@ -3,16 +3,19 @@
 #include <sstream>
 
 namespace py = pybind11;
+using namespace py::literals;  // enables "name"_a syntax
 namespace sv {
 
 struct __attribute__((visibility("hidden"))) VoxelModel::PyState {
     py::object svm;        // Python SparseVoxelModel
     py::object optimizer_py;  // Python SparseAdam
+    py::object scheduler_py; 
 
     ~PyState() {
         py::gil_scoped_acquire gil;
         svm = py::none();
         optimizer_py = py::none();
+        scheduler_py = py::none();
     }
 };
 VoxelModel::~VoxelModel() {
@@ -104,7 +107,7 @@ void VoxelModel::createFromPcd(
     auto opts_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     torch::Tensor bounding_cpu = torch::empty({2,3}, opts_cpu);
     // Row 0 = min, Row 1 = max
-    bounding_cpu[0][0] = -10.748001f;  bounding_cpu[0][1] = -29.842281f;  bounding_cpu[0][2] = -0.293899f;
+    bounding_cpu[0][0] = -10.748001f;  bounding_cpu[0][1] = -29.842281f;  bounding_cpu[0][2] = -0.483899f;
     bounding_cpu[1][0] =  56.780504f;  bounding_cpu[1][1] =  18.760179f;  bounding_cpu[1][2] = 66.683914f;
 
     // Move to your device for model_init:
@@ -129,9 +132,7 @@ void VoxelModel::createFromPcd(
         return py::module::import("src.sparse_voxel_model");
     }();
     py::object SVM    = svm_mod.attr("SparseVoxelModel");
-    py_->svm = SVM(py::arg("sh_degree")        = max_sh_degree_,
-                        py::arg("black_background") = true);
-
+    py_->svm = SVM(py::arg("sh_degree")        = max_sh_degree_);
     py_->svm.attr("model_init")(
         py::arg("bounding")        = bounding,
         py::arg("outside_level")   = 0,
@@ -143,6 +144,15 @@ void VoxelModel::createFromPcd(
         py::arg("shs_init")        = 0.0f
     );
 
+    {
+        py::gil_scoped_acquire gil;
+        auto sh0 = py_->svm.attr("_sh0");
+        auto shs = py_->svm.attr("_shs");
+        auto geo = py_->svm.attr("_geo_grid_pts");
+        sh0.attr("requires_grad_")(true);
+        shs.attr("requires_grad_")(true);
+        geo.attr("requires_grad_")(true);
+    }
     // ─── 4) Pull back all core tensors from the Python object ───────────
     auto fetch = [&](const char* name){
         return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
@@ -155,6 +165,10 @@ void VoxelModel::createFromPcd(
     this->grid_pts_key_  = fetch("grid_pts_key");
     this->vox_key_       = fetch("vox_key");      
     // ─── 5) Copy over the learnable fields ─────────────────────────────
+    // this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
+    // this->sh0_ = fetch("_sh0").view({-1,1,3}).requires_grad_(true);
+    // this->shs_ = fetch("_shs").requires_grad_(true);
+    // this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
     this->_geo_grid_pts_ = fetch("_geo_grid_pts");
     this->sh0_ = fetch("_sh0").view({-1,1,3});
     this->shs_ = fetch("_shs");
@@ -363,7 +377,7 @@ void VoxelModel::createFromPcd(
 //         py::arg("init_n_level")    = 6,
 //         py::arg("init_out_ratio")  = 2,
 //         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = 0.1f,
+//         py::arg("geo_init")        = -10.0f,
 //         py::arg("sh0_init")        = 0.5f,
 //         py::arg("shs_init")        = 0.0f
 //         // py::arg("cameras")  = all_py_cams
@@ -494,7 +508,7 @@ void VoxelModel::createFromPcd(
 //         py::arg("init_n_level")    = 6,
 //         py::arg("init_out_ratio")  = 2,
 //         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = 0.1f,
+//         py::arg("geo_init")        = -10.0f,
 //         py::arg("sh0_init")        = 0.5f,
 //         py::arg("shs_init")        = 0.0f
 //         // py::arg("cameras")  = all_py_cams
@@ -658,7 +672,7 @@ void VoxelModel::createFromPcd(
 //         py::arg("scene_extent")      = py::cast(this->scene_extent_),
 //         py::arg("xyz")               = py::cast(pts),              // already on CUDA
 //         py::arg("expected_vox_size") = 0.05f,      
-//         py::arg("density")           = 0.1f,
+//         py::arg("density")           = -10.0f,
 //         py::arg("rgb")               = py::cast(cols),              // already on CUDA
 //         py::arg("shs")               = 0.0
 //     );
@@ -782,6 +796,16 @@ void VoxelModel::createFromPcd(
 //         py::arg("shs")               = 0.0
 //     );
 
+//     {
+//         py::gil_scoped_acquire gil;
+//         auto sh0 = py_->svm.attr("_sh0");
+//         auto shs = py_->svm.attr("_shs");
+//         auto geo = py_->svm.attr("_geo_grid_pts");
+//         sh0.attr("requires_grad_")(true);
+//         shs.attr("requires_grad_")(true);
+//         geo.attr("requires_grad_")(true);
+//     }
+
 //     // ─── 4) Pull back all core tensors from the Python object ───────────
 //      auto fetch = [&](const char* name){
 //         return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
@@ -798,6 +822,10 @@ void VoxelModel::createFromPcd(
 //     this->sh0_ = fetch("_sh0").view({-1,1,3});
 //     this->shs_ = fetch("_shs");
 //     this->subdiv_p_ = fetch("_subdiv_p");
+//     // this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
+//     // this->sh0_ = fetch("_sh0").view({-1,1,3}).requires_grad_(true);
+//     // this->shs_ = fetch("_shs").requires_grad_(true);
+//     // this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
 //     // subdiv_p_   .retain_grad();
 //     // ─── 6) Stats buffers (exactly as before) ───────────────────────────
 //     this->max_w_ = torch::zeros({center_.size(0), 1},
@@ -920,7 +948,7 @@ void VoxelModel::increasePcd(
     //         py::arg("scene_extent")      = py::cast(this->scene_extent),
     //         py::arg("xyz")               = py::cast(xyz_new),
     //         py::arg("expected_vox_size") = 0.03f,
-    //         py::arg("density")           = 0.1f,
+    //         py::arg("density")           = -10.0f,
     //         py::arg("rgb")               = py::cast(rgb_new),
     //         py::arg("shs")               = 0.0f
     //     );
@@ -1433,7 +1461,7 @@ void VoxelModel::increasePcd(
 //             py::arg("scene_extent")      = py::cast(scene_extent),
 //             py::arg("xyz")               = py::cast(xyz_new),
 //             py::arg("expected_vox_size") = 0.05f,
-//             py::arg("density")           = 0.1f,
+//             py::arg("density")           = -10.0f,
 //             py::arg("rgb")               = py::cast(rgb_new),
 //             py::arg("shs")               = 0.0f
 //         );
@@ -1788,44 +1816,44 @@ void VoxelModel::increasePcd(
 //     py::object SimpleNS = py::module_::import("types").attr("SimpleNamespace");
 //     py::object pcd_obj  = SimpleNS(py::arg("points") = np_array);
 
-//     py::list tr_cams;
-//     py::list py_cams; 
-//     for (auto& kf : kfs)
-//     {
-//         /* 1.  Position ------------------------------------------------------ */
-//         const Eigen::Vector3d& p = kf->t_;               // translation part
-//         torch::Tensor pos_cpu = torch::tensor(
-//             {static_cast<float>(p.x()),
-//             static_cast<float>(p.y()),
-//             static_cast<float>(p.z())},
-//             torch::TensorOptions().dtype(torch::kFloat32));   // stays on CPU
+    // py::list tr_cams;
+    // py::list py_cams; 
+    // for (auto& kf : kfs)
+    // {
+    //     /* 1.  Position ------------------------------------------------------ */
+    //     const Eigen::Vector3d& p = kf->t_;               // translation part
+    //     torch::Tensor pos_cpu = torch::tensor(
+    //         {static_cast<float>(p.x()),
+    //         static_cast<float>(p.y()),
+    //         static_cast<float>(p.z())},
+    //         torch::TensorOptions().dtype(torch::kFloat32));   // stays on CPU
                                                             
-//         /* 2.  Forward (+Z) direction in world space ------------------------- */
-//         Eigen::Vector3d fwd_eig = kf->R_quaternion_ * Eigen::Vector3d(0,0,1);
-//         fwd_eig.normalize();
-//         torch::Tensor look_cpu = torch::tensor(
-//             {static_cast<float>(fwd_eig.x()),
-//             static_cast<float>(fwd_eig.y()),
-//             static_cast<float>(fwd_eig.z())},
-//             torch::TensorOptions().dtype(torch::kFloat32));
+    //     /* 2.  Forward (+Z) direction in world space ------------------------- */
+    //     Eigen::Vector3d fwd_eig = kf->R_quaternion_ * Eigen::Vector3d(0,0,1);
+    //     fwd_eig.normalize();
+    //     torch::Tensor look_cpu = torch::tensor(
+    //         {static_cast<float>(fwd_eig.x()),
+    //         static_cast<float>(fwd_eig.y()),
+    //         static_cast<float>(fwd_eig.z())},
+    //         torch::TensorOptions().dtype(torch::kFloat32));
 
-//         /* 3.  Wrap as NumPy for SimpleNamespace ----------------------------- */
-//         py::object np_pos    = py::cast(pos_cpu).attr("numpy")();
-//         py::object np_lookat = py::cast(look_cpu).attr("numpy")();
+    //     /* 3.  Wrap as NumPy for SimpleNamespace ----------------------------- */
+    //     py::object np_pos    = py::cast(pos_cpu).attr("numpy")();
+    //     py::object np_lookat = py::cast(look_cpu).attr("numpy")();
 
-//         tr_cams.append(
-//             SimpleNS(py::arg("position") = np_pos,
-//                     py::arg("lookat")   = np_lookat)
-//         );
-//         // build a *real* MiniCam
-//         sv::MiniCam mc  = kf->toMiniCam();          // C++ struct
-//         py::object cam_py = MiniCam_to_py(mc);      // Python object
-//         cam_py.attr("w2c") = cam_py.attr("w2c").attr("cuda")();
-//         cam_py.attr("c2w") = cam_py.attr("c2w").attr("cuda")();
-//         cam_py.attr("position") = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 3)];
-//         cam_py.attr("lookat")   = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 2)];
-//         py_cams.append(cam_py);                     // keep for model_init()
-//     }
+    //     tr_cams.append(
+    //         SimpleNS(py::arg("position") = np_pos,
+    //                 py::arg("lookat")   = np_lookat)
+    //     );
+    //     // build a *real* MiniCam
+    //     sv::MiniCam mc  = kf->toMiniCam();          // C++ struct
+    //     py::object cam_py = MiniCam_to_py(mc);      // Python object
+    //     cam_py.attr("w2c") = cam_py.attr("w2c").attr("cuda")();
+    //     cam_py.attr("c2w") = cam_py.attr("c2w").attr("cuda")();
+    //     cam_py.attr("position") = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 3)];
+    //     cam_py.attr("lookat")   = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 2)];
+    //     py_cams.append(cam_py);                     // keep for model_init()
+    // }
 
 //     py::module bu_mod     = py::module_::import("src.utils.bounding_utils");
 //     py::object decide_bb  = bu_mod.attr("decide_main_bounding");
@@ -1855,7 +1883,7 @@ void VoxelModel::increasePcd(
 //         py::arg("init_n_level")    = 6,
 //         py::arg("init_out_ratio")  = 2,
 //         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = 0.1f,
+//         py::arg("geo_init")        = -10.0f,
 //         py::arg("sh0_init")        = 0.5f,
 //         py::arg("shs_init")        = 0.0f,
 //         py::arg("cameras")         = py_cams
@@ -2119,38 +2147,32 @@ void VoxelModel::initOptimizer(float geo_lr, float sh0_lr, float shs_lr,
     py::module sadam = py::module::import("svraster_cuda.sparse_adam");
     py::object SparseAdam = sadam.attr("SparseAdam");
 
-    // Three param groups like train.py (only params + lr per group)
     py::list groups;
-
     {
-        py::dict g0;
-        g0["params"] = py::make_tuple(py_->svm.attr("_geo_grid_pts"));
-        g0["lr"]     = geo_lr;
-        groups.append(g0);
+        py::dict g0; g0["params"] = py::make_tuple(py_->svm.attr("_geo_grid_pts")); g0["lr"] = geo_lr; groups.append(g0);
     }
     {
-        py::dict g1;
-        g1["params"] = py::make_tuple(py_->svm.attr("_sh0"));
-        g1["lr"]     = sh0_lr;
-        groups.append(g1);
+        py::dict g1; g1["params"] = py::make_tuple(py_->svm.attr("_sh0"));          g1["lr"] = sh0_lr; groups.append(g1);
     }
     {
-        py::dict g2;
-        g2["params"] = py::make_tuple(py_->svm.attr("_shs"));
-        g2["lr"]     = shs_lr;
-        groups.append(g2);
+        py::dict g2; g2["params"] = py::make_tuple(py_->svm.attr("_shs"));          g2["lr"] = shs_lr; groups.append(g2);
     }
 
-    // SparseAdam(params, lr=..., betas=(...), eps=...)
-    // Call with positionals to avoid keyword syntax:
+    // Match Python: SparseAdam(groups, betas=(beta1,beta2), eps=eps)
+    // (global lr is unused because each group has its own 'lr')
     py_->optimizer_py = SparseAdam(groups,
-                              0.0,                              // lr
-                              py::make_tuple(beta1, beta2),     // betas
-                              eps);                              // eps
+                                   "betas"_a = py::make_tuple(beta1, beta2),
+                                   "eps"_a   = eps);
 }
 
 void VoxelModel::rebuildOptimizer(float geo_lr, float sh0_lr, float shs_lr,
                                   float beta1, float beta2, float eps) {
+    {
+        py::gil_scoped_acquire gil;
+        py_->svm.attr("_geo_grid_pts").attr("requires_grad_")(true);
+        py_->svm.attr("_sh0").attr("requires_grad_")(true);
+        py_->svm.attr("_shs").attr("requires_grad_")(true);
+    }
     // Same as initOptimizer, but you may want to preserve your current LRs.
     initOptimizer(geo_lr, sh0_lr, shs_lr, beta1, beta2, eps);
 }
@@ -2188,6 +2210,64 @@ float VoxelModel::multiStepDecay(int iter, float base_lr,
     for (int m : milestones) if (m > 0 && iter >= m) ++passed;
     if (passed == 0) return base_lr;
     return base_lr * std::pow(gamma, passed);
+}
+
+void VoxelModel::createTrainer(float geo_lr, float sh0_lr, float shs_lr,
+                               float beta1, float beta2, float eps,
+                               const std::vector<int>& milestones,
+                               float gamma)
+{
+    py::gil_scoped_acquire gil;
+
+    // --- Optimizer (SparseAdam) ---
+    py::module sadam = py::module::import("svraster_cuda.sparse_adam");
+    py::object SparseAdam = sadam.attr("SparseAdam");
+
+    py::list groups;
+    {
+        py::dict g0; g0["params"] = py::make_tuple(py_->svm.attr("_geo_grid_pts")); g0["lr"] = geo_lr; groups.append(g0);
+    }
+    {
+        py::dict g1; g1["params"] = py::make_tuple(py_->svm.attr("_sh0"));          g1["lr"] = sh0_lr; groups.append(g1);
+    }
+    {
+        py::dict g2; g2["params"] = py::make_tuple(py_->svm.attr("_shs"));          g2["lr"] = shs_lr; groups.append(g2);
+    }
+
+    // Same call style as Python (group-specific lrs; global lr unused)
+    py_->optimizer_py = SparseAdam(groups,
+                                   "betas"_a = py::make_tuple(beta1, beta2),
+                                   "eps"_a   = eps);
+
+    // --- Scheduler (MultiStepLR) ---
+    py::module lr_sched = py::module::import("torch.optim.lr_scheduler");
+    py_->scheduler_py = lr_sched.attr("MultiStepLR")(
+        py_->optimizer_py,
+        "milestones"_a = py::cast(milestones),
+        "gamma"_a = gamma
+    );
+}
+
+py::object VoxelModel::schedulerStateDict()
+{
+    py::gil_scoped_acquire gil;
+    if (py_->scheduler_py.is_none()) return py::none();
+    return py_->scheduler_py.attr("state_dict")();
+}
+
+void VoxelModel::schedulerLoadStateDict(const py::object& state)
+{
+    if (state.is_none()) return;
+    py::gil_scoped_acquire gil;
+    if (!py_->scheduler_py.is_none())
+        py_->scheduler_py.attr("load_state_dict")(state);
+}
+
+void VoxelModel::schedulerStep()
+{
+    py::gil_scoped_acquire gil;
+    if (!py_->scheduler_py.is_none())
+        py_->scheduler_py.attr("step")();
 }
 
 /* static */ torch::Tensor
@@ -2313,9 +2393,17 @@ torch::Tensor VoxelModel::subdivisionPriority() const {
 }
 
 torch::Tensor VoxelModel::voxSize() const {
-    // ensure [N,1]
-    if (size_.dim() == 1) return size_.unsqueeze(1);
-    return size_;
+    torch::Tensor out = (size_.dim() == 1) ? size_.unsqueeze(1) : size_; // [N,1]
+    // Light stats; item<>() syncs but is fine occasionally
+    auto flat = out.view(-1);
+    float minv = flat.min().item<float>();
+    float maxv = flat.max().item<float>();
+    float mean = flat.mean().item<float>();
+    // std::cout << "[DBG][voxSize] shape=" << out.sizes()
+    //           << " N=" << out.size(0)
+    //           << " min/mean/max=" << minv << "/" << mean << "/" << maxv
+    //           << std::endl;
+    return out;
 }
 
 torch::Tensor VoxelModel::octLevel() const {
@@ -2386,15 +2474,6 @@ VoxelModel::render(const MiniCam&              cam,
     /* 3) pack voxel buffers into a python dict                              */
     /* --------------------------------------------------------------------- */
     py::dict d;
-    // d["geo_grid_pts"] = py::cast(_geo_grid_pts_);
-    // d["sh0"]        = py::cast(sh0_);
-    // d["shs"]           = py::cast(shs_);
-    // d["subdiv_p"]      = py::cast(subdiv_p_);
-    // d["octpath"]      = py::cast(oct_path_);
-    // d["center"]       = py::cast(center_);
-    // d["vox_size"]  = py::cast(size_);
-    // d["vox_key"]   = py::cast(vox_key_);
-    // d["active_sh_degree"]     = py::int_(active_sh_degree_);
     d["geo_grid_pts"]      = py_->svm.attr("_geo_grid_pts");
     d["sh0"]               = py_->svm.attr("_sh0");
     d["shs"]               = py_->svm.attr("_shs");
@@ -2404,7 +2483,7 @@ VoxelModel::render(const MiniCam&              cam,
     d["center"]            = py_->svm.attr("vox_center");
     d["vox_size"]          = py_->svm.attr("vox_size");
     d["vox_key"]           = py_->svm.attr("vox_key");
-    d["active_sh_degree"]  = py::int_(active_sh_degree_);
+    d["active_sh_degree"]  = py::int_(this->active_sh_degree_);
 
     /* --------------------------------------------------------------------- */
     /* 4) call python                                                        */
@@ -2466,18 +2545,100 @@ VoxelModel::render(const MiniCam&              cam,
     return pkg;                       // may be empty on error
 }
 
+void VoxelModel::applyTvOnDensityField(float lambda_tv_density) {
+    // Must NOT be inside a NoGrad guard — we want to add to _geo_grid_pts.grad
+    py::gil_scoped_acquire gil;
+    try {
+        // Uses SVProperties.apply_tv_on_density_field(self, weight)
+        // which sets up grad if needed and calls svraster_cuda.grid_loss_bw.total_variation
+        py_->svm.attr("apply_tv_on_density_field")(lambda_tv_density);
+    } catch (const py::error_already_set& e) {
+        std::cerr << "[TV] apply_tv_on_density_field failed: " << e.what() << std::endl;
+    }
+}
+
 float VoxelModel::paramL2(const char* name) {
     py::gil_scoped_acquire gil;
     auto t = py_->svm.attr(name).cast<torch::Tensor>();
-    return t.norm().item<float>();
+    return t.defined()? t.norm().item<float>() : 0.f;
 }
 
 float VoxelModel::gradL2(const char* name) {
     py::gil_scoped_acquire gil;
     auto p = py_->svm.attr(name).cast<torch::Tensor>();
-    auto g = p.grad(); // C++ API: p.grad() (or from py: p.attr("grad"))
-    if (!g.defined()) return 0.f;
-    return g.norm().item<float>();
+    auto g = p.grad();
+    return (g.defined()? g.norm().item<float>() : 0.f);
+}
+
+void VoxelModel::debugParamChain() {
+    py::gil_scoped_acquire gil;
+
+    auto p_geo = py_->svm.attr("_geo_grid_pts").cast<torch::Tensor>();
+    auto p_sh0 = py_->svm.attr("_sh0").cast<torch::Tensor>();
+    auto p_shs = py_->svm.attr("_shs").cast<torch::Tensor>();
+
+    auto g_geo = p_geo.grad();
+    auto g_sh0 = p_sh0.grad();
+    auto g_shs = p_shs.grad();
+
+    auto ptr = [](const torch::Tensor& t)->uintptr_t { return (uintptr_t)t.data_ptr(); };
+    auto nrm = [](const torch::Tensor& t)->double { return (t.defined() ? t.norm().item<double>() : -1.0); };
+
+    std::cout << std::fixed << std::setprecision(6)
+              << "[autograd] _geo  req=" << p_geo.requires_grad()
+              << "  p="  << ptr(p_geo)
+              << "  ||p||="   << nrm(p_geo)
+              << "  grad? "   << (g_geo.defined())
+              << "  ||g||="   << nrm(g_geo) << "\n"
+              << "[autograd] _sh0  req=" << p_sh0.requires_grad()
+              << "  p="  << ptr(p_sh0)
+              << "  ||p||="   << nrm(p_sh0)
+              << "  grad? "   << (g_sh0.defined())
+              << "  ||g||="   << nrm(g_sh0) << "\n"
+              << "[autograd] _shs  req=" << p_shs.requires_grad()
+              << "  p="  << ptr(p_shs)
+              << "  ||p||="   << nrm(p_shs)
+              << "  grad? "   << (g_shs.defined())
+              << "  ||g||="   << nrm(g_shs) << std::endl;
+}
+
+void VoxelModel::debugOptimizer() {
+    py::gil_scoped_acquire gil;
+    if (py_->optimizer_py.is_none()) {
+        std::cout << "[optim] None\n"; return;
+    }
+    py::list groups = py_->optimizer_py.attr("param_groups");
+    for (ssize_t i = 0; i < (ssize_t)groups.size(); ++i) {
+        auto g = groups[i].cast<py::dict>();
+        double lr = py::float_(g["lr"]);
+        py::tuple params = g["params"].cast<py::tuple>();
+        std::cout << "[optim] group " << i << " lr=" << lr
+                  << " nparams=" << params.size() << "\n";
+        for (ssize_t j = 0; j < (ssize_t)params.size(); ++j) {
+            auto t = py::reinterpret_borrow<py::object>(params[j]).cast<torch::Tensor>();
+            auto tg = t.grad();
+            std::cout << "   - shape=" << t.sizes()
+                      << " req=" << t.requires_grad()
+                      << " ||p||=" << (t.defined()? t.norm().item<double>(): -1.0)
+                      << " grad? " << tg.defined()
+                      << " ||g||=" << (tg.defined()? tg.norm().item<double>(): -1.0)
+                      << "\n";
+        }
+    }
+}
+
+torch::Tensor VoxelModel::snapParam(const char* name) {
+    py::gil_scoped_acquire gil;
+    auto t = py_->svm.attr(name).cast<torch::Tensor>();
+    return t.detach().clone();               // CPU clone if you prefer
+}
+
+double VoxelModel::deltaFrom(const char* name, const torch::Tensor& prev) {
+    py::gil_scoped_acquire gil;
+    auto t = py_->svm.attr(name).cast<torch::Tensor>();
+    auto d = (t - prev).norm().item<double>();
+    auto n = t.norm().item<double>();
+    return (n > 0.0 ? d / n : 0.0);
 }
 
 } // namespace sv

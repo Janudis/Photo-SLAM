@@ -177,12 +177,18 @@ protected:
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
 
-    void saveVoxelErrorHeatmap(
-        const sv::MiniCam& cam,
-        const torch::Tensor& geom,
-        const torch::Tensor&  gt_img,
-        int fid,          // key-frame id
-        const std::string& base_dir); // e.g. result_dir_/heatmaps
+    // void saveVoxelErrorHeatmap(
+    //     const std::shared_ptr<VoxelKeyframe>& kf,
+    //     int iter,
+    //     const torch::Tensor& rendered_image_01,   // (1,3,H,W) in [0,1]
+    //     const torch::Tensor& gt_image_01,
+    //     const torch::Tensor& geom_idx);
+    
+    void saveVoxelErrorHeatmap(const sv::MiniCam& cam,
+                            const at::Tensor& rendered_img,
+                            const at::Tensor& gt_img,
+                            int fid,
+                            const std::string& base_dir);
 
 public:
     std::vector<float> best_loss_per_kf_;          // size == #key-frames

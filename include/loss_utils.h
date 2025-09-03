@@ -30,6 +30,12 @@ inline torch::Tensor l1_loss(torch::Tensor &network_output, torch::Tensor &gt)
     return torch::abs(network_output - gt).mean();
 }
 
+inline torch::Tensor l2_loss(torch::Tensor &network_output, torch::Tensor &gt) {
+    // Equivalent to torch.nn.functional.mse_loss(x, y, reduction='mean')
+    // auto diff = network_output - gt;
+    // return diff.mul(diff).mean();
+    return torch::nn::functional::mse_loss(network_output, gt);
+}
 inline torch::Tensor psnr(torch::Tensor &img1, torch::Tensor &img2)
 {
     auto mse = torch::pow(img1 - img2, 2).mean();

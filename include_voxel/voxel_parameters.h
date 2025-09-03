@@ -67,7 +67,10 @@ public:
         float subdivide_samp_thres_  = 1.0f,
         float subdivide_prop_        = 0.05f,        // top 5% by priority
         int   subdivide_max_num_     = 10000000,   // hard cap
-        float lambda_dssim = 0.2f
+        float lambda_dssim = 0.2f,
+        float lambda_tv_density = 1e-10f,
+        int   tv_from = 0,
+        int   tv_until = 10000
     );
 
 public:
@@ -89,6 +92,9 @@ public:
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
-    int subdivide_max_num_;     
-    float lambda_dssim_;              
+    int subdivide_max_num_;
+    float lambda_dssim_;
+    float lambda_tv_density_;
+    int   tv_from_;
+    int   tv_until_;
 };

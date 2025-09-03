@@ -37,7 +37,7 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 # SVRaster-style optimisation parameters
 ##############################################################################
 # Training length
-Optimization.max_num_iterations: 20000
+Optimization.max_num_iterations: 30100
 
 # SparseAdam param groups (match train.py)
 Optimization.geo_lr: 0.025
@@ -51,7 +51,7 @@ Optimization.optim_eps: 1e-15
 
 # MultiStep LR decay (like torch.optim.lr_scheduler.MultiStepLR)
 # Use a YAML sequence for OpenCV FileStorage compatibility.
-Optimization.lr_decay_ckpt: [19000]
+Optimization.lr_decay_ckpt:  [19000] 
 Optimization.lr_decay_mult: 0.1
 
 # Photometric loss blend used in your mapper (L1 + DSSIM)
@@ -61,19 +61,23 @@ Optimization.lambda_dssim: 0.20
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
 Optimization.adapt_from: 500
-Optimization.adapt_every: 500
+Optimization.adapt_every: 100
 
 # Pruning
 Optimization.prune_until: 18000
 Optimization.prune_thres_init: 0.0001
-Optimization.prune_thres_final: 0.05
+Optimization.prune_thres_final: 0.03 #0.05
 
 # Subdivision
 Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0
 Optimization.subdivide_samp_thres: 1.0
-Optimization.subdivide_prop: 0.05
+Optimization.subdivide_prop: 0.08 #0.05
 Optimization.subdivide_max_num: 10000000
+
+Optimization.lambda_tv_density: 1e-10
+Optimization.tv_from: 0
+Optimization.tv_until: 10000
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

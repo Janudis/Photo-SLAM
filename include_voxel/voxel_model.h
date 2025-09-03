@@ -12,6 +12,7 @@
 #include <Python.h>  
 #include <pybind11/embed.h>                         // for Python bridge
 #include <pybind11/stl.h>
+#include <pybind11/pybind11.h>
 #include <torch/extension.h>
 #include <iostream>
 #include <cstdlib>
@@ -83,6 +84,8 @@ public:
     void oneUpShDegree();
     void setShDegree(int sh);
 
+    torch::Tensor voxCenter() { return this->center_; }
+
     void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd);
     void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
     // void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
@@ -101,6 +104,13 @@ public:
     float multiStepDecay(int iter, float base_lr,
                         const std::vector<int>& milestones,
                         float gamma);
+    void createTrainer(float geo_lr, float sh0_lr, float shs_lr,
+                       float beta1=0.9f, float beta2=0.999f, float eps=1e-15f,
+                       const std::vector<int>& milestones = {},
+                       float gamma = 0.1f);
+    py::object schedulerStateDict();
+    void schedulerStep();
+    void schedulerLoadStateDict(const py::object& state_dict);
 
     // torch::Tensor errorNormalized() const;
     // void accumulateError(const torch::Tensor& vis_idx,
@@ -156,8 +166,14 @@ public:
         const pybind11::array_t<uint8_t>& rgb_image
     ) const;
 
+    void applyTvOnDensityField(float lambda_tv_density);
+
     float paramL2(const char* name);
     float gradL2(const char* name);
+    void    debugParamChain();
+    void    debugOptimizer();
+    torch::Tensor snapParam(const char* name);                       // <- return Tensor
+    double        deltaFrom(const char* name, const torch::Tensor& prev);
 
 public:
     torch::DeviceType device_type_;
@@ -211,7 +227,7 @@ protected:
     static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
     static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy)
     // Cache MAX_NUM_LEVELS
-    int max_num_levels_ = 12; // safe default; overwritten at init
+    int max_num_levels_ = 16; // safe default; overwritten at init
 
     std::mutex mutex_settings_;
 };

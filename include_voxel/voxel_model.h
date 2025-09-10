@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <ATen/ATen.h>
 #include <cmath>
+#include <tuple>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 #include "third_party/simple-knn/spatial.h"
@@ -42,17 +43,6 @@
     this->Tensor_vec_sh0_       = { this->sh0_ };       \
     this->Tensor_vec_shs_       = { this->shs_ };       \
 
-// #define VOXEL_MODEL_INIT_TENSORS(device_type)                                 \
-//     this->center_               = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->size_                 = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->_geo_grid_pts_         = torch::empty({0, 8},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->sh0_                  = torch::empty({0, 3},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->shs_                  = torch::empty({0, 45, 3},torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->oct_path_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
-//     this->oct_level_            = torch::empty({0},       torch::TensorOptions().dtype(torch::kInt32  ).device(device_type)); \
-//     this->subdiv_meta_          = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     this->subdiv_p_             = torch::empty({0},       torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-//     VOXEL_MODEL_TENSORS_TO_VEC
 #define VOXEL_MODEL_INIT_TENSORS(device_type)                                              \
     this->center_       = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->size_         = torch::empty({0},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
@@ -62,7 +52,7 @@
     this->oct_path_     = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
     this->oct_level_    = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kInt8   ).device(device_type)); \
     this->subdiv_p_     = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->max_w_         = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+    this->max_w_        = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     VOXEL_MODEL_TENSORS_TO_VEC
 
 // namespace py = pybind11;
@@ -111,6 +101,7 @@ public:
     py::object schedulerStateDict();
     void schedulerStep();
     void schedulerLoadStateDict(const py::object& state_dict);
+    std::tuple<double,double,double> currentLearningRates() const;
 
     // torch::Tensor errorNormalized() const;
     // void accumulateError(const torch::Tensor& vis_idx,
@@ -148,6 +139,8 @@ public:
     torch::Tensor octLevel() const;            // [N,1] int8
     int           numVoxels() const;           // N
     int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
+    torch::Tensor SceneCenter() const;  
+    torch::Tensor SceneExtent() const;
     // Maintenance
     void resetSubdivisionPriority();
     void freezeVoxGeo();
@@ -161,10 +154,7 @@ public:
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
     std::unordered_map<std::string, torch::Tensor>
-    render(
-        const MiniCam&                   cam,
-        const pybind11::array_t<uint8_t>& rgb_image
-    ) const;
+    render(const MiniCam& cam) const;
 
     void applyTvOnDensityField(float lambda_tv_density);
 
@@ -204,13 +194,6 @@ public:
                                 Tensor_vec_sh0_,
                                 Tensor_vec_shs_;
 
-    /// The Adam optimizer
-    // std::shared_ptr<torch::optim::Adam> optimizer_;
-    // py::object svm_;
-    // py::object optimizer_py_;
-    struct PyState;                // forward declaration only
-    std::unique_ptr<PyState> py_;  // holds all pybind objects
-
     torch::Tensor sparse_points_xyz_;
     torch::Tensor sparse_points_color_;
 
@@ -220,6 +203,12 @@ public:
     torch::Tensor bb_min_eff_, bb_max_eff_;
 
 protected:
+    /// The Adam optimizer
+    // std::shared_ptr<torch::optim::Adam> optimizer_;
+    // py::object svm_;
+    // py::object optimizer_py_;
+    struct PyState;                // forward declaration only
+    std::unique_ptr<PyState> py_;  // holds all pybind objects
     // Pull all core tensors from the Python SVM after any topology change.
     void syncFromPython_();
     // Helper math

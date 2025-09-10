@@ -238,7 +238,9 @@ add_library(voxel_core
         src_voxel/voxel_parameters.cpp
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
-        src_voxel/voxel_model.cpp)
+        src_voxel/voxel_model.cpp
+        third_party/tinyply/tinyply.h
+        third_party/tinyply/tinyply.cpp)
         
 target_include_directories (voxel_core
         PUBLIC

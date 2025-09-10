@@ -58,18 +58,14 @@ def safe_stat(x, name):
         print(f"[PY] {name}: ERROR: {e}")
 print("=== LOADING voxel_bridge!!! ===")
 
-def render(cam, voxel_data, rgb_image):
+def render(cam, voxel_data):
     # ensure watchdog is running
     start_watchdog()
     # print("\n[PY-DBG] ===== ENTER render() =====")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cam.w2c = cam.w2c.to(device)
     cam.c2w = cam.c2w.to(device)
-    if rgb_image is None or (isinstance(rgb_image, np.ndarray) and rgb_image.size == 0):
-        gt_image = None
-    else:
-        gt_image = (torch.from_numpy(np.asarray(rgb_image, dtype=np.uint8))
-                        .float().div_(255.0).permute(2,0,1).to(device))
+
     if voxel_data["center"].numel() == 0:
         print("[WARNING] No voxels to render!")
         return
@@ -91,7 +87,8 @@ def render(cam, voxel_data, rgb_image):
             voxel_data['center'],    # vox_center  (N,3)
             cam_pos,                  # cam_pos (3,) #cam.c2w[:3, 3],
             viewdir,                        # viewdir
-            voxel_data['sh0'].squeeze(1),     # sh0  (N,3)
+            # voxel_data['sh0'].squeeze(1),     # sh0  (N,3)
+            voxel_data['sh0'],
             voxel_data['shs']         # shs  (N,45,3)
         )      
         return dict(

@@ -173,7 +173,7 @@ protected:
     void renderAndRecordAllKeyframes(
         const std::string& name_suffix = "");
 
-    void savePly (const std::filesystem::path& dir);            
+    void savePly(std::filesystem::path result_dir);         
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
 

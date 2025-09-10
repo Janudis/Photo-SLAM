@@ -55,7 +55,7 @@ public:
         std::vector<int> lr_decay_ckpt = {19000}, // milestones in iterations
         float lr_decay_mult = 0.1f,                            // gamma
         // --- Adaptive procedure (SV style) ---
-        int   adapt_from_            = 1000,
+        int   adapt_from_            = 800,
         int   adapt_every_           = 1000,
         // Pruning
         int   prune_until_           = 18000,

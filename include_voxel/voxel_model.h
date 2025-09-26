@@ -37,6 +37,7 @@
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/py_utils.h"
 #include "include_voxel/voxel_constants.h"
+#include <rerun.hpp>
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
     this->Tensor_vec_geo_       = { this->_geo_grid_pts_ };       \
@@ -75,6 +76,10 @@ public:
     void setShDegree(int sh);
 
     torch::Tensor voxCenter() { return this->center_; }
+    int64_t numGridPts() const;
+    const torch::Tensor& geoGridPts() const;
+    const torch::Tensor& sh0() const;
+    const torch::Tensor& shs() const;
 
     void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd);
     void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
@@ -102,25 +107,7 @@ public:
     void schedulerStep();
     void schedulerLoadStateDict(const py::object& state_dict);
     std::tuple<double,double,double> currentLearningRates() const;
-
-    // torch::Tensor errorNormalized() const;
-    // void accumulateError(const torch::Tensor& vis_idx,
-    //                     const torch::Tensor& err);
-    // torch::Tensor validMask(float size_mul) const;
-    // TrainingStat computeTrainingStat(
-    //     const std::vector<MiniCam>& cameras,
-    //     const py::array_t<uint8_t>& rgb_image
-    // );
-    // void prune(const torch::Tensor& mask_keep);
-    // void subdivide(const torch::Tensor& mask);
-    // void setSubdivMeta(const torch::Tensor& updated);
-    // /// Return gradient of `subdiv_p_`; requires that backward() was already called.
-    // torch::Tensor getSubdivPriorityGrad() const;
-    // /// Scatter‐add `parent_grads` into `subdiv_p_grad_buffer_` at indices `parent_idx`.
-    // void accumulateSubdivGradients(
-    //     const torch::Tensor& parent_idx,
-    //     const torch::Tensor& parent_grads
-    // );
+    void appendGroup_(int group_idx, const torch::Tensor& add_rows, const char* svm_field_name, torch::Tensor* out_member_param);
 
     // === Adaptive API (SVRaster style) ===
     struct StatPkg {
@@ -165,15 +152,39 @@ public:
     torch::Tensor snapParam(const char* name);                       // <- return Tensor
     double        deltaFrom(const char* name, const torch::Tensor& prev);
 
+    void rrInitOnce();
+    void rrLogPointsAndAABB(int iteration,                   // keep if you want for labels
+                            const at::Tensor& xyz,
+                            const at::Tensor& rgb,
+                            const at::Tensor& bounding_2x3,
+                            const std::string& tag,
+                            int64_t max_points_for_viz = 200000,
+                            bool log_points = true,
+                            bool log_box   = true,
+                            int64_t inc = -1); 
+    void logParamSignature(const char* tag);
+    void rrLogVoxelBoxes(const at::Tensor& centers,
+                         const at::Tensor& sizes,
+                         int64_t max_boxes_for_viz = 100000000,
+                         const std::string& tag = "boxes",
+                         int64_t inc = -1);
+    void rrLogGlobalSceneAABB(int64_t inc);
+
+private:
+    std::unique_ptr<rerun::RecordingStream> rr_;
+    std::vector<rerun::Vec3D> rr_acc_mins_;
+    std::vector<rerun::Vec3D> rr_acc_sizes_;
+    std::vector<rerun::Rgba32> rr_acc_colors_;
+    std::vector<std::string>   rr_acc_labels_;
+    bool rr_initialized_ = false;
+    int64_t rr_inc_step_ = 0;  // unique per increasePcd() call
+
 public:
     torch::DeviceType device_type_;
 
     /// Current & maximum SH degree
     int active_sh_degree_;
     int max_sh_degree_;
-
-    int outside_level_ = 5;    // match svraster default
-    int inside_level_  = 6;    // number of “dense” levels inside the bound
 
     /// Main voxel tensors
     torch::Tensor center_;             // [N, 3]
@@ -197,10 +208,16 @@ public:
     torch::Tensor sparse_points_xyz_;
     torch::Tensor sparse_points_color_;
 
-    torch::Tensor scene_center_;
-    torch::Tensor scene_extent_;
-    torch::Tensor scene_inside_;
-    torch::Tensor bb_min_eff_, bb_max_eff_;
+    torch::Tensor scene_center_;   // [3], CUDA
+    torch::Tensor scene_extent_;   // [1], CUDA
+    torch::Tensor scene_min_t_;      // [3], CUDA
+    torch::Tensor vox_eff_;      // [1,1], CUDA (effective voxel size for fixed level)
+    // int8_t  octlevel_ = 0; 
+
+    float global_scene_extent_ = 150.0f;  // example: 200 m cube
+    std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
+    float fixed_vox_size_ = 0.05f;        // your chosen voxel size
+
 
 protected:
     /// The Adam optimizer
@@ -216,7 +233,7 @@ protected:
     static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
     static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy)
     // Cache MAX_NUM_LEVELS
-    int max_num_levels_ = 16; // safe default; overwritten at init
+    const int max_num_levels_ = 16; // safe default; overwritten at init
 
     std::mutex mutex_settings_;
 };

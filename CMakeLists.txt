@@ -6,6 +6,11 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+include(FetchContent)
+FetchContent_Declare(rerun_sdk URL https://github.com/rerun-io/rerun/releases/download/0.24.1/rerun_cpp_sdk.zip)
+FetchContent_MakeAvailable(rerun_sdk)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
@@ -254,7 +259,8 @@ target_link_libraries (voxel_core
             "${TORCH_LIBRARIES}"
             Python3::Python
             pybind11::embed
-            ${OpenCV_LIBRARIES})
+            ${OpenCV_LIBRARIES}
+            rerun_sdk)
 
 add_library(voxel_viewer SHARED
     viewer/drawer_utils.h

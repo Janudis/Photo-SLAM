@@ -21,6 +21,7 @@
 #include <ctime>
 #include <sstream>
 #include <thread>
+#include <limits>
 
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_keyframe.h"

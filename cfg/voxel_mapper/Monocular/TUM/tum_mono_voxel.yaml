@@ -64,8 +64,8 @@ Optimization.lambda_dssim: 0.20
 # Optimization.adapt_every: 100
 # Optimization.adapt_from: 150
 # Optimization.adapt_every: 100
-Optimization.adapt_from: 1000
-Optimization.adapt_every: 1000
+Optimization.adapt_from: 800
+Optimization.adapt_every: 800
 # Pruning
 Optimization.prune_until: 18000
 Optimization.prune_thres_init: 0.0001
@@ -73,7 +73,7 @@ Optimization.prune_thres_final: 0.05
 
 # Subdivision
 Optimization.subdivide_until: 15000
-Optimization.subdivide_all_until: 150
+Optimization.subdivide_all_until: 0
 Optimization.subdivide_samp_thres: 1.0
 Optimization.subdivide_prop: 0.05
 Optimization.subdivide_max_num: 10000000

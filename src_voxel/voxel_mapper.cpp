@@ -11,6 +11,33 @@ std::ofstream loss_l1_log_;
 std::ofstream loss_ssim_log_;
 std::ofstream loss_l2_log_;
 
+void saveTensor(const torch::Tensor &t,
+                const std::string &tag,
+                const std::string &dbg_dir,
+                int iter,
+                int image_id)
+{
+    auto img = t.squeeze(0)
+                 .permute({1,2,0})
+               // optional gamma:
+               // .clamp(0.0f, 1.0f).pow(1.0f/2.2f)
+                 .mul(255.0f).clamp(0.0f,255.0f)
+                 .to(torch::kUInt8)
+                 .contiguous()
+                 .cpu();
+    int H = img.size(0), W = img.size(1);
+    cv::Mat rgb(H, W, CV_8UC3, img.data_ptr());
+    cv::Mat bgr;
+    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+    std::ostringstream ss;
+    ss << dbg_dir << "/" 
+       << tag 
+       << "_iter" << std::setw(6) << std::setfill('0') << iter
+       << "_img"  << std::setw(3) << std::setfill('0') << image_id
+       << ".png";
+    cv::imwrite(ss.str(), bgr);
+}
+
 inline void saveDebugImage(torch::Tensor tensor, const std::string& path) {
     torch::NoGradGuard ng;
     namespace fs = std::filesystem;
@@ -940,21 +967,21 @@ void VoxelMapper::run()
                     std::cout << "[VoxelMapper] Scene extent: " 
                               << scene_->cameras_extent_ << std::endl;
                     // save_initial_pcd_npy(result_dir_, scene_->cached_point_cloud_);
-                    auto restored = load_full_pcd_from_logs((result_dir_ / "offline_experiment").string());
+                    // auto restored = load_full_pcd_from_logs((result_dir_ / "offline_experiment").string());
                     // voxel_model_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_, keyframes_for_bounding, (result_dir_ / "training_camera_poses.txt").string());
-                    voxel_model_->createFromPcd(scene_->cached_point_cloud_);
+                    // registerCurrentBoxFromModel("init");
                     // voxel_model_->createFromPcd(std::move(restored));
+                    voxel_model_->createFromPcd(scene_->cached_point_cloud_);
                     std::unique_lock<std::mutex> lock(mutex_settings_);
                     voxel_model_->createTrainer(
-                                                    opt_params_.geo_lr_,
-                                                    opt_params_.sh0_lr_,
-                                                    opt_params_.shs_lr_,
-                                                    opt_params_.optim_beta1_,
-                                                    opt_params_.optim_beta2_,
-                                                    opt_params_.optim_eps_,
-                                                    opt_params_.lr_decay_ckpt_,     // milestones (vector<int>)
-                                                    opt_params_.lr_decay_mult_      // gamma
-                                                );
+                                                opt_params_.geo_lr_,
+                                                opt_params_.sh0_lr_,
+                                                opt_params_.shs_lr_,
+                                                opt_params_.optim_beta1_,
+                                                opt_params_.optim_beta2_,
+                                                opt_params_.optim_eps_,
+                                                opt_params_.lr_decay_ckpt_,
+                                                opt_params_.lr_decay_mult_);
                 }
 
                 // One warm-up optimization step
@@ -1102,17 +1129,6 @@ void VoxelMapper::trainForOneIteration()
 
     // ) build a MiniCam out of this keyframe
     sv::MiniCam cam = viewpoint_cam->toMiniCam();
-    // py::module_ np = py::module_::import("numpy");
-    // torch::Tensor chw_u8 = viewpoint_cam->original_image_    // (3,H,W) in [0,1]
-    //                         .mul(255.0f)
-    //                         .clamp(0.0f, 255.0f)
-    //                         .to(torch::kUInt8)            // <--- cast to U8
-    //                         .cpu()
-    //                         .contiguous();
-    // torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
-    // py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
-    // np.attr("save")("/home/dimitris/Photo-SLAM/gt_image.npy", rgb_numpy);
-
     auto render_pkg = voxel_model_->render(cam);
     if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
         std::cout << "render pkg empty" << std::endl;
@@ -1127,54 +1143,6 @@ void VoxelMapper::trainForOneIteration()
     torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
     torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
     torch::Tensor masked_gt   = gt_image * mask;
-    
-    // saveVoxelErrorHeatmap(cam, masked_image.detach(), masked_gt.detach(),
-    //                     viewpoint_cam->fid_, (result_dir_ / "heatmaps").string());
-    // saved_this_iter = true;
-
-    // --- Save render for the FIRST keyframe ---
-    // {
-    //     torch::NoGradGuard no_grad;
-    //     namespace fs = std::filesystem;
-
-    //     // Resolve the first keyframe id once (min id in the map)
-    //     static int first_fid = -1;
-    //     if (first_fid < 0) {
-    //         const auto& kfs = scene_->keyframes();
-    //         if (!kfs.empty()) first_fid = kfs.begin()->first; // std::map => smallest id
-    //     }
-
-    //     // Save only if this iteration actually trained on the first KF
-    //     if (first_fid >= 0 && viewpoint_cam->fid_ == first_fid) {
-    //         const int iter = getIteration();
-
-    //         // Folder name is robust to nonzero first_fid
-    //         std::ostringstream kf_dir_name;
-    //         kf_dir_name << "kf" << std::setw(4) << std::setfill('0') << first_fid;
-    //         fs::path dir_kf = result_dir_ / "renders" / kf_dir_name.str();
-    //         fs::create_directories(dir_kf);
-
-    //         // Filename with iter stamp
-    //         std::ostringstream fn;
-    //         fn << "kf" << std::setw(4) << std::setfill('0') << first_fid
-    //         << "_iter" << std::setw(6) << std::setfill('0') << iter << ".png";
-
-    //         std::cout << "[KF-LOG] iter " << std::setw(6) << std::setfill('0') << getIteration()
-    //           << " trained on KF " << viewpoint_cam->fid_
-    //           << " (first_fid=" << first_fid << ")\n";
-
-    //         // Use the render you already computed for this KF
-    //         saveDebugImage(render_pkg.at("color"), (dir_kf / fn.str()).string());
-
-    //         // Save GT once for this KF
-    //         static bool gt_saved_once = false;
-    //         if (!gt_saved_once) {
-    //             saveDebugImage(viewpoint_cam->original_image_.unsqueeze(0),
-    //                         (dir_kf / "gt.png").string());
-    //             gt_saved_once = true;
-    //         }
-    //     }
-    // }
 
     auto Ll1 = loss_utils::l1_loss(rendered_image, gt_image);
     float lambda_dssim = lambdaDssim();
@@ -1194,53 +1162,13 @@ void VoxelMapper::trainForOneIteration()
         loss.backward();
     }
 
-    // Sanity probe: are grads on the actual Python params?
-    // Optional: pre-step grad check
-    // if (iter % 10 == 1) {
-    //     std::cout << "[dbg] pre-step: ||_sh0.grad||=" << voxel_model_->gradL2("_sh0")
-    //             << "  ||_shs.grad||=" << voxel_model_->gradL2("_shs")
-    //             << "  ||_geo.grad||=" << voxel_model_->gradL2("_geo_grid_pts") << "\n";
-    // }
-    // /* ===================== step-delta probe (place here) ===================== */
-    // static torch::Tensor sh0_prev, shs_prev, geo_prev;
-    // if (iter % 100 == 1) {
-    //     sh0_prev = voxel_model_->snapParam("_sh0");
-    //     shs_prev = voxel_model_->snapParam("_shs");
-    //     geo_prev = voxel_model_->snapParam("_geo_grid_pts");
-    // }
-
     if (opt_params_.lambda_tv_density_ > 0.f &&
         iter >= opt_params_.tv_from_ &&
         iter <= opt_params_.tv_until_) {
         voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
     }
-    // if (opt_params_.lambda_tv_density_ > 0.f &&
-    //     iter >= opt_params_.tv_from_ &&
-    //     iter <= opt_params_.tv_until_) {
-    //     if ((iter % 200) == 0) {
-    //         std::cout << "[tv] ||_geo.grad|| before TV = "
-    //                 << voxel_model_->gradL2("_geo_grid_pts") << "\n";
-    //         voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
-    //         std::cout << "[tv] ||_geo.grad||  after TV = "
-    //                 << voxel_model_->gradL2("_geo_grid_pts") << "\n";
-    //     } else {
-    //         voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
-    //     }
-    // }
 
-    voxel_model_->optimizerStep();   // <-- the actual update happens here
-    // std::cout << "geo_lr: " << geo_lr << " sh0_lr: " << sh0_lr << " shs_lr: " << shs_lr << std::endl;
-
-    // if (iter % 100 == 1) {
-    //     std::cout << std::fixed << std::setprecision(6)
-    //             << "[step∆] rel||sh0||=" << voxel_model_->deltaFrom("_sh0", sh0_prev)
-    //             << "  rel||shs||="      << voxel_model_->deltaFrom("_shs", shs_prev)
-    //             << "  rel||geo||="      << voxel_model_->deltaFrom("_geo_grid_pts", geo_prev)
-    //             << "\n";
-    // }
-    // // optional deep debug
-    // if (iter % 50 == 1)  voxel_model_->debugParamChain();
-    // if (iter % 200 == 1) voxel_model_->debugOptimizer();
+    voxel_model_->optimizerStep();   // <-- the actual update
 
     {
         // Densification for increasePcd
@@ -1257,7 +1185,6 @@ void VoxelMapper::trainForOneIteration()
             (iter <= opt_params_.subdivide_until_) &&
             (voxel_model_->numVoxels() < opt_params_.subdivide_max_num_);
 
-        py::object sched_state;  // keep in outer scope of the densification block
         if (need_pruning || need_subdividing)
         {
             // Build list of training cameras (use all current keyframes)
@@ -1268,7 +1195,7 @@ void VoxelMapper::trainForOneIteration()
 
             // Compute statistics once (max_w, min_samp_interval, view_cnt)
             auto stat = voxel_model_->computeTrainingStat(tr_cams);
-            sched_state = voxel_model_->schedulerStateDict();
+            py::object sched_state = voxel_model_->schedulerStateDict();
 
             std::cout << "[densify:stat] N=" << voxel_model_->numVoxels()
                     << "  max_w=" << shp(stat.max_w)
@@ -1443,7 +1370,6 @@ void VoxelMapper::trainForOneIteration()
                     }
                 }
             }
-
             voxel_model_->createTrainer(
                 opt_params_.geo_lr_,
                 opt_params_.sh0_lr_,
@@ -1479,22 +1405,6 @@ void VoxelMapper::trainForOneIteration()
                                     gt_image,
                                     viewpoint_cam->fid_,
                                     result_dir_, result_dir_, result_dir_);
-        // every training_report_interval_ iterations, print a concise report
-        // if (training_report_interval_ && iteration_ % training_report_interval_ == 0) {
-        //     sv::VoxelTrainer::trainingReport(
-        //         iteration_,
-        //         opt_params_.iterations_,
-        //         Ll1,
-        //         loss,
-        //         ema_loss_for_log_,
-        //         loss_utils::l1_loss,
-        //         // elapsed_ms,
-        //         *voxel_model_,
-        //         *scene_,
-        //         pipe_params_,
-        //         background_
-        //     );
-        // }
         
         // Extract scalars
         const float l1_val    = Ll1.item<float>();
@@ -1532,366 +1442,184 @@ void VoxelMapper::trainForOneIteration()
         
         if (loop_closure_iteration_)
             loop_closure_iteration_ = false;
+
+        float loss_val = loss.item<float>();
+        int fid = viewpoint_cam->fid_;                 // key-frame ID being trained
+        // --- 1) ensure our vectors are big enough ---
+        if (fid >= static_cast<int>(best_loss_per_kf_.size())) {
+            size_t newSize = fid + 1;
+            best_loss_per_kf_.resize(newSize,
+                                    std::numeric_limits<float>::infinity());
+            worst_loss_per_kf_.resize(newSize,
+                                    -std::numeric_limits<float>::infinity());
+        }
+        // references into the right slot
+        float &best  = best_loss_per_kf_[fid];
+        float &worst = worst_loss_per_kf_[fid];
+        // --- 2) update “best” for this KF ---
+        if (loss_val < best) {
+            best = loss_val;
+            auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+            std::filesystem::create_directories(kf_dir);
+            saveTensor(gt_image,     "best_gt",     kf_dir.string(), iteration_, fid);
+            saveTensor(masked_image, "best_masked", kf_dir.string(), iteration_, fid);
+        }
+        // --- 3) update “worst” for this KF ---
+        if (loss_val > worst) {
+            worst = loss_val;
+            auto kf_dir = extrema_dir_ / ("kf" + std::to_string(fid));
+            std::filesystem::create_directories(kf_dir);
+            saveTensor(gt_image,     "worst_gt",     kf_dir.string(), iteration_, fid);
+            saveTensor(masked_image, "worst_masked", kf_dir.string(), iteration_, fid);
+        }
     }
 }
 
-    // {
-    //     // Densification
-    //     const bool meet_adapt_period =
-    //         (iter % opt_params_.adapt_every_ == 0) &&
-    //         (iter >= opt_params_.adapt_from_)     &&
-    //         (iter <= opt_params_.iterations_ - 500);
-
-    //     const bool need_pruning =
-    //         meet_adapt_period && (iter <= opt_params_.prune_until_);
-
-    //     const bool need_subdividing =
-    //         meet_adapt_period &&
-    //         (iter <= opt_params_.subdivide_until_) &&
-    //         (voxel_model_->numVoxels() < opt_params_.subdivide_max_num_);
-
-    //     py::object sched_state;  // keep in outer scope of the densification block
-    //     if (need_pruning || need_subdividing)
-    //     {
-    //         bool changed = false;
-    //         // Build list of training cameras (use all current keyframes)
-    //         std::vector<sv::MiniCam> tr_cams; tr_cams.reserve(scene_->keyframes().size());
-    //         for (auto& kv : scene_->keyframes()) {
-    //             if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
-    //         }
-
-    //         // Compute statistics once (max_w, min_samp_interval, view_cnt)
-    //         auto stat = voxel_model_->computeTrainingStat(tr_cams);
-    //         sched_state = voxel_model_->schedulerStateDict();
-
-    //         std::cout << "[densify:stat] N=" << voxel_model_->numVoxels()
-    //         << "  max_w=" << shp(stat.max_w)
-    //         << "  min_itv=" << shp(stat.min_samp_interval)
-    //         << "  view_cnt=" << shp(stat.view_cnt) << "\n";
-
-    //         // PRUNE
-    //         torch::Tensor prune_mask; // keep for subdiv mask logic
-    //         if (need_pruning) {
-    //             const int   a0 = opt_params_.adapt_from_;
-    //             const int   a1 = opt_params_.prune_until_;
-    //             const float t0 = opt_params_.prune_thres_init_;
-    //             const float t1 = opt_params_.prune_thres_final_;
-
-    //             const float prune_thres = (iter <= a0) ? t0 :
-    //                                     (iter >= a1) ? t1 :
-    //                                     (t0 + (t1 - t0) * float(iter - a0) / float(std::max(1, a1 - a0)));
-
-    //             int ori_n = voxel_model_->numVoxels();
-    //             prune_mask = (stat.max_w < prune_thres).squeeze(1); // [N] bool
-
-    //             int n_can = stat.max_w.size(0);
-    //             int n_prune = (int)(prune_mask.defined()? prune_mask.sum().item<int64_t>() : -1);
-    //             std::cout << "[PRUNE:prep] thresh=" << prune_thres
-    //                     << "  N=" << n_can
-    //                     << "  prune_sum=" << n_prune << "\n";
-
-    //             voxel_model_->pruning(prune_mask);
-    //             int new_n = voxel_model_->numVoxels();
-
-    //             std::cout << "[PRUNING]     " << std::setw(7) << ori_n
-    //                     << " => "          << std::setw(7) << new_n
-    //                     << " (x" << std::fixed << std::setprecision(2)
-    //                     << (double)new_n / std::max(1, ori_n)
-    //                     << "; thres=" << std::setprecision(4) << prune_thres << ")\n";
-
-    //             std::cout << "[PRUNE:after] N=" << voxel_model_->numVoxels() << "\n";
-    //             auto pr_dbg = voxel_model_->subdivisionPriority();
-    //             std::cout << "    priority def=" << (pr_dbg.defined()?1:0)
-    //                     << " shape=" << shp(pr_dbg)
-    //                     << " numel=" << (pr_dbg.defined()? pr_dbg.numel() : 0) << "\n";
-    //         }
-
-    //         // SUBDIVIDE
-    //         if (need_subdividing) {
-    //             int ori_n = voxel_model_->numVoxels();
-
-    //             // Exclude newly pruned ones from min_samp_interval if we just pruned
-    //             auto min_samp_interval = stat.min_samp_interval; // [N,1]
-    //             if (need_pruning && prune_mask.defined()) {
-    //                 auto keep_mask = (~prune_mask).to(torch::kBool);
-    //                 min_samp_interval = min_samp_interval.index({keep_mask});
-    //             }
-
-    //             auto size_thres    = min_samp_interval * opt_params_.subdivide_samp_thres_; // [M,1]
-    //             auto vox_size      = voxel_model_->voxSize();                                // [M,1]
-    //             auto large_enough  = (vox_size * 0.5 > size_thres).squeeze(1);               // [M] bool
-    //             // auto non_finest    = (voxel_model_->octLevel().squeeze(1).to(torch::kInt32)
-    //             //                     < voxel_model_->maxNumLevels());                        // [M] bool
-    //             auto octlv        = voxel_model_->octLevel();
-    //             if (octlv.defined() && octlv.dim()==2 && octlv.size(1)==1) octlv = octlv.squeeze(1);
-    //             auto non_finest   = (octlv.to(torch::kInt32) < voxel_model_->maxNumLevels()); // [M]
-    //             auto valid_mask    = large_enough & non_finest;
-    //             auto priority = voxel_model_->subdivisionPriority();              // [M]
-
-    //             std::cout << "[SUBDIV:prep] N=" << voxel_model_->numVoxels()
-    //                     << "  large_enough=" << shp(large_enough)
-    //                     << "  octlevel=" << shp(voxel_model_->octLevel())
-    //                     << "  octlv(1D)=" << shp(octlv)
-    //                     << "  non_finest=" << shp(non_finest)
-    //                     << "  valid_mask=" << shp(valid_mask)
-    //                     << "  sum(valid)=" << (valid_mask.defined()? valid_mask.sum().item<int64_t>() : -1) << "\n";
-
-    //             std::cout << "    priority def=" << (priority.defined()?1:0)
-    //                     << " shape=" << shp(priority)
-    //                     << " numel=" << (priority.defined()? priority.numel() : 0) << "\n";
-
-    //             // --- the line that explodes if shapes differ:
-    //             std::cout << "    CHECK: priority.size(0)="
-    //                     << (priority.defined() && priority.dim()? priority.size(0) : -1)
-    //                     << "  vs valid_mask.size(0)=" << (valid_mask.defined()? valid_mask.size(0) : -1) << "\n";
-
-    //             priority = priority * valid_mask; // mask to zero for invalid
-
-    //             torch::Tensor subdivide_mask;
-    //             if (iter <= opt_params_.subdivide_all_until_) {
-    //                 subdivide_mask = valid_mask; // take all valids early on
-    //             } else {
-    //                 // threshold by (1 - subdivide_prop_) quantile
-    //                 double q = std::max(0.0, 1.0 - (double)opt_params_.subdivide_prop_);
-    //                 auto thres = priority.quantile(q);
-    //                 subdivide_mask = (priority > thres) & valid_mask;
-    //             }
-
-    //             // cap number of parents (each makes +7 children)
-    //             int max_n_subdiv = std::round(
-    //                 (opt_params_.subdivide_max_num_ - voxel_model_->numVoxels()) / 7.0);
-
-    //             if (max_n_subdiv > 0) {
-    //                 int num_sel = (int)subdivide_mask.sum().item<int64_t>();
-    //                 if (num_sel > max_n_subdiv) {
-    //                     auto pos_idx  = subdivide_mask.nonzero().squeeze(1); // [K]
-    //                     auto pos_vals = priority.index({pos_idx});           // [K]
-    //                     auto sorted   = std::get<0>(pos_vals.sort(/*dim=*/0)); // asc
-    //                     int  n_removed = num_sel - max_n_subdiv;
-    //                     auto cutoff    = sorted.index({n_removed - 1});
-    //                     subdivide_mask = subdivide_mask & (priority > cutoff);
-    //                 }
-
-    //                 voxel_model_->subdividing(subdivide_mask);
-    //                 int new_n = voxel_model_->numVoxels();
-
-    //                 std::cout << "[SUBDIVIDING] " << std::setw(7) << ori_n
-    //                         << " => "          << std::setw(7) << new_n
-    //                         << " (x" << std::fixed << std::setprecision(2)
-    //                         << (double)new_n / std::max(1, ori_n) << ")\n";
-
-    //                 voxel_model_->resetSubdivisionPriority();
-    //             }
-    //         }
-
-    //         // if (changed) {
-    //         //     auto render_pkg2 = voxel_model_->render(cam);
-    //         //     auto masked2 = render_pkg2["color"].to(mDevice) * mask;
-    //         //     saveVoxelErrorHeatmap(cam, masked2.detach().contiguous(),
-    //         //                         masked_gt.detach().contiguous(),
-    //         //                         viewpoint_cam->fid_, (result_dir_ / "heatmaps").string());
-    //         // }
-
-    //         voxel_model_->createTrainer(
-    //             opt_params_.geo_lr_,
-    //             opt_params_.sh0_lr_,
-    //             opt_params_.shs_lr_,
-    //             opt_params_.optim_beta1_,
-    //             opt_params_.optim_beta2_,
-    //             opt_params_.optim_eps_,
-    //             opt_params_.lr_decay_ckpt_,
-    //             opt_params_.lr_decay_mult_
-    //         );
-    //         voxel_model_->schedulerLoadStateDict(sched_state);
-    //         // Empty CUDA cache as SV does
-    //         {
-    //             py::gil_scoped_acquire gil;
-    //             py::module_ torch_mod = py::module_::import("torch");
-    //             torch_mod.attr("cuda").attr("empty_cache")();
-    //         }
-    //     }
-    // }
-    
 void VoxelMapper::combineMappingOperations()
- {
-     // Get Mapping Operations
-     while (mpSLAM->getAtlas()->hasMappingOperation()) {
-         ORB_SLAM3::MappingOperation opr =
-             mpSLAM->getAtlas()->getAndPopMappingOperation();
- 
-         switch (opr.meOperationType)
-         {
-         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
-         {
-            bool kf_changed = false;
-             // std::cout << "[Gaussian Mapper]Local BA Detected."
-             //           << std::endl;
- 
-             // Get new keyframes
-             auto& associated_kfs = opr.associatedKeyFrames();
-
-             // Add keyframes to the scene
-             for (auto& kf : associated_kfs) {
-                 // Keyframe Id
-                 auto kfid = std::get<0>(kf);
-                 std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
-                 // If the keyframe is already in the scene, only update the pose.
-                 // Otherwise create a new one
-                 if (pkf) {
-                    //  std::cout << "if pkf" << std::endl;
-                     auto& pose = std::get<2>(kf);
-                     pkf->setPose(
-                         pose.unit_quaternion().cast<double>(),
-                         pose.translation().cast<double>());
-                    //  pkf->computeTransformTensors();
-
-                     // Give local BA keyframes times of use
-                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
-                     
-                     kf_changed = true;
-                 }
-                 else {
-                    // std::cout << "no pkf" << std::endl;
-                    handleNewKeyframe(kf);                   // still void
-
-                    if (pkf) {
-                        // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
-                        torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
-                        torch::Tensor hwc = chw.permute({1,2,0}).contiguous(); // (H,W,3), float32
-                        // Copy into a CV_32FC3 Mat (RGB)
-                        const int H = hwc.size(0);
-                        const int W = hwc.size(1);
-                        cv::Mat img_float(H, W, CV_32FC3);
-                        std::memcpy(img_float.data, hwc.data_ptr<float>(), H*W*3*sizeof(float));
-                        static const auto proj_dir = result_dir_ / "proj_debug";
-                        static const auto imgs_dir = proj_dir / "imgs";
-                        std::filesystem::create_directories(imgs_dir);
-                        saveKfPng_fromFloatRGB(img_float, kfid, imgs_dir);
-                    }
-                 }
-             }
-             
-             // Get new points
-             auto& associated_points = opr.associatedMapPoints();
-             auto& points = std::get<0>(associated_points);
-             auto& colors = std::get<1>(associated_points);
-
-            // //  // Add new points to the model
-            //  if (initial_mapped_ && points.size() >= 30) {
-            //     extendAABB_with_flat_xyz(aabb_min_, aabb_max_, points);  // points = std::vector<float>
-            //     have_bounds_ = true;
-
-            //      torch::NoGradGuard no_grad;
-            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
-
-            //     // log_increase_batch_npy(result_dir_, points, colors, getIteration(), next_batch_index_);
-            //     // ++next_batch_index_;
-            //     //  std::cout << "first increasePcd" << std::endl;
-            //     //  voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
-            //     voxel_model_->increasePcd(points, colors, getIteration());
-            //     // py::object sched_state = voxel_model_->schedulerStateDict();
-            //     // voxel_model_->createTrainer(
-            //     //                             opt_params_.geo_lr_,
-            //     //                             opt_params_.sh0_lr_,
-            //     //                             opt_params_.shs_lr_,
-            //     //                             opt_params_.optim_beta1_,
-            //     //                             opt_params_.optim_beta2_,
-            //     //                             opt_params_.optim_eps_,
-            //     //                             opt_params_.lr_decay_ckpt_,
-            //     //                             opt_params_.lr_decay_mult_);
-            //     // voxel_model_->schedulerLoadStateDict(sched_state);
-            //  }
-
-            // Only try to grow if model was initialized and we have any new points
-            if (initial_mapped_ && !points.empty()) {
-                // 1) Get current bound
-                torch::Tensor sc  = voxel_model_->SceneCenter();  // [3] if set
-                torch::Tensor se  = voxel_model_->SceneExtent();  // [1] if set
-
-                // If the model hasn't been initialized yet (shouldn’t happen here), skip.
-                if (sc.defined() && se.defined() && sc.numel()==3 && se.numel()==1) {
-                    auto sc_cpu = sc.detach().to(torch::kCPU);
-                    auto se_cpu = se.detach().to(torch::kCPU);
-
-                    // scene_min = center - 0.5 * extent;  scene_max = center + 0.5 * extent
-                    float cx = sc_cpu[0].item<float>();
-                    float cy = sc_cpu[1].item<float>();
-                    float cz = sc_cpu[2].item<float>();
-                    float ex = se_cpu[0].item<float>() * 0.5f;
-                    float minx = cx - ex, maxx = cx + ex;
-                    float miny = cy - ex, maxy = cy + ex;
-                    float minz = cz - ex, maxz = cz + ex;
-
-                    const float eps = 1e-6f; // tiny numerical slack
-
-                    // 2) Keep only points outside current AABB
-                    std::vector<float> out_pts;
-                    std::vector<float> out_cols;
-                    out_pts.reserve(points.size());  // upper bound
-                    out_cols.reserve(colors.size());
-
-                    const size_t N = points.size() / 3;
-                    for (size_t i = 0; i < N; ++i) {
-                        float x = points[3*i + 0];
-                        float y = points[3*i + 1];
-                        float z = points[3*i + 2];
-
-                        bool outside =
-                            (x < minx - eps) || (x > maxx + eps) ||
-                            (y < miny - eps) || (y > maxy + eps) ||
-                            (z < minz - eps) || (z > maxz + eps);
-
-                        if (outside) {
-                            out_pts.push_back(x);
-                            out_pts.push_back(y);
-                            out_pts.push_back(z);
-
-                            out_cols.push_back(colors[3*i + 0]);
-                            out_cols.push_back(colors[3*i + 1]);
-                            out_cols.push_back(colors[3*i + 2]);
-                        }
-                    }
-
-                    // 3) Only grow if enough out-of-bounds points
-                    const int MIN_OUTSIDE = 10; // your threshold
-                    if ((int)(out_pts.size()/3) >= MIN_OUTSIDE) {
-                        // Optional: ensure we don't move the 'min side' if you want perfect key stability
-                        // (Counts of which side is violated; skip if it would force min to move)
-                        // bool touches_min_side = (min of any coord < minX/Y/Z);
-                        // if (touches_min_side) { /* decide: defer / tile / rebase */ }
-
-                        torch::NoGradGuard no_grad;
-                        std::unique_lock<std::mutex> lock_render(mutex_render_);
-                        // 4) Actually insert *only* the outside points
-                        voxel_model_->increasePcd(out_pts, out_cols, getIteration());
-                        // // Snapshot scheduler/opt state before we rebuild
-                        // py::object sched_state = voxel_model_->schedulerStateDict();
-                        // {
-                        //     std::unique_lock<std::mutex> lock(mutex_settings_);
-                        //     voxel_model_->createTrainer(
-                        //         opt_params_.geo_lr_,
-                        //         opt_params_.sh0_lr_,
-                        //         opt_params_.shs_lr_,
-                        //         opt_params_.optim_beta1_,
-                        //         opt_params_.optim_beta2_,
-                        //         opt_params_.optim_eps_,
-                        //         opt_params_.lr_decay_ckpt_,
-                        //         opt_params_.lr_decay_mult_);
-                        //     voxel_model_->schedulerLoadStateDict(sched_state);
-                        // }
-                    }
+{
+    // Get Mapping Operations
+    while (mpSLAM->getAtlas()->hasMappingOperation()) {
+        ORB_SLAM3::MappingOperation opr =
+            mpSLAM->getAtlas()->getAndPopMappingOperation();
+        switch (opr.meOperationType)
+        {
+        case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
+        {
+        bool kf_changed = false;
+            // std::cout << "[Gaussian Mapper]Local BA Detected."
+            //           << std::endl;
+            // Get new keyframes
+            auto& associated_kfs = opr.associatedKeyFrames();
+            // Add keyframes to the scene
+            for (auto& kf : associated_kfs) {
+                // Keyframe Id
+                auto kfid = std::get<0>(kf);
+                std::shared_ptr<VoxelKeyframe> pkf = scene_->getKeyframe(kfid);
+                // If the keyframe is already in the scene, only update the pose.
+                // Otherwise create a new one
+                if (pkf) {
+                //  std::cout << "if pkf" << std::endl;
+                    auto& pose = std::get<2>(kf);
+                    pkf->setPose(
+                        pose.unit_quaternion().cast<double>(),
+                        pose.translation().cast<double>());
+                //  pkf->computeTransformTensors();
+                    // Give local BA keyframes times of use
+                    increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
+                    kf_changed = true;
+                }
+                else {
+                // std::cout << "no pkf" << std::endl;
+                handleNewKeyframe(kf);                   // still void
+                if (pkf) {
+                    // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
+                    torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
+                    torch::Tensor hwc = chw.permute({1,2,0}).contiguous(); // (H,W,3), float32
+                    // Copy into a CV_32FC3 Mat (RGB)
+                    const int H = hwc.size(0);
+                    const int W = hwc.size(1);
+                    cv::Mat img_float(H, W, CV_32FC3);
+                    std::memcpy(img_float.data, hwc.data_ptr<float>(), H*W*3*sizeof(float));
+                    static const auto proj_dir = result_dir_ / "proj_debug";
+                    static const auto imgs_dir = proj_dir / "imgs";
+                    std::filesystem::create_directories(imgs_dir);
+                    saveKfPng_fromFloatRGB(img_float, kfid, imgs_dir);
+                }
                 }
             }
+            // Get new points
+            auto& associated_points = opr.associatedMapPoints();
+            auto& points = std::get<0>(associated_points);
+            auto& colors = std::get<1>(associated_points);
 
+            // Add new points to the model
+            if (initial_mapped_ && points.size() >= 30) {
+                torch::NoGradGuard no_grad;
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
+            // log_increase_batch_npy(result_dir_, points, colors, getIteration(), next_batch_index_);
+            // ++next_batch_index_;
+            //  voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
+                // py::object sched_state = voxel_model_->schedulerStateDict();
+                voxel_model_->increasePcd(points, colors, getIteration());
+                // voxel_model_->createTrainer(
+                //                             opt_params_.geo_lr_,
+                //                             opt_params_.sh0_lr_,
+                //                             opt_params_.shs_lr_,
+                //                             opt_params_.optim_beta1_,
+                //                             opt_params_.optim_beta2_,
+                //                             opt_params_.optim_eps_,
+                //                             opt_params_.lr_decay_ckpt_,
+                //                             opt_params_.lr_decay_mult_);
+                // voxel_model_->schedulerLoadStateDict(sched_state);
+            }
+
+            // // Only try to grow if model was initialized and we have any new points
+            // // if (initial_mapped_ && !points.empty()) {
+            // if (initial_mapped_ && points.size() >= 30) {
+            //     // 1) Get current bound
+            //     torch::Tensor sc  = voxel_model_->SceneCenter();  // [3] if set
+            //     torch::Tensor se  = voxel_model_->SceneExtent();  // [1] if set
+            //     // If the model hasn't been initialized yet (shouldn’t happen here), skip.
+            //     if (sc.defined() && se.defined() && sc.numel()==3 && se.numel()==1) {
+            //         auto sc_cpu = sc.detach().to(torch::kCPU);
+            //         auto se_cpu = se.detach().to(torch::kCPU);
+            //         // scene_min = center - 0.5 * extent;  scene_max = center + 0.5 * extent
+            //         float cx = sc_cpu[0].item<float>();
+            //         float cy = sc_cpu[1].item<float>();
+            //         float cz = sc_cpu[2].item<float>();
+            //         float ex = se_cpu[0].item<float>() * 0.5f;
+            //         float minx = cx - ex, maxx = cx + ex;
+            //         float miny = cy - ex, maxy = cy + ex;
+            //         float minz = cz - ex, maxz = cz + ex;
+            //         const float eps = 1e-6f; // tiny numerical slack
+            //         // 2) Keep only points outside current AABB
+            //         std::vector<float> out_pts;
+            //         std::vector<float> out_cols;
+            //         out_pts.reserve(points.size());  // upper bound
+            //         out_cols.reserve(colors.size());
+            //         const size_t N = points.size() / 3;
+            //         for (size_t i = 0; i < N; ++i) {
+            //             float x = points[3*i + 0];
+            //             float y = points[3*i + 1];
+            //             float z = points[3*i + 2];
+            //             bool outside =
+            //                 (x < minx - eps) || (x > maxx + eps) ||
+            //                 (y < miny - eps) || (y > maxy + eps) ||
+            //                 (z < minz - eps) || (z > maxz + eps);
+            //             if (outside) {
+            //                 out_pts.push_back(x);
+            //                 out_pts.push_back(y);
+            //                 out_pts.push_back(z);
+
+            //                 out_cols.push_back(colors[3*i + 0]);
+            //                 out_cols.push_back(colors[3*i + 1]);
+            //                 out_cols.push_back(colors[3*i + 2]);
+            //             }
+            //         }
+            //         // 3) Only grow if enough out-of-bounds points
+            //         const int MIN_OUTSIDE = 10; // your threshold
+            //         if ((int)(out_pts.size()/3) >= MIN_OUTSIDE) {
+            //             // Optional: ensure we don't move the 'min side' if you want perfect key stability
+            //             // (Counts of which side is violated; skip if it would force min to move)
+            //             // bool touches_min_side = (min of any coord < minX/Y/Z);
+            //             // if (touches_min_side) { /* decide: defer / tile / rebase */ }
+            //             torch::NoGradGuard no_grad;
+            //             std::unique_lock<std::mutex> lock_render(mutex_render_);
+            //             // 4) Actually insert *only* the outside points
+            //             voxel_model_->increasePcd(out_pts, out_cols, getIteration());
+            //             // voxel_model_->increasePcd(points, colors, getIteration());
+            //         }
+            //     }
+            // }
             if (kf_changed) {
                 dumpKeyframesForProjectionFile(scene_->keyframes(), scene_->cameras_,
                                             result_dir_ / "proj_debug");
             }
-         }
-         break;
- 
-         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
-         {
+        }
+        break;
+
+        case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
+        {
             std::cout << "[Voxel Mapper]Loop Closure Detected."
                     << std::endl;
 
@@ -2421,7 +2149,7 @@ void VoxelMapper::savePly(std::filesystem::path result_dir)
     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(ply_dir)
 
     // Reconstructed voxel scene
-    voxel_model_->savePly(ply_dir / "point_cloud.ply");
+    // voxel_model_->savePly(ply_dir / "point_cloud.ply");
     // Input sparse points (from ORB-SLAM map) for reference
     // voxel_model_->saveSparsePointsPly(result_dir / "input.ply");
 }

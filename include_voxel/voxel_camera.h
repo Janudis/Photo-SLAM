@@ -66,7 +66,8 @@ public:
     inline void initUndistortRectifyMapAndMask(
         cv::InputArray old_camera_matrix,
         const cv::Size old_size,
-        cv::InputArray new_camera_matrix)
+        cv::InputArray new_camera_matrix,
+        bool do_gaus_pyramid_training)
     {
         cv::initUndistortRectifyMap(
             old_camera_matrix,
@@ -81,6 +82,20 @@ public:
 
         cv::Mat white(old_size, CV_32FC3, cv::Vec3f(1.0f, 1.0f, 1.0f));
         undistortImage(white, undistort_mask);
+
+        if (do_gaus_pyramid_training) {
+            assert(!gaus_pyramid_height_.empty() && !gaus_pyramid_width_.empty());
+            cv::cuda::GpuMat undistort_mask_gpu;
+            undistort_mask_gpu.upload(undistort_mask);
+            gaus_pyramid_undistort_mask_.resize(num_gaus_pyramid_sub_levels_);
+            for (int l = 0; l < num_gaus_pyramid_sub_levels_; ++l) {
+                cv::cuda::GpuMat undistort_mask_gpu_resized;
+                cv::cuda::resize(undistort_mask_gpu, undistort_mask_gpu_resized,
+                                 cv::Size(gaus_pyramid_width_[l], gaus_pyramid_height_[l]));
+                gaus_pyramid_undistort_mask_[l] =
+                    tensor_utils::cvGpuMat2TorchTensor_Float32(undistort_mask_gpu_resized);
+            }
+        }
     }
 
     inline void undistortImage(cv::InputArray src, cv::OutputArray dst)
@@ -102,6 +117,10 @@ public:
     std::size_t width_ = 0UL;
     std::size_t height_ = 0UL;
 
+    int num_gaus_pyramid_sub_levels_ = 0;
+    std::vector<std::size_t> gaus_pyramid_width_;
+    std::vector<std::size_t> gaus_pyramid_height_;
+
     std::vector<double> params_;
 
     bool prior_focal_length_ = false;
@@ -111,10 +130,7 @@ public:
     cv::Mat dist_coeff_ = (cv::Mat_<float>(1, 4) << 0.0f, 0.0f, 0.0f, 0.0f);
     cv::Mat undistort_map1, undistort_map2;
     cv::Mat undistort_mask;
-
-    // float tanfovx;
-    // float tanfovy;
-    // std::string cam_mode = "persp";
+    std::vector<torch::Tensor> gaus_pyramid_undistort_mask_;
 };
 
 }

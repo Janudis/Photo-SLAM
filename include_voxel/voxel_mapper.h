@@ -118,7 +118,7 @@ public:
     bool isKeepingTraining();
     int stableNumIterExistence();
     bool isdoingInactiveGeoDensify();
-    int subdivideInterval();
+    bool isdoingGausPyramidTraining();
 
     void setGeoLearningRateInit(const float lr);
 
@@ -177,13 +177,6 @@ protected:
     void savePly(std::filesystem::path result_dir);         
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
-
-    // void saveVoxelErrorHeatmap(
-    //     const std::shared_ptr<VoxelKeyframe>& kf,
-    //     int iter,
-    //     const torch::Tensor& rendered_image_01,   // (1,3,H,W) in [0,1]
-    //     const torch::Tensor& gt_image_01,
-    //     const torch::Tensor& geom_idx);
     
     void saveVoxelErrorHeatmap(const sv::MiniCam& cam,
                             const at::Tensor& rendered_img,
@@ -208,6 +201,10 @@ public:
 
     // Settings
     torch::DeviceType device_type_;
+    torch::Device mDevice = torch::Device(torch::kCPU); 
+    int num_gaus_pyramid_sub_levels_ = 0;
+    std::vector<int> kf_gaus_pyramid_times_of_use_;
+    std::vector<float> kf_gaus_pyramid_factors_;
 
     bool viewer_camera_id_set_ = false;
     std::uint32_t viewer_camera_id_ = 0;
@@ -219,9 +216,9 @@ public:
 
     // Data
     bool kfid_shuffled_  = false;
-     std::map<camera_id_t, torch::Tensor> undistort_mask_;
-     std::map<camera_id_t, torch::Tensor> viewer_main_undistort_mask_;
-     std::map<camera_id_t, torch::Tensor> viewer_sub_undistort_mask_; 
+    std::map<camera_id_t, torch::Tensor> undistort_mask_;
+    std::map<camera_id_t, torch::Tensor> viewer_main_undistort_mask_;
+    std::map<camera_id_t, torch::Tensor> viewer_sub_undistort_mask_; 
 
     std::ofstream pose_dump_stream_;
     bool poses_header_written_ = false;
@@ -259,13 +256,14 @@ protected:
     // Settings
     SystemSensorType sensor_type_;
 
-    // configuration & file paths ---------------------------------------------
-    std::filesystem::path               mSeqDir;
-    std::filesystem::path               mOutDir;
-    torch::Device                       mDevice = torch::Device(torch::kCPU);
-
-    // voxel state -------------------------------------------------------------
-    torch::Tensor                       voxel_centers_;    
+    float monocular_inactive_geo_densify_max_pixel_dist_ = 20.0;
+    float stereo_baseline_length_ = 0.0f;
+    int stereo_min_disparity_ = 0;
+    int stereo_num_disparity_ = 128;
+    cv::Mat stereo_Q_;
+    // cv::Ptr<cv::cuda::StereoSGM> stereo_cv_sgm_;
+    float RGBD_min_depth_ = 0.0f;
+    float RGBD_max_depth_ = 100.0f;
 
     bool do_inactive_geo_densify = true;
 
@@ -281,6 +279,8 @@ protected:
 
     bool cull_keyframes_;
     int stable_num_iter_existence_;
+
+    bool do_gaus_pyramid_training_;
 
     std::filesystem::path result_dir_;
     int keyframe_record_interval_;

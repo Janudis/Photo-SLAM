@@ -66,6 +66,8 @@ def render(cam, voxel_data):
     cam.w2c = cam.w2c.to(device)
     cam.c2w = cam.c2w.to(device)
 
+    t_prep0 = time.perf_counter()
+
     if voxel_data["center"].numel() == 0:
         print("[WARNING] No voxels to render!")
         return
@@ -74,7 +76,13 @@ def render(cam, voxel_data):
         if isinstance(t, torch.Tensor) and t.device != device:
             voxel_data[k] = t.to(device, non_blocking=True).contiguous()    # ← keep original leaf
 
+    torch.cuda.synchronize()  # make prep blocking for a clean split
+    t_prep1 = time.perf_counter()
+    prep_ms = (t_prep1 - t_prep0) * 1000.0
+    seen = set()
     def vox_fn(idx, cam_pos, color_mode=None, viewdir=None):
+        if isinstance(idx, torch.Tensor):
+            seen.update(idx.detach().cpu().tolist())
         # print(f"[PY-DBG] Running vox_fn with mode: {mode}, idx: {idx}")
         geos = svr.GatherGeoParams.apply(          # build it on-the-fly
             voxel_data['vox_key'],
@@ -113,6 +121,9 @@ def render(cam, voxel_data):
             track_max_w = True,
     )
     
+    torch.cuda.synchronize()
+    t_rast0 = time.perf_counter()
+
     try:
         out = svr.rasterize_voxels(
             rs,
@@ -128,6 +139,20 @@ def render(cam, voxel_data):
         raise e
 
     torch.cuda.synchronize()
+
+    t_rast1 = time.perf_counter()
+    raster_ms = (t_rast1 - t_rast0) * 1000.0
+    # ---- PRINT: Python-side timing ----
+    total_ms = prep_ms + raster_ms
+    n_vox = int(voxel_data["center"].shape[0])
+    H, W = int(cam.image_height), int(cam.image_width)
+    # print(f"[PY][render] voxels={n_vox} res={W}x{H} "
+    #       f"prep={prep_ms:.3f}ms raster={raster_ms:.3f}ms total={total_ms:.3f}ms",
+    #       flush=True)
+    used = len(seen)
+    total = voxel_data["center"].shape[0]
+    # print(f"[VOX][render] used={used} / total={total}")
+
     color, depth, normal, T, max_w = out
     # SVRaster gives (H,W,3) color → make (1,3,H,W)
     color  = color .unsqueeze(0)

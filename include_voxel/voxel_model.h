@@ -124,6 +124,7 @@ public:
     torch::Tensor subdivisionPriority() const; // [N,1]
     torch::Tensor voxSize() const;             // [N,1]
     torch::Tensor octLevel() const;            // [N,1] int8
+    torch::Tensor octPath() const;             // [N,1] int64
     int           numVoxels() const;           // N
     int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
     torch::Tensor SceneCenter() const;  
@@ -170,6 +171,8 @@ public:
                          int64_t inc = -1);
     void rrLogGlobalSceneAABB(int64_t inc);
 
+    void debugAssertTopologyConsistent(const char* where) const;
+
 private:
     std::unique_ptr<rerun::RecordingStream> rr_;
     std::vector<rerun::Vec3D> rr_acc_mins_;
@@ -212,11 +215,17 @@ public:
     torch::Tensor scene_extent_;   // [1], CUDA
     torch::Tensor scene_min_t_;      // [3], CUDA
     torch::Tensor vox_eff_;      // [1,1], CUDA (effective voxel size for fixed level)
-    // int8_t  octlevel_ = 0; 
+    int8_t  octlevel_ = 0; 
 
-    float global_scene_extent_ = 150.0f;  // example: 200 m cube
+    float global_scene_extent_ = 200.0f;  // example: 200 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
     float fixed_vox_size_ = 0.05f;        // your chosen voxel size
+
+    bool   fill_empty_cells_ = true;
+    int64_t max_artifact_cells_ = 200000; // safety cap
+    std::array<float,3> artifact_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
+
+    torch::Tensor bb_min_viz, bb_max_viz, sel_artifacts_viz, ijk_box_viz;
 
 
 protected:

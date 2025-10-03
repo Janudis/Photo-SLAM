@@ -52,7 +52,6 @@ public:
         const point2D_idx_t point2D_idx,
         const point3D_id_t point3D_id);
 
-    /* -------------------------------------------- transform tensors */
     void computeTransformTensors();
     sv::MiniCam toMiniCam() const;
 
@@ -66,6 +65,8 @@ public:
         float fovX,
         float fovY,
         torch::DeviceType device_type = torch::kCUDA);
+
+    int getCurrentGausPyramidLevel();
 
 public:
     std::size_t fid_;
@@ -83,6 +84,12 @@ public:
     torch::Tensor original_image_; ///< image
     int image_width_;              ///< image
     int image_height_;             ///< image
+
+    int num_gaus_pyramid_sub_levels_;
+    std::vector<int> gaus_pyramid_times_of_use_;
+    std::vector<std::size_t> gaus_pyramid_width_;            ///< gaus_pyramid image
+    std::vector<std::size_t> gaus_pyramid_height_;           ///< gaus_pyramid image
+    std::vector<torch::Tensor> gaus_pyramid_original_image_; ///< gaus_pyramid image
 
     std::vector<float> intr_; ///< intrinsics
 

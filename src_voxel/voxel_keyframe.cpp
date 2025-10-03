@@ -62,6 +62,10 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     this->image_height_ = camera.height_;
     this->image_width_ = camera.width_;
 
+    this->num_gaus_pyramid_sub_levels_ = camera.num_gaus_pyramid_sub_levels_;
+    this->gaus_pyramid_height_ = camera.gaus_pyramid_height_;
+    this->gaus_pyramid_width_ = camera.gaus_pyramid_width_;
+
     this->intr_.resize(camera.params_.size());
     for (std::size_t i = 0; i < camera.params_.size(); ++i)
         this->intr_[i] = static_cast<float>(camera.params_[i]);
@@ -111,7 +115,7 @@ void VoxelKeyframe::computeTransformTensors()
             this->getWorld2View2(this->trans_, this->scale_),
             torch::kCUDA
         ).transpose(0, 1);
-        std::cout << " voxel_keyframe znear " << this->znear_ << " zfar " << this->zfar_ << std::endl;
+        // std::cout << " voxel_keyframe znear " << this->znear_ << " zfar " << this->zfar_ << std::endl;
         if (!this->set_projection_matrix_) {
             this->projection_matrix_ = this->getProjectionMatrix(
                 this->znear_,
@@ -188,6 +192,18 @@ torch::Tensor VoxelKeyframe::getProjectionMatrix(
     P.index({2, 2}) = z_sign * zfar / (zfar - znear);
     P.index({2, 3}) = -(zfar * znear) / (zfar - znear);
     return P;
+}
+
+int VoxelKeyframe::getCurrentGausPyramidLevel()
+{
+    for (int i = 0; i < gaus_pyramid_times_of_use_.size(); ++i) {
+        if (gaus_pyramid_times_of_use_[i]) {
+            --gaus_pyramid_times_of_use_[i];
+            return i;
+        }
+    }
+    // If all sub levels has been used up
+    return num_gaus_pyramid_sub_levels_;
 }
 
 // helper to build MiniCam

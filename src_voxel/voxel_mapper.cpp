@@ -604,23 +604,42 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     best_loss_per_kf_.assign(N,  std::numeric_limits<float>::infinity());
     worst_loss_per_kf_.assign(N, -std::numeric_limits<float>::infinity());
     extrema_dir_ = result_dir_ / "extrema";
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(extrema_dir_, ec); // best-effort cleanup
+    }
     std::filesystem::create_directories(extrema_dir_);
 
     switch (pSLAM->getSensorType()) {
     case ORB_SLAM3::System::MONOCULAR:
     case ORB_SLAM3::System::IMU_MONOCULAR:
-        sensor_type_ = MONOCULAR;
-        break;
+    {
+        this->sensor_type_ = MONOCULAR;
+    }
+    break;
     case ORB_SLAM3::System::STEREO:
     case ORB_SLAM3::System::IMU_STEREO:
-        sensor_type_ = STEREO;
-        break;
+    {
+        this->sensor_type_ = STEREO;
+        this->stereo_baseline_length_ = pSLAM->getSettings()->b();
+        // this->stereo_cv_sgm_ = cv::cuda::createStereoSGM(
+        //     this->stereo_min_disparity_,
+        //     this->stereo_num_disparity_);
+        this->stereo_Q_ = pSLAM->getSettings()->Q().clone();
+        stereo_Q_.convertTo(stereo_Q_, CV_32FC3, 1.0);
+    }
+    break;
     case ORB_SLAM3::System::RGBD:
     case ORB_SLAM3::System::IMU_RGBD:
-        sensor_type_ = RGBD;
-        break;
+    {
+        this->sensor_type_ = RGBD;
+    }
+    break;
     default:
-        throw std::runtime_error("[Voxel Mapper]Unsupported sensor type!");
+    {
+        throw std::runtime_error("[Gaussian Mapper]Unsupported sensor type!");
+    }
+    break;
     }
 
     // /* Load every ORB-SLAM3 camera, convert to Camera, pre–compute            */
@@ -653,6 +672,14 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
             camera.height_ = undistort_params.old_size_.height;
             float y_ratio = static_cast<float>(camera.height_) / undistort_params.old_size_.height;
 
+            camera.num_gaus_pyramid_sub_levels_ = num_gaus_pyramid_sub_levels_;
+            camera.gaus_pyramid_width_.resize(num_gaus_pyramid_sub_levels_);
+            camera.gaus_pyramid_height_.resize(num_gaus_pyramid_sub_levels_);
+            for (int l = 0; l < num_gaus_pyramid_sub_levels_; ++l) {
+                camera.gaus_pyramid_width_[l] = camera.width_ * this->kf_gaus_pyramid_factors_[l];
+                camera.gaus_pyramid_height_[l] = camera.height_ * this->kf_gaus_pyramid_factors_[l];
+            }
+
             camera.params_[0]/*new fx*/= SLAM_fx * x_ratio;
             camera.params_[1]/*new fy*/= SLAM_fy * y_ratio;
             camera.params_[2]/*new cx*/= SLAM_cx * x_ratio;
@@ -669,7 +696,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
             if (this->sensor_type_ == MONOCULAR || this->sensor_type_ == RGBD)
                 undistort_params.dist_coeff_.copyTo(camera.dist_coeff_);
 
-            camera.initUndistortRectifyMapAndMask(K, SLAM_im_size, K_new);
+            camera.initUndistortRectifyMapAndMask(K, SLAM_im_size, K_new, true);
 
             undistort_mask_[camera.camera_id_] =
                 tensor_utils::cvMat2TorchTensor_Float32(
@@ -692,6 +719,20 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
             viewer_main_undistort_mask_[camera.camera_id_] =
                 tensor_utils::cvMat2TorchTensor_Float32(
                     viewer_main_undistort_mask, device_type_);
+
+            if (this->sensor_type_ == STEREO) {
+                camera.stereo_bf_ = stereo_baseline_length_ * camera.params_[0];
+                if (this->stereo_Q_.cols != 4) {
+                    this->stereo_Q_ = cv::Mat(4, 4, CV_32FC1);
+                    this->stereo_Q_.setTo(0.0f);
+                    this->stereo_Q_.at<float>(0, 0) = 1.0f;
+                    this->stereo_Q_.at<float>(0, 3) = -camera.params_[2];
+                    this->stereo_Q_.at<float>(1, 1) = 1.0f;
+                    this->stereo_Q_.at<float>(1, 3) = -camera.params_[3];
+                    this->stereo_Q_.at<float>(2, 3) = camera.params_[0];
+                    this->stereo_Q_.at<float>(3, 2) = 1.0f / stereo_baseline_length_;
+                }
+            }
         }
         else if (SLAM_camera->GetType() == ORB_SLAM3::GeometricCamera::CAM_FISHEYE) {
             camera.setModelId(sv::Camera::CameraModelType::FISHEYE);
@@ -750,6 +791,19 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     pipe_params_.convert_SHs_ =
          (settings_file["Pipeline.convert_SHs"].operator int()) != 0;
 
+    do_gaus_pyramid_training_ =
+         (settings_file["GausPyramid.do"].operator int()) != 0;
+    num_gaus_pyramid_sub_levels_ =
+        settings_file["GausPyramid.num_sub_levels"].operator int();
+    int sub_level_times_of_use =
+        settings_file["GausPyramid.sub_level_times_of_use"].operator int();
+    kf_gaus_pyramid_times_of_use_.resize(num_gaus_pyramid_sub_levels_);
+    kf_gaus_pyramid_factors_.resize(num_gaus_pyramid_sub_levels_);
+    for (int l = 0; l < num_gaus_pyramid_sub_levels_; ++l) {
+        kf_gaus_pyramid_times_of_use_[l] = sub_level_times_of_use;
+        kf_gaus_pyramid_factors_[l] = std::pow(0.5f, num_gaus_pyramid_sub_levels_ - l);
+    }
+    
     /* ───────── OPTIMIZATION PARAMETERS ───────── */
     opt_params_.iterations_ =
         settings_file["Optimization.max_num_iterations"].operator int();
@@ -851,9 +905,7 @@ void VoxelMapper::run()
     py::gil_scoped_acquire gil;
     py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
 
-    /* ───────────────────────────────────────────────
-     *  1.  INITIAL VOXEL   M A P P I N G  LOOP
-     * ─────────────────────────────────────────────── */
+    // First loop: Initial gaussian mapping
     while (!isStopped())
     {
         // Check conditions for initial mapping
@@ -865,13 +917,10 @@ void VoxelMapper::run()
             auto pMap = mpSLAM->getAtlas()->GetCurrentMap();
             std::vector<ORB_SLAM3::KeyFrame*> vKFs;
             std::vector<ORB_SLAM3::MapPoint*> vMPs;
-
-            // std::vector<std::shared_ptr<VoxelKeyframe>> keyframes_for_bounding;
             {
                 std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
                 vKFs = pMap->GetAllKeyFrames();
                 vMPs = pMap->GetAllMapPoints();
-
                 for (const auto& pMP : vMPs)
                 {
                      Point3D point3D;
@@ -896,99 +945,148 @@ void VoxelMapper::run()
                         pose.unit_quaternion().cast<double>(),
                         pose.translation().cast<double>()
                     );
-                    cv::Mat imgRGB_undistorted;
+                    cv::Mat imgRGB_undistorted, imgAux_undistorted;
                     // Debug: Print Keyframe pose
                     // std::cout << "[DEBUG] Keyframe ID: " << pKF->mnId 
                     //           << " Pose: (" << pose.translation().x() << ", " << pose.translation().y() << ", " << pose.translation().z() << ")\n";
                     // Camera
                     sv::Camera& camera = scene_->cameras_.at(pKF->mpCamera->GetId());
                     new_kf->setCameraParams(camera);
+
                     // Image (left if STEREO)
                     cv::Mat imgRGB = pKF->imgLeftRGB;
-                    camera.undistortImage(imgRGB, imgRGB_undistorted);
+                    // camera.undistortImage(imgRGB, imgRGB_undistorted);
+                    if (this->sensor_type_ == STEREO)
+                            imgRGB_undistorted = imgRGB;
+                        else
+                            camera.undistortImage(imgRGB, imgRGB_undistorted);
+                    // Auxiliary Image
+                    cv::Mat imgAux = pKF->imgAuxiliary;
+                    if (this->sensor_type_ == RGBD)
+                        camera.undistortImage(imgAux, imgAux_undistorted);
+                    else
+                        imgAux_undistorted = imgAux;
 
-                    {
-                        static const auto proj_dir = result_dir_ / "proj_debug";
-                        static const auto imgs_dir = proj_dir / "imgs";
-                        std::filesystem::create_directories(imgs_dir);
-                        // imgRGB_undistorted is CV_32FC3 RGB in [0..1] (in Photo-SLAM). If it’s 8U, convert first:
-                        cv::Mat img_float;
-                        if (imgRGB_undistorted.type() == CV_32FC3) {
-                            img_float = imgRGB_undistorted;
-                        } else {
-                            imgRGB_undistorted.convertTo(img_float, CV_32FC3, 1.0/255.0);
-                        }
-                        saveKfPng_fromFloatRGB(img_float, pKF->mnId, imgs_dir);
-                    }
+                    // {
+                    //     static const auto proj_dir = result_dir_ / "proj_debug";
+                    //     static const auto imgs_dir = proj_dir / "imgs";
+                    //     std::filesystem::create_directories(imgs_dir);
+                    //     // imgRGB_undistorted is CV_32FC3 RGB in [0..1] (in Photo-SLAM). If it’s 8U, convert first:
+                    //     cv::Mat img_float;
+                    //     if (imgRGB_undistorted.type() == CV_32FC3) {
+                    //         img_float = imgRGB_undistorted;
+                    //     } else {
+                    //         imgRGB_undistorted.convertTo(img_float, CV_32FC3, 1.0/255.0);
+                    //     }
+                    //     saveKfPng_fromFloatRGB(img_float, pKF->mnId, imgs_dir);
+                    // }
 
                     new_kf->original_image_ =
                         tensor_utils::cvMat2TorchTensor_Float32(imgRGB_undistorted, device_type_);
                     new_kf->img_filename_ = pKF->mNameFile;
+                    new_kf->gaus_pyramid_height_ = camera.gaus_pyramid_height_;
+                    new_kf->gaus_pyramid_width_ = camera.gaus_pyramid_width_;
+                    new_kf->gaus_pyramid_times_of_use_ = kf_gaus_pyramid_times_of_use_;
 
                     // Compute transformations
-                    // new_kf->computeTransformTensors();
+                    new_kf->computeTransformTensors(); //useless
                     scene_->addKeyframe(new_kf, &kfid_shuffled_);
 
                     increaseKeyframeTimesOfUse(new_kf, newKeyframeTimesOfUse());
+
+                    // // Features for increasePcdByKeyframeInactiveGeoDensify
+                    // std::vector<float> pixels;
+                    // std::vector<float> pointsLocal;
+                    // pKF->GetKeypointInfo(pixels, pointsLocal);
+                    // new_kf->kps_pixel_ = std::move(pixels);
+                    // new_kf->kps_point_local_ = std::move(pointsLocal);
+                    new_kf->img_undist_ = imgRGB_undistorted;
+                    new_kf->img_auxiliary_undist_ = imgAux_undistorted;
                 }
             }   // Mutex released
 
-                aabb_min_.setConstant( std::numeric_limits<float>::infinity());
-                aabb_max_.setConstant(-std::numeric_limits<float>::infinity());
-                have_bounds_ = false;
-                for (const auto& kv : scene_->cached_point_cloud_) {
-                    // cast<float>() returns a temporary → store as a VALUE, not a const&
-                    Eigen::Vector3f P = kv.second.xyz_.cast<float>();
-                    extendAABB(aabb_min_, aabb_max_, P);
-                    have_bounds_ = true;
+            // Prepare multi resolution images for training
+            for (auto& kfit : scene_->keyframes()) {
+                auto pkf = kfit.second;
+                if (device_type_ == torch::kCUDA) {
+                    cv::cuda::GpuMat img_gpu;
+                    img_gpu.upload(pkf->img_undist_);
+                    pkf->gaus_pyramid_original_image_.resize(num_gaus_pyramid_sub_levels_);
+                    for (int l = 0; l < num_gaus_pyramid_sub_levels_; ++l) {
+                        cv::cuda::GpuMat img_resized;
+                        cv::cuda::resize(img_gpu, img_resized,
+                                        cv::Size(pkf->gaus_pyramid_width_[l], pkf->gaus_pyramid_height_[l]));
+                        pkf->gaus_pyramid_original_image_[l] =
+                            tensor_utils::cvGpuMat2TorchTensor_Float32(img_resized);
+                    }
                 }
-                if (have_bounds_) {
-                    std::cout.setf(std::ios::fixed);
-                    // std::cout << std::setprecision(6)
-                    //         << "[AABB:init] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
-                    //         << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
+                else {
+                    pkf->gaus_pyramid_original_image_.resize(num_gaus_pyramid_sub_levels_);
+                    for (int l = 0; l < num_gaus_pyramid_sub_levels_; ++l) {
+                        cv::Mat img_resized;
+                        cv::resize(pkf->img_undist_, img_resized,
+                                cv::Size(pkf->gaus_pyramid_width_[l], pkf->gaus_pyramid_height_[l]));
+                        pkf->gaus_pyramid_original_image_[l] =
+                            tensor_utils::cvMat2TorchTensor_Float32(img_resized, device_type_);
+                    }
                 }
-                dumpKeyframesForProjectionFile(
-                    scene_->keyframes(),        // all KFs currently in the scene
-                    scene_->cameras_,           // intrinsics you already use
-                    result_dir_ / "proj_debug"  // output folder
-                );
+            }
 
-                std::vector<sv::MiniCam> tr_cams;
-                tr_cams.reserve(scene_->keyframes().size());
-                for (auto& kv : scene_->keyframes()) {
-                    if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
-                }
+            // aabb_min_.setConstant( std::numeric_limits<float>::infinity());
+            // aabb_max_.setConstant(-std::numeric_limits<float>::infinity());
+            // have_bounds_ = false;
+            // for (const auto& kv : scene_->cached_point_cloud_) {
+            //     // cast<float>() returns a temporary → store as a VALUE, not a const&
+            //     Eigen::Vector3f P = kv.second.xyz_.cast<float>();
+            //     extendAABB(aabb_min_, aabb_max_, P);
+            //     have_bounds_ = true;
+            // }
+            // if (have_bounds_) {
+            //     std::cout.setf(std::ios::fixed);
+            //     // std::cout << std::setprecision(6)
+            //     //         << "[AABB:init] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
+            //     //         << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
+            // }
+            // dumpKeyframesForProjectionFile(
+            //     scene_->keyframes(),        // all KFs currently in the scene
+            //     scene_->cameras_,           // intrinsics you already use
+            //     result_dir_ / "proj_debug"  // output folder
+            // );
 
-                // D) Create voxel model & trainer setup
-                {
-                    std::unique_lock<std::mutex> lock_render(mutex_render_);
-                    scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
-                    std::cout << "[VoxelMapper] Scene extent: " 
-                              << scene_->cameras_extent_ << std::endl;
-                    // save_initial_pcd_npy(result_dir_, scene_->cached_point_cloud_);
-                    // auto restored = load_full_pcd_from_logs((result_dir_ / "offline_experiment").string());
-                    // voxel_model_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_, keyframes_for_bounding, (result_dir_ / "training_camera_poses.txt").string());
-                    // registerCurrentBoxFromModel("init");
-                    // voxel_model_->createFromPcd(std::move(restored));
-                    voxel_model_->createFromPcd(scene_->cached_point_cloud_);
-                    std::unique_lock<std::mutex> lock(mutex_settings_);
-                    voxel_model_->createTrainer(
-                                                opt_params_.geo_lr_,
-                                                opt_params_.sh0_lr_,
-                                                opt_params_.shs_lr_,
-                                                opt_params_.optim_beta1_,
-                                                opt_params_.optim_beta2_,
-                                                opt_params_.optim_eps_,
-                                                opt_params_.lr_decay_ckpt_,
-                                                opt_params_.lr_decay_mult_);
-                }
+            // C) Create MiniCams for all keyframes and use them for densification later
+            std::vector<sv::MiniCam> tr_cams;
+            tr_cams.reserve(scene_->keyframes().size());
+            for (auto& kv : scene_->keyframes()) {
+                if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
+            }
+            // D) Create voxel model & trainer setup
+            {
+                std::unique_lock<std::mutex> lock_render(mutex_render_);
+                scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
+                std::cout << "[VoxelMapper] Scene extent: " 
+                            << scene_->cameras_extent_ << std::endl;
+                // save_initial_pcd_npy(result_dir_, scene_->cached_point_cloud_);
+                // auto restored = load_full_pcd_from_logs((result_dir_ / "offline_experiment").string());
+                // registerCurrentBoxFromModel("init");
+                // voxel_model_->createFromPcd(std::move(restored));
+                voxel_model_->createFromPcd(scene_->cached_point_cloud_);
+                std::unique_lock<std::mutex> lock(mutex_settings_);
+                voxel_model_->createTrainer(
+                                            opt_params_.geo_lr_,
+                                            opt_params_.sh0_lr_,
+                                            opt_params_.shs_lr_,
+                                            opt_params_.optim_beta1_,
+                                            opt_params_.optim_beta2_,
+                                            opt_params_.optim_eps_,
+                                            opt_params_.lr_decay_ckpt_,
+                                            opt_params_.lr_decay_mult_);
+            }
 
-                // One warm-up optimization step
-                trainForOneIteration();
+            // One warm-up optimization step
+            trainForOneIteration();
 
-                initial_mapped_ = true;
-                break;  // Exit the initial mapping loop
+            initial_mapped_ = true;
+            break;  // Exit the initial mapping loop
         }
         else if (mpSLAM->isShutDown())
         {
@@ -1000,9 +1098,8 @@ void VoxelMapper::run()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    /* ───────────────────────────────────────────────
-     *  2.  INCREMENTAL   M A P P I N G  LOOP
-     * ───────────────────────────────────────────── */
+
+    // Second loop: Incremental gaussian mapping
      int SLAM_stop_iter = 0;
      while (!isStopped()) {
          // Check conditions for incremental mapping
@@ -1023,34 +1120,33 @@ void VoxelMapper::run()
          if (SLAM_ended_ || getIteration() >= opt_params_.iterations_)
              break;
      }
-    /* ───────────────────────────────────────────────
-     *  3.  TAIL   O P T I M I S A T I O N
-     * ───────────────────────────────────────────── */
+
+    // Third loop: Tail gaussian optimization
     int adapt_interval = std::max(1, opt_params_.adapt_every_);          // cfg.procedure.adapt_every
     int n_delay_iters  = static_cast<int>(adapt_interval * 0.8f);        // same heuristic as GS code
 
-    while (  (getIteration() - SLAM_stop_iter) <= n_delay_iters
+    while (getIteration() - SLAM_stop_iter <= n_delay_iters
         || (getIteration() % adapt_interval) <= n_delay_iters
         || isKeepingTraining() )
     {
         trainForOneIteration();
         // Re-read in case user changed cfg at runtime
-        adapt_interval = std::max(1, opt_params_.adapt_every_);
-        n_delay_iters  = static_cast<int>(adapt_interval * 0.8f);
+        adapt_interval = opt_params_.adapt_every_;
+        n_delay_iters  = adapt_interval * 0.8f;
     }
 
-    if (have_bounds_) {
-        std::cout.setf(std::ios::fixed);
-        std::cout << std::setprecision(6)
-                << "[AABB:final] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
-                << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
-    }
+    // if (have_bounds_) {
+    //     std::cout.setf(std::ios::fixed);
+    //     std::cout << std::setprecision(6)
+    //             << "[AABB:final] min:[" << aabb_min_.x() << "," << aabb_min_.y() << "," << aabb_min_.z()
+    //             << "] max:[" << aabb_max_.x() << "," << aabb_max_.y() << "," << aabb_max_.z() << "]\n";
+    // }
 
      // Save and clear
      renderAndRecordAllKeyframes("_shutdown");
      savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
      writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
-    //  pose_dump_stream_.close();
+     
      signalStop();
  }
 
@@ -1086,25 +1182,45 @@ void VoxelMapper::trainForOneIteration()
     // 2) pick a random keyframe from the sliding window
     std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
     if (!viewpoint_cam) {
-        // if none available, roll back iteration and exit
         increaseIteration(-1);
         return;
     }
+
     writeKeyframeUsedTimes(result_dir_ / "used_times");
+
     const int iter = getIteration();
-    // bool saved_this_iter = false;
-    // 3) select ground truth image + mask tensors
-    //    (it always use the “original” resolution in our voxel case)
+    int training_level = num_gaus_pyramid_sub_levels_;
     int image_height, image_width;
     torch::Tensor gt_image, mask;
-    image_height = viewpoint_cam->image_height_;
-    image_width = viewpoint_cam->image_width_;
-    gt_image = viewpoint_cam->original_image_
-                                .to(mDevice)          // (3,H,W)
-                                .unsqueeze(0);        // → (1,3,H,W)
-    mask = undistort_mask_[viewpoint_cam->camera_id_]
-                                .to(mDevice)
-                                .to(torch::kFloat32); // (H,W)
+    // image_height = viewpoint_cam->image_height_;
+    // image_width = viewpoint_cam->image_width_;
+    // gt_image = viewpoint_cam->original_image_
+    //                             .to(mDevice)          // (3,H,W)
+    //                             .unsqueeze(0);        // → (1,3,H,W)
+    // mask = undistort_mask_[viewpoint_cam->camera_id_]
+    //                             .to(mDevice)
+    //                             .to(torch::kFloat32); // (H,W)
+    if (isdoingGausPyramidTraining())
+         training_level = viewpoint_cam->getCurrentGausPyramidLevel();
+    if (training_level == num_gaus_pyramid_sub_levels_) {
+        // std::cout << "training full res\n";
+        image_height = viewpoint_cam->image_height_;
+        image_width = viewpoint_cam->image_width_;
+        // gt_image = viewpoint_cam->original_image_.cuda();
+        // mask = undistort_mask_[viewpoint_cam->camera_id_];
+        gt_image = viewpoint_cam->original_image_
+                            .to(mDevice)          // (3,H,W)
+                            .unsqueeze(0);        // → (1,3,H,W)
+        mask = undistort_mask_[viewpoint_cam->camera_id_]
+                                    .to(mDevice)
+                                    .to(torch::kFloat32); // (H,W)
+    }
+    else {
+        image_height = viewpoint_cam->gaus_pyramid_height_[training_level];
+        image_width = viewpoint_cam->gaus_pyramid_width_[training_level];
+        gt_image = viewpoint_cam->gaus_pyramid_original_image_[training_level].cuda();
+        mask = scene_->cameras_.at(viewpoint_cam->camera_id_).gaus_pyramid_undistort_mask_[training_level];
+    }
     // if it somehow came in as 3×H×W, just take the first (they're identical)
     if (mask.dim() == 3 && mask.size(0) == 3) {
         mask = mask[0];   // now (H,W)
@@ -1117,16 +1233,15 @@ void VoxelMapper::trainForOneIteration()
         // if somebody gave you (1,H,W) already:
         mask = mask.unsqueeze(1);  // (1,1,H,W)
     }
-
     // 4) grow SH degree every 1000 iterations (locked during render)
     std::unique_lock<std::mutex> lock_render(mutex_render_);
+
     if (getIteration() % 1000 == 0 && default_sh_ < model_params_.sh_degree_)
     {
         default_sh_ += 1;
         std::cout << "[VoxelMapper] SH degree: " << default_sh_ << std::endl;
     }    
     voxel_model_->setShDegree(default_sh_);
-
     // ) build a MiniCam out of this keyframe
     sv::MiniCam cam = viewpoint_cam->toMiniCam();
     auto render_pkg = voxel_model_->render(cam);
@@ -1357,7 +1472,6 @@ void VoxelMapper::trainForOneIteration()
                             const int before = voxel_model_->numVoxels();
                             voxel_model_->subdividing(subdivide_mask);
                             const int after  = voxel_model_->numVoxels();
-
                             std::cout << "[SUBDIVIDING] " << std::setw(7) << before
                                     << " => "          << std::setw(7) << after
                                     << " (x" << std::fixed << std::setprecision(2)
@@ -1503,7 +1617,7 @@ void VoxelMapper::combineMappingOperations()
                     pkf->setPose(
                         pose.unit_quaternion().cast<double>(),
                         pose.translation().cast<double>());
-                //  pkf->computeTransformTensors();
+                 pkf->computeTransformTensors();
                     // Give local BA keyframes times of use
                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
                     kf_changed = true;
@@ -1698,7 +1812,7 @@ void VoxelMapper::combineMappingOperations()
                      pkf->setPose(
                          pose.unit_quaternion().cast<double>(),
                          pose.translation().cast<double>());
-                    //  pkf->computeTransformTensors();
+                     pkf->computeTransformTensors();
  // if (std::get<4>(kf)) renderAndRecordKeyframe(pkf, result_dir_, "_2_after_pose_correction");
 
                     kf_changed = true;
@@ -1783,7 +1897,7 @@ void VoxelMapper::combineMappingOperations()
                      Sophus::SE3f Tcy = Tyc.inverse();
                      std::cout << "ScaleRefinement: kf " << Tcy.translation() << std::endl;
                      pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
-                    //  pkf->computeTransformTensors();
+                     pkf->computeTransformTensors();
                  }
              }
          }
@@ -1956,16 +2070,16 @@ void VoxelMapper::handleNewKeyframe(
         tensor_utils::cvMat2TorchTensor_Float32(imgRGB_undistorted, device_type_);
     pkf->img_filename_ = std::get<8>(kf);
      
-     // Add the new keyframe to the scene
-    //  pkf->computeTransformTensors();
-     scene_->addKeyframe(pkf, &kfid_shuffled_);
- 
-     // Give new keyframes times of use and add it to the training sliding window
-     increaseKeyframeTimesOfUse(pkf, newKeyframeTimesOfUse());
+    // Add the new keyframe to the scene
+    pkf->computeTransformTensors();
+    scene_->addKeyframe(pkf, &kfid_shuffled_);
 
-    // Get dense point cloud from the new keyframe to accelerate training
-     pkf->img_undist_ = imgRGB_undistorted;
- }
+    // Give new keyframes times of use and add it to the training sliding window
+    increaseKeyframeTimesOfUse(pkf, newKeyframeTimesOfUse());
+
+// Get dense point cloud from the new keyframe to accelerate training
+    pkf->img_undist_ = imgRGB_undistorted;
+}
 
 bool VoxelMapper::isStopped() const {
     std::unique_lock<std::mutex> lock_status(this->mutex_status_);
@@ -2064,19 +2178,35 @@ void VoxelMapper::renderAndRecordKeyframe(
     // torch::Tensor hwc_u8 = chw_u8.permute({1,2,0}).contiguous();  // (H,W,3)
     // // convert CHW→HWC uint8 numpy without any CUDA involvement
     // py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
+
     /* ------------------------------------------------ 3. render   */
-    auto t0 = std::chrono::steady_clock::now();
+    // auto t0 = std::chrono::steady_clock::now();
+    // auto render_pkg = voxel_model_->render(cam);
+    // torch::cuda::synchronize();  // make GPU work blocking before t1
+    // auto t1 = std::chrono::steady_clock::now();
+    // render_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+    // // ---- PRINT: C++-side timing ----
+    // std::cout << "[C++][render] fid=" << pkf->fid_
+    //           << " time=" << std::fixed << std::setprecision(3)
+    //           << render_ms << " ms" << std::endl;
+
+    // if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
+    //     std::cout << "render pkg empty" << std::endl;
+    //     return;
+    // }
+    auto start_timing = std::chrono::steady_clock::now();
     auto render_pkg = voxel_model_->render(cam);
-    auto t1 = std::chrono::steady_clock::now();
-    render_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
-
-    if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
-        std::cout << "render pkg empty" << std::endl;
-        return;
-    }
     torch::Tensor rendered_image = render_pkg.at("color").to(mDevice);          // (1,3,H,W)
-
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
+    torch::cuda::synchronize();
+    auto end_timing = std::chrono::steady_clock::now();
+    auto render_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_timing - start_timing).count();
+    render_ms = 1e-6 * render_time_ns;
+        // ---- PRINT: C++-side timing ----
+    // std::cout << "[C++][render] fid=" << pkf->fid_
+    //           << " time=" << std::fixed << std::setprecision(3)
+    //           << render_ms << " ms" << std::endl;
+
     // saveTensor(masked_image,     "masked_image",    "/home/dimitris/Photo-SLAM/debug", getIteration(), pkf->fid_);
     masked_image = masked_image.squeeze(0);   
     auto gt_image = pkf->original_image_;
@@ -2256,11 +2386,17 @@ cv::Mat VoxelMapper::renderFromPose(
 //     mpSLAM.reset();
 // }
 
- bool VoxelMapper::isKeepingTraining()
- {
-     std::unique_lock<std::mutex> lock(mutex_settings_);
-     return keep_training_;
- }
+bool VoxelMapper::isKeepingTraining()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return keep_training_;
+}
+
+bool VoxelMapper::isdoingGausPyramidTraining()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return do_gaus_pyramid_training_;
+}
 
 int VoxelMapper::getIteration()
 {

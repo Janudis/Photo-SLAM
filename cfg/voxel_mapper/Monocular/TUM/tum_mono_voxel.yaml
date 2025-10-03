@@ -23,6 +23,10 @@ Mapper.cull_keyframes:                 0
 Mapper.large_rotation_threshold: 30.0 #10.0 #
 Mapper.large_translation_threshold: 1.0 #0.1 #
 
+GausPyramid.do: 0  # 0:false, 1 or other integer:true
+GausPyramid.num_sub_levels: 2
+GausPyramid.sub_level_times_of_use: 8
+
 Pipeline.convert_SHs: 0  # 0:false, 1 or other integer:true
 
 Record.keyframe_record_interval: 0 # 0:never, 1:always, others:periodically
@@ -60,12 +64,8 @@ Optimization.lambda_dssim: 0.20
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-# Optimization.adapt_from: 800
-# Optimization.adapt_every: 100
-# Optimization.adapt_from: 150
-# Optimization.adapt_every: 100
-Optimization.adapt_from: 800
-Optimization.adapt_every: 800
+Optimization.adapt_from: 600
+Optimization.adapt_every: 600
 # Pruning
 Optimization.prune_until: 18000
 Optimization.prune_thres_init: 0.0001

@@ -6,7 +6,8 @@
 #include <random>
 #include <iostream>
 
-namespace sv {
+sv::VoxelTrainer::VoxelTrainer()
+{}
 
 // void sv::VoxelTrainer::trainingOnce(
 //     std::shared_ptr<VoxelScene>    scene,
@@ -128,25 +129,25 @@ namespace sv {
 //     }
 // }
 
-void VoxelTrainer::trainingReport(
+void sv::VoxelTrainer::trainingReport(
     int iteration,
     int num_iterations,
     torch::Tensor& Ll1,
     torch::Tensor& loss,
     float ema_loss_for_log,
-    std::function<torch::Tensor(torch::Tensor&, torch::Tensor&)> l1_loss,
+    torch::Tensor& mse,
     int64_t elapsed_time,
-    VoxelModel& voxels,
-    VoxelScene& scene,
+    sv::VoxelModel& voxels,
+    sv::VoxelScene& scene,
     VoxelPipelineParams& pipeParams,
     torch::Tensor& background
 ) {
-    // std::cout << std::fixed << std::setprecision(8)
-    //           << "Training iteration " << iteration << "/" << num_iterations
-    //           << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
-    //           << ", ema_loss: " << ema_loss_for_log
-    //           << ", num_voxels: " << voxels.getCenters().size(0)
-    //           << std::endl;
+    std::cout << std::fixed << std::setprecision(8)
+              << "Training iteration " << iteration << "/" << num_iterations
+              << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
+              << ", ema_loss: " << ema_loss_for_log
+              << ", L1: " << Ll1.item<float>()
+              << ", MSE: " << mse.item<float>()
+              << ", num_voxels: " << voxels.numVoxels()
+              << std::endl;
 }
-
-} // namespace sv

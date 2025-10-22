@@ -70,7 +70,11 @@ public:
         float lambda_dssim = 0.2f,
         float lambda_tv_density = 1e-10f,
         int   tv_from = 0,
-        int   tv_until = 10000
+        int   tv_until = 10000,
+        float ss_aug_max = 1.5,
+        float lambda_R_concen = 0.01,
+        float lambda_dist = 0.1,
+        float lambda_T_inside = 0.01
     );
 
 public:
@@ -97,4 +101,8 @@ public:
     float lambda_tv_density_;
     int   tv_from_;
     int   tv_until_;
+    float ss_aug_max_;
+    float lambda_R_concen_;
+    float lambda_dist_;
+    float lambda_T_inside_;
 };

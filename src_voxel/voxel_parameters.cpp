@@ -57,7 +57,11 @@ VoxelOptimizationParams::VoxelOptimizationParams(
     float lambda_dssim,
     float lambda_tv_density,
     int   tv_from,
-    int   tv_until
+    int   tv_until,
+    float ss_aug_max,
+    float lambda_R_concen,
+    float lambda_dist,
+    float lambda_T_inside
 )
     :   iterations_(iterations),
         geo_lr_(geo_lr),
@@ -81,5 +85,9 @@ VoxelOptimizationParams::VoxelOptimizationParams(
         lambda_dssim_(lambda_dssim),
         lambda_tv_density_(lambda_tv_density),
         tv_from_(tv_from),
-        tv_until_(tv_until)
+        tv_until_(tv_until),
+        ss_aug_max_(ss_aug_max),
+        lambda_R_concen_(lambda_R_concen),
+        lambda_dist_(lambda_dist),
+        lambda_T_inside_(lambda_T_inside)
 {}

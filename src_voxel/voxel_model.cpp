@@ -1181,885 +1181,6 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
     //       << this->oct_path_.size(0) << "\n";
 }
 
-// void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd)
-// {
-//     // '''
-//     // dense grid
-//     // '''
-//     std::cout << "VoxelModel::createPcd() called with "
-//               << pcd.size() << " points." << std::endl;
-//     namespace py = pybind11;
-
-//     // ─── 0) Reset per-scene stuff ───────────────────────────────────────
-//     rr_inc_step_ = 0;                 // (if you use Rerun time axis)
-//     const int64_t inc0 = 0;
-
-//     // ─── 1) Pack PCD into two [N×3] CUDA tensors ────────────────────────
-//     const int N = (int)pcd.size();
-//     torch::Tensor xyz = torch::empty({N,3},
-//         torch::TensorOptions()
-//             .dtype(torch::kFloat32)
-//             .device(device_type_));
-//     torch::Tensor rgb = torch::empty({N,3},
-//         torch::TensorOptions()
-//             .dtype(torch::kFloat32)
-//             .device(device_type_));
-//     {
-//         int i = 0;
-//         for (auto& [id, P] : pcd) {
-//             xyz[i] = torch::tensor(
-//                       {P.xyz_(0), P.xyz_(1), P.xyz_(2)},
-//                       torch::kFloat32);
-//             // normalize 0–1 range
-//             rgb[i] = torch::tensor(
-//                       {P.color_(0), P.color_(1), P.color_(2)},
-//                       torch::kFloat32) / 255.0f;
-//             ++i;
-//         }
-//     }
-
-//     // ─── 2) Ask Python to compute the bounding box via decide_main_bounding ──
-//     py::gil_scoped_acquire gil;
-//     static py::module bu_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.utils.bounding_utils");
-//     }();
-//     py::object decide_main_bounding = bu_mod.attr("decide_main_bounding");
-
-//     // xyz.mul_(6.0f);
-//     // Pass the point cloud to Python as a (N,3) float32 tensor on CPU
-//     torch::Tensor xyz_cpu = xyz.cpu().contiguous();
-//     // 1) Wrap the CPU tensor as a Python torch.Tensor
-//     py::object torch_tensor_py = py::cast(xyz_cpu);
-//     // 2) Call its .numpy() in Python to get a NumPy array
-//     py::object np_array = torch_tensor_py.attr("numpy")();
-//     // 3) Build a SimpleNamespace(points=ndarray) so .points works in Python
-//     py::object SimpleNS = py::module_::import("types").attr("SimpleNamespace");
-//     py::object pcd_obj  = SimpleNS(py::arg("points") = np_array);
-
-//     // py::list tr_cams;
-//     // py::list py_cams; 
-
-//     // for (auto& kf : keyframes)
-//     // {
-//     //     /* 1.  Position ------------------------------------------------------ */
-//     //     const Eigen::Vector3d& p = kf->t_;               // translation part
-//     //     torch::Tensor pos_cpu = torch::tensor(
-//     //         {static_cast<float>(p.x()),
-//     //         static_cast<float>(p.y()),
-//     //         static_cast<float>(p.z())},
-//     //         torch::TensorOptions().dtype(torch::kFloat32));   // stays on CPU
-                                                            
-//     //     /* 2.  Forward (+Z) direction in world space ------------------------- */
-//     //     Eigen::Vector3d fwd_eig = kf->R_quaternion_ * Eigen::Vector3d(0,0,1);
-//     //     fwd_eig.normalize();
-//     //     torch::Tensor look_cpu = torch::tensor(
-//     //         {static_cast<float>(fwd_eig.x()),
-//     //         static_cast<float>(fwd_eig.y()),
-//     //         static_cast<float>(fwd_eig.z())},
-//     //         torch::TensorOptions().dtype(torch::kFloat32));
-
-//     //     /* 3.  Wrap as NumPy for SimpleNamespace ----------------------------- */
-//     //     py::object np_pos    = py::cast(pos_cpu).attr("numpy")();
-//     //     py::object np_lookat = py::cast(look_cpu).attr("numpy")();
-
-//     //     tr_cams.append(
-//     //         SimpleNS(py::arg("position") = np_pos,
-//     //                 py::arg("lookat")   = np_lookat)
-//     //     );
-//     //     // build a *real* MiniCam
-//     //     sv::MiniCam mc  = kf->toMiniCam();          // C++ struct
-//     //     py::object cam_py = MiniCam_to_py(mc);      // Python object
-//     //     cam_py.attr("w2c") = cam_py.attr("w2c").attr("cuda")();
-//     //     cam_py.attr("c2w") = cam_py.attr("c2w").attr("cuda")();
-//     //     cam_py.attr("position") = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 3)];
-//     //     cam_py.attr("lookat")   = cam_py.attr("c2w")[py::make_tuple(py::slice(0,3,1), 2)];
-//     //     py_cams.append(cam_py);                     // keep for model_init()
-//     // }
-
-//     // py::list all_tr_cams = build_tr_cams_from_file_light(cam_pose_txt_path, 1.0f);
-//     // py::list all_py_cams = build_full_py_cams_from_file(cam_pose_txt_path, 1.0f);
-
-//     py::object bounding_py = decide_main_bounding(
-//         py::arg("bound_mode")      = "pcd",   // or "default" / "camera_max" …
-//         py::arg("pcd_density_rate")= 0.1,
-//         py::arg("bound_scale")     = 1.0,
-//         py::arg("pcd")             = pcd_obj  // just needs .points attribute-like
-//     );
-//     // py::object bounding_py = decide_main_bounding(
-//     //     py::arg("bound_mode")      = "default",   // or "default" / "camera_max" …
-//     //     py::arg("tr_cams")             = all_tr_cams  // just needs .points attribute-like
-//     // );
-//     // 1) cast to py::array_t<float> so we can access the buffer
-//     auto arr = bounding_py.cast<py::array_t<float>>();
-//     py::buffer_info info = arr.request();
-//     // 2) build a CPU tensor that wraps that data
-//     //    shape should be [2,3] here
-//     std::vector<int64_t> shape{ (int64_t)info.shape[0],
-//                                 (int64_t)info.shape[1] };
-//     auto options = torch::TensorOptions()
-//                     .dtype(torch::kFloat32)
-//                     .device(torch::kCPU);
-//     torch::Tensor bounding_cpu = torch::from_blob(
-//         info.ptr, shape, options);
-//     // 3) clone + move to your GPU (or whatever device_type_ is)
-//     torch::Tensor bounding = bounding_cpu.clone()
-//                                 .to(device_type_);
-
-//     torch::Tensor scene_min = bounding_cpu[0].to(device_type_);
-//     torch::Tensor scene_max = bounding_cpu[1].to(device_type_);
-//     this->scene_center_ = 0.5f * (scene_min + scene_max);
-//     float extent_side  = (scene_max - scene_min).max().item<float>();
-//     // extent_side *= 3.0f;
-//     this->scene_extent_       = torch::tensor({extent_side},
-//                                  torch::TensorOptions().dtype(torch::kFloat32)
-//                                                         .device(device_type_));
-//     // std::cout << "this->scene_center_" << this->scene_center_ << std::endl;
-//     // std::cout << "this->scene_extent_" << this->scene_extent_ << std::endl;
-//     logAABB_bounding2x3(
-//         bounding_cpu, "init_raw", /*iter=*/0,
-//         std::filesystem::path("/home/dimitris/Photo-SLAM/results/tum_voxel/rgbd_dataset_freiburg1_desk/atlas_debug"));
-//     // std::cout << "[Debug] scene_extent = " << extent_side << std::endl;
-//     // float float_level = -std::log2(0.05f / extent_side);
-//     // int level = std::round(float_level);
-//     // std::cout << "level = " << level
-//     //           << " (float_level = " << float_level << ")" << std::endl;
-//     // const int init_level = 6;
-//     // // option A: using std::pow
-//     // float vox_size_pow   = extent_side * std::pow(2.0f, -init_level);
-//     // // option B: using std::ldexp (more efficient for integer exponents)
-//     // float vox_size_ldexp = std::ldexp(extent_side, -init_level);
-//     // std::cout << "[Debug] scene_extent = " << extent_side
-//     //         << ", init_n_level = " << init_level
-//     //         << "\n         voxel_size_pow   = " << vox_size_pow
-//     //         << "\n         voxel_size_ldexp = " << vox_size_ldexp
-//     //         << std::endl;
-//     //  log the raw bounding from Python (min/max)
-//     rrLogPointsAndAABB(/*iteration=*/0, xyz, rgb, bounding_cpu,
-//                        /*tag=*/"init_raw",
-//                        /*max_points_for_viz=*/200000,
-//                        /*log_points=*/true, /*log_box=*/true,
-//                        /*inc=*/inc0);    
-//     // rrLogVoxelBoxes(center_, size_, /*max_boxes=*/20000, "boxes", inc0);
-
-//     const float extent_val = this->scene_extent_.item<float>();
-//     // 2) Build the used min/max as CPU tensors (shape [3]), using the scalar
-//     torch::Tensor used_min_cpu = (this->scene_center_ - 0.5f * extent_val).to(torch::kCPU);
-//     torch::Tensor used_max_cpu = (this->scene_center_ + 0.5f * extent_val).to(torch::kCPU);
-
-//     // 3) Record current inside AABB (host copies)
-//     for (int d = 0; d < 3; ++d) {
-//         cur_min_[d] = used_min_cpu[d].item<float>();
-//         cur_max_[d] = used_max_cpu[d].item<float>();
-//     }
-//     have_cur_aabb_ = true;
-
-//     torch::Tensor used_box_cpu = torch::stack({used_min_cpu, used_max_cpu}); // [2,3]
-    
-//     // 4) Fix the global lattice
-//     const int kInitLevel = 6; 
-//     global_vox_       = extent_val / float(1 << kInitLevel);  // <-- was scene_extent_ / ...
-//     global_origin_[0]= used_min_cpu[0].item<float>();
-//     global_origin_[1]= used_min_cpu[1].item<float>();
-//     global_origin_[2]= used_min_cpu[2].item<float>();
-//     global_grid_ok_   = true;
-
-//     // ─── 3) Call into Python’s SparseVoxelModel.model_init() ────────────
-//     // py::gil_scoped_acquire gil;
-//     static py::module svm_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.sparse_voxel_model");
-//     }();
-//     py::object SVM     = svm_mod.attr("SparseVoxelModel");
-//     py_->svm = SVM(
-//         py::arg("sh_degree")        = max_sh_degree_,
-//         py::arg("black_background") = true
-//     );
-//     py_->svm.attr("model_init")(
-//         // py::arg("bounding")        = bounding,
-//         py::arg("bounding")        = used_box_cpu.to(device_type_),
-//         py::arg("outside_level")   = 0,
-//         // py::arg("init_n_level")    = level,
-//         py::arg("init_n_level")    = 6,
-//         py::arg("init_out_ratio")  = 2,
-//         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = -10.0f,
-//         py::arg("sh0_init")        = 0.5f,
-//         py::arg("shs_init")        = 0.0f
-//         // py::arg("cameras")  = all_py_cams
-//     );
-
-    // // ─── 4) Pull back all core tensors from the Python object ───────────
-    // auto fetch = [&](const char* name){
-    //     return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
-    // };
-    // this->oct_path_      = fetch("octpath");
-    // this->oct_level_     = fetch("octlevel");
-    // this->center_        = fetch("vox_center");
-    // this->size_          = fetch("vox_size").squeeze(1);
-    // this->vox_size_inv_  = 1.0f / size_;
-    // this->grid_pts_key_  = fetch("grid_pts_key");
-    // this->vox_key_       = fetch("vox_key");      
-    // // ─── 5) Copy over the learnable fields ─────────────────────────────
-    // this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-    // this->sh0_ = fetch("_sh0").requires_grad_(true);
-    // this->shs_ = fetch("_shs").requires_grad_(true);
-    // this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
-    // // subdiv_p_   .retain_grad();
-    // // ─── 6) Stats buffers (exactly as before) ───────────────────────────
-    // this->max_w_ = torch::zeros({center_.size(0), 1},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-
-//     py::module_ np = py::module_::import("numpy");
-//     // save raw point‐cloud + colors
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_pts.npy",
-//                     tensor_to_numpy(xyz.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_cols.npy",
-//                     tensor_to_numpy(rgb.cpu()));
-//     // save voxel cell centres + edge lengths
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_centers.npy",
-//                     tensor_to_numpy(center_.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_size.npy",
-//                     tensor_to_numpy(size_.cpu()));
-//     torch::Tensor sh0_cpu = sh0_.view({-1,3}).cpu().contiguous();
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_color.npy",
-//                     tensor_to_numpy(sh0_cpu));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_pts_all.npy",
-//                     tensor_to_numpy(xyz.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_cols_all.npy",
-//                     tensor_to_numpy(rgb.cpu()));
-
-//     // ─── 7) Register with the optimizer, etc. ──────────────────────────
-//     VOXEL_MODEL_TENSORS_TO_VEC
-// }
-
-// void VoxelModel::increasePcd(std::vector<float> pcd_full,
-//                              std::vector<float> colors,
-//                              const int /*iteration*/)
-// {
-//     const int Nf = static_cast<int>(pcd_full.size());
-//     if (Nf < 3 || colors.size() < 3) return;
-//     const int N = Nf / 3;
-//     std::cout << "VoxelModel::increasePcd() called with "
-//               << Nf << " floats (" << N << " points).\n";
-
-//     // ─────────────────────────────────────────────────────────────────────
-//     // 0) Early-out guard: if empty or no bbox expansion needed
-//     //    (we’ll *still* compute a “raw” bbox via Python to match createFromPcd)
-//     // ─────────────────────────────────────────────────────────────────────
-
-//     // Build a CPU torch tensor (N,3) from incoming points (like createFromPcd)
-//     torch::Tensor xyz_cpu = torch::from_blob(
-//         pcd_full.data(),
-//         { (int64_t)N, (int64_t)3 },
-//         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
-//     ).clone(); // clone so lifetime is independent of pcd_full
-//     torch::Tensor rgb_cpu;
-//     rgb_cpu = torch::from_blob(
-//         colors.data(), { (int64_t)N, (int64_t)3 },
-//         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
-//     ).clone().div_(255.0f);
-//     // ─────────────────────────────────────────────────────────────────────
-//     // 1) Ask Python to compute a fresh bounding from the *incoming points*
-//     //    the same way as in createFromPcd (pcd mode).
-//     // ─────────────────────────────────────────────────────────────────────
-//     namespace py = pybind11;
-//     py::gil_scoped_acquire gil;
-
-//     static py::module bu_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.utils.bounding_utils");
-//     }();
-//     py::object decide_main_bounding = bu_mod.attr("decide_main_bounding");
-
-//     // Wrap xyz_cpu as Python tensor → numpy → SimpleNamespace(points=…)
-//     py::object torch_tensor_py = py::cast(xyz_cpu);
-//     py::object np_array = torch_tensor_py.attr("numpy")();
-//     py::object SimpleNS = py::module_::import("types").attr("SimpleNamespace");
-//     py::object pcd_obj  = SimpleNS(py::arg("points") = np_array);
-//     py::object bounding_py = decide_main_bounding(
-//         py::arg("bound_mode")       = "pcd",
-//         py::arg("pcd_density_rate") = 0.1,
-//         py::arg("bound_scale")      = 1.0,
-//         py::arg("pcd")              = pcd_obj
-//     );
-//     // Convert py ndarray [2,3] → torch CPU tensor
-//     auto arr       = bounding_py.cast<py::array_t<float>>();
-//     py::buffer_info info = arr.request();
-//     TORCH_CHECK(info.ndim == 2 && info.shape[0] == 2 && info.shape[1] == 3,
-//                 "decide_main_bounding returned invalid shape");
-//     torch::Tensor bounding_cpu = torch::from_blob(
-//         info.ptr, { (int64_t)2, (int64_t)3 },
-//         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
-//     ).clone();
-
-//     // ---- LOG: new raw bbox from Python (red) ----
-//     int64_t inc = ++rr_inc_step_;  // advance a global “time” for Rerun
-//     rrLogPointsAndAABB(
-//         /*iteration=*/static_cast<int>(inc),
-//         /*xyz=*/xyz_cpu, /*rgb=*/rgb_cpu,
-//         /*bounding_2x3=*/bounding_cpu,
-//         /*tag=*/"increase_raw",
-//         /*max_points_for_viz=*/200000,
-//         /*log_points=*/true, /*log_box=*/true,
-//         /*inc=*/inc
-//     );
-
-//     // Convert to the “used” cube the same way as in createFromPcd:
-//     // used_min/used_max are center +/- 0.5*extent_side where extent_side = max(range per axis)
-//     torch::Tensor scene_min_cpu = bounding_cpu[0];
-//     torch::Tensor scene_max_cpu = bounding_cpu[1];
-//     torch::Tensor center_cpu    = 0.5f * (scene_min_cpu + scene_max_cpu);
-//     float extent_side           = (scene_max_cpu - scene_min_cpu).max().item<float>();
-//     torch::Tensor used_min_cpu  = center_cpu - 0.5f * extent_side;
-//     torch::Tensor used_max_cpu  = center_cpu + 0.5f * extent_side;
-
-//     auto cpu_opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-//     // Previous USED box (what we are currently training in)
-//     torch::Tensor prev_used_cpu = torch::tensor(
-//         { {cur_min_[0], cur_min_[1], cur_min_[2]},
-//         {cur_max_[0], cur_max_[1], cur_max_[2]} }, cpu_opt);
-
-//     // ---- LOG: previously used box (green) ----
-//     rrLogPointsAndAABB(
-//         /*iteration=*/static_cast<int>(inc),
-//         /*xyz=*/xyz_cpu, /*rgb=*/rgb_cpu,
-//         /*bounding_2x3=*/prev_used_cpu,
-//         /*tag=*/"increase_prev_used",
-//         /*max_points_for_viz=*/200000,
-//         /*log_points=*/false, /*log_box=*/true,
-//         /*inc=*/inc
-//     );
-
-//     // ─────────────────────────────────────────────────────────────────────
-//     // 2) UNION with the previously *used* box (cur_min_/cur_max_)
-//     // ─────────────────────────────────────────────────────────────────────
-//     float new_used_min[3], new_used_max[3];
-//     for (int d=0; d<3; ++d) {
-//         const float cand_min = used_min_cpu[d].item<float>();
-//         const float cand_max = used_max_cpu[d].item<float>();
-//         new_used_min[d] = std::min(cur_min_[d], cand_min);
-//         new_used_max[d] = std::max(cur_max_[d], cand_max);
-//     }
-//     // If union == current (within small epsilon), nothing to do
-//     auto nearly_equal = [](float a, float b, float eps=1e-6f){ return std::fabs(a-b) <= eps; };
-//     bool same_box = true;
-//     for (int d=0; d<3; ++d) {
-//         if (!nearly_equal(new_used_min[d], cur_min_[d]) ||
-//             !nearly_equal(new_used_max[d], cur_max_[d])) {
-//             same_box = false; break;
-//         }
-//     }
-//     if (same_box) {
-//         // Still fully inside (union didn’t grow) → keep training
-//         return;
-//     }
-//     // ─────────────────────────────────────────────────────────────────────
-//     // 3) Prepare NEW union box tensors & new lattice (fixed level)
-//     // ─────────────────────────────────────────────────────────────────────
-//     // Fixed init level (e.g., 6 ⇒ 64^3) to keep memory bounded
-//     static constexpr int kInitLevel = 6;
-
-//     // Make the union cubic (like “used”): take side = max(range) over d,
-//     // centered at union center.
-//     const float ucen[3] = {
-//         0.5f * (new_used_min[0] + new_used_max[0]),
-//         0.5f * (new_used_min[1] + new_used_max[1]),
-//         0.5f * (new_used_min[2] + new_used_max[2])
-//     };
-//     const float urange[3] = {
-//         new_used_max[0] - new_used_min[0],
-//         new_used_max[1] - new_used_min[1],
-//         new_used_max[2] - new_used_min[2]
-//     };
-//     float uni_extent = std::max(std::max(urange[0], urange[1]), urange[2]);
-//     float uni_min[3] = { ucen[0] - 0.5f*uni_extent,
-//                          ucen[1] - 0.5f*uni_extent,
-//                          ucen[2] - 0.5f*uni_extent };
-//     float uni_max[3] = { ucen[0] + 0.5f*uni_extent,
-//                          ucen[1] + 0.5f*uni_extent,
-//                          ucen[2] + 0.5f*uni_extent };
-
-//     // New voxel edge length from fixed level
-//     const float new_vox = uni_extent / float(1 << kInitLevel);
-
-//     // Save old lattice & min for corner-world reconstruction
-//     const float old_vox = global_vox_;
-//     const float old_min[3] = { cur_min_[0], cur_min_[1], cur_min_[2] };
-
-//     // ─────────────────────────────────────────────────────────────────────
-//     // 5) Re-init Python SVM with the **union** box (fixed kInitLevel)
-//     // ─────────────────────────────────────────────────────────────────────
-//     {
-//         static py::module svm_mod = []{
-//             py::module sys = py::module::import("sys");
-//             sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//             return py::module::import("src.sparse_voxel_model");
-//         }();
-//         py::object SVM = svm_mod.attr("SparseVoxelModel");
-//         py_->svm = SVM(py::arg("sh_degree")        = max_sh_degree_,
-//                        py::arg("black_background") = true);
-
-//         auto cpu_opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-//         torch::Tensor union_bound_cpu = torch::tensor(
-//             { {uni_min[0], uni_min[1], uni_min[2]},
-//               {uni_max[0], uni_max[1], uni_max[2]} }, cpu_opt);
-
-//         // ---- LOG: union box (green) ----
-//         rrLogPointsAndAABB(
-//             /*iteration=*/static_cast<int>(inc),
-//             /*xyz=*/xyz_cpu, /*rgb=*/rgb_cpu,
-//             /*bounding_2x3=*/union_bound_cpu,
-//             /*tag=*/"increase_union_used",
-//             /*max_points_for_viz=*/200000,
-//             /*log_points=*/false, /*log_box=*/true,
-//             /*inc=*/inc
-//         );
-
-//         py_->svm.attr("model_init")(
-//             py::arg("bounding")       = union_bound_cpu.to(device_type_),
-//             py::arg("outside_level")  = 0,
-//             py::arg("init_n_level")   = kInitLevel,
-//             py::arg("init_out_ratio") = 2,
-//             py::arg("sh_degree_init") = 3,
-//             py::arg("geo_init")       = -10.0f,
-//             py::arg("sh0_init")       = 0.5f,
-//             py::arg("shs_init")       = 0.0f
-//         );
-
-//         auto fetch = [&](const char* name){ return py_->svm.attr(name).cast<torch::Tensor>(); };
-//         oct_path_      = fetch("octpath");
-//         oct_level_     = fetch("octlevel");
-//         center_        = fetch("vox_center");                  // [Nnew,3]
-//         size_          = fetch("vox_size").squeeze(1);         // [Nnew]
-//         vox_size_inv_  = 1.0f / size_;
-//         grid_pts_key_  = fetch("grid_pts_key");                // [NgNew,3]
-//         vox_key_       = fetch("vox_key");
-
-//         _geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-//         sh0_           = fetch("_sh0").requires_grad_(true);
-//         shs_           = fetch("_shs").requires_grad_(true);
-//         subdiv_p_      = fetch("_subdiv_p").requires_grad_(true);
-
-//         max_w_ = torch::zeros({center_.size(0), 1},
-//                               torch::dtype(torch::kFloat32).device(device_type_));
-//     }
-//     // rrLogVoxelBoxes(center_, size_, /*max_boxes=*/20000, "boxes", inc);
-//     // Update NEW globals & AABB to UNION
-//     global_vox_       = new_vox;
-//     global_origin_[0] = uni_min[0];
-//     global_origin_[1] = uni_min[1];
-//     global_origin_[2] = uni_min[2];
-//     for (int d=0; d<3; ++d) { cur_min_[d] = uni_min[d]; cur_max_[d] = uni_max[d]; }
-//     have_cur_aabb_ = true;
-// }
-
-// void VoxelModel::increasePcd(std::vector<float> pcd_full,
-//                              std::vector<float> colors,
-//                              const int /*iteration*/)
-// {
-//     // '''
-//     // dense grid
-//     // '''
-//     namespace py = pybind11;
-
-//     const int N = static_cast<int>(pcd_full.size() / 3);
-//     torch::Tensor xyz  = torch::from_blob(pcd_full.data(), {N,3}, torch::kFloat32).clone().to(device_type_);
-//     torch::Tensor cols = torch::from_blob(colors.data(),   {N,3}, torch::kFloat32).clone().to(device_type_);
-
-//     // ─── 2) Ask Python to compute the bounding box via decide_main_bounding ──
-//     py::gil_scoped_acquire gil;
-//     static py::module bu_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.utils.bounding_utils");
-//     }();
-//     py::object decide_main_bounding = bu_mod.attr("decide_main_bounding");
-
-//     // Pass the point cloud to Python as a (N,3) float32 tensor on CPU
-//     torch::Tensor xyz_cpu = xyz.cpu().contiguous();
-//     // 1) Wrap the CPU tensor as a Python torch.Tensor
-//     py::object torch_tensor_py = py::cast(xyz_cpu);
-//     // 2) Call its .numpy() in Python to get a NumPy array
-//     py::object np_array = torch_tensor_py.attr("numpy")();
-//     // 3) Build a SimpleNamespace(points=ndarray) so .points works in Python
-//     py::object SimpleNS = py::module_::import("types").attr("SimpleNamespace");
-//     py::object pcd_obj  = SimpleNS(py::arg("points") = np_array);
-
-//     py::object bounding_py = decide_main_bounding(
-//         py::arg("bound_mode")      = "pcd",   // or "default" / "camera_max" …
-//         py::arg("pcd_density_rate")= 0.1,
-//         py::arg("bound_scale")     = 1.0,
-//         py::arg("pcd")             = pcd_obj  // just needs .points attribute-like
-//     );
-//     // 1) cast to py::array_t<float> so we can access the buffer
-//     auto arr = bounding_py.cast<py::array_t<float>>();
-//     py::buffer_info info = arr.request();
-//     // 2) build a CPU tensor that wraps that data
-//     //    shape should be [2,3] here
-//     std::vector<int64_t> shape{ (int64_t)info.shape[0],
-//                                 (int64_t)info.shape[1] };
-//     auto options = torch::TensorOptions()
-//                     .dtype(torch::kFloat32)
-//                     .device(torch::kCPU);
-//     torch::Tensor bounding_cpu = torch::from_blob(
-//         info.ptr, shape, options);
-//     // 3) clone + move to your GPU (or whatever device_type_ is)
-//     torch::Tensor bounding = bounding_cpu.clone()
-//                                 .to(device_type_);
-
-//     torch::Tensor scene_min = bounding_cpu[0].to(device_type_);
-//     torch::Tensor scene_max = bounding_cpu[1].to(device_type_);
-//     this->scene_center_ = 0.5f * (scene_min + scene_max);
-//     float extent_side  = (scene_max - scene_min).max().item<float>();
-//     this->scene_extent_       = torch::tensor({extent_side},
-//                                  torch::TensorOptions().dtype(torch::kFloat32)
-//                                                         .device(device_type_));
-//     // std::cout << "[Debug] scene_extent = " << extent_side << std::endl;
-//     // float float_level = -std::log2(0.05f / extent_side);
-//     // int level = std::round(float_level);
-//     // std::cout << "level = " << level
-//     //           << " (float_level = " << float_level << ")" << std::endl;
-
-//     // ─── 3) Call into Python’s SparseVoxelModel.model_init() ────────────
-//     // py::gil_scoped_acquire gil;
-//     static py::module svm_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.sparse_voxel_model");
-//     }();
-//     py::object SVM     = svm_mod.attr("SparseVoxelModel");
-//     py_->svm = SVM(
-//         py::arg("sh_degree")        = max_sh_degree_,
-//         py::arg("black_background") = true
-//     );
-//     py_->svm.attr("model_init")(
-//         py::arg("bounding")        = bounding,
-//         py::arg("outside_level")   = 0,
-//         py::arg("init_n_level")    = 6,
-//         py::arg("init_out_ratio")  = 2,
-//         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = -10.0f,
-//         py::arg("sh0_init")        = 0.5f,
-//         py::arg("shs_init")        = 0.0f
-//     );
-
-//     // ─── 4) Pull back all core tensors from the Python object ───────────
-//     auto fetch = [&](const char* name){
-//         return py_->svm.attr(name).cast<torch::Tensor>();
-//         // .contiguous();
-//     };
-//     this->oct_path_      = fetch("octpath");
-//     this->oct_level_     = fetch("octlevel");
-//     this->center_        = fetch("vox_center");
-//     this->size_          = fetch("vox_size").squeeze(1);
-//     this->vox_size_inv_  = 1.0f / size_;
-//     this->grid_pts_key_  = fetch("grid_pts_key");
-//     this->vox_key_       = fetch("vox_key");      
-//     // ─── 5) Copy over the learnable fields ─────────────────────────────
-//     this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-//     this->sh0_ = fetch("_sh0").requires_grad_(true);
-//     this->shs_ = fetch("_shs").requires_grad_(true);
-//     this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
-//     // subdiv_p_   .retain_grad();
-//     // ─── 6) Stats buffers (exactly as before) ───────────────────────────
-//     this->max_w_ = torch::zeros({center_.size(0), 1},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-
-//     // // ─── 7) Register with the optimizer, etc. ──────────────────────────
-//     // VOXEL_MODEL_TENSORS_TO_VEC
-//     syncFromPython_();
-// }
-
-// void VoxelModel::createFromPcd(
-//     const std::map<point3D_id_t, Point3D>& pcd)
-// {
-//     // '''
-//     // offline approach with dense grid
-//     // '''
-//     std::cout << "VoxelModel::createPcd() called with "
-//               << pcd.size() << " points." << std::endl;
-//     namespace py = pybind11;
-
-//     // ─── 1) Pack PCD into two [N×3] CUDA tensors ────────────────────────
-//     const int N = (int)pcd.size();
-//     torch::Tensor xyz = torch::empty({N,3},
-//         torch::TensorOptions()
-//             .dtype(torch::kFloat32)
-//             .device(device_type_));
-//     torch::Tensor rgb = torch::empty({N,3},
-//         torch::TensorOptions()
-//             .dtype(torch::kFloat32)
-//             .device(device_type_));
-//     {
-//         int i = 0;
-//         for (auto& [id, P] : pcd) {
-//             xyz[i] = torch::tensor(
-//                       {P.xyz_(0), P.xyz_(1), P.xyz_(2)},
-//                       torch::kFloat32);
-//             // normalize 0–1 range
-//             rgb[i] = torch::tensor(
-//                       {P.color_(0), P.color_(1), P.color_(2)},
-//                       torch::kFloat32) / 255.0f;
-//             ++i;
-//         }
-//     }
-//     // ─── 2) Use KNOWN inflated bounding directly (no file, no Python utils) ──
-//     auto opts_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-//     torch::Tensor bounding_cpu = torch::empty({2,3}, opts_cpu);
-//     // Row 0 = min, Row 1 = max
-//     bounding_cpu[0][0] = -10.748001f;  bounding_cpu[0][1] = -25.842281f;  bounding_cpu[0][2] = -0.403899f;
-//     bounding_cpu[1][0] =  56.780504f;  bounding_cpu[1][1] =  15.760179f;  bounding_cpu[1][2] = 60.683914f;
-
-//     // Move to your device for model_init:
-//     torch::Tensor bounding = bounding_cpu.to(device_type_);
-//     torch::Tensor scene_min = bounding_cpu[0].to(device_type_);
-//     torch::Tensor scene_max = bounding_cpu[1].to(device_type_);
-//     this->scene_center_ = 0.5f * (scene_min + scene_max);
-//     float extent_side  = (scene_max - scene_min).max().item<float>();
-//     this->scene_extent_       = torch::tensor({extent_side},
-//                                  torch::TensorOptions().dtype(torch::kFloat32)
-//                                                         .device(device_type_));
-//     float float_level = -std::log2(0.05f / extent_side);
-//     int level = std::round(float_level);
-//     std::cout << "level = " << level
-//               << " (float_level = " << float_level << ")" << std::endl;
-
-//     // ─── 3) Call into Python’s SparseVoxelModel.model_init() ───────────────
-//     py::gil_scoped_acquire gil;
-//     static py::module svm_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.sparse_voxel_model");
-//     }();
-//     py::object SVM    = svm_mod.attr("SparseVoxelModel");
-//     py_->svm = SVM(py::arg("sh_degree")        = max_sh_degree_);
-//     py_->svm.attr("model_init")(
-//         py::arg("bounding")        = bounding,
-//         py::arg("outside_level")   = 0,
-//         py::arg("init_n_level")    = 6,
-//         py::arg("init_out_ratio")  = 2,
-//         py::arg("sh_degree_init")  = 3,
-//         py::arg("geo_init")        = -10.0f,
-//         py::arg("sh0_init")        = 0.5f,
-//         py::arg("shs_init")        = 0.0f
-//     );
-
-//     // {
-//     //     py::gil_scoped_acquire gil;
-//     //     auto sh0 = py_->svm.attr("_sh0");
-//     //     auto shs = py_->svm.attr("_shs");
-//     //     auto geo = py_->svm.attr("_geo_grid_pts");
-//     //     sh0.attr("requires_grad_")(true);
-//     //     shs.attr("requires_grad_")(true);
-//     //     geo.attr("requires_grad_")(true);
-//     // }
-//     // ─── 4) Pull back all core tensors from the Python object ───────────
-//     auto fetch = [&](const char* name){
-//         return py_->svm.attr(name).cast<torch::Tensor>();
-//         // .contiguous();
-//     };
-//     this->oct_path_      = fetch("octpath");
-//     this->oct_level_     = fetch("octlevel");
-//     this->center_        = fetch("vox_center");
-//     this->size_          = fetch("vox_size").squeeze(1);
-//     this->vox_size_inv_  = 1.0f / this->size_;
-//     this->grid_pts_key_  = fetch("grid_pts_key");
-//     this->vox_key_       = fetch("vox_key");      
-//     // ─── 5) Copy over the learnable fields ─────────────────────────────
-//     this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-//     // this->sh0_ = fetch("_sh0").view({-1,1,3}).requires_grad_(true);
-//     this->sh0_ = fetch("_sh0").requires_grad_(true);
-//     // this->sh0_ = this->sh0_.view({-1,1,3});
-//     this->shs_ = fetch("_shs").requires_grad_(true);
-//     this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
-
-//     // this->_geo_grid_pts_ = fetch("_geo_grid_pts");
-//     // this->sh0_ = fetch("_sh0").view({-1,1,3});
-//     // this->shs_ = fetch("_shs");
-//     // this->subdiv_p_ = fetch("_subdiv_p");
-//     // ─── 6) Stats buffers (exactly as before) ───────────────────────────
-//     this->max_w_ = torch::zeros({center_.size(0), 1},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-
-//     // std::cout << " center_ " << center_ << std::endl;
-//     // After you fetch center_ (M×3) and size_ (M,)
-//     auto c_cpu = center_.cpu();
-//     auto s_cpu = size_.cpu();
-//     torch::Tensor bb_min_eff = (c_cpu - 0.5 * s_cpu.unsqueeze(1)).amin(/*dim=*/0);
-//     torch::Tensor bb_max_eff = (c_cpu + 0.5 * s_cpu.unsqueeze(1)).amax(/*dim=*/0);
-//     this->bb_min_eff_ = bb_min_eff.to(device_type_);
-//     this->bb_max_eff_ = bb_max_eff.to(device_type_);
-//     std::cout << std::fixed << std::setprecision(6)
-//             << "[VOXEL GRID AABB] min:[" << bb_min_eff[0].item<float>() << ","
-//                                         << bb_min_eff[1].item<float>() << ","
-//                                         << bb_min_eff[2].item<float>() << "]  "
-//             << "max:[" << bb_max_eff[0].item<float>() << ","
-//                         << bb_max_eff[1].item<float>() << ","
-//                         << bb_max_eff[2].item<float>() << "]\n";
-
-//     py::module_ np = py::module_::import("numpy");
-//     // save raw point‐cloud + colors
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_pts.npy",
-//                     tensor_to_numpy(xyz.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_cols.npy",
-//                     tensor_to_numpy(rgb.cpu()));
-//     // save voxel cell centres + edge lengths
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_centers.npy",
-//                     tensor_to_numpy(center_.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_size.npy",
-//                     tensor_to_numpy(size_.cpu()));
-//     torch::Tensor sh0_cpu = sh0_.view({-1,3}).cpu().contiguous();
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_color.npy",
-//                     tensor_to_numpy(sh0_cpu));
-
-//     VOXEL_MODEL_TENSORS_TO_VEC
-// }
-
-// void VoxelModel::createFromPcd(
-//     const std::map<point3D_id_t, Point3D>& pcd)
-// {
-//     // '''
-//     // offline approach points_init
-//     // '''
-//     std::cout << "VoxelModel::createPcd() called with "
-//               << pcd.size() << " points." << std::endl;
-//     namespace py = pybind11;
-
-//     /* 1) copy PCD → CUDA (unchanged) */
-//     const int N_pts = static_cast<int>(pcd.size());
-//     torch::Tensor pts  = torch::zeros({N_pts,3}, torch::kFloat32).to(device_type_);
-//     torch::Tensor cols = torch::zeros({N_pts,3}, torch::kFloat32).to(device_type_);
-//     {
-//         int i = 0;
-//         for (const auto& kv : pcd) {
-//             const Point3D& p = kv.second;
-//             pts[i]  = torch::tensor({p.xyz_(0), p.xyz_(1), p.xyz_(2)},
-//                                     torch::kFloat32).to(device_type_);
-//             cols[i] = torch::tensor({p.color_(0), p.color_(1), p.color_(2)},
-//                                     torch::kFloat32).to(device_type_);
-//             ++i;
-//         }
-//     }
-
-//     auto mn = std::get<0>(pts.min(0));
-//     auto mx = std::get<0>(pts.max(0));
-//     float raw_extent     = (mx - mn).max().item<float>();
-//     float padded_extent = raw_extent * 1.01f;   // ← 1% padding
-//     this->scene_center_ = (mn + mx) * 0.5f;
-//     this->scene_extent_ = torch::tensor({padded_extent},
-//                                  torch::TensorOptions().dtype(torch::kFloat32)
-//                                                         .device(device_type_));
-
-//     // py::gil_scoped_acquire gil;
-//     // static py::module bu_mod = []{
-//     //     py::module sys = py::module::import("sys");
-//     //     sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//     //     return py::module::import("src.utils.bounding_utils");
-//     // }();
-//     // py::object decide_main_bounding = bu_mod.attr("decide_main_bounding");
-//     // // Pass the point cloud to Python as a (N,3) float32 tensor on CPU
-//     // torch::Tensor xyz_cpu = pts.cpu().contiguous();
-//     // // 1) Wrap the CPU tensor as a Python torch.Tensor
-//     // py::object torch_tensor_py = py::cast(xyz_cpu);
-//     // // 2) Call its .numpy() in Python to get a NumPy array
-//     // py::object np_array = torch_tensor_py.attr("numpy")();
-//     // // 3) Build a SimpleNamespace(points=ndarray) so .points works in Python
-//     // py::object SimpleNS = py::module_::import("types").attr("SimpleNamespace");
-//     // py::object pcd_obj  = SimpleNS(py::arg("points") = np_array);
-//     // py::object bounding_py = decide_main_bounding(
-//     //     py::arg("bound_mode")      = "pcd",   // or "default" / "camera_max" …
-//     //     py::arg("pcd_density_rate")= 0.1,
-//     //     py::arg("bound_scale")     = 1.0,
-//     //     py::arg("pcd")             = pcd_obj  // just needs .points attribute-like
-//     // );
-//     // auto arr = bounding_py.cast<py::array_t<float>>();
-//     // py::buffer_info info = arr.request();
-//     // //    shape should be [2,3] here
-//     // std::vector<int64_t> shape{ (int64_t)info.shape[0],
-//     //                             (int64_t)info.shape[1] };
-//     // auto options = torch::TensorOptions()
-//     //                 .dtype(torch::kFloat32)
-//     //                 .device(torch::kCPU);
-//     // torch::Tensor bounding_cpu = torch::from_blob(
-//     //     info.ptr, shape, options);
-//     // // 3) clone + move to your GPU (or whatever device_type_ is)
-//     // torch::Tensor bounding = bounding_cpu.clone()
-//     //                             .to(device_type_);
-//     // torch::Tensor scene_min = bounding_cpu[0].to(device_type_);
-//     // torch::Tensor scene_max = bounding_cpu[1].to(device_type_);
-//     // this->scene_center_ = (scene_min + scene_max) * 0.5f;
-//     // float extent_side  = (scene_max - scene_min).max().item<float>();
-//     // this->scene_extent_       = torch::tensor({extent_side},
-//     //                              torch::TensorOptions().dtype(torch::kFloat32)
-//     //                                                     .device(device_type_));
-
-//     std::cout << "[Debug] scene_extent = " <<  this->scene_extent_ << std::endl;
-//     // ─── 3) Call into Python’s SparseVoxelModel() ────────────
-//     py::gil_scoped_acquire gil;
-//     static py::module svm_mod = []{
-//         py::module sys = py::module::import("sys");
-//         sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-//         return py::module::import("src.sparse_voxel_model");
-//     }();
-//     py::object SVM     = svm_mod.attr("SparseVoxelModel");
-//     py_->svm = SVM(
-//         py::arg("sh_degree")        = max_sh_degree_,
-//         py::arg("black_background") = true
-//     );
-    
-//     py_->svm.attr("points_init")(
-//         py::arg("scene_center")      = py::cast(this->scene_center_),
-//         py::arg("scene_extent")      = py::cast(this->scene_extent_),
-//         py::arg("xyz")               = py::cast(pts),              // already on CUDA
-//         py::arg("expected_vox_size") = 0.05f,      
-//         py::arg("density")           = -10.0f,
-//         py::arg("rgb")               = py::cast(cols),              // already on CUDA
-//         py::arg("shs")               = 0.0
-//     );
-
-//     // ─── 4) Pull back all core tensors from the Python object ───────────
-//      auto fetch = [&](const char* name){
-//         return py_->svm.attr(name).cast<torch::Tensor>();
-//         // .contiguous();
-//     };
-//     this->oct_path_      = fetch("octpath");
-//     this->oct_level_     = fetch("octlevel");
-//     this->center_        = fetch("vox_center");
-//     this->size_          = fetch("vox_size").squeeze(1);
-//     this->vox_size_inv_  = 1.0f / size_;
-//     this->grid_pts_key_  = fetch("grid_pts_key");
-//     this->vox_key_       = fetch("vox_key");      
-//     // ─── 5) Copy over the learnable fields ─────────────────────────────
-    // this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-    // this->sh0_ = fetch("_sh0").requires_grad_(true);
-    // this->shs_ = fetch("_shs").requires_grad_(true);
-    // this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
-//     // ─── 6) Stats buffers (exactly as before) ───────────────────────────
-//     this->max_w_ = torch::zeros({center_.size(0), 1},
-//         torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-
-//     py::module_ np = py::module_::import("numpy");
-//     // save raw point‐cloud + colors
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_pts.npy",
-//                     tensor_to_numpy(pts.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_cols.npy",
-//                     tensor_to_numpy(cols.cpu()));
-//     // save voxel cell centres + edge lengths
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_centers.npy",
-//                     tensor_to_numpy(center_.cpu()));
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_size.npy",
-//                     tensor_to_numpy(size_.cpu()));
-//     torch::Tensor sh0_cpu = sh0_.view({-1,3}).cpu().contiguous();
-//     np.attr("save")("/home/dimitris/Photo-SLAM/debug_vox_color.npy",
-//                     tensor_to_numpy(sh0_cpu));
-
-//     VOXEL_MODEL_TENSORS_TO_VEC
-// }
-
 void VoxelModel::syncFromPython_() {
     py::gil_scoped_acquire gil;
 
@@ -2171,7 +1292,8 @@ void VoxelModel::appendGroup_(int group_idx,
     bool had_state = state.contains(py::cast(old_param));
 
     // 3) Build new concatenated param (cat along dim=0)
-    torch::Tensor new_param = torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().requires_grad_(true);
+    // torch::Tensor new_param = torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().requires_grad_(true);
+    torch::Tensor new_param = torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().detach().requires_grad_(true); // leaf
 
     // 4) Move/extend state if present
     if (had_state) {
@@ -2252,13 +1374,20 @@ VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_type_);
     // auto max_w            = torch::zeros({N,1}, opts);
     this->max_w_.zero_();
-    auto min_samp_interval= torch::full ({N,1}, 1e30f, opts);
+    auto min_samp_interval = torch::full ({N,1}, 1e30f, opts);
     auto view_cnt         = torch::zeros({N,1}, opts);
 
     for (const auto& cam : cams) {
-        // Render with track_max_w; our wrapper already returns "max_w"
-        // (your VoxelModel::render already returns 'max_w' in pkg)
-        auto pkg = render(cam);
+        // std::cout << "rendering cam " << cam.width << "x" << cam.height << "\n";
+        // auto pkg = render(cam, torch::Tensor(), cam.height, cam.width, color_mode='dontcare', track_max_w=True);
+        auto pkg = render(
+            cam, 
+            cam.height, 
+            cam.width, 
+            torch::Tensor(),
+            "dontcare", 
+            true);
+        
         if (!pkg.count("max_w") || !pkg.at("max_w").defined())
             continue;
 
@@ -2364,50 +1493,92 @@ void VoxelModel::resetSubdivisionPriority() {
 void VoxelModel::freezeVoxGeo() {
     py::gil_scoped_acquire gil;
 
-    // care_idx = torch.arange(self.num_voxels, device="cuda")
-    const int64_t N = this->center_.size(0);
-    auto care_idx = torch::arange(
-        N, torch::TensorOptions().dtype(torch::kLong).device(device_type_));
+    const int64_t N = center_.size(0);
+    auto care_idx = torch::arange(N, torch::dtype(torch::kLong).device(device_type_));
 
-    // with torch.no_grad(): GatherGeoParams.apply(...)
-    py::object no_grad_cm = py::module_::import("torch").attr("no_grad")();
-    no_grad_cm.attr("__enter__")();
+    auto torch_mod = py::module_::import("torch");
+    auto no_grad   = torch_mod.attr("no_grad")();
+    no_grad.attr("__enter__")();
     try {
-        py::object Gather = py::module_::import("svraster_cuda.renderer").attr("GatherGeoParams");
+        auto renderer = py::module_::import("svraster_cuda.renderer");
+        auto Gather   = renderer.attr("GatherGeoParams");
         // returns a torch.Tensor
-        py::object frozen = Gather.attr("apply")(this->vox_key_, care_idx, this->_geo_grid_pts_);
-
-        // Persist on the Python SVM so vox_fn() will use it
-        py_->svm.attr("frozen_vox_geo") = frozen;
-
-        // Disable grads on grid points parameter (same as Python)
-        this->_geo_grid_pts_.set_requires_grad(false);
-
-        no_grad_cm.attr("__exit__")(py::none(), py::none(), py::none());
+        py::object py_frozen = Gather.attr("apply")(vox_key_, care_idx, _geo_grid_pts_);
+        frozen_vox_geo_ = py_frozen.cast<torch::Tensor>().contiguous();
+        _geo_grid_pts_.set_requires_grad(false);
+        no_grad.attr("__exit__")(py::none(), py::none(), py::none());
     } catch (...) {
-        // make sure we exit the context on error too
-        no_grad_cm.attr("__exit__")(py::none(), py::none(), py::none());
+        no_grad.attr("__exit__")(py::none(), py::none(), py::none());
         throw;
     }
 }
 
-// VoxelModel::unfreezeVoxGeo — mirror SVRenderer.unfreeze_vox_geo
 void VoxelModel::unfreezeVoxGeo() {
     py::gil_scoped_acquire gil;
-
-    // Remove the attribute entirely (hasattr() must return False)
-    if (py::hasattr(py_->svm, "frozen_vox_geo")) {
-        py::delattr(py_->svm, "frozen_vox_geo");
-    }
-    this->_geo_grid_pts_.set_requires_grad(true);
+    frozen_vox_geo_.reset();              // make it undefined
+    _geo_grid_pts_.set_requires_grad(true);
 }
 
-std::unordered_map<std::string, torch::Tensor>
-VoxelModel::render(const MiniCam&              cam) const
+static inline py::dict make_kwargs_from(
+    const sv::RenderOpts& a,
+    // explicit function params (after color_mode)
+    bool track_max_w,
+    std::optional<float> ss,
+    bool output_depth,
+    bool output_normal,
+    bool output_T,
+    bool rand_bg,
+    bool use_auto_exposure)
 {
-    /* --------------------------------------------------------------------- */
+    py::dict kw;
+
+    // 1) Start with struct — these become **other_opt
+    if (a.lambda_dist.has_value())       kw["lambda_dist"]      = *a.lambda_dist;
+    if (a.lambda_ascending.has_value())  kw["lambda_ascending"] = *a.lambda_ascending;
+    if (a.lambda_R_concen.has_value())  kw["lambda_R_concen"] = *a.lambda_R_concen;
+    if (a.gt_color.defined())            kw["gt_color"]         = a.gt_color;
+    // If you have other non-overlapping keys (e.g., n_samp_per_vox), add them here as well:
+    // if (a.n_samp_per_vox.has_value()) kw["n_samp_per_vox"] = *a.n_samp_per_vox;
+
+    // Overlapping names: add **only** to kwargs (we won’t pass them positionally)
+    // struct values (if set) first…
+    if (a.track_max_w)        kw["track_max_w"]       = true;
+    if (a.ss.has_value())     kw["ss"]                = *a.ss;
+    if (a.output_depth)       kw["output_depth"]      = true;
+    if (a.output_normal)      kw["output_normal"]     = true;
+    if (a.output_T)           kw["output_T"]          = true;
+    if (a.rand_bg)            kw["rand_bg"]           = true;
+    if (a.use_auto_exposure)  kw["use_auto_exposure"] = true;
+
+    // …then override with explicit function arguments if caller set them.
+    if (track_max_w)          kw["track_max_w"]       = true;
+    if (ss.has_value())       kw["ss"]                = *ss;
+    if (output_depth)         kw["output_depth"]      = true;
+    if (output_normal)        kw["output_normal"]     = true;
+    if (output_T)             kw["output_T"]          = true;
+    if (rand_bg)              kw["rand_bg"]           = true;
+    if (use_auto_exposure)    kw["use_auto_exposure"] = true;
+
+    return kw;
+}
+
+// std::unordered_map<std::string, torch::Tensor> VoxelModel::render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss, bool track_max_w) const
+std::unordered_map<std::string, torch::Tensor> VoxelModel::render(
+    const sv::MiniCam& cam,
+    int im_height,
+    int im_width,
+    const torch::Tensor& gt_image,
+    const char* color_mode,
+    bool track_max_w,
+    std::optional<float> ss,
+    bool output_depth,
+    bool output_normal,
+    bool output_T,
+    bool rand_bg,
+    bool use_auto_exposure,
+    const sv::RenderOpts& other_opt) const
+{
     /* 1) import the python entry-point once                                 */
-    /* --------------------------------------------------------------------- */
     py::gil_scoped_acquire gil;
     static py::object py_render;
     if (!py_render) {
@@ -2422,35 +1593,12 @@ VoxelModel::render(const MiniCam&              cam) const
             return {};
         }
     }
-    /* --------------------------------------------------------------------- */
-    /* 2) quick bail-out if there is nothing to render                       */
-    /* --------------------------------------------------------------------- */
-    if (center_.numel() == 0) {
-        std::cout << "[INFO] Skipping render – voxel buffer empty.\n";
-        return {};
-    }
-    // if (_geo_grid_pts_=! 0.1) {
-    //     std::cout << "[INFO] _geo_grid_pts_ " << _geo_grid_pts_ << std::endl;
-    //     std::cout << "[INFO] this->_geo_grid_pts_ " << this->_geo_grid_pts_ << std::endl;
-    // }
-    /* --------------------------------------------------------------------- */
-    /* 3) pack voxel buffers into a python dict                              */
-    /* --------------------------------------------------------------------- */
+
     py::dict d;
-    // d["geo_grid_pts"]      = py_->svm.attr("_geo_grid_pts");
-    // d["sh0"]               = py_->svm.attr("_sh0");
-    // d["shs"]               = py_->svm.attr("_shs");
-    // d["subdiv_p"]          = py_->svm.attr("_subdiv_p");        // gradient used as priority
-    // d["octpath"]           = py_->svm.attr("octpath");
-    // d["octlevel"]          = py_->svm.attr("octlevel");
-    // d["center"]            = py_->svm.attr("vox_center");
-    // d["vox_size"]          = py_->svm.attr("vox_size");
-    // d["vox_key"]           = py_->svm.attr("vox_key");
-    // d["active_sh_degree"]  = py::int_(this->active_sh_degree_);
-    d["geo_grid_pts"]      = this->_geo_grid_pts_;
+    d["_geo_grid_pts"]      = this->_geo_grid_pts_;
     d["sh0"]               = this->sh0_;
     d["shs"]               = this->shs_;
-    d["subdiv_p"]          = this->subdiv_p_;     // gradient used as priority
+    d["subdiv_p"]          = this->subdiv_p_;
     d["octpath"]           = this->oct_path_;
     d["octlevel"]          = this->oct_level_;
     d["center"]            = this->center_;
@@ -2458,38 +1606,55 @@ VoxelModel::render(const MiniCam&              cam) const
     d["vox_key"]           = this->vox_key_;
     d["active_sh_degree"]  = py::int_(this->active_sh_degree_);
 
-    /* --------------------------------------------------------------------- */
+    d["white_background"] = py::bool_(this->white_background_);
+    d["black_background"] = py::bool_(this->black_background_);
+    d["ss"]               = py::float_(this->ss_);       // default SS (used if ss=None)
+    d["n_samp_per_vox"]   = py::int_(this->n_samp_per_vox_);
+    d["num_voxels"]        = static_cast<long long>(this->center_.size(0));
+
+    // Optional: expose pre-gathered geo if present
+    if (this->frozen_vox_geo_.defined() && this->frozen_vox_geo_.numel() > 0) {
+        d["frozen_vox_geo"] = this->frozen_vox_geo_;
+    }
+
+    // Build kwargs (**other_opt). IMPORTANT: do NOT pass overlapping args positionally.
+    py::dict kwargs = make_kwargs_from(
+        other_opt, track_max_w, ss, output_depth, output_normal,
+        output_T, rand_bg, use_auto_exposure);
+    // std::cout << "kwargs" << kwargs << std::endl;   
     /* 4) call python                                                        */
-    /* --------------------------------------------------------------------- */
     py::object py_cam  = MiniCam_to_py(cam);
     py::object py_out;
+    py::tuple args = py::make_tuple(
+        d,
+        py_cam,
+        im_height,
+        im_width,
+        gt_image,
+        color_mode
+    ); 
     try {
-        py_out = py_render(py_cam, d);
+        py_out = py_render(*args, **kwargs);
+        // py_out = py_render(
+        //     d,
+        //     py_cam,
+        //     im_height,
+        //     im_width,
+        //     gt_image,
+        //     color_mode,
+        //     py::kwargs(kwargs) );
+        // py_out = py_render(py_cam, d, gt_image, image_height, image_width, ss, track_max_w);
     } catch (const py::error_already_set& e) {
         std::cerr << "[PYBIND11] Exception thrown by renderer:\n"
                   << e.what() << std::endl;
         return {};
     }
-
-    /* --------------------------------------------------------------------- */
-    /* 5) the python function *should* return a dict                         */
-    /* --------------------------------------------------------------------- */
-    if (!py::isinstance<py::dict>(py_out)) {
-        std::cerr << "[WARN] renderer_wrapper.render returned "
-                     "a non-dict object - skipping frame.\n";
-        return {};
-    }
     py::dict out_dict = py_out.cast<py::dict>();
 
-    /* --------------------------------------------------------------------- */
     /* 6) copy every tensor into a C++ map                                   */
-    /* --------------------------------------------------------------------- */
     std::unordered_map<std::string, torch::Tensor> pkg;
-    // std::cout << "\n[DBG]  content coming back from Python:\n";
     for (auto item : out_dict) {
         const std::string key = py::str(item.first);
-
-        // try to cast – even if isinstance fails we fall back to a try/catch
         torch::Tensor t;
         bool is_tensor = true;
         try {
@@ -2497,24 +1662,9 @@ VoxelModel::render(const MiniCam&              cam) const
         } catch (...) {
             is_tensor = false;
         }
-        // std::cout << "    • " << key << "  : ";
-        if (!is_tensor) {
-            std::cout << "(not a tensor)\n";
-            continue;
-        }
-        // std::cout << (t.defined() ? "tensor  " : "UNDEFINED ")
-        //           << t.sizes() << '\n';
         if (t.defined())
             pkg.emplace(key, std::move(t));
-    }
-    /* --------------------------------------------------------------------- */
-    /* 7) sanity-check – we really want at least “color”                     */
-    /* --------------------------------------------------------------------- */
-    if (!pkg.count("color") || !pkg["color"].defined()) {
-        std::cerr << "[ERROR] Python renderer did not supply a valid "
-                     "\"color\" tensor – skipping frame.\n";
-        pkg.clear();                  // signal failure to caller
-    }    
+    }   
     return pkg;                       // may be empty on error
 }
 

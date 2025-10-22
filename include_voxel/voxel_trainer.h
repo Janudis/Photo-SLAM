@@ -10,14 +10,13 @@
 #include "include/loss_utils.h"
 
 namespace sv {
-
 class VoxelTrainer {
 public:
-    VoxelTrainer() = delete;
+    VoxelTrainer();
 
     static void trainingOnce(
-        std::shared_ptr<VoxelScene> scene,
-        std::shared_ptr<VoxelModel> voxels,
+        std::shared_ptr<sv::VoxelScene> scene,
+        std::shared_ptr<sv::VoxelModel> voxels,
         VoxelModelParams& dataset,
         VoxelOptimizationParams& optParams,
         VoxelPipelineParams& pipeParams,
@@ -27,21 +26,19 @@ public:
         std::vector<int> checkpoint_iterations = {}
     );
 
-    /// After each optimization step (or at logging intervals), print a concise report:
-    ///   iteration, num_iterations, L1‐loss, total loss, EMA, elapsed_time, 
-    ///   VoxelModel state, VoxelScene state, pipeline flags, background image, etc.
     static void trainingReport(
         int iteration,
         int num_iterations,
         torch::Tensor& Ll1,
         torch::Tensor& loss,
         float ema_loss_for_log,
-        std::function<torch::Tensor(torch::Tensor&, torch::Tensor&)> l1_loss,
+        torch::Tensor& mse,
         int64_t elapsed_time,
-        VoxelModel& voxels,
-        VoxelScene& scene,
+        sv::VoxelModel& voxels,
+        sv::VoxelScene& scene,
         VoxelPipelineParams& pipeParams,
         torch::Tensor& background
     );
 };
-} // namespace sv
+
+}

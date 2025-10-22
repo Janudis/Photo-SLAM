@@ -700,7 +700,7 @@
  
      torch::cuda::synchronize();
  
-     {
+    {
          torch::NoGradGuard no_grad;
          ema_loss_for_log_ = 0.4f * loss.item().toFloat() + 0.6 * ema_loss_for_log_;
  
@@ -770,8 +770,8 @@
              gaussians_->optimizer_->step();
              gaussians_->optimizer_->zero_grad(true);
          }
-     }
- }
+    }
+}
  
  bool GaussianMapper::isStopped()
  {

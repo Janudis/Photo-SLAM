@@ -22,6 +22,7 @@
 #include <sstream>
 #include <thread>
 #include <limits>
+#include <optional>
 
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_keyframe.h"
@@ -35,6 +36,7 @@
 #include "include/tensor_utils.h"
 #include "include_voxel/voxel_model.h"
 #include "include_voxel/py_utils.h"
+#include "include_voxel/render_opts.h"  
 
 // ORB_SLAM3::System
 #include "ORB-SLAM3/include/System.h"
@@ -231,6 +233,8 @@ public:
                             -std::numeric_limits<float>::infinity() };
     bool have_bounds_ = false;
     int next_batch_index_ = 0;
+
+    std::vector<sv::MiniCam> tr_cams;
 
 protected:
     VoxelModelParams model_params_;

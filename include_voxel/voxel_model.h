@@ -19,6 +19,7 @@
 #include <ATen/ATen.h>
 #include <cmath>
 #include <tuple>
+#include <optional>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 #include "third_party/simple-knn/spatial.h"
@@ -37,6 +38,7 @@
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/py_utils.h"
 #include "include_voxel/voxel_constants.h"
+#include "include_voxel/render_opts.h" 
 #include <rerun.hpp>
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
@@ -142,7 +144,20 @@ public:
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
     std::unordered_map<std::string, torch::Tensor>
-    render(const MiniCam& cam) const;
+    // render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss = 1.0f, bool track_max_w = false) const;
+    render(const sv::MiniCam& cam,
+        int im_height,
+        int im_width,
+        const torch::Tensor& gt_image = torch::Tensor(),
+        const char* color_mode = nullptr,
+        bool track_max_w = false,
+        std::optional<float> ss = std::nullopt,
+        bool output_depth=false,
+        bool output_normal=false,
+        bool output_T=false,
+        bool rand_bg=false,
+        bool use_auto_exposure=false,
+        const sv::RenderOpts& other_opt = sv::RenderOpts()) const;
 
     void applyTvOnDensityField(float lambda_tv_density);
 
@@ -203,6 +218,12 @@ public:
     torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
     torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
     torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
+    torch::Tensor frozen_vox_geo_;
+    
+    float ss_ = 1.5f;
+    bool  white_background_ = false;
+    bool  black_background_ = false;
+    int   n_samp_per_vox_ = 3;
 
     std::vector<torch::Tensor>  Tensor_vec_geo_,
                                 Tensor_vec_sh0_,

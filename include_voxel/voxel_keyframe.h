@@ -53,7 +53,7 @@ public:
         const point3D_id_t point3D_id);
 
     void computeTransformTensors();
-    sv::MiniCam toMiniCam() const;
+    sv::MiniCam toMiniCam(int im_height = 480, int im_width = 640) const;
 
     Eigen::Matrix4f getWorld2View2(
         const Eigen::Vector3f& trans = {0.0f, 0.0f, 0.0f},

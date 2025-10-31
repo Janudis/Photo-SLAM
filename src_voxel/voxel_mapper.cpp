@@ -1060,12 +1060,15 @@ void VoxelMapper::run()
             //     result_dir_ / "proj_debug"  // output folder
             // );
 
-            // // C) Create MiniCams for all keyframes and use them for densification later
-            // std::vector<sv::MiniCam> tr_cams;
-            // tr_cams.reserve(scene_->keyframes().size());
-            // for (auto& kv : scene_->keyframes()) {
-            //     if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
-            // }
+            // C) Create MiniCams for all keyframes and use them for densification later
+            std::vector<sv::MiniCam> tr_cams;
+            tr_cams.reserve(scene_->keyframes().size());
+            for (auto& kv : scene_->keyframes()) {
+                // if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
+                auto& kf = *kv.second;
+                // Use full-res here; you can choose a smaller level if you like.
+                tr_cams.emplace_back(kf.toMiniCam(kf.image_height_, kf.image_width_));
+            }
             
             // D) Create voxel model & trainer setup
             {
@@ -1076,7 +1079,7 @@ void VoxelMapper::run()
                 // save_initial_pcd_npy(result_dir_, scene_->cached_point_cloud_);
                 // auto restored = load_full_pcd_from_logs((result_dir_ / "offline_experiment").string());
                 // voxel_model_->createFromPcd(std::move(restored));
-                voxel_model_->createFromPcd(scene_->cached_point_cloud_);
+                voxel_model_->createFromPcd(scene_->cached_point_cloud_, tr_cams);
                 std::unique_lock<std::mutex> lock(mutex_settings_);
                 voxel_model_->createTrainer(
                                             opt_params_.geo_lr_,
@@ -1229,31 +1232,31 @@ void VoxelMapper::trainForOneIteration()
     }    
     voxel_model_->setShDegree(default_sh_);
 
-    // // Use default super-sampling option (enable after 1000 iters)
-    // if (iter > 200) {
-    //     if (opt_params_.ss_aug_max_ > 1.0f) {
-    //         static thread_local std::mt19937 rng{std::random_device{}()};
-    //         std::uniform_real_distribution<float> dist(1.0f, opt_params_.ss_aug_max_);
-    //         ropts.ss = dist(rng);                 // tr_render_opt['ss'] = U(1, ss_aug_max)
-    //     } else {
-    //         ropts.ss = std::nullopt;              // pop('ss') -> use model default self.ss
-    //     }
-    // } else {
-    //     ropts.ss = 1.0f;                           // disable supersampling at first
-    // }
-    // // ropts.ss = 1.0f;   
-    // if (iter > 400 && opt_params_.lambda_dist_ > 0.0f) {
-    //     ropts.lambda_dist = opt_params_.lambda_dist_;
-    // }
+    // Use default super-sampling option (enable after 1000 iters)
+    if (iter > 200) {
+        if (opt_params_.ss_aug_max_ > 1.0f) {
+            static thread_local std::mt19937 rng{std::random_device{}()};
+            std::uniform_real_distribution<float> dist(1.0f, opt_params_.ss_aug_max_);
+            ropts.ss = dist(rng);                 // tr_render_opt['ss'] = U(1, ss_aug_max)
+        } else {
+            ropts.ss = std::nullopt;              // pop('ss') -> use model default self.ss
+        }
+    } else {
+        ropts.ss = 1.0f;                           // disable supersampling at first
+    }
+    // ropts.ss = 1.0f;   
+    if (iter > 400 && opt_params_.lambda_dist_ > 0.0f) {
+        ropts.lambda_dist = opt_params_.lambda_dist_;
+    }
 
-    // if (opt_params_.lambda_R_concen_ > 0.0f) {
-    //     ropts.lambda_R_concen = opt_params_.lambda_R_concen_;
-    //     ropts.gt_color = gt_image;
-    // }
+    if (opt_params_.lambda_R_concen_ > 0.0f) {
+        ropts.lambda_R_concen = opt_params_.lambda_R_concen_;
+        ropts.gt_color = gt_image;
+    }
 
-    // if (opt_params_.lambda_T_inside_ > 0.0f) {
-    //     ropts.output_T = true;
-    // }
+    if (opt_params_.lambda_T_inside_ > 0.0f) {
+        ropts.output_T = true;
+    }
 
     // ) build a MiniCam out of this keyframe
     // std::cout << "build minicam image size: " << image_width << "x" << image_height << std::endl;
@@ -1266,7 +1269,7 @@ void VoxelMapper::trainForOneIteration()
         image_width,
         /* gt_image   */  gt_image,            
         /* color_mode   */   nullptr,             
-        /* track_max_w   */  false,
+        /* track_max_w   */  true,
         /* ss            */  std::nullopt,
         /* output_depth  */  false,
         /* output_normal */  false,
@@ -1301,17 +1304,17 @@ void VoxelMapper::trainForOneIteration()
                 << (rendered_image.grad_fn() ? "set" : "NULL") << "\n";
     }
 
-    // if (opt_params_.lambda_T_inside_ > 0.0f) {
-    //     auto it = render_pkg.find("raw_T");
-    //     if (it != render_pkg.end() && it->second.defined()) {
-    //         // raw_T has shape (…, H, W); same as in Python
-    //         torch::Tensor reg = it->second.pow(2).mean();
-    //         loss = loss + opt_params_.lambda_T_inside_ * reg;
-    //     } else {
-    //         // We expected raw_T because we requested output_T above
-    //         std::cerr << "[warn] raw_T not in render_pkg (output_T might be off)\n";
-    //     }
-    // }
+    if (opt_params_.lambda_T_inside_ > 0.0f) {
+        auto it = render_pkg.find("raw_T");
+        if (it != render_pkg.end() && it->second.defined()) {
+            // raw_T has shape (…, H, W); same as in Python
+            torch::Tensor reg = it->second.pow(2).mean();
+            loss = loss + opt_params_.lambda_T_inside_ * reg;
+        } else {
+            // We expected raw_T because we requested output_T above
+            std::cerr << "[warn] raw_T not in render_pkg (output_T might be off)\n";
+        }
+    }
 
     voxel_model_->optimizerZeroGrad();   // move this BEFORE backward
     {
@@ -1319,11 +1322,11 @@ void VoxelMapper::trainForOneIteration()
         loss.backward();
     }
 
-    // if (opt_params_.lambda_tv_density_ > 0.f &&
-    //     iter >= opt_params_.tv_from_ &&
-    //     iter <= opt_params_.tv_until_) {
-    //     voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
-    // }
+    if (opt_params_.lambda_tv_density_ > 0.f &&
+        iter >= opt_params_.tv_from_ &&
+        iter <= opt_params_.tv_until_) {
+        voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
+    }
 
     voxel_model_->optimizerStep();   // <-- the actual update
 
@@ -1344,7 +1347,7 @@ void VoxelMapper::trainForOneIteration()
 
         if (need_pruning || need_subdividing)
         {
-            // Build list of training cameras (use all current keyframes)
+            // // Build list of training cameras (use all current keyframes)
             std::vector<sv::MiniCam> tr_cams; 
             tr_cams.reserve(scene_->keyframes().size());
             std::cout << "keyframes size: " << scene_->keyframes().size() << std::endl;
@@ -1354,9 +1357,12 @@ void VoxelMapper::trainForOneIteration()
                 // std::cout << "image_height_ : " << kv.second->image_height_ << std::endl;
                 if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
             }
-
+            
             // Compute statistics once (max_w, min_samp_interval, view_cnt)
             // std::cout << "length of training cams: " << tr_cams.size() << std::endl;
+
+            // tr_cams.reserve(1);
+            // tr_cams.push_back(cam);
             auto stat = voxel_model_->computeTrainingStat(tr_cams);
             py::object sched_state = voxel_model_->schedulerStateDict();
 
@@ -1375,10 +1381,11 @@ void VoxelMapper::trainForOneIteration()
                 const float prune_thres = (iter <= a0) ? t0 :
                                         (iter >= a1) ? t1 :
                                         (t0 + (t1 - t0) * float(iter - a0) / float(std::max(1, a1 - a0)));
+                // float prune_thres = t0;
 
                 const int ori_n = voxel_model_->numVoxels();
                 auto prune_mask = (stat.max_w < prune_thres).squeeze(1); // [N] bool
-
+                
                 const int n_can   = stat.max_w.size(0);
                 const int n_prune = (int)(prune_mask.defined()? prune_mask.sum().item<int64_t>() : -1);
                 std::cout << "[PRUNE:prep] thresh=" << prune_thres
@@ -1553,6 +1560,7 @@ void VoxelMapper::trainForOneIteration()
     }
     // Update learning rate
     voxel_model_->schedulerStep();
+    
     if (mDevice == torch::kCUDA) torch::cuda::synchronize();
 
     {
@@ -1711,7 +1719,15 @@ void VoxelMapper::combineMappingOperations()
             // ++next_batch_index_;
             //  voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
                 // py::object sched_state = voxel_model_->schedulerStateDict();
-                voxel_model_->increasePcd(points, colors, getIteration());
+
+                // Build training camera list from the keyframes we keep in the scene
+                std::vector<sv::MiniCam> tr_cams;
+                tr_cams.reserve(scene_->keyframes().size());
+                for (auto& kv : scene_->keyframes()) {
+                    if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
+                }
+                voxel_model_->increasePcd(points, colors, getIteration(), tr_cams);
+
                 // voxel_model_->createTrainer(
                 //                             opt_params_.geo_lr_,
                 //                             opt_params_.sh0_lr_,

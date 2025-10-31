@@ -304,6 +304,25 @@ target_include_directories(voxel_viewer
 #     gaussian_mapper
 #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+add_executable(replica_mono_voxel examples/replica_mono_voxel.cpp)
+target_include_directories(replica_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel      # <‑‑ header path
+        pybind11::embed
+)
+target_link_libraries(replica_mono_voxel
+        voxel_core          # lib that implements LiveVoxelTrainer
+        voxel_viewer
+        # gaussian_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(replica_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # # TUM Monocular
 # add_executable(tum_mono examples/tum_mono.cpp)
 # target_link_libraries(tum_mono
@@ -332,12 +351,20 @@ set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# # TUM RGBD
-# add_executable(tum_rgbd examples/tum_rgbd.cpp)
-# target_link_libraries(tum_rgbd
-#     gaussian_viewer    
-#     gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# TUM RGBD
+add_executable(tum_rgbd_voxel examples/tum_rgbd_voxel.cpp)
+target_link_libraries(tum_rgbd_voxel
+        voxel_core          # lib that implements LiveVoxelTrainer
+        voxel_viewer
+        # gaussian_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(tum_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # # EuRoC Stereo
 # add_executable(euroc_stereo examples/euroc_stereo.cpp)

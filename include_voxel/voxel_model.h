@@ -61,12 +61,6 @@
 // namespace py = pybind11;
 namespace sv {
 
-struct TrainingStat {
-  torch::Tensor max_w;             // (N,1)
-  torch::Tensor min_samp_interval; // (N,1)
-  torch::Tensor view_cnt;          // (N,1)
-};
-
 class VoxelModel 
 {
 public:
@@ -83,8 +77,8 @@ public:
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
 
-    void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd);
-    void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration);
+    void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams);
+    void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration, const std::vector<sv::MiniCam>& cams);
     // void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
 
     // ───────── Optimizer setup ─────────
@@ -237,13 +231,14 @@ public:
     torch::Tensor scene_min_t_;      // [3], CUDA
     torch::Tensor vox_eff_;      // [1,1], CUDA (effective voxel size for fixed level)
     int8_t  octlevel_ = 0; 
+    torch::Tensor inside_extent_; // [1], CUDA
 
     float global_scene_extent_ = 200.0f;  // example: 200 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
     float fixed_vox_size_ = 0.05f;        // your chosen voxel size
 
     bool   fill_empty_cells_ = true;
-    int64_t max_artifact_cells_ = 200000; // safety cap
+    int64_t max_artifact_cells_ = 150000; // safety cap
     std::array<float,3> artifact_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
 
     torch::Tensor bb_min_viz, bb_max_viz, sel_artifacts_viz, ijk_box_viz;

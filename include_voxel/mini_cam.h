@@ -16,7 +16,7 @@ struct MiniCam {
     float cy      = 0.f;
     float tanfovx = 0.f;        
     float tanfovy = 0.f;      
-    float near    = 0.02f;
+    float near    = 0.01f;
     std::string cam_mode = "persp";
     int   frame_id = -1;
 };

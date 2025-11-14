@@ -1,0 +1,59 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters (Mega-NeRF building-pixsfm)
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+Camera.newWidth: 1536
+Camera.newHeight: 1152
+
+# Camera calibration and distortion parameters (OpenCV)
+Camera1.fx: 2981.551270
+Camera1.fy: 2981.551270
+Camera1.cx: 2304.000000
+Camera1.cy: 1728.000000
+
+# If Mega-NeRF images are rectified, leave distortion as zeros
+Camera1.k1: 0.0
+Camera1.k2: 0.0
+Camera1.k3: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+
+# Camera frames per second (estimated or defaulted)
+Camera.fps: 10
+
+# Color order of the images (0: BGR, 1: RGB)
+# Your runner converts BGR->RGB before TrackMonocular, so keep 1
+Camera.RGB: 1
+
+# Camera resolution
+Camera.width: 4608
+Camera.height: 3456
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters (keep Photo-SLAM defaults unless you need to tune)
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 2000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+

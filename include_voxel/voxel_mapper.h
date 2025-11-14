@@ -70,16 +70,18 @@ enum SystemSensorType {
     RGBD = 3
 };
 
-// struct VariableParameters {
-//     float position_lr_init;
-//     float lambda_photo;
-//     float lambda_dssim;
-//     int new_kf_times_of_use;
-//     int   stable_num_iter_existence;
-
-//     bool  keep_training;
-//     bool  do_inactive_geo_densify;
-// };
+ struct VariableParameters
+ {
+     float geo_lr;
+     float sh0_lr;
+     float shs_lr;
+     float lambda_dssim;
+     int densify_interval;
+     int new_kf_times_of_use;
+     int stable_num_iter_existence; ///< loop closure correction
+     bool keep_training;
+     bool do_gaus_pyramid_training;
+ };
 
 class VoxelMapper {
 public:
@@ -112,6 +114,7 @@ public:
     int  getIteration();
     void increaseIteration(const int inc=1);
     
+    float geoLearningRateInit();
     float sh0LearningRate();
     float shsLearningRate();
     float lambdaDssim();
@@ -119,17 +122,20 @@ public:
     int newKeyframeTimesOfUse();
     bool isKeepingTraining();
     int stableNumIterExistence();
-    bool isdoingInactiveGeoDensify();
     bool isdoingGausPyramidTraining();
 
-    void setGeoLearningRateInit(const float lr);
+    void setgeoLearningRateInit(const float lr);
+    void setsh0LearningRate(const float lr);
+    void setshsLearningRate(const float lr);
+    void setLambdaDssim(const float lambda_dssim);
+    void setDensifyInterval(const int interval);
+    void setNewKeyframeTimesOfUse(const int times);
+    void setKeepTraining(const bool keep);
+    void setStableNumIterExistence(const int niter);
+    void setDoGausPyramidTraining(const bool gaus_pyramid);
 
-    // VariableParameters getVariableParameters() const;
-    // void setVariableParameters(const VariableParameters& p);
-
-    // void setKeepTraining(const bool keep);
-
-    std::shared_ptr<sv::VoxelTrainer> getTrainer() const;
+    VariableParameters getVaribleParameters();
+    void setVaribleParameters(const VariableParameters& params);
 
 protected:    
     // SLAM‑pipeline logic -----------------------------------------------------

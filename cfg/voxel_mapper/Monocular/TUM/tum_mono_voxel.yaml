@@ -14,6 +14,7 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 ##############################################################################
 
 Camera.z_near: 0.01
+Camera.z_far: 100.0
 
 Mapper.min_num_initial_map_kfs:        20
 Mapper.new_keyframe_times_of_use:      2 #8 #2
@@ -22,6 +23,7 @@ Mapper.loop_closure_increased_times_of_use_: 2
 Mapper.cull_keyframes:                 0
 Mapper.large_rotation_threshold: 30.0 #20.0 #30.0 #10.0 #
 Mapper.large_translation_threshold: 1.0 #0.5 #1.0 #0.1 #
+Mapper.stable_num_iter_existence: 1
 
 GausPyramid.do: 1  # 0:false, 1 or other integer:true
 GausPyramid.num_sub_levels: 2
@@ -42,18 +44,16 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 ##############################################################################
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups (match train.py)
-Optimization.geo_lr: 0.1 #0.025 # very important 4x better than 8x
-Optimization.sh0_lr: 0.04 #0.010 # very important
-Optimization.shs_lr: 0.001 #0.00025 #important
-
+Optimization.geo_lr: 0.05 #0.1 #0.025 # very important 4x better than 8x
+Optimization.sh0_lr: 0.010 #0.04 #0.010 # very important
+Optimization.shs_lr: 0.00025 #0.001 #0.00025 #important
 # Optimizer hyper-params (match svraster cfg.optimizer)
 Optimization.optim_beta1: 0.1
 Optimization.optim_beta2: 0.99
 Optimization.optim_eps: 1e-15
-
 # MultiStep LR decay (like torch.optim.lr_scheduler.MultiStepLR)
 # Use a YAML sequence for OpenCV FileStorage compatibility.
-Optimization.lr_decay_ckpt: [19000] # [24]
+Optimization.lr_decay_ckpt: [1600] #[19000] # [24]
 Optimization.lr_decay_mult: 0.1
 
 # Photometric loss blend used in your mapper (L1 + DSSIM)
@@ -62,19 +62,19 @@ Optimization.lambda_dssim: 0.2
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 800
-Optimization.adapt_every: 800
+Optimization.adapt_from: 300
+Optimization.adapt_every: 300
 # Pruning
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.0001
-Optimization.prune_thres_final: 0.05 #0.15
+Optimization.prune_thres_final: 0.15 #0.05 #0.15
 
 # Subdivision
 Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
 Optimization.subdivide_samp_thres: 1.0 #0.7 #1.0
 Optimization.subdivide_prop: 0.05 #0.1 #0.05
-Optimization.subdivide_max_num: 3000000 #10000000
+Optimization.subdivide_max_num: 10000000 #3000000 #10000000
 
 Optimization.lambda_tv_density: 0 #1e-10
 Optimization.tv_from: 0
@@ -89,8 +89,8 @@ Optimization.lambda_T_inside: 0 #0.01 #axristo
 # Viewer Parameters
 #--------------------------------------------------------------------------------------------
 
-VoxelViewer.glfw_window_width: 1400
-VoxelViewer.glfw_window_height: 1050
+VoxelViewer.glfw_window_width: 1400 #1600
+VoxelViewer.glfw_window_height: 1050 #900
 VoxelViewer.image_scale: 0.5
 VoxelViewer.image_scale_main: 1.0
 VoxelViewer.camera_watch_dist: 0.000001

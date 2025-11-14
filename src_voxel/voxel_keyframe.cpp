@@ -76,8 +76,8 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     {
         float focal_length_x = static_cast<float>(camera.params_[0]);
         float focal_length_y = static_cast<float>(camera.params_[1]);
-        this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
-        this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
+        // this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
+        // this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
         this->set_camera_ = true;
         // std::cout << "voxel_keyframe.cpp: setCameraParams() Pinhole camera model with FoVx: "
         //           << this->FoVx_ << " and FoVy: " << this->FoVy_ << std::endl;
@@ -218,5 +218,6 @@ sv::MiniCam VoxelKeyframe::toMiniCam(int im_height, int im_width) const
                             w2c_eig, torch::kCPU);      // keep on CPU
     // std::cout << "voxel_keyframe.cpp: toMiniCam() FoVx_ = " << FoVx_ << std::endl;
 
-    return sv::fromCamera(cam_, c2w, im_height, im_width, static_cast<int>(fid_));
+    // return sv::fromCamera(cam_, c2w, im_height, im_width, static_cast<int>(fid_));
+    return sv::ToMiniCam(cam_, c2w, im_height, im_width, static_cast<int>(fid_));
 }

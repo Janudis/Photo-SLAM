@@ -36,7 +36,7 @@ namespace cg = cooperative_groups;
 namespace FORWARD {
 
 // CUDA sparse voxel rendering.
-template <bool need_feat, bool need_depth, bool need_distortion, bool need_normal, bool track_max_w,
+template <bool need_depth, bool need_distortion, bool need_normal, bool track_max_w,
           int n_samp>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -46,8 +46,7 @@ renderCUDA(
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* __restrict__ c2w_matrix,
-    const float3* __restrict__ background,
-    const int cam_mode,
+    const float bg_color,
 
     const uint2* __restrict__ bboxes,
     const float3* __restrict__ vox_centers,
@@ -62,11 +61,7 @@ renderCUDA(
     float* __restrict__ out_depth,
     float* __restrict__ out_normal,
     float* __restrict__ out_T,
-    float* __restrict__ max_w,
-
-    const int feat_dim,
-    const float* __restrict__ feats,
-    float* __restrict__ out_feat)
+    float* __restrict__ max_w)
 {
     // Identify current tile and associated min/max pixel range.
     auto block = cg::this_thread_block();
@@ -105,27 +100,13 @@ renderCUDA(
     // Compute camera info.
     float3 ro, rd, rd_inv;
     float rd_norm_inv;
-    if (cam_mode == CAM_ORTHO)
-    {
-        const float3 lookat = third_col_3x4(c2w_matrix);
-        rd = lookat;
-        rd_inv = {1.f/ rd.x, 1.f / rd.y, 1.f / rd.z};
-        rd_norm_inv = 1.f;
-
-        const float3 cam_rd = compute_ray_d(pixf, W, H, tan_fovx, tan_fovy, cx, cy);
-        const float3 cam_ro = make_float3(cam_rd.x, cam_rd.y, 0.f);
-        ro = transform_3x4(c2w_matrix, cam_ro);
-    }
-    else
-    {
-        const float3 cam_rd = compute_ray_d(pixf, W, H, tan_fovx, tan_fovy, cx, cy);
-        const float rd_norm = sqrtf(dot(cam_rd, cam_rd));
-        const float3 rd_raw = rotate_3x4(c2w_matrix, cam_rd);
-        rd_norm_inv = 1.f / rd_norm;
-        ro = last_col_3x4(c2w_matrix);
-        rd = rd_raw * rd_norm_inv;
-        rd_inv = {1.f/ rd.x, 1.f / rd.y, 1.f / rd.z};
-    }
+    const float3 cam_rd = compute_ray_d(pixf, W, H, tan_fovx, tan_fovy, cx, cy);
+    const float rd_norm = sqrtf(dot(cam_rd, cam_rd));
+    const float3 rd_raw = rotate_3x4(c2w_matrix, cam_rd);
+    rd_norm_inv = 1.f / rd_norm;
+    ro = last_col_3x4(c2w_matrix);
+    rd = rd_raw * rd_norm_inv;
+    rd_inv = {1.f/ rd.x, 1.f / rd.y, 1.f / rd.z};
 
     const uint32_t pix_quad_id = compute_ray_quadrant_id(rd);
 
@@ -168,8 +149,6 @@ renderCUDA(
     float D_med = 0.f;
     float Ddist = 0.f;
     int j_lst[BLOCK_SIZE];
-
-    float feat[MAX_FEAT_DIM] = {0.f};
 
     // Iterate over batches until all done or range is complete.
     for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -276,12 +255,6 @@ renderCUDA(
             // Accumulate to the pixel.
             float pt_w = T * alpha;
             C = C + pt_w * collected_rgb[j];
-
-            if (need_feat)
-            {
-                for (int k=0; k<feat_dim; ++k)
-                    feat[k] += pt_w * feats[vox_id*feat_dim + k];
-            }
 
             if (need_depth)
             {
@@ -394,18 +367,11 @@ renderCUDA(
     // rendering data to the frame and auxiliary buffers.
     if (inside)
     {
-        const float3 bg_color = *(background);
-
         n_contrib[pix_id] = last_contributor;
-        out_color[0 * H * W + pix_id] = C.x + T * bg_color.x;
-        out_color[1 * H * W + pix_id] = C.y + T * bg_color.y;
-        out_color[2 * H * W + pix_id] = C.z + T * bg_color.z;
+        out_color[0 * H * W + pix_id] = C.x + T * bg_color;
+        out_color[1 * H * W + pix_id] = C.y + T * bg_color;
+        out_color[2 * H * W + pix_id] = C.z + T * bg_color;
         out_T[pix_id] = T;  // Equal to (1 - alpha).
-        if (need_feat)
-        {
-            for (int k=0; k<feat_dim; ++k)
-                out_feat[k * H * W + pix_id] = feat[k];
-        }
         if (need_depth)
         {
             out_depth[pix_id] = D * rd_norm_inv;
@@ -430,69 +396,37 @@ renderCUDA(
 // Dirty trick. The argument name must be aligned with FORWARD::render.
 #define FwRendFunc(...) \
     ( \
-        (need_feat && need_depth && need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<true, true, true, true, true, __VA_ARGS__> :\
-        (need_feat && need_depth && need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<true, true, true, true, false, __VA_ARGS__> :\
-        (need_feat && need_depth && need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<true, true, true, false, true, __VA_ARGS__> :\
-        (need_feat && need_depth && need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<true, true, true, false, false, __VA_ARGS__> :\
-        (need_feat && need_depth && !need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<true, true, false, true, true, __VA_ARGS__> :\
-        (need_feat && need_depth && !need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<true, true, false, true, false, __VA_ARGS__> :\
-        (need_feat && need_depth && !need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<true, true, false, false, true, __VA_ARGS__> :\
-        (need_feat && need_depth && !need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<true, true, false, false, false, __VA_ARGS__> :\
-        (need_feat && !need_depth && need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<true, false, true, true, true, __VA_ARGS__> :\
-        (need_feat && !need_depth && need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<true, false, true, true, false, __VA_ARGS__> :\
-        (need_feat && !need_depth && need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<true, false, true, false, true, __VA_ARGS__> :\
-        (need_feat && !need_depth && need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<true, false, true, false, false, __VA_ARGS__> :\
-        (need_feat && !need_depth && !need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<true, false, false, true, true, __VA_ARGS__> :\
-        (need_feat && !need_depth && !need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<true, false, false, true, false, __VA_ARGS__> :\
-        (need_feat && !need_depth && !need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<true, false, false, false, true, __VA_ARGS__> :\
-        (need_feat && !need_depth && !need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<true, false, false, false, false, __VA_ARGS__> :\
-        (!need_feat && need_depth && need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<false, true, true, true, true, __VA_ARGS__> :\
-        (!need_feat && need_depth && need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<false, true, true, true, false, __VA_ARGS__> :\
-        (!need_feat && need_depth && need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<false, true, true, false, true, __VA_ARGS__> :\
-        (!need_feat && need_depth && need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<false, true, true, false, false, __VA_ARGS__> :\
-        (!need_feat && need_depth && !need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<false, true, false, true, true, __VA_ARGS__> :\
-        (!need_feat && need_depth && !need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<false, true, false, true, false, __VA_ARGS__> :\
-        (!need_feat && need_depth && !need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<false, true, false, false, true, __VA_ARGS__> :\
-        (!need_feat && need_depth && !need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<false, true, false, false, false, __VA_ARGS__> :\
-        (!need_feat && !need_depth && need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<false, false, true, true, true, __VA_ARGS__> :\
-        (!need_feat && !need_depth && need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<false, false, true, true, false, __VA_ARGS__> :\
-        (!need_feat && !need_depth && need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<false, false, true, false, true, __VA_ARGS__> :\
-        (!need_feat && !need_depth && need_distortion && !need_normal && !track_max_w) ?\
-            renderCUDA<false, false, true, false, false, __VA_ARGS__> :\
-        (!need_feat && !need_depth && !need_distortion && need_normal && track_max_w) ?\
-            renderCUDA<false, false, false, true, true, __VA_ARGS__> :\
-        (!need_feat && !need_depth && !need_distortion && need_normal && !track_max_w) ?\
-            renderCUDA<false, false, false, true, false, __VA_ARGS__> :\
-        (!need_feat && !need_depth && !need_distortion && !need_normal && track_max_w) ?\
-            renderCUDA<false, false, false, false, true, __VA_ARGS__> :\
-            renderCUDA<false, false, false, false, false, __VA_ARGS__> \
+        (need_depth && need_distortion && need_normal && track_max_w) ?\
+            renderCUDA<true, true, true, true, __VA_ARGS__> :\
+        (need_depth && need_distortion && need_normal && !track_max_w) ?\
+            renderCUDA<true, true, true, false, __VA_ARGS__> :\
+        (need_depth && need_distortion && !need_normal && track_max_w) ?\
+            renderCUDA<true, true, false, true, __VA_ARGS__> :\
+        (need_depth && need_distortion && !need_normal && !track_max_w) ?\
+            renderCUDA<true, true, false, false, __VA_ARGS__> :\
+        (need_depth && !need_distortion && need_normal && track_max_w) ?\
+            renderCUDA<true, false, true, true, __VA_ARGS__> :\
+        (need_depth && !need_distortion && need_normal && !track_max_w) ?\
+            renderCUDA<true, false, true, false, __VA_ARGS__> :\
+        (need_depth && !need_distortion && !need_normal && track_max_w) ?\
+            renderCUDA<true, false, false, true, __VA_ARGS__> :\
+        (need_depth && !need_distortion && !need_normal && !track_max_w) ?\
+            renderCUDA<true, false, false, false, __VA_ARGS__> :\
+        (!need_depth && need_distortion && need_normal && track_max_w) ?\
+            renderCUDA<false, true, true, true, __VA_ARGS__> :\
+        (!need_depth && need_distortion && need_normal && !track_max_w) ?\
+            renderCUDA<false, true, true, false, __VA_ARGS__> :\
+        (!need_depth && need_distortion && !need_normal && track_max_w) ?\
+            renderCUDA<false, true, false, true, __VA_ARGS__> :\
+        (!need_depth && need_distortion && !need_normal && !track_max_w) ?\
+            renderCUDA<false, true, false, false, __VA_ARGS__> :\
+        (!need_depth && !need_distortion && need_normal && track_max_w) ?\
+            renderCUDA<false, false, true, true, __VA_ARGS__> :\
+        (!need_depth && !need_distortion && need_normal && !track_max_w) ?\
+            renderCUDA<false, false, true, false, __VA_ARGS__> :\
+        (!need_depth && !need_distortion && !need_normal && track_max_w) ?\
+            renderCUDA<false, false, false, true, __VA_ARGS__> :\
+            renderCUDA<false, false, false, false, __VA_ARGS__> \
     )
 #endif
 
@@ -502,14 +436,12 @@ void render(
     const dim3 tile_grid, const dim3 block,
     const uint2* ranges,
     const uint32_t* vox_list,
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     int W, int H,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* c2w_matrix,
-    const float3* background,
-    const int cam_mode,
+    const float bg_color,
     const bool need_depth,
     const bool need_distortion,
     const bool need_normal,
@@ -527,22 +459,16 @@ void render(
     float* out_depth,
     float* out_normal,
     float* out_T,
-    float* max_w,
-
-    const int feat_dim,
-    const float* feats,
-    float* out_feat)
+    float* max_w)
 {
-    const bool need_feat = (feat_dim > 0);
     const bool track_max_w = (max_w != nullptr);
 
-    // The density_mode now is always EXP_LINEAR_11_MODE
     const auto kernel_func =
-        (vox_geo_mode == VOX_TRIINTERP1_MODE) ?
-            FwRendFunc(1) :
-        (vox_geo_mode == VOX_TRIINTERP3_MODE) ?
+        (n_samp_per_vox == 3) ?
             FwRendFunc(3) :
-            FwRendFunc(2) ;
+        (n_samp_per_vox == 2) ?
+            FwRendFunc(2) :
+            FwRendFunc(1) ;
 
     kernel_func <<<tile_grid, block>>> (
         ranges,
@@ -551,8 +477,7 @@ void render(
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix,
-        background,
-        cam_mode,
+        bg_color,
 
         bboxes,
         vox_centers,
@@ -567,11 +492,7 @@ void render(
         out_depth,
         out_normal,
         out_T,
-        max_w,
-
-        feat_dim,
-        feats,
-        out_feat);
+        max_w);
 }
 
 
@@ -682,15 +603,13 @@ int rasterize_voxels_procedure(
     std::function<char* (size_t)> binningBuffer,
     std::function<char* (size_t)> imageBuffer,
     const int P,
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int width, const int height,
     const float tan_fovx, const float tan_fovy,
     const float cx, float cy,
     const float* w2c_matrix,
     const float* c2w_matrix,
-    const float* background,
-    const int cam_mode,
+    const float bg_color,
     const bool need_depth,
     const bool need_distortion,
     const bool need_normal,
@@ -706,10 +625,6 @@ int rasterize_voxels_procedure(
     float* out_normal,
     float* out_T,
     float* max_w,
-
-    const int feat_dim,
-    const float* feats,
-    float* out_feat,
 
     bool debug)
 {
@@ -789,14 +704,12 @@ int rasterize_voxels_procedure(
         tile_grid, block,
         imgState.ranges,
         binningState.vox_list,
-        vox_geo_mode,
-        density_mode,
+        n_samp_per_vox,
         width, height,
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix,
-        (float3*)background,
-        cam_mode,
+        bg_color,
         need_depth,
         need_distortion,
         need_normal,
@@ -814,11 +727,7 @@ int rasterize_voxels_procedure(
         out_depth,
         out_normal,
         out_T,
-        max_w,
-
-        feat_dim,
-        feats,
-        out_feat);
+        max_w);
     CHECK_CUDA(debug);
 
     return num_rendered;
@@ -826,17 +735,15 @@ int rasterize_voxels_procedure(
 
 
 // Interface for python to run forward rasterization.
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels(
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int image_width, const int image_height,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const torch::Tensor& background,
-    const int cam_mode,
+    const float bg_color,
     const bool need_depth,
     const bool need_distortion,
     const bool need_normal,
@@ -847,7 +754,6 @@ rasterize_voxels(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
-    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
 
@@ -857,10 +763,6 @@ rasterize_voxels(
         AT_ERROR("vox_centers must have dimensions (num_points, 3)");
     if (rgbs.ndimension() != 2 || rgbs.size(1) != 3)
         AT_ERROR("rgbs should be either (num_points, 3)");
-    if (feats.ndimension() != 2)
-        AT_ERROR("feats should be either (num_points, n_dim)");
-    if (feats.size(1) > MAX_FEAT_DIM)
-        AT_ERROR("feats dimension out of maximum");
     if (vox_centers.size(0) != rgbs.size(0))
         AT_ERROR("size mismatch");
 
@@ -868,7 +770,8 @@ rasterize_voxels(
     const int H = image_height;
     const int W = image_width;
 
-    auto float_opts = vox_centers.options().dtype(torch::kFloat32);
+    auto float_opts = torch::TensorOptions(torch::kFloat32).device(torch::kCUDA);
+    auto byte_opts = torch::TensorOptions(torch::kByte).device(torch::kCUDA);
 
     torch::Tensor out_color = torch::full({3, H, W}, 0.f, float_opts);
     torch::Tensor out_depth = need_depth || need_distortion ? torch::full({3, H, W}, 0.f, float_opts) : torch::empty({0});
@@ -876,13 +779,8 @@ rasterize_voxels(
     torch::Tensor out_T = torch::full({1, H, W}, 0.f, float_opts);
     torch::Tensor max_w = track_max_w ? torch::full({P, 1}, 0.f, float_opts) : torch::empty({0});
 
-    const int feat_dim = feats.size(1);
-    torch::Tensor out_feat = torch::full({feat_dim, H, W}, 0.f, float_opts);
-
-    torch::Device device(torch::kCUDA);
-    torch::TensorOptions options(torch::kByte);
-    torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-    torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+    torch::Tensor binningBuffer = torch::empty({0}, byte_opts);
+    torch::Tensor imgBuffer = torch::empty({0}, byte_opts);
     std::function<char*(size_t)> binningFunc = RASTER_STATE::resizeFunctional(binningBuffer);
     std::function<char*(size_t)> imgFunc = RASTER_STATE::resizeFunctional(imgBuffer);
 
@@ -897,16 +795,14 @@ rasterize_voxels(
             binningFunc,
             imgFunc,
             P,
-            vox_geo_mode,
-            density_mode,
+            n_samp_per_vox,
 
             W, H,
             tan_fovx, tan_fovy,
             cx, cy,
             w2c_matrix.contiguous().data_ptr<float>(),
             c2w_matrix.contiguous().data_ptr<float>(),
-            background.contiguous().data_ptr<float>(),
-            cam_mode,
+            bg_color,
             need_depth,
             need_distortion,
             need_normal,
@@ -923,13 +819,9 @@ rasterize_voxels(
             out_T.contiguous().data_ptr<float>(),
             max_w_pointer,
 
-            feat_dim,
-            feats.contiguous().data_ptr<float>(),
-            out_feat.contiguous().data_ptr<float>(),
-
             debug);
 
-    return std::make_tuple(rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w, out_feat);
+    return std::make_tuple(rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w);
 }
 
 }

@@ -54,6 +54,19 @@ find_package(OpenGL REQUIRED)
 find_package(glm REQUIRED)
 find_package(glfw3 REQUIRED)
 
+# --- Glue for RealSense config expecting bare 'fastcdr'/'fastrtps' targets ---
+find_package(fastrtps QUIET)
+if (fastrtps_FOUND AND NOT TARGET fastrtps)
+    add_library(fastrtps INTERFACE IMPORTED)
+    target_link_libraries(fastrtps INTERFACE fastrtps::fastrtps)
+endif()
+
+find_package(FastCDR QUIET)
+if (FastCDR_FOUND AND NOT TARGET fastcdr)
+    add_library(fastcdr INTERFACE IMPORTED)
+    target_link_libraries(fastcdr INTERFACE FastCDR::fastcdr)
+endif()
+# ---------------------------------------------------------------------------
 find_package(realsense2)
 
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
@@ -236,6 +249,36 @@ target_link_libraries(imgui glfw OpenGL::GL)
 #             ${Python3_INCLUDE_DIRS})
 # target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
 
+add_library(cuda_voxel_rasterizer SHARED
+    cuda_voxel_rasterizer/auxiliary.h
+    cuda_voxel_rasterizer/backward.cu
+    cuda_voxel_rasterizer/backward.h
+    cuda_voxel_rasterizer/config.h
+    cuda_voxel_rasterizer/forward.cu
+    cuda_voxel_rasterizer/forward.h
+    cuda_voxel_rasterizer/adam_step.h
+    cuda_voxel_rasterizer/adam_step.cu
+    cuda_voxel_rasterizer/geo_params_gather.h
+    cuda_voxel_rasterizer/geo_params_gather.cu
+    cuda_voxel_rasterizer/preprocess.h
+    cuda_voxel_rasterizer/preprocess.cu
+    cuda_voxel_rasterizer/raster_state.h
+    cuda_voxel_rasterizer/raster_state.cu
+    cuda_voxel_rasterizer/sh_compute.h
+    cuda_voxel_rasterizer/sh_compute.cu
+    cuda_voxel_rasterizer/tv_compute.h
+    cuda_voxel_rasterizer/tv_compute.cu
+    cuda_voxel_rasterizer/utils.h
+    cuda_voxel_rasterizer/utils.cu)
+set_target_properties(cuda_voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "75;86")
+# target_compile_features(cuda_voxel_rasterizer PUBLIC cxx_std_17)
+target_include_directories(cuda_voxel_rasterizer PRIVATE
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+target_link_libraries(cuda_voxel_rasterizer
+    glm::glm
+    "${TORCH_LIBRARIES}"
+    Eigen3::Eigen)
+
 ### 3.2  C++ core / optimiser  ---------------------------------------
 add_library(voxel_core
         src_voxel/voxel_trainer.cpp
@@ -244,6 +287,10 @@ add_library(voxel_core
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
+        src_voxel/voxel_rasterizer.cpp
+        src_voxel/svraster_utils.cpp
+        src_voxel/voxel_renderer.cpp
+        include_voxel/opt_sched.hpp
         third_party/tinyply/tinyply.h
         third_party/tinyply/tinyply.cpp)
         
@@ -255,7 +302,7 @@ target_include_directories (voxel_core
             ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
 target_link_libraries (voxel_core
         PUBLIC
-            # voxel_rasterizer           # call kernels directly if needed
+            cuda_voxel_rasterizer           # call kernels directly if needed
             "${TORCH_LIBRARIES}"
             Python3::Python
             pybind11::embed
@@ -272,7 +319,7 @@ add_library(voxel_viewer SHARED
 target_link_libraries(voxel_viewer
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
     voxel_core      # <-- Make sure voxel_core is linked
-    # voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
+    # cuda_voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
     imgui
     ${OpenCV_LIBRARIES}
     jsoncpp_lib
@@ -291,6 +338,7 @@ target_include_directories(voxel_viewer
 ##################################################################################
 
 # # Replica Monocular
+
 # add_executable(replica_mono examples/replica_mono.cpp)
 # target_link_libraries(replica_mono
 #     gaussian_viewer    
@@ -373,18 +421,32 @@ set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 #     gaussian_mapper
 #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+# # meganerf
+add_executable(meganerf_mono examples/meganerf_mono.cpp)
+target_link_libraries(meganerf_mono
+        voxel_core          # lib that implements LiveVoxelTrainer
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(meganerf_mono PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
 
 # Intel Realsense
 if(realsense2_FOUND)
-    add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
-    target_include_directories(realsense_rgbd PUBLIC
+    add_executable(realsense_rgbd_voxel examples/realsense_rgbd_voxel.cpp)
+    target_include_directories(realsense_rgbd_voxel PUBLIC
         ${realsense_INCLUDE_DIR})
-    target_link_libraries(realsense_rgbd
-        gaussian_viewer    
-        gaussian_mapper
+    target_link_libraries(realsense_rgbd_voxel
+        voxel_core         
+        voxel_viewer
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-        ${realsense2_LIBRARY})
+        realsense2::realsense2)  # use the imported target
 endif()

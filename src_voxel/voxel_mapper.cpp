@@ -2,8 +2,8 @@
 #include <limits>
 #include <cmath>
 #include <iomanip>
-#include <mutex>
 #include <regex>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 namespace py = pybind11;
 std::ofstream loss_log_;
@@ -117,25 +117,25 @@ static inline void extendAABB_with_flat_xyz(Eigen::Vector3f& mn, Eigen::Vector3f
     }
 }
 
-namespace {
+// namespace {
 
-std::mutex g_dumpkf_mutex;
+// std::mutex g_dumpkf_mutex;
 
-static void saveKfPng_fromFloatRGB(const cv::Mat& im_float_rgb,   // CV_32FC3 in [0..1] RGB
-                                   int fid,
-                                   const std::filesystem::path& imgs_dir)
-{
-    // convert float[0..1] RGB -> 8-bit BGR
-    cv::Mat tmp8, bgr8;
-    im_float_rgb.convertTo(tmp8, CV_8UC3, 255.0);
-    cv::cvtColor(tmp8, bgr8, cv::COLOR_RGB2BGR);
-    std::ostringstream oss;
-    oss << "kf_" << fid << ".png";
-    const auto img_path = (imgs_dir / oss.str()).string();
-    bool ok = cv::imwrite(img_path, bgr8);
-    // std::cout << "[saveKfPng] " << img_path << " ok=" << std::boolalpha << ok
-    //           << " mean(BGR)=" << cv::mean(bgr8) << std::endl;
-}
+// static void saveKfPng_fromFloatRGB(const cv::Mat& im_float_rgb,   // CV_32FC3 in [0..1] RGB
+//                                    int fid,
+//                                    const std::filesystem::path& imgs_dir)
+// {
+//     // convert float[0..1] RGB -> 8-bit BGR
+//     cv::Mat tmp8, bgr8;
+//     im_float_rgb.convertTo(tmp8, CV_8UC3, 255.0);
+//     cv::cvtColor(tmp8, bgr8, cv::COLOR_RGB2BGR);
+//     std::ostringstream oss;
+//     oss << "kf_" << fid << ".png";
+//     const auto img_path = (imgs_dir / oss.str()).string();
+//     bool ok = cv::imwrite(img_path, bgr8);
+//     // std::cout << "[saveKfPng] " << img_path << " ok=" << std::boolalpha << ok
+//     //           << " mean(BGR)=" << cv::mean(bgr8) << std::endl;
+// }
 
 // template<typename KFMap, typename CamContainer>
 // void dumpKeyframesForProjectionFile(const KFMap& kfmap,
@@ -183,7 +183,7 @@ static void saveKfPng_fromFloatRGB(const cv::Mat& im_float_rgb,   // CV_32FC3 in
 //     }
 //     // std::cout << "[dumpKF] wrote " << out_file << " (" << n_lines << " lines)\n";
 // }
-} // namespace
+// } // namespace
 
 inline void write_npy_float32(const std::string &path, const torch::Tensor &tensor)
 {
@@ -356,12 +356,12 @@ static void log_increase_batch_npy(
     int iter, int batch_idx)
 {
     if (points_flat.size() % 3 != 0 || colors_flat.size() % 3 != 0)
-        throw std::runtime_error("log_increase_batch_npy: flat vectors must be multiples of 3");
+        throw std::runtime_error("log_increase_batch: flat vectors must be multiples of 3");
 
     const int Np = (int)(points_flat.size() / 3);
     const int Nc = (int)(colors_flat.size() / 3);
     if (Np != Nc)
-        throw std::runtime_error("log_increase_batch_npy: points and colors count mismatch");
+        throw std::runtime_error("log_increase_batch: points and colors count mismatch");
 
     // Ensure .../batches exists (C++17)
     #if __has_include(<filesystem>)
@@ -564,6 +564,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
 {
     std::srand(seed);
     torch::manual_seed(seed);
+
     loss_log_.open("loss.csv", std::ios::out);
     loss_ssim_log_.open("loss_ssim.csv", std::ios::out);
     loss_l1_log_.open("loss_l1.csv", std::ios::out);
@@ -907,8 +908,8 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
 void VoxelMapper::run()
 {
     /* expose our helper scripts to the embedded Python side */
-    py::gil_scoped_acquire gil;
-    py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+    // py::gil_scoped_acquire gil;
+    // py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
 
     // First loop: Initial gaussian mapping
     while (!isStopped())
@@ -1233,7 +1234,7 @@ void VoxelMapper::trainForOneIteration()
     voxel_model_->setShDegree(default_sh_);
 
     // Use default super-sampling option (enable after 1000 iters)
-    if (iter > 200) {
+    if (iter > 500) {
         if (opt_params_.ss_aug_max_ > 1.0f) {
             static thread_local std::mt19937 rng{std::random_device{}()};
             std::uniform_real_distribution<float> dist(1.0f, opt_params_.ss_aug_max_);
@@ -1245,7 +1246,7 @@ void VoxelMapper::trainForOneIteration()
         ropts.ss = 1.0f;                           // disable supersampling at first
     }
     // ropts.ss = 1.0f;   
-    if (iter > 400 && opt_params_.lambda_dist_ > 0.0f) {
+    if (iter > 1000 && opt_params_.lambda_dist_ > 0.0f) {
         ropts.lambda_dist = opt_params_.lambda_dist_;
     }
 
@@ -1254,16 +1255,18 @@ void VoxelMapper::trainForOneIteration()
         ropts.gt_color = gt_image;
     }
 
-    if (opt_params_.lambda_T_inside_ > 0.0f) {
-        ropts.output_T = true;
-    }
+    // if (opt_params_.lambda_T_inside_ > 0.0f) {
+    //     ropts.output_T = true;
+    // }
 
     // ) build a MiniCam out of this keyframe
     // std::cout << "build minicam image size: " << image_width << "x" << image_height << std::endl;
     sv::MiniCam cam = viewpoint_cam->toMiniCam(image_height, image_width);
     // tr_cams.push_back(cam); // for densification later
     // std::cout << "ropts.track_max_w = " << ropts.track_max_w << std::endl;
-    auto render_pkg = voxel_model_->render(
+
+    sv::VoxelRenderer renderer(voxel_model_.get());
+    sv::RenderOutput render_pkg = renderer.render(
         cam,
         image_height,
         image_width,
@@ -1278,7 +1281,28 @@ void VoxelMapper::trainForOneIteration()
         /* use_auto_exp  */  false,
         ropts               // your struct (will be used for **other_opt-safe fields)
     );
-    if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
+
+    // auto render_pkg = voxel_model_->render(
+    //     cam,
+    //     image_height,
+    //     image_width,
+    //     /* gt_image   */  gt_image,            
+    //     /* color_mode   */   nullptr,             
+    //     /* track_max_w   */  true,
+    //     /* ss            */  std::nullopt,
+    //     /* output_depth  */  false,
+    //     /* output_normal */  false,
+    //     /* output_T      */  false,
+    //     /* rand_bg       */  false,
+    //     /* use_auto_exp  */  false,
+    //     ropts               // your struct (will be used for **other_opt-safe fields)
+    // );
+    
+    // if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
+    //     std::cout << "voxel_mapper render: pkg empty" << std::endl;
+    //     return;
+    // }
+    if (!render_pkg.color.defined() || render_pkg.color.numel() == 0) {
         std::cout << "voxel_mapper render: pkg empty" << std::endl;
         return;
     }
@@ -1288,7 +1312,8 @@ void VoxelMapper::trainForOneIteration()
     //         voxel_model_->max_w_, render_pkg["max_w"].to(mDevice));
     // }
 
-    torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
+    // torch::Tensor rendered_image = render_pkg["color"].to(mDevice);
+    torch::Tensor rendered_image = render_pkg.color.to(mDevice);
     torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
     // torch::Tensor masked_gt   = gt_image * mask;
 
@@ -1305,28 +1330,27 @@ void VoxelMapper::trainForOneIteration()
     }
 
     if (opt_params_.lambda_T_inside_ > 0.0f) {
-        auto it = render_pkg.find("raw_T");
-        if (it != render_pkg.end() && it->second.defined()) {
-            // raw_T has shape (…, H, W); same as in Python
-            torch::Tensor reg = it->second.pow(2).mean();
-            loss = loss + opt_params_.lambda_T_inside_ * reg;
+        const torch::Tensor& raw_T = render_pkg.raw_T;   // CHW or HW after resize
+        if (raw_T.defined() && raw_T.numel() > 0) {
+            torch::Tensor reg = raw_T.pow(2).mean();
+            // e.g., accumulate: loss += opt_params_.lambda_T_inside_ * reg;
         } else {
-            // We expected raw_T because we requested output_T above
-            std::cerr << "[warn] raw_T not in render_pkg (output_T might be off)\n";
+            std::cerr << "[warn] raw_T not available (did you call render with output_T=true?)\n";
         }
     }
 
     voxel_model_->optimizerZeroGrad();   // move this BEFORE backward
-    {
-        py::gil_scoped_release no_gil;
-        loss.backward();
-    }
+    // {
+    //     py::gil_scoped_release no_gil;
+    //     loss.backward();
+    // }
+    loss.backward();  
 
-    if (opt_params_.lambda_tv_density_ > 0.f &&
-        iter >= opt_params_.tv_from_ &&
-        iter <= opt_params_.tv_until_) {
-        voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
-    }
+    // if (opt_params_.lambda_tv_density_ > 0.f &&
+    //     iter >= opt_params_.tv_from_ &&
+    //     iter <= opt_params_.tv_until_) {
+    //     voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
+    // }
 
     voxel_model_->optimizerStep();   // <-- the actual update
 
@@ -1364,7 +1388,8 @@ void VoxelMapper::trainForOneIteration()
             // tr_cams.reserve(1);
             // tr_cams.push_back(cam);
             auto stat = voxel_model_->computeTrainingStat(tr_cams);
-            py::object sched_state = voxel_model_->schedulerStateDict();
+            // py::object sched_state = voxel_model_->schedulerStateDict();
+            auto sched_state = voxel_model_->schedulerStateDict();  // sv::optim::MultiStepLRState
 
             std::cout << "[densify:stat] N=" << voxel_model_->numVoxels()
                     << "  max_w=" << shp(stat.max_w)
@@ -1551,11 +1576,12 @@ void VoxelMapper::trainForOneIteration()
             );
             voxel_model_->schedulerLoadStateDict(sched_state);
             // Empty CUDA cache as SV does
-            {
-                py::gil_scoped_acquire gil;
-                py::module_ torch_mod = py::module_::import("torch");
-                torch_mod.attr("cuda").attr("empty_cache")();
-            }
+            // {
+            //     py::gil_scoped_acquire gil;
+            //     py::module_ torch_mod = py::module_::import("torch");
+            //     torch_mod.attr("cuda").attr("empty_cache")();
+            // }
+            c10::cuda::CUDACachingAllocator::emptyCache();
         }
     }
     // Update learning rate
@@ -1690,20 +1716,20 @@ void VoxelMapper::combineMappingOperations()
                 else {
                 // std::cout << "no pkf" << std::endl;
                 handleNewKeyframe(kf);                   // still void
-                if (pkf) {
-                    // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
-                    torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
-                    torch::Tensor hwc = chw.permute({1,2,0}).contiguous(); // (H,W,3), float32
-                    // Copy into a CV_32FC3 Mat (RGB)
-                    const int H = hwc.size(0);
-                    const int W = hwc.size(1);
-                    cv::Mat img_float(H, W, CV_32FC3);
-                    std::memcpy(img_float.data, hwc.data_ptr<float>(), H*W*3*sizeof(float));
-                    static const auto proj_dir = result_dir_ / "proj_debug";
-                    static const auto imgs_dir = proj_dir / "imgs";
-                    std::filesystem::create_directories(imgs_dir);
-                    saveKfPng_fromFloatRGB(img_float, kfid, imgs_dir);
-                }
+                // if (pkf) {
+                //     // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
+                //     torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
+                //     torch::Tensor hwc = chw.permute({1,2,0}).contiguous(); // (H,W,3), float32
+                //     // Copy into a CV_32FC3 Mat (RGB)
+                //     const int H = hwc.size(0);
+                //     const int W = hwc.size(1);
+                //     cv::Mat img_float(H, W, CV_32FC3);
+                //     std::memcpy(img_float.data, hwc.data_ptr<float>(), H*W*3*sizeof(float));
+                //     static const auto proj_dir = result_dir_ / "proj_debug";
+                //     static const auto imgs_dir = proj_dir / "imgs";
+                //     std::filesystem::create_directories(imgs_dir);
+                //     saveKfPng_fromFloatRGB(img_float, kfid, imgs_dir);
+                // }
                 }
             }
             // Get new points
@@ -2274,8 +2300,33 @@ void VoxelMapper::renderAndRecordKeyframe(
     // std::cout << "pkf image height and width: " << pkf->image_height_ << " " << pkf->image_width_ << std::endl;
     sv::MiniCam cam = pkf->toMiniCam(pkf->image_height_, pkf->image_width_);
     auto start_timing = std::chrono::steady_clock::now();
-    auto render_pkg = voxel_model_->render(cam, pkf->image_height_, pkf->image_width_, pkf->original_image_);
-    torch::Tensor rendered_image = render_pkg.at("color").to(mDevice);          // (1,3,H,W)
+    // auto render_pkg = voxel_model_->render(cam, pkf->image_height_, pkf->image_width_, pkf->original_image_);
+
+    sv::VoxelRenderer renderer(voxel_model_.get());
+    // sv::RenderOutput render_pkg = renderer.render(
+    //     cam,
+    //     pkf->image_height_,
+    //     pkf->image_width_,
+    //     /* gt_image   */  pkf->original_image_);
+
+    sv::RenderOutput render_pkg = renderer.render(
+        cam,
+        pkf->image_height_,
+        pkf->image_width_,
+        /* gt_image   */  pkf->original_image_,
+        /* color_mode   */   nullptr,
+        /* track_max_w   */  true,
+        /* ss            */  std::nullopt,
+        /* output_depth  */  false,
+        /* output_normal */  false,
+        /* output_T      */  false,
+        /* rand_bg       */  false,
+        /* use_auto_exp  */  false,
+        sv::RenderOpts{}        
+    );
+
+    // torch::Tensor rendered_image = render_pkg.at("color").to(mDevice);          // (1,3,H,W)
+    torch::Tensor rendered_image = render_pkg.color.to(mDevice);
     torch::Tensor masked_image = rendered_image * undistort_mask_[pkf->camera_id_];
     torch::cuda::synchronize();
     auto end_timing = std::chrono::steady_clock::now();
@@ -2400,57 +2451,53 @@ cv::Mat VoxelMapper::renderFromPose(
         // Camera
         sv::Camera& camera = scene_->cameras_.at(viewer_camera_id_);
         pkf->setCameraParams(camera);
-        // Transformations
-        // pkf->computeTransformTensors();
     }
     catch (std::out_of_range) {
         throw std::runtime_error("[Mapper::renderFromPose]KeyFrame Camera not found!");
     }
 
-    // // MiniCam helper already implemented in VoxelKeyframe
-    // sv::MiniCam miniCam = pkf->toMiniCam();
-    // miniCam.c2w = miniCam.c2w.to(device_type_);
-    // miniCam.w2c = miniCam.w2c.to(device_type_);
+    sv::MiniCam cam = pkf->toMiniCam(height, width);
+    // --- keep the same lock scope & tuple API as Photo-SLAM ---
+    std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> render_pkg;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
 
-    // auto chw_u8 = pkf->original_image_
-    //                   .mul(255.0f).clamp(0.0f,255.0f)
-    //                   .to(torch::kUInt8)
-    //                   .cpu()
-    //                   .contiguous();
-    // auto hwc_u8 = chw_u8.permute({1,2,0}).contiguous();
-    // py::array rgb_numpy = sv::tensorToNumpyRGB(hwc_u8);
+        // Construct a local renderer (same lifetime semantics as GaussianRenderer::render)
+        sv::VoxelRenderer renderer(voxel_model_.get());
 
-    // // 3) call into your voxel_renderer under the lock
-    // std::unordered_map<std::string, at::Tensor> render_pkg;
-    // {
-    //     std::unique_lock<std::mutex> lock(mutex_render_);
-    //     render_pkg = voxel_model_->render(pkf->toMiniCam());
-    // }
+        // Call your renderer; we don't need gt_color in the viewer, and we only use color
+        const sv::RenderOutput out = renderer.render(
+            cam,
+            height,
+            width,
+            /* gt_image      */ torch::Tensor(),   // viewer doesn't need supervision here
+            /* color_mode    */ "sh",
+            /* track_max_w   */ false,
+            /* ss            */ std::nullopt,
+            /* output_depth  */ false,
+            /* output_normal */ false,
+            /* output_T      */ false,             // viewer uses only color; keep parity with get<0>
+            /* rand_bg       */ false,
+            /* use_auto_exp  */ false,
+            sv::RenderOpts{});
 
-    // // 4) extract the “rgb” tensor (batch of 1×3×H×W)
-    // if (!render_pkg.count("color") || !render_pkg["color"].defined()) {
-    //     // if rendering failed, return a black image
-    //     return cv::Mat(height, width, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
-    // }
-    // at::Tensor rgb = render_pkg["color"];          // (1,3,H,W)
-    // rgb = rgb.to(torch::kCPU);
-    // rgb = rgb.squeeze(0);                        // → (3,H,W)
+        // Adapt to the Photo-SLAM tuple ABI (we only read get<0> later).
+        // Fill unused slots with empty tensors to match the signature.
+        render_pkg = std::make_tuple(
+            out.color,                   // std::get<0>
+            at::Tensor(),                // std::get<1> (unused)
+            at::Tensor(),                // std::get<2> (unused)
+            at::Tensor()                 // std::get<3> (unused)
+        );
+    }
 
-    // cv::imwrite("debug_rgb.png", tensor_utils::torchTensor2CvMat_Float32(rgb));
-    // std::cout << "[renderFromPose] rgb min/max = "
-    //       << rgb.min().item<float>() << "/"
-    //       << rgb.max().item<float>() << "\n";
-
-    // // 5) apply the appropriate undistort mask
-    // at::Tensor mask = main_vision
-    //     ? viewer_main_undistort_mask_.at(pkf->camera_id_)
-    //     : viewer_sub_undistort_mask_.at(pkf->camera_id_);
-    // // ensure mask is on CPU and broadcastable
-    // mask = mask.to(torch::kFloat32).to(rgb.device());
-    // at::Tensor masked = rgb * mask;             // (3,H,W)
-
-    // // 6) convert back to cv::Mat
-    // return tensor_utils::torchTensor2CvMat_Float32(masked);
+    // --- unchanged viewer code below ---
+    torch::Tensor masked_image;
+    if (main_vision)
+        masked_image = std::get<0>(render_pkg) * viewer_main_undistort_mask_[pkf->camera_id_];
+    else
+        masked_image = std::get<0>(render_pkg) * viewer_sub_undistort_mask_[pkf->camera_id_];
+    return tensor_utils::torchTensor2CvMat_Float32(masked_image);
 }
 
 // VoxelMapper::~VoxelMapper() {
@@ -2458,18 +2505,6 @@ cv::Mat VoxelMapper::renderFromPose(
 //     voxel_model_.reset();  // Deallocates all tensors and Python wrappers
 //     mpSLAM.reset();
 // }
-
-bool VoxelMapper::isKeepingTraining()
-{
-    std::unique_lock<std::mutex> lock(mutex_settings_);
-    return keep_training_;
-}
-
-bool VoxelMapper::isdoingGausPyramidTraining()
-{
-    std::unique_lock<std::mutex> lock(mutex_settings_);
-    return do_gaus_pyramid_training_;
-}
 
 int VoxelMapper::getIteration()
 {
@@ -2482,28 +2517,140 @@ void VoxelMapper::increaseIteration(const int inc)
     iteration_ += inc;
 }
 
+float VoxelMapper::geoLearningRateInit()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return opt_params_.geo_lr_;
+}
+
+float VoxelMapper::sh0LearningRate()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return opt_params_.sh0_lr_;
+}
+
+float VoxelMapper::shsLearningRate()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return opt_params_.shs_lr_;
+}
+
+float VoxelMapper::lambdaDssim()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return opt_params_.lambda_dssim_;
+}
+
+int VoxelMapper::densifyInterval()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return opt_params_.adapt_every_;
+}
+
 int VoxelMapper::newKeyframeTimesOfUse()
 {
     std::unique_lock<std::mutex> lock(mutex_settings_);
     return new_keyframe_times_of_use_;
 }
 
-float VoxelMapper::lambdaDssim()
+int VoxelMapper::stableNumIterExistence()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return stable_num_iter_existence_;
+}
+
+bool VoxelMapper::isKeepingTraining()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return keep_training_;
+}
+bool VoxelMapper::isdoingGausPyramidTraining()
+{
+    std::unique_lock<std::mutex> lock(mutex_settings_);
+    return do_gaus_pyramid_training_;
+}
+
+ void VoxelMapper::setgeoLearningRateInit(const float lr)
  {
      std::unique_lock<std::mutex> lock(mutex_settings_);
-     return opt_params_.lambda_dssim_;
+     opt_params_.geo_lr_ = lr;
+ }
+ void VoxelMapper::setsh0LearningRate(const float lr)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     opt_params_.sh0_lr_ = lr;
+ }
+ void VoxelMapper::setshsLearningRate(const float lr)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     opt_params_.shs_lr_ = lr;
+ }
+ void VoxelMapper::setLambdaDssim(const float lambda_dssim)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     opt_params_.lambda_dssim_ = lambda_dssim;
  }
 
-float VoxelMapper::sh0LearningRate()
+ void VoxelMapper::setDensifyInterval(const int interval)
  {
      std::unique_lock<std::mutex> lock(mutex_settings_);
-     return opt_params_.sh0_lr_;
+     opt_params_.adapt_every_ = interval;
  }
-
- float VoxelMapper::shsLearningRate()
+ void VoxelMapper::setNewKeyframeTimesOfUse(const int times)
  {
      std::unique_lock<std::mutex> lock(mutex_settings_);
-     return opt_params_.shs_lr_;
+     new_keyframe_times_of_use_ = times;
+ }
+ void VoxelMapper::setStableNumIterExistence(const int niter)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     stable_num_iter_existence_ = niter;
+ }
+ void VoxelMapper::setKeepTraining(const bool keep)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     keep_training_ = keep;
+ }
+ void VoxelMapper::setDoGausPyramidTraining(const bool gaus_pyramid)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     do_gaus_pyramid_training_ = gaus_pyramid;
+ }
+ 
+ VariableParameters VoxelMapper::getVaribleParameters()
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     VariableParameters params;
+     params.geo_lr = opt_params_.geo_lr_;
+     params.sh0_lr = opt_params_.sh0_lr_;
+     params.shs_lr = opt_params_.shs_lr_;
+     params.lambda_dssim = opt_params_.lambda_dssim_;
+     params.densify_interval = opt_params_.adapt_every_;
+     params.new_kf_times_of_use = new_keyframe_times_of_use_;
+     params.stable_num_iter_existence = stable_num_iter_existence_;
+     params.keep_training = keep_training_;
+     params.do_gaus_pyramid_training = do_gaus_pyramid_training_;
+     return params;
+ }
+ 
+ void VoxelMapper::setVaribleParameters(const VariableParameters &params)
+ {
+     std::unique_lock<std::mutex> lock(mutex_settings_);
+     opt_params_.geo_lr_ = params.geo_lr;
+     opt_params_.sh0_lr_ = params.sh0_lr;
+     opt_params_.shs_lr_ = params.shs_lr;
+     opt_params_.lambda_dssim_ = params.lambda_dssim;
+     opt_params_.adapt_every_ = params.densify_interval;
+     new_keyframe_times_of_use_ = params.new_kf_times_of_use;
+     stable_num_iter_existence_ = params.stable_num_iter_existence;
+     keep_training_ = params.keep_training;
+     do_gaus_pyramid_training_ = params.do_gaus_pyramid_training;
+     opt_params_.lambda_dssim_ = params.lambda_dssim;
+     opt_params_.adapt_every_ = params.densify_interval;
+     new_keyframe_times_of_use_ = params.new_kf_times_of_use;
+     stable_num_iter_existence_ = params.stable_num_iter_existence;
+     keep_training_ = params.keep_training;
+     do_gaus_pyramid_training_ = params.do_gaus_pyramid_training;
  }
 
 // void VoxelMapper::saveVoxelErrorHeatmap(const sv::MiniCam& cam,

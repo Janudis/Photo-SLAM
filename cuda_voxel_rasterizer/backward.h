@@ -11,7 +11,11 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #ifndef RASTERIZER_BACKWARD_H_INCLUDED
 #define RASTERIZER_BACKWARD_H_INCLUDED
 
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace BACKWARD
 {
@@ -20,14 +24,13 @@ namespace BACKWARD
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int image_width, const int image_height,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const torch::Tensor& background,
+    const float bg_color,
 
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,

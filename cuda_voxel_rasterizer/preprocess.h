@@ -11,7 +11,11 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #ifndef RASTERIZER_PREPROCESS_H_INCLUDED
 #define RASTERIZER_PREPROCESS_H_INCLUDED
 
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace PREPROCESS {
 
@@ -23,7 +27,6 @@ rasterize_preprocess(
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const int cam_mode,
     const float near,
 
     const torch::Tensor& octree_paths,

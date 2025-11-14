@@ -23,7 +23,6 @@
 #include "map_drawer.h"
 
 #include "include/graphics_utils.h"
-// #include "include/gaussian_mapper.h"
 #include "include_voxel/voxel_mapper.h"
 
 #include "ORB-SLAM3/include/FrameDrawer.h"
@@ -61,7 +60,6 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     ImGuiViewer(
         std::shared_ptr<ORB_SLAM3::System> pSLAM,
-        // std::shared_ptr<GaussianMapper> pGausMapper,
         std::shared_ptr<VoxelMapper> pVoxelMapper,
         bool training = true);
     void readConfigFromFile(std::filesystem::path cfg_path);
@@ -79,7 +77,6 @@ protected:
 
 protected:
     std::shared_ptr<ORB_SLAM3::System> pSLAM_;
-    // std::shared_ptr<GaussianMapper> pGausMapper_;
     std::shared_ptr<VoxelMapper> pVoxelMapper_;
 
     ORB_SLAM3::FrameDrawer* pSlamFrameDrawer_;
@@ -131,31 +128,15 @@ protected:
     bool show_sparse_mappoints_ = false;
     bool show_main_rendered_ = true;
 
-    // float position_lr_init_;
-    // float feature_lr_;
-    // float opacity_lr_;
-    // float scaling_lr_;
-    // float rotation_lr_;
-    // float percent_dense_;
-    // float lambda_dssim_;
-    // int opacity_reset_interval_;
-    // float densify_grad_th_;
-    // int densify_interval_;
-    // int new_kf_times_of_use_;
-    // int stable_num_iter_existence_; ///< loop closure correction
-
-    // bool keep_training_ = false;
-    // bool do_gaus_pyramid_training_;
-    // bool do_inactive_geo_densify_;
-
-    // Configurable sliders
-    float position_lr_init_ = 0.001f;
-    float lambda_photo_ = 1.0f;
-    float lambda_dssim_ = 0.02f;
-    int new_kf_times_of_use_ = 3;
-    int stable_num_iter_existence_ = 10;
-    bool keep_training_ = true;
-
+    float geo_lr_;
+    float sh0_lr_;
+    float shs_lr_;
+    float lambda_dssim_;
+    int densify_interval_;
+    int new_kf_times_of_use_;
+    int stable_num_iter_existence_; ///< loop closure correction
+    bool keep_training_ = false;
+    bool do_gaus_pyramid_training_;
     // Status
     bool stopped_ = false;
 

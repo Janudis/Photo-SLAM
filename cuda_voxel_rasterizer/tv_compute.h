@@ -11,7 +11,11 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #ifndef TV_COMPUTE_H_INCLUDED
 #define TV_COMPUTE_H_INCLUDED
 
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace TV_COMPUTE {
 

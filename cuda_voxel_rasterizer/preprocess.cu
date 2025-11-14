@@ -1,14 +1,3 @@
-/*
- * Copyright (C) 2023, Inria
- * GRAPHDECO research group, https://team.inria.fr/graphdeco
- * All rights reserved.
- *
- * This software is free for non-commercial, research and evaluation use 
- * under the terms of the LICENSE.md file.
- *
- * For inquiries contact  george.drettakis@inria.fr
- */
-
 /*************************************************************************
 Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
@@ -32,7 +21,6 @@ namespace cg = cooperative_groups;
 namespace PREPROCESS {
 
 // CUDA implementation of the preprocess step.
-template <int cam_mode>
 __global__ void preprocessCUDA(
     const int P,
     const int W, const int H,
@@ -96,18 +84,9 @@ __global__ void preprocessCUDA(
 
         float2 corner_coord;
         int quadrant_id;
-        if (cam_mode == CAM_ORTHO)
-        {
-            const float3 lookat = third_col_3x4(c2w_matrix);
-            corner_coord = make_float2(cam_corner.x, cam_corner.y);
-            quadrant_id = compute_ray_quadrant_id(lookat);
-        }
-        else
-        {
-            const float inv_z = 1.0f / cam_corner.z;
-            corner_coord = make_float2(cam_corner.x * inv_z, cam_corner.y * inv_z);
-            quadrant_id = compute_corner_quadrant_id(world_corner, ro);
-        }
+        const float inv_z = 1.0f / cam_corner.z;
+        corner_coord = make_float2(cam_corner.x * inv_z, cam_corner.y * inv_z);
+        quadrant_id = compute_corner_quadrant_id(world_corner, ro);
 
         coord_min = min(coord_min, corner_coord);
         coord_max = max(coord_max, corner_coord);
@@ -161,7 +140,6 @@ rasterize_preprocess(
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const int cam_mode,
     const float near,
 
     const torch::Tensor& octree_paths,
@@ -196,12 +174,7 @@ rasterize_preprocess(
     const float focal_y = 0.5f * image_height / tan_fovy;
 
     // Lanching CUDA
-    const auto kernel_func =
-        (cam_mode == CAM_ORTHO) ?
-            preprocessCUDA<CAM_ORTHO> :
-            preprocessCUDA<CAM_PERSP> ;
-
-    kernel_func <<<(P + 255) / 256, 256>>> (
+    preprocessCUDA <<<(P + 255) / 256, 256>>> (
         P,
         image_width, image_height,
         tan_fovx, tan_fovy,

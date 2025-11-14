@@ -9,10 +9,10 @@
 #include <algorithm>
 #include <torch/torch.h>
 #include <c10/cuda/CUDACachingAllocator.h>
-#include <Python.h>  
-#include <pybind11/embed.h>                         // for Python bridge
-#include <pybind11/stl.h>
-#include <pybind11/pybind11.h>
+// #include <Python.h>  
+// #include <pybind11/embed.h>                         // for Python bridge
+// #include <pybind11/stl.h>
+// #include <pybind11/pybind11.h>
 #include <torch/extension.h>
 #include <iostream>
 #include <cstdlib>
@@ -40,6 +40,10 @@
 #include "include_voxel/voxel_constants.h"
 #include "include_voxel/render_opts.h" 
 #include <rerun.hpp>
+#include "include_voxel/svraster_utils.h"       // sv::oct::*
+#include "include_voxel/voxel_renderer.h"
+#include "include_voxel/opt_sched.hpp"
+
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
     this->Tensor_vec_geo_       = { this->_geo_grid_pts_ };       \
@@ -59,8 +63,8 @@
     VOXEL_MODEL_TENSORS_TO_VEC
 
 // namespace py = pybind11;
-namespace sv {
 
+namespace sv {
 class VoxelModel 
 {
 public:
@@ -72,10 +76,32 @@ public:
     void setShDegree(int sh);
 
     torch::Tensor voxCenter() { return this->center_; }
-    int64_t numGridPts() const;
     const torch::Tensor& geoGridPts() const;
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
+    // Read helpers (mirrors SVM tensors)
+    int64_t numGridPts() const;
+    torch::Tensor subdivisionPriority() const; // [N,1]
+    torch::Tensor voxSize() const;             // [N,1]
+    torch::Tensor octLevel() const;            // [N,1] int8
+    torch::Tensor octPath() const;             // [N,1] int64
+    int           numVoxels() const;           // N
+    int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
+    torch::Tensor SceneCenter() const;  
+    torch::Tensor SceneExtent() const;
+    // Helper math
+    static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
+    static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
+    static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy)
+
+    // ---- public SVRaster-style accessors (put in public section) ----
+    int64_t num_grid_pts() const;
+    const at::Tensor& vox_center()   const;
+    const at::Tensor& vox_size()     const;
+    const at::Tensor& grid_pts_key() const;
+    const at::Tensor& vox_key()      const;
+    const at::Tensor& vox_size_inv() const;
+    const at::Tensor& grid_pts_xyz() const; // optional, used where needed
 
     void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams);
     void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration, const std::vector<sv::MiniCam>& cams);
@@ -99,9 +125,11 @@ public:
                        float beta1=0.9f, float beta2=0.999f, float eps=1e-15f,
                        const std::vector<int>& milestones = {},
                        float gamma = 0.1f);
-    py::object schedulerStateDict();
+    // py::object schedulerStateDict();
     void schedulerStep();
-    void schedulerLoadStateDict(const py::object& state_dict);
+    // void schedulerLoadStateDict(const py::object& state_dict);
+    sv::optim::MultiStepLRState schedulerStateDict() const;
+    void schedulerLoadStateDict(const sv::optim::MultiStepLRState& state);
     std::tuple<double,double,double> currentLearningRates() const;
     void appendGroup_(int group_idx, const torch::Tensor& add_rows, const char* svm_field_name, torch::Tensor* out_member_param);
 
@@ -116,19 +144,10 @@ public:
     // Topology changes (mirrors python SparseVoxelModel)
     void pruning(const torch::Tensor& prune_mask);         // mask: [N] or [N,1] bool/byte
     void subdividing(const torch::Tensor& subdivide_mask); // mask: [N] or [N,1] bool/byte
-    // Read helpers (mirrors SVM tensors)
-    torch::Tensor subdivisionPriority() const; // [N,1]
-    torch::Tensor voxSize() const;             // [N,1]
-    torch::Tensor octLevel() const;            // [N,1] int8
-    torch::Tensor octPath() const;             // [N,1] int64
-    int           numVoxels() const;           // N
-    int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
-    torch::Tensor SceneCenter() const;  
-    torch::Tensor SceneExtent() const;
     // Maintenance
     void resetSubdivisionPriority();
-    void freezeVoxGeo();
-    void unfreezeVoxGeo();
+    // void freezeVoxGeo();
+    // void unfreezeVoxGeo();
 
     /// Load all voxel fields from a PLY file (structure matches savePly).
     void loadPly(const std::filesystem::path& ply_file);
@@ -199,25 +218,47 @@ public:
     int max_sh_degree_;
 
     /// Main voxel tensors
-    torch::Tensor center_;             // [N, 3]
-    torch::Tensor size_;               // [N]
-    torch::Tensor geo_;                // [N, 8] (covariance and pad)
-    torch::Tensor sh0_;                // [N, 3]
-    torch::Tensor shs_;                // [N, 45, 3]
-    torch::Tensor oct_path_;           // [N]
-    torch::Tensor oct_level_;          // [N]
-    torch::Tensor subdiv_p_;           // [N]
-    torch::Tensor max_w_;              // [N]
-    torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
-    torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
-    torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
-    torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
+    mutable torch::Tensor center_;            
+    mutable torch::Tensor size_;               
+    torch::Tensor geo_;               
+    torch::Tensor sh0_;               
+    torch::Tensor shs_;               
+    torch::Tensor oct_path_;           
+    torch::Tensor oct_level_;         
+    torch::Tensor subdiv_p_;          
+    torch::Tensor max_w_;              
+    mutable torch::Tensor grid_pts_key_;    
+    torch::Tensor _geo_grid_pts_;    
+    mutable torch::Tensor vox_key_;         
+    mutable torch::Tensor vox_size_inv_;    
     torch::Tensor frozen_vox_geo_;
+    mutable torch::Tensor _grid_pts_xyz_;    
     
     float ss_ = 1.5f;
     bool  white_background_ = false;
     bool  black_background_ = false;
     int   n_samp_per_vox_ = 3;
+
+    // ---- Signature (parity to SVRaster) ----
+    struct DerivedSignature {
+        int64_t num_voxels = -1;
+        const c10::TensorImpl* octpath_impl = nullptr;
+        const c10::TensorImpl* octlevel_impl = nullptr;
+        bool operator==(const DerivedSignature& o) const {
+            return num_voxels == o.num_voxels &&
+                octpath_impl == o.octpath_impl &&
+                octlevel_impl == o.octlevel_impl;
+        }
+        bool operator!=(const DerivedSignature& o) const { return !(*this == o); }
+    };
+
+    mutable DerivedSignature _check_derived_voxel_attr_signature_{};
+    mutable DerivedSignature _vox_size_inv_signature_{};
+    mutable DerivedSignature _grid_pts_xyz_signature_{};
+
+    // ---- helpers (SVRaster-compatible names) ----
+    DerivedSignature signature() const;
+    void _check_derived_voxel_attr() const;
 
     std::vector<torch::Tensor>  Tensor_vec_geo_,
                                 Tensor_vec_sh0_,
@@ -237,8 +278,8 @@ public:
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
     float fixed_vox_size_ = 0.05f;        // your chosen voxel size
 
-    bool   fill_empty_cells_ = true;
-    int64_t max_artifact_cells_ = 150000; // safety cap
+    bool   fill_empty_cells_ = true; // use bigger voxels here instead of 0.05
+    int64_t max_artifact_cells_ = 200000; // safety cap
     std::array<float,3> artifact_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
 
     torch::Tensor bb_min_viz, bb_max_viz, sel_artifacts_viz, ijk_box_viz;
@@ -249,18 +290,19 @@ protected:
     // std::shared_ptr<torch::optim::Adam> optimizer_;
     // py::object svm_;
     // py::object optimizer_py_;
-    struct PyState;                // forward declaration only
-    std::unique_ptr<PyState> py_;  // holds all pybind objects
+    // struct PyState;                // forward declaration only
+    // std::unique_ptr<PyState> py_;  // holds all pybind objects
     // Pull all core tensors from the Python SVM after any topology change.
     void syncFromPython_();
-    // Helper math
-    static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
-    static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
-    static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy)
     // Cache MAX_NUM_LEVELS
-    const int max_num_levels_ = 16; // safe default; overwritten at init
+    const int max_num_levels_ = 16; 
 
     std::mutex mutex_settings_;
+
+    std::unique_ptr<sv::optim::SparseAdam>  optimizer_;
+    std::unique_ptr<sv::optim::MultiStepLR> scheduler_;
+    std::vector<int> sched_milestones_;
+    double sched_gamma_ = 1.0;
 };
 
 } // namespace sv

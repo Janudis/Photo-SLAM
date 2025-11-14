@@ -17,8 +17,15 @@ struct MiniCam {
     float tanfovx = 0.f;        
     float tanfovy = 0.f;      
     float near    = 0.01f;
+    // Misc
     std::string cam_mode = "persp";
     int   frame_id = -1;
+
+    // Derived vectors for SVRaster helpers
+    torch::Tensor position;          // [3] float32 CUDA  (c2w[:3, 3])
+    torch::Tensor lookat;            // [3] float32 CUDA  (c2w[:3, 2], unit)
+    // Pixel footprint used by mark_max_samp_rate (≈ 2*tanfovx / width)
+    float pix_size = 0.f;
 };
 
 /* -------- helper: build MiniCam from a C++ Camera + pose ---------------- */
@@ -58,4 +65,75 @@ inline MiniCam fromCamera(const Camera& cam,
 
     return m;
 }
+
+// --- internal helpers ---
+inline torch::Tensor ensure_cuda_f32(const torch::Tensor& t) {
+    auto out = t;
+    if (out.dtype() != torch::kFloat32) out = out.to(torch::kFloat32);
+    if (!out.is_cuda()) out = out.to(torch::kCUDA);
+    return out.contiguous();
+}
+
+inline torch::Tensor mat_inv_cuda_f32(const torch::Tensor& m44) {
+    return ensure_cuda_f32(torch::linalg_inv(m44));
+}
+
+inline torch::Tensor vec_norm(const torch::Tensor& v) {
+    auto n = torch::norm(v);
+    // avoid div-by-zero; if zero, just return v
+    if (n.item<float>() > 0.f) return v / n;
+    return v;
+}
+
+/**
+ * Build a MiniCam from Photo-SLAM’s Camera + world pose.
+ * This REPLACES the old Python MiniCam and your previous fromCamera().
+ * - Computes tanfovx/tanfovy from intrinsics.
+ * - Fills position = c2w[:3,3], lookat = normalize(c2w[:3,2]).
+ * - Sets pix_size = 2*tanfovx/width.
+ * - Ensures all tensors are float32 CUDA.
+ */
+inline MiniCam ToMiniCam(const Camera& cam,
+                         const torch::Tensor& c2w_in,
+                         int im_height,
+                         int im_width,
+                         int frame_id = -1)
+{
+    MiniCam m;
+    // Image size (explicit overrides are consistent with your current usage)
+    m.width  = im_width;
+    m.height = im_height;
+
+    // Intrinsics
+    m.fx = cam.fx();
+    m.fy = cam.fy();
+    // You were forcing principal point to image center; keep that unless you want cam.cx()/cam.cy()
+    m.cx = static_cast<float>(im_width)  * 0.5f;
+    m.cy = static_cast<float>(im_height) * 0.5f;
+
+    // FOVs → tan(FOV/2)
+    const float fovx = graphics_utils::focal2fov(cam.fx(), cam.width());
+    const float fovy = graphics_utils::focal2fov(cam.fy(), cam.height());
+    m.tanfovx = std::tan(fovx * 0.5f);
+    m.tanfovy = std::tan(fovy * 0.5f);
+
+    // Poses: ensure CUDA float32 & contiguous
+    m.c2w = ensure_cuda_f32(c2w_in);
+    m.w2c = mat_inv_cuda_f32(m.c2w);
+
+    // Derived vectors
+    m.position = ensure_cuda_f32(m.c2w.index({torch::indexing::Slice(0,3), 3}));
+    auto forward = ensure_cuda_f32(m.c2w.index({torch::indexing::Slice(0,3), 2}));
+    m.lookat = vec_norm(forward);  // keep unit; python version didn’t normalize, but safe to normalize here
+
+    // Pixel footprint used by sampling-rate helper
+    m.pix_size = (m.width > 0) ? (2.f * m.tanfovx / static_cast<float>(m.width)) : 0.f;
+
+    m.cam_mode = "persp";
+    m.frame_id = frame_id;
+    // near already set to 0.02f to match SVRaster defaults
+
+    return m;
+}
+
 } // namespace sv

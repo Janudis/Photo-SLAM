@@ -42,7 +42,7 @@ renderCUDA(
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* __restrict__ c2w_matrix,
-    const float3* __restrict__ background,
+    const float bg_color,
 
     const uint2* __restrict__ bboxes,
     const float3* __restrict__ vox_centers,
@@ -170,8 +170,7 @@ renderCUDA(
         dL_dpix.y = dL_dout_color[1 * H * W + pix_id];
         dL_dpix.z = dL_dout_color[2 * H * W + pix_id];
         const float dL_dpix_T = dL_dout_T[pix_id];
-        const float3 bg_color = background[0];
-        last_dL_dT = dL_dpix_T + dot(bg_color, dL_dpix);
+        last_dL_dT = dL_dpix_T + bg_color * (dL_dpix.x + dL_dpix.y + dL_dpix.z);
 
         dL_dD = dL_dout_depth[pix_id] * rd_norm_inv;
         dL_dN.x = dL_dout_normal[0 * H * W + pix_id];
@@ -573,13 +572,12 @@ void render(
     const dim3 tile_grid, const dim3 block,
     const uint2* ranges,
     const uint32_t* vox_list,
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int W, const int H,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* c2w_matrix,
-    const float3* background,
+    const float bg_color,
 
     const uint2* bboxes,
     const float3* vox_centers,
@@ -611,11 +609,11 @@ void render(
 
     // The density_mode now is always EXP_LINEAR_11_MODE
     const auto kernel_func =
-        (vox_geo_mode == VOX_TRIINTERP1_MODE) ?
-            BwRendFunc(1) :
-        (vox_geo_mode == VOX_TRIINTERP3_MODE) ?
+        (n_samp_per_vox == 3) ?
             BwRendFunc(3) :
-            BwRendFunc(2) ;
+        (n_samp_per_vox == 2) ?
+            BwRendFunc(2) :
+            BwRendFunc(1) ;
 
     kernel_func <<<tile_grid, block>>> (
         ranges,
@@ -624,7 +622,7 @@ void render(
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix,
-        background,
+        bg_color,
 
         bboxes,
         vox_centers,
@@ -656,14 +654,13 @@ void render(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int image_width, const int image_height,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const torch::Tensor& background,
+    const float bg_color,
 
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
@@ -729,13 +726,12 @@ rasterize_voxels_backward(
         tile_grid, block,
         imgState.ranges,
         binningState.vox_list,
-        vox_geo_mode,
-        density_mode,
+        n_samp_per_vox,
         image_width, image_height,
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix.contiguous().data_ptr<float>(),
-        (float3*)(background.contiguous().data_ptr<float>()),
+        bg_color,
 
         geomState.bboxes,
         (float3*)(vox_centers.contiguous().data_ptr<float>()),
@@ -765,9 +761,9 @@ rasterize_voxels_backward(
     CHECK_CUDA(debug);
 
     std::vector<torch::Tensor> gradient_lst = dL_dvox.split({geos.size(1), 3, 1}, 1);
-    torch::Tensor dL_dgeos = gradient_lst[0];
-    torch::Tensor dL_drgbs = gradient_lst[1];
-    torch::Tensor subdiv_p_bw = gradient_lst[2];
+    torch::Tensor dL_dgeos = gradient_lst[0].contiguous();
+    torch::Tensor dL_drgbs = gradient_lst[1].contiguous();
+    torch::Tensor subdiv_p_bw = gradient_lst[2].contiguous();
 
     return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw);
 }

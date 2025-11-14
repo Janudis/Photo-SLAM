@@ -1,14 +1,3 @@
-/*
- * Copyright (C) 2023, Inria
- * GRAPHDECO research group, https://team.inria.fr/graphdeco
- * All rights reserved.
- *
- * This software is free for non-commercial, research and evaluation use 
- * under the terms of the LICENSE.md file.
- *
- * For inquiries contact  george.drettakis@inria.fr
- */
-
 /*************************************************************************
 Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
@@ -242,7 +231,7 @@ __forceinline__ __device__ float3 rotate_3x4(const float* matrix, const float3& 
     return transformed;
 }
 
-// Depth convertion
+
 __forceinline__ __device__ float depth_contracted(float x)
 {
     return (x < 1.f) ? x : 2.f - 1.f / x;
@@ -270,20 +259,20 @@ __forceinline__ __device__ float sigmoid(float x)
 
 __forceinline__ __device__ float softplus(float x)
 {
-    return (x > SOFTPLUS_THRES) ? x : log1pf(expf(x));
+    return (x > 10.f) ? x : log1pf(expf(x));
 }
 
 __forceinline__ __device__ float2 softplus2(float base, float x)
 {
     const float total = base + x;
-    return (total > SOFTPLUS_THRES)
+    return (total > 10.f)
                 ? make_float2(base, x)
                 : make_float2(log1pf(expf(total)), 0.0f);
 }
 
 __forceinline__ __device__ float softplus_bw(float x)
 {
-    return (x > SOFTPLUS_THRES) ? 1.f : sigmoid(x);
+    return (x > 10.f) ? 1.f : sigmoid(x);
 }
 
 __forceinline__ __device__ float exp_linear_11(float x)

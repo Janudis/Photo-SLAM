@@ -74,19 +74,19 @@ void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
 
 int main(int argc, char **argv)
 {
-    pybind11::initialize_interpreter();
-    {
-      // make sure Python torch.cuda is initialized first
-      pybind11::gil_scoped_acquire gil;
-      // add your voxel scripts to PYTHONPATH
-      py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
-      // import the wrapper – this will pull in PyTorch’s cuda module under Python
-      py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-      // also explicitly touch torch.cuda
-      py::module_::import("torch.cuda");
-    }
-    // now we can safely drop the GIL
-    pybind11::gil_scoped_release release;
+    // pybind11::initialize_interpreter();
+    // {
+    //   // make sure Python torch.cuda is initialized first
+    //   pybind11::gil_scoped_acquire gil;
+    //   // add your voxel scripts to PYTHONPATH
+    // //   py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+    // //   // import the wrapper – this will pull in PyTorch’s cuda module under Python
+    // //   py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
+    //   // also explicitly touch torch.cuda
+    //   py::module_::import("torch.cuda");
+    // }
+    // // now we can safely drop the GIL
+    // pybind11::gil_scoped_release release;
 
     if (argc != 6 && argc != 7)
     {
@@ -123,8 +123,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    torch::DeviceType device_type = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
-    std::cout << "[INFO] Using device: " << (device_type == torch::kCUDA ? "CUDA" : "CPU") << std::endl;
+    // Device
+    torch::DeviceType device_type;
+    if (torch::cuda::is_available())
+    {
+        std::cout << "CUDA available! Training on GPU." << std::endl;
+        device_type = torch::kCUDA;
+    }
+    else
+    {
+        std::cout << "Training on CPU." << std::endl;
+        device_type = torch::kCPU;
+    }
 
     std::shared_ptr<ORB_SLAM3::System> pSLAM =
         std::make_shared<ORB_SLAM3::System>(

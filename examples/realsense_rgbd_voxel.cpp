@@ -16,7 +16,6 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
-
 #include <torch/torch.h>
 
 #include <iostream>
@@ -29,16 +28,17 @@
 #include <filesystem>
 #include <memory>
 #include <condition_variable>
+#include <iomanip>
+#include <unistd.h>
 
 #include <opencv2/core/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <librealsense2/rs.hpp>
 #include <librealsense2/rsutil.h>
 
 #include "ORB-SLAM3/include/System.h"
-
-#include "include/gaussian_mapper.h"
-
+#include "include_voxel/voxel_mapper.h"
 #include "viewer/imgui_viewer.h"
 
 rs2_stream find_stream_to_align(const std::vector<rs2::stream_profile>& streams)
@@ -138,18 +138,22 @@ void saveGpuPeakMemoryUsage(std::filesystem::path pathSave);
 
 int main(int argc, char** argv)
 {
-    if (argc != 5)
+    if (argc != 5 && argc != 6)
     {
         std::cerr << std::endl
                   << "Usage: " << argv[0]
                   << " path_to_vocabulary"                   /*1*/
                   << " path_to_ORB_SLAM3_settings"           /*2*/
-                  << " path_to_gaussian_mapping_settings"    /*3*/
+                  << " path_to_voxel_mapping_settings"    /*3*/
                   << " path_to_output_directory/"            /*4*/
+                  << " (optional)no_viewer"
                   << std::endl;
         return 1;
     }
+    
     bool use_viewer = true;
+    if (argc == 6)
+        use_viewer = (std::string(argv[5]) == "no_viewer" ? false : true);
 
     std::string output_directory = std::string(argv[4]);
     if (output_directory.back() != '/')
@@ -316,19 +320,19 @@ int main(int argc, char** argv)
             argv[1], argv[2], ORB_SLAM3::System::RGBD, 0, "realsense_rgbd");
     float imageScale = pSLAM->GetImageScale();
 
-    // Create GaussianMapper
-    std::filesystem::path gaussian_cfg_path(argv[3]);
-    std::shared_ptr<GaussianMapper> pGausMapper =
-        std::make_shared<GaussianMapper>(
-            pSLAM, gaussian_cfg_path, output_dir, 0, device_type);
-    std::thread training_thd(&GaussianMapper::run, pGausMapper.get());
+    // Create VoxelMapper
+    std::filesystem::path voxel_cfg_path(argv[3]);
+    std::shared_ptr<VoxelMapper> pVoxelMapper =
+        std::make_shared<VoxelMapper>(
+            pSLAM, voxel_cfg_path, output_dir, 0, device_type);
+    std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
-    // Create Gaussian Viewer
+    // Create voxel Viewer
     std::thread viewer_thd;
     std::shared_ptr<ImGuiViewer> pViewer;
     if (use_viewer)
     {
-        pViewer = std::make_shared<ImGuiViewer>(pSLAM, pGausMapper);
+        pViewer = std::make_shared<ImGuiViewer>(pSLAM, pVoxelMapper);
         viewer_thd = std::thread(&ImGuiViewer::run, pViewer.get());
     }
 

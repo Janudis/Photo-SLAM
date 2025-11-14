@@ -11,22 +11,24 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #ifndef RASTERIZER_FORWARD_H_INCLUDED
 #define RASTERIZER_FORWARD_H_INCLUDED
 
-#include <torch/extension.h>
+// #include <torch/extension.h>
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace FORWARD {
 
 // Interface for python to run forward rasterization.
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels(
-    const int vox_geo_mode,
-    const int density_mode,
+    const int n_samp_per_vox,
     const int image_width, const int image_height,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const torch::Tensor& background,
-    const int cam_mode,
+    const float bg_color,
     const bool need_depth,
     const bool need_distortion,
     const bool need_normal,
@@ -37,7 +39,6 @@ rasterize_voxels(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
-    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
 

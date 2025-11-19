@@ -108,8 +108,8 @@ inline MiniCam ToMiniCam(const Camera& cam,
     m.fx = cam.fx();
     m.fy = cam.fy();
     // You were forcing principal point to image center; keep that unless you want cam.cx()/cam.cy()
-    m.cx = static_cast<float>(im_width)  * 0.5f;
-    m.cy = static_cast<float>(im_height) * 0.5f;
+    m.cx = im_width  * 0.5f;
+    m.cy = im_height * 0.5f;
 
     // FOVs → tan(FOV/2)
     const float fovx = graphics_utils::focal2fov(cam.fx(), cam.width());

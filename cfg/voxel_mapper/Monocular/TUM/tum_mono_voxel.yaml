@@ -25,7 +25,7 @@ Mapper.large_rotation_threshold: 30.0 #20.0 #30.0 #10.0 #
 Mapper.large_translation_threshold: 1.0 #0.5 #1.0 #0.1 #
 Mapper.stable_num_iter_existence: 1
 
-GausPyramid.do: 1  # 0:false, 1 or other integer:true
+GausPyramid.do: 0  # 0:false, 1 or other integer:true
 GausPyramid.num_sub_levels: 2
 GausPyramid.sub_level_times_of_use: 8
 
@@ -44,26 +44,23 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 ##############################################################################
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups (match train.py)
-Optimization.geo_lr: 0.05 #0.1 #0.025 # very important 4x better than 8x
-Optimization.sh0_lr: 0.010 #0.04 #0.010 # very important
-Optimization.shs_lr: 0.00025 #0.001 #0.00025 #important
+Optimization.geo_lr: 0.1 #0.025 # very important 4x better than 8x
+Optimization.sh0_lr: 0.04 #0.010 # very important
+Optimization.shs_lr: 0.001 #0.00025 #important
 # Optimizer hyper-params (match svraster cfg.optimizer)
 Optimization.optim_beta1: 0.1
 Optimization.optim_beta2: 0.99
 Optimization.optim_eps: 1e-15
 # MultiStep LR decay (like torch.optim.lr_scheduler.MultiStepLR)
 # Use a YAML sequence for OpenCV FileStorage compatibility.
-Optimization.lr_decay_ckpt: [1600] #[19000] # [24]
+Optimization.lr_decay_ckpt: [19000] #[1600] #[19000] # [24]
 Optimization.lr_decay_mult: 0.1
-
-# Photometric loss blend used in your mapper (L1 + DSSIM)
-Optimization.lambda_dssim: 0.2
 
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 300
-Optimization.adapt_every: 300
+Optimization.adapt_from: 400
+Optimization.adapt_every: 400
 # Pruning
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.0001
@@ -76,14 +73,36 @@ Optimization.subdivide_samp_thres: 1.0 #0.7 #1.0
 Optimization.subdivide_prop: 0.05 #0.1 #0.05
 Optimization.subdivide_max_num: 10000000 #3000000 #10000000
 
-Optimization.lambda_tv_density: 0 #1e-10
-Optimization.tv_from: 0
-Optimization.tv_until: 1000
-
+# Regularization weights (set to 0 to disable)
 Optimization.ss_aug_max: 0 #1.5 #axristo
 Optimization.lambda_R_concen: 0 #0.01 #axristo
 Optimization.lambda_dist: 0 #0.1 #axristo
 Optimization.lambda_T_inside: 0 #0.01 #axristo
+Optimization.lambda_tv_density: 0 #1e-10
+Optimization.tv_from: 0
+Optimization.tv_until: 1000
+
+Optimization.lambda_dssim: 0.2
+Optimization.lambda_ssim : 0.00
+# Optimization.lambda_photo : 1.0
+# Optimization.use_l1 : False
+# Optimization.use_huber : False
+# Optimization.huber_thres : 0.03
+# Optimization.lambda_sparse_depth : 0.0
+# Optimization.sparse_depth_until : 1000
+# Optimization.lambda_mask : 0.0
+# Optimization.lambda_T_concen : 0.0
+# Optimization.lambda_ascending : 0.0
+# Optimization.ascending_from : 0
+# Optimization.dist_from : 10000
+# Optimization.lambda_normal_dmean : 0.0
+# Optimization.n_dmean_from : 10000
+# Optimization.n_dmean_end : 20000
+# Optimization.n_dmean_ks : 3
+# Optimization.n_dmean_tol_deg : 90.0
+# Optimization.lambda_normal_dmed : 0.0
+# Optimization.n_dmed_from : 3000
+# Optimization.n_dmed_end : 20000
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

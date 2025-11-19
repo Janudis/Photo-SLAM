@@ -881,6 +881,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     opt_params_.lambda_R_concen_ = settings_file["Optimization.lambda_R_concen"].operator float();
     opt_params_.lambda_dist_ = settings_file["Optimization.lambda_dist"].operator float();
     opt_params_.lambda_T_inside_ = settings_file["Optimization.lambda_T_inside"].operator float();
+    opt_params_.lambda_ssim_ = settings_file["Optimization.lambda_ssim"].operator float();
 
     /* ───────── LOGGING PARAMETERS ───────── */
     training_report_interval_ =
@@ -1132,18 +1133,18 @@ void VoxelMapper::run()
              break;
      }
 
-    // Third loop: Tail gaussian optimization
-    int adapt_interval = opt_params_.adapt_every_;          // cfg.procedure.adapt_every
-    int n_delay_iters  = adapt_interval * 0.8f;        // same heuristic as GS code
-    while (getIteration() - SLAM_stop_iter <= n_delay_iters
-        || (getIteration() % adapt_interval) <= n_delay_iters
-        || isKeepingTraining() )
-    {
-        trainForOneIteration();
-        // Re-read in case user changed cfg at runtime
-        adapt_interval = opt_params_.adapt_every_;
-        n_delay_iters  = adapt_interval * 0.8f;
-    }
+    // // Third loop: Tail gaussian optimization
+    // int adapt_interval = opt_params_.adapt_every_;          // cfg.procedure.adapt_every
+    // int n_delay_iters  = adapt_interval * 0.8f;        // same heuristic as GS code
+    // while (getIteration() - SLAM_stop_iter <= n_delay_iters
+    //     || (getIteration() % adapt_interval) <= n_delay_iters
+    //     || isKeepingTraining() )
+    // {
+    //     trainForOneIteration();
+    //     // Re-read in case user changed cfg at runtime
+    //     adapt_interval = opt_params_.adapt_every_;
+    //     n_delay_iters  = adapt_interval * 0.8f;
+    // }
 
     // if (have_bounds_) {
     //     std::cout.setf(std::ios::fixed);
@@ -1192,6 +1193,9 @@ void VoxelMapper::trainForOneIteration()
 
     sv::RenderOpts ropts;
 
+    // auto sparse_depth_loss = loss_utils::SparseDepthLoss(
+    //     iter_end=opt_params_.sparse_depth_until)
+
     // 2) pick a random keyframe from the sliding window
     std::shared_ptr<VoxelKeyframe> viewpoint_cam = useOneRandomSlidingWindowKeyframe();
     if (!viewpoint_cam) {
@@ -1233,19 +1237,26 @@ void VoxelMapper::trainForOneIteration()
     }    
     voxel_model_->setShDegree(default_sh_);
 
-    // Use default super-sampling option (enable after 1000 iters)
-    if (iter > 500) {
-        if (opt_params_.ss_aug_max_ > 1.0f) {
-            static thread_local std::mt19937 rng{std::random_device{}()};
-            std::uniform_real_distribution<float> dist(1.0f, opt_params_.ss_aug_max_);
-            ropts.ss = dist(rng);                 // tr_render_opt['ss'] = U(1, ss_aug_max)
-        } else {
-            ropts.ss = std::nullopt;              // pop('ss') -> use model default self.ss
-        }
-    } else {
-        ropts.ss = 1.0f;                           // disable supersampling at first
+    // // Use default super-sampling option (enable after 1000 iters)
+    // if (iter > 500) {
+    //     if (opt_params_.ss_aug_max_ > 1.0f) {
+    //         static thread_local std::mt19937 rng{std::random_device{}()};
+    //         std::uniform_real_distribution<float> dist(1.0f, opt_params_.ss_aug_max_);
+    //         ropts.ss = dist(rng);                 // tr_render_opt['ss'] = U(1, ss_aug_max)
+    //     } else {
+    //         ropts.ss = std::nullopt;              // pop('ss') -> use model default self.ss
+    //     }
+    // } else {
+    //     ropts.ss = 1.0f;                           // disable supersampling at first
+    // }
+
+    // const bool need_sparse_depth = (opt_params_.lambda_sparse_depth_ > 0.0f) && sparse_depth_loss_.isActive(iter);
+    // ropts.output_T     = (opt_params_.lambda_T_inside_ > 0.0f) || need_sparse_depth;
+    // ropts.output_depth = need_sparse_depth; 
+    if (opt_params_.lambda_T_inside_ > 0.0f) {
+        ropts.output_T = true;
     }
-    // ropts.ss = 1.0f;   
+
     if (iter > 1000 && opt_params_.lambda_dist_ > 0.0f) {
         ropts.lambda_dist = opt_params_.lambda_dist_;
     }
@@ -1254,10 +1265,6 @@ void VoxelMapper::trainForOneIteration()
         ropts.lambda_R_concen = opt_params_.lambda_R_concen_;
         ropts.gt_color = gt_image;
     }
-
-    // if (opt_params_.lambda_T_inside_ > 0.0f) {
-    //     ropts.output_T = true;
-    // }
 
     // ) build a MiniCam out of this keyframe
     // std::cout << "build minicam image size: " << image_width << "x" << image_height << std::endl;
@@ -1272,7 +1279,7 @@ void VoxelMapper::trainForOneIteration()
         image_width,
         /* gt_image   */  gt_image,            
         /* color_mode   */   nullptr,             
-        /* track_max_w   */  true,
+        /* track_max_w   */  false,
         /* ss            */  std::nullopt,
         /* output_depth  */  false,
         /* output_normal */  false,
@@ -1316,24 +1323,33 @@ void VoxelMapper::trainForOneIteration()
     torch::Tensor rendered_image = render_pkg.color.to(mDevice);
     torch::Tensor masked_image = rendered_image * mask;      // (1,3,H,W)
     // torch::Tensor masked_gt   = gt_image * mask;
+    if (!rendered_image.requires_grad()) {
+        std::cerr << "[warn] rendered_image.requires_grad == false; grad_fn="
+                << (rendered_image.grad_fn() ? "set" : "NULL") << "\n";
+    }
 
     auto Ll1 = loss_utils::l1_loss(masked_image, gt_image);
     float lambda_dssim = lambdaDssim();
     auto photoslam_loss = (1.0 - lambda_dssim) * Ll1
             + lambda_dssim * (1.0 - loss_utils::ssim(masked_image, gt_image, mDevice.type()));
     auto mse  = loss_utils::l2_loss(masked_image, gt_image);
-    auto loss = mse; 
+    auto loss = mse.clone();
 
-    if (!rendered_image.requires_grad()) {
-        std::cerr << "[warn] rendered_image.requires_grad == false; grad_fn="
-                << (rendered_image.grad_fn() ? "set" : "NULL") << "\n";
+    if (opt_params_.lambda_ssim_ > 0.0f) {
+        loss += opt_params_.lambda_ssim_ * loss_utils::fast_ssim_loss(masked_image, gt_image);
+        // std::cout << "[iter " << iter << "] "
+        //           << "MSE: " << mse.item<float>()
+        //           << " SSIM_loss: " << (opt_params_.lambda_ssim_ * loss_utils::fast_ssim_loss(masked_image, gt_image)).item<float>()
+        //           << " loss: " << loss.item<float>() << "\n";
     }
-
+    // if (need_sparse_depth) {
+    //     loss += opt_params_.lambda_sparse_depth * sparse_depth_loss(cam, render_pkg);
+    // }
     if (opt_params_.lambda_T_inside_ > 0.0f) {
         const torch::Tensor& raw_T = render_pkg.raw_T;   // CHW or HW after resize
         if (raw_T.defined() && raw_T.numel() > 0) {
             torch::Tensor reg = raw_T.pow(2).mean();
-            // e.g., accumulate: loss += opt_params_.lambda_T_inside_ * reg;
+            loss += opt_params_.lambda_T_inside_ * reg;
         } else {
             std::cerr << "[warn] raw_T not available (did you call render with output_T=true?)\n";
         }
@@ -2232,7 +2248,14 @@ void VoxelMapper::increaseKeyframeTimesOfUse(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         int times)
  {
+    //  std::cout << "[Voxel Mapper]Keyframe " << pkf->fid_
+    //            << " has " << pkf->remaining_times_of_use_ << " remaining times of use before increase."
+    //            << std::endl;
      pkf->remaining_times_of_use_ += times;
+    //  std::cout << "[Voxel Mapper]Keyframe " << pkf->fid_
+    //            << " increased times of use by " << times
+    //            << ", now has " << pkf->remaining_times_of_use_ << " remaining times of use."
+    //            << std::endl;
  }
 
 void VoxelMapper::writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix)
@@ -2315,7 +2338,7 @@ void VoxelMapper::renderAndRecordKeyframe(
         pkf->image_width_,
         /* gt_image   */  pkf->original_image_,
         /* color_mode   */   nullptr,
-        /* track_max_w   */  true,
+        /* track_max_w   */  false,
         /* ss            */  std::nullopt,
         /* output_depth  */  false,
         /* output_normal */  false,
@@ -2639,12 +2662,6 @@ bool VoxelMapper::isdoingGausPyramidTraining()
      opt_params_.geo_lr_ = params.geo_lr;
      opt_params_.sh0_lr_ = params.sh0_lr;
      opt_params_.shs_lr_ = params.shs_lr;
-     opt_params_.lambda_dssim_ = params.lambda_dssim;
-     opt_params_.adapt_every_ = params.densify_interval;
-     new_keyframe_times_of_use_ = params.new_kf_times_of_use;
-     stable_num_iter_existence_ = params.stable_num_iter_existence;
-     keep_training_ = params.keep_training;
-     do_gaus_pyramid_training_ = params.do_gaus_pyramid_training;
      opt_params_.lambda_dssim_ = params.lambda_dssim;
      opt_params_.adapt_every_ = params.densify_interval;
      new_keyframe_times_of_use_ = params.new_kf_times_of_use;

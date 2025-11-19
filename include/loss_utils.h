@@ -129,4 +129,25 @@ inline torch::Tensor ssim(
     return _ssim(img1, img2, window, window_size, channel, size_average);
 }
 
+inline torch::Tensor fast_ssim_loss(torch::Tensor x, torch::Tensor y)
+{
+    // Match Python: inputs are [C,H,W] or [B,C,H,W]; fused_ssim expects [B,C,H,W].
+    if (x.dim() == 3)
+    {
+        x = x.unsqueeze(0);  // [1,C,H,W]
+        y = y.unsqueeze(0);
+    }
+
+    const bool is_train = x.requires_grad() || y.requires_grad();
+
+    // Fallback: use your existing SSIM implementation (slower).
+    // Note: your ssim() already expects 4D input [B,C,H,W].
+    torch::DeviceType device_type =
+        x.is_cuda() ? torch::kCUDA : torch::kCPU;
+    torch::Tensor ssim_val = ssim(x, y, device_type);
+
+    // Return loss = 1 - SSIM
+    return 1.0f - ssim_val;
+}
+
 }

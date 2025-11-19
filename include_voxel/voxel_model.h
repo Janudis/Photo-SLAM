@@ -156,21 +156,21 @@ public:
     /// Save only sparse voxels to PLY (not implemented here).
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
-    std::unordered_map<std::string, torch::Tensor>
-    // render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss = 1.0f, bool track_max_w = false) const;
-    render(const sv::MiniCam& cam,
-        int im_height,
-        int im_width,
-        const torch::Tensor& gt_image = torch::Tensor(),
-        const char* color_mode = nullptr,
-        bool track_max_w = false,
-        std::optional<float> ss = std::nullopt,
-        bool output_depth=false,
-        bool output_normal=false,
-        bool output_T=false,
-        bool rand_bg=false,
-        bool use_auto_exposure=false,
-        const sv::RenderOpts& other_opt = sv::RenderOpts()) const;
+    // std::unordered_map<std::string, torch::Tensor>
+    // // render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss = 1.0f, bool track_max_w = false) const;
+    // render(const sv::MiniCam& cam,
+    //     int im_height,
+    //     int im_width,
+    //     const torch::Tensor& gt_image = torch::Tensor(),
+    //     const char* color_mode = nullptr,
+    //     bool track_max_w = false,
+    //     std::optional<float> ss = std::nullopt,
+    //     bool output_depth=false,
+    //     bool output_normal=false,
+    //     bool output_T=false,
+    //     bool rand_bg=false,
+    //     bool use_auto_exposure=false,
+    //     const sv::RenderOpts& other_opt = sv::RenderOpts()) const;
 
     void applyTvOnDensityField(float lambda_tv_density);
 

@@ -76,8 +76,8 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     {
         float focal_length_x = static_cast<float>(camera.params_[0]);
         float focal_length_y = static_cast<float>(camera.params_[1]);
-        // this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
-        // this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
+        this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
+        this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
         this->set_camera_ = true;
         // std::cout << "voxel_keyframe.cpp: setCameraParams() Pinhole camera model with FoVx: "
         //           << this->FoVx_ << " and FoVy: " << this->FoVy_ << std::endl;

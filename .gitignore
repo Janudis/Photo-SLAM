@@ -45,3 +45,6 @@
 # ImGui .ini
 *imgui.iniscripts/data/
 scripts/data/
+
+# rerun
+*.rrd

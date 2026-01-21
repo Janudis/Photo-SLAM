@@ -19,6 +19,9 @@ struct MiniCam {
     float near    = 0.01f;
     std::string cam_mode = "persp";
     int   frame_id = -1;
+    torch::Tensor position;   // [3] CPU
+    torch::Tensor lookat;     // [3] CPU
+    float pix_size = 0.f;
 };
 
 /* -------- helper: build MiniCam from a C++ Camera + pose ---------------- */
@@ -51,6 +54,15 @@ inline MiniCam fromCamera(const Camera& cam,
     m.w2c = torch::linalg_inv(c2w);
     m.frame_id = frame_id;
 
+    m.position = m.c2w.index({torch::indexing::Slice(0,3), 3}).clone();  // [3] CPU
+    m.lookat   = m.c2w.index({torch::indexing::Slice(0,3), 2}).clone();  // [3] CPU
+    // normalize lookat to be safe
+    auto norm = m.lookat.norm().item<float>();
+    if (norm > 1e-6f) {
+        // std::cout << "minicam.h: normalizing lookat vector, norm = " << norm << std::endl;
+        m.lookat = m.lookat / norm;
+    }
+    m.pix_size = 2.f * m.tanfovx / m.width;
     // std::cout << "minicam.h: fovx = " << fovx << " fovy = " << fovy << " cx,cy=" << m.cx << "," << m.cy << " im_width,im_height=" << im_width << "," << im_height << std::endl;
     // std::cout << "m.c2w" << m.c2w << std::endl;
     // std::cout << "m.w2c" << m.w2c << std::endl;

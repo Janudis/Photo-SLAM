@@ -76,10 +76,13 @@ public:
     const torch::Tensor& geoGridPts() const;
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
+    torch::Tensor voxelDensityMean() const;
+    torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
+    torch::Tensor voxKey() const { return this->vox_key_; }
 
     void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams);
     void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration, const std::vector<sv::MiniCam>& cams);
-    // void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
+    void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
 
     // ───────── Optimizer setup ─────────
     void setGeoLearningRate(float geo_lr);
@@ -161,7 +164,10 @@ public:
     void    debugOptimizer();
     torch::Tensor snapParam(const char* name);                       // <- return Tensor
     double        deltaFrom(const char* name, const torch::Tensor& prev);
+    void debugAssertTopologyConsistent(const char* where) const;
+    void logParamSignature(const char* tag);
 
+    // Initialize once & spawn viewer
     void rrInitOnce();
     void rrLogPointsAndAABB(int iteration,                   // keep if you want for labels
                             const at::Tensor& xyz,
@@ -172,15 +178,22 @@ public:
                             bool log_points = true,
                             bool log_box   = true,
                             int64_t inc = -1); 
-    void logParamSignature(const char* tag);
     void rrLogVoxelBoxes(const at::Tensor& centers,
                          const at::Tensor& sizes,
                          int64_t max_boxes_for_viz = 100000000,
                          const std::string& tag = "boxes",
                          int64_t inc = -1);
     void rrLogGlobalSceneAABB(int64_t inc);
+    void rrLogTrainingCamera(const sv::MiniCam& cam, int64_t inc);
+    void rrLogVoxelBoxesWithShColor(const at::Tensor& centers,
+                                    const at::Tensor& sizes,
+                                    const at::Tensor& sh0,
+                                    int64_t max_boxes_for_viz = 100000,
+                                    const std::string& tag = "boxes_sh_color",
+                                    int64_t inc = -1);
 
-    void debugAssertTopologyConsistent(const char* where) const;
+    void applyTsdfTransparency(const torch::Tensor& tsdf_mask, float geo_value);
+    void applySingleVoxelTsdfTransparency(int64_t voxel_idx, float geo_value);
 
 private:
     std::unique_ptr<rerun::RecordingStream> rr_;
@@ -238,16 +251,26 @@ public:
     float fixed_vox_size_ = 0.05f;        // your chosen voxel size
 
     bool   fill_empty_cells_ = true;
-    int64_t max_artifact_cells_ = 150000; // safety cap
+    int64_t max_artifact_cells_ = 1000000; // safety cap
     std::array<float,3> artifact_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
 
     torch::Tensor bb_min_viz, bb_max_viz, sel_artifacts_viz, ijk_box_viz;
+    py::object svm() const;
 
+    torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
+    torch::Tensor global_pcd_max_;   // [3], CPU or CUDA
+    
+    bool has_global_pcd_bb_ = false;
+    bool consumeArtifactFillFlag() {
+        bool v = artifact_fill_happened_;
+        artifact_fill_happened_ = false;
+        return v;
+    }
+    bool artifact_fill_happened_ = false;  // default false
 
 protected:
     /// The Adam optimizer
     // std::shared_ptr<torch::optim::Adam> optimizer_;
-    // py::object svm_;
     // py::object optimizer_py_;
     struct PyState;                // forward declaration only
     std::unique_ptr<PyState> py_;  // holds all pybind objects

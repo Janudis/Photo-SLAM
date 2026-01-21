@@ -61,7 +61,10 @@ VoxelOptimizationParams::VoxelOptimizationParams(
     float ss_aug_max,
     float lambda_R_concen,
     float lambda_dist,
-    float lambda_T_inside
+    float lambda_T_inside,
+    float lambda_ssim,
+    float lambda_sparse_depth,
+    int   sparse_depth_until
 )
     :   iterations_(iterations),
         geo_lr_(geo_lr),
@@ -89,5 +92,8 @@ VoxelOptimizationParams::VoxelOptimizationParams(
         ss_aug_max_(ss_aug_max),
         lambda_R_concen_(lambda_R_concen),
         lambda_dist_(lambda_dist),
-        lambda_T_inside_(lambda_T_inside)
+        lambda_T_inside_(lambda_T_inside),
+        lambda_ssim_(lambda_ssim),
+        lambda_sparse_depth_(lambda_sparse_depth),
+        sparse_depth_until_(sparse_depth_until)
 {}

@@ -55,6 +55,15 @@ VoxelModel::VoxelModel(const VoxelModelParams& model_params)
     py_ = std::make_unique<PyState>();
 }
 
+py::object VoxelModel::svm() const
+{
+    py::gil_scoped_acquire gil;
+    if (!py_ || py_->svm.is_none()) {
+        return py::none();
+    }
+    return py_->svm;
+}
+
 int64_t sv::VoxelModel::numGridPts() const {
     return (grid_pts_key_.defined() && grid_pts_key_.dim() > 0)
            ? grid_pts_key_.size(0)
@@ -64,6 +73,27 @@ int64_t sv::VoxelModel::numGridPts() const {
 const torch::Tensor& sv::VoxelModel::geoGridPts() const { return _geo_grid_pts_; }
 const torch::Tensor& sv::VoxelModel::sh0()        const { return sh0_; }
 const torch::Tensor& sv::VoxelModel::shs()        const { return shs_; }
+
+torch::Tensor VoxelModel::voxelDensityMean() const
+{
+    TORCH_CHECK(_geo_grid_pts_.defined(), "_geo_grid_pts_ not defined");
+    TORCH_CHECK(vox_key_.defined(), "vox_key_ not defined");
+
+    // 1) Flatten grid scalar: [Mg,1] -> [Mg]
+    auto geo_flat = _geo_grid_pts_.view({-1});  // [Mg]
+
+    // 2) Flatten voxel keys: [Nv,8] -> [Nv*8] (long)
+    auto vk_long = vox_key_.to(torch::kLong).view({-1}); // [Nv*8]
+
+    // 3) Gather 8 corner densities per voxel:
+    auto geo_corners = geo_flat.index_select(0, vk_long); // [Nv*8]
+
+    // 4) Reshape to [Nv, 8] and average:
+    const auto Nv = vox_key_.size(0);
+    auto geo_per_voxel = geo_corners.view({Nv, 8}).mean(1); // [Nv]
+
+    return geo_per_voxel;  // pre-activation densities per voxel
+}
 
 void VoxelModel::oneUpShDegree()
 {
@@ -182,174 +212,276 @@ static inline void print_aabb(const char* name,
     //           << "vol=" << vol << "\n";
 }
 
-static inline std::string rrTimestamp() {
-    std::time_t t = std::time(nullptr);
-    std::tm tm;
-    localtime_r(&t, &tm);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-    return buf;
-}
+// static inline std::string rrTimestamp() {
+//     std::time_t t = std::time(nullptr);
+//     std::tm tm;
+//     localtime_r(&t, &tm);
+//     char buf[32];
+//     std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+//     return buf;
+// }
 
-inline void sv::VoxelModel::rrInitOnce() {
-    if (rr_initialized_) return;
-    rr_ = std::make_unique<rerun::RecordingStream>("PhotoSLAM");
-    const std::string f = "/home/dimitris/Photo-SLAM/rerun/debug_run_" + rrTimestamp() + ".rrd";
-    rr_->save(f).exit_on_failure();  // offline
-    rr_initialized_ = true;
-    // optional: std::cout << "[Rerun] writing to " << f << "\n";
-}
+// inline void sv::VoxelModel::rrInitOnce() {
+//     if (rr_initialized_) return;
+//     rr_ = std::make_unique<rerun::RecordingStream>("PhotoSLAM");
+//     const std::string f = "/home/dimitris/Photo-SLAM/rerun/debug_run_" + rrTimestamp() + ".rrd";
+//     rr_->save(f).exit_on_failure();  // offline
+//     rr_initialized_ = true;
+//     // optional: std::cout << "[Rerun] writing to " << f << "\n";
+// }
 
-static inline std::string rrSanitize(std::string s) {
-    for (char& ch : s)
-        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch=='_' || ch=='-' || ch=='/'))
-            ch = '_';
-    return s;
-}
+// static inline std::string rrSanitize(std::string s) {
+//     for (char& ch : s)
+//         if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch=='_' || ch=='-' || ch=='/'))
+//             ch = '_';
+//     return s;
+// }
 
-void sv::VoxelModel::rrLogPointsAndAABB(
-    int iteration,                        // only for label text
-    const at::Tensor& xyz,                // [N,3] (on any device)
-    const at::Tensor& rgb,                // [N,3] or empty
-    const at::Tensor& bounding_2x3,       // [2,3] min/max (CPU or GPU)
-    const std::string& tag,               // e.g., "init_raw", "init_used", "increase_raw", "increase_used"
-    int64_t max_points_for_viz,           // subsample cap; 0 => no subsampling
-    bool log_points,                      // log point cloud?
-    bool log_box,                         // log AABB?
-    int64_t inc                           // required: single time axis
-){
-    rrInitOnce();
+// void sv::VoxelModel::rrLogPointsAndAABB(
+//     int iteration,                        // only for label text
+//     const at::Tensor& xyz,                // [N,3] (on any device)
+//     const at::Tensor& rgb,                // [N,3] or empty
+//     const at::Tensor& bounding_2x3,       // [2,3] min/max (CPU or GPU)
+//     const std::string& tag,               // e.g., "init_raw", "init_used", "increase_raw", "increase_used"
+//     int64_t max_points_for_viz,           // subsample cap; 0 => no subsampling
+//     bool log_points,                      // log point cloud?
+//     bool log_box,                         // log AABB?
+//     int64_t inc                           // required: single time axis
+// ){
+//     rrInitOnce();
 
-    const std::string tag_safe = rrSanitize(tag);
+//     const std::string tag_safe = rrSanitize(tag);
 
-    // ---- Points ----
-    if (log_points && xyz.defined() && xyz.numel() >= 3) {
-        at::Tensor P = xyz.detach().to(at::kCPU).to(at::kFloat).contiguous();
-        if (P.dim()==2 && P.size(1)==3) {
-            at::Tensor C;
-            if (rgb.defined() && rgb.sizes()==P.sizes())
-                C = rgb.detach().clamp(0,1).to(at::kCPU).to(at::kFloat).contiguous();
-            else
-                C = at::ones({P.size(0),3}, P.options());
+//     // ---- Points ----
+//     if (log_points && xyz.defined() && xyz.numel() >= 3) {
+//         at::Tensor P = xyz.detach().to(at::kCPU).to(at::kFloat).contiguous();
+//         if (P.dim()==2 && P.size(1)==3) {
+//             at::Tensor C;
+//             if (rgb.defined() && rgb.sizes()==P.sizes())
+//                 C = rgb.detach().clamp(0,1).to(at::kCPU).to(at::kFloat).contiguous();
+//             else
+//                 C = at::ones({P.size(0),3}, P.options());
 
-            const int64_t N = P.size(0);
-            const int64_t stride = (max_points_for_viz>0 && N>max_points_for_viz)
-                                   ? ((N + max_points_for_viz - 1) / max_points_for_viz)
-                                   : 1;
+//             const int64_t N = P.size(0);
+//             const int64_t stride = (max_points_for_viz>0 && N>max_points_for_viz)
+//                                    ? ((N + max_points_for_viz - 1) / max_points_for_viz)
+//                                    : 1;
 
-            std::vector<rerun::Vec3D> positions; positions.reserve((N + stride - 1) / stride);
-            std::vector<rerun::Rgba32> colors;    colors.reserve((N + stride - 1) / stride);
+//             std::vector<rerun::Vec3D> positions; positions.reserve((N + stride - 1) / stride);
+//             std::vector<rerun::Rgba32> colors;    colors.reserve((N + stride - 1) / stride);
 
-            const float* p = P.data_ptr<float>();
-            const float* c = C.data_ptr<float>();
-            for (int64_t i=0; i<N; i+=stride) {
-                positions.emplace_back(p[3*i+0], p[3*i+1], p[3*i+2]);
-                colors.emplace_back(
-                    (uint8_t)std::lround(255.f * c[3*i+0]),
-                    (uint8_t)std::lround(255.f * c[3*i+1]),
-                    (uint8_t)std::lround(255.f * c[3*i+2]),
-                    255
-                );
-            }
+//             const float* p = P.data_ptr<float>();
+//             const float* c = C.data_ptr<float>();
+//             for (int64_t i=0; i<N; i+=stride) {
+//                 positions.emplace_back(p[3*i+0], p[3*i+1], p[3*i+2]);
+//                 colors.emplace_back(
+//                     (uint8_t)std::lround(255.f * c[3*i+0]),
+//                     (uint8_t)std::lround(255.f * c[3*i+1]),
+//                     (uint8_t)std::lround(255.f * c[3*i+2]),
+//                     255
+//                 );
+//             }
 
-            rr_->set_time_sequence("inc", inc);
-            rr_->log("world/points/" + tag_safe,
-                     rerun::Points3D(positions).with_colors(colors));
-        }
-    }
+//             rr_->set_time_sequence("inc", inc);
+//             rr_->log("world/points/" + tag_safe,
+//                      rerun::Points3D(positions).with_colors(colors));
+//         }
+//     }
 
-    // ---- Box ----
-    if (log_box && bounding_2x3.defined() && bounding_2x3.numel()==6) {
-        at::Tensor B = bounding_2x3.detach().to(at::kCPU).to(at::kFloat).contiguous();
-        if (B.dim()==2 && B.size(0)==2 && B.size(1)==3) {
-            const float minx = B[0][0].item<float>();
-            const float miny = B[0][1].item<float>();
-            const float minz = B[0][2].item<float>();
-            const float maxx = B[1][0].item<float>();
-            const float maxy = B[1][1].item<float>();
-            const float maxz = B[1][2].item<float>();
+//     // ---- Box ----
+//     if (log_box && bounding_2x3.defined() && bounding_2x3.numel()==6) {
+//         at::Tensor B = bounding_2x3.detach().to(at::kCPU).to(at::kFloat).contiguous();
+//         if (B.dim()==2 && B.size(0)==2 && B.size(1)==3) {
+//             const float minx = B[0][0].item<float>();
+//             const float miny = B[0][1].item<float>();
+//             const float minz = B[0][2].item<float>();
+//             const float maxx = B[1][0].item<float>();
+//             const float maxy = B[1][1].item<float>();
+//             const float maxz = B[1][2].item<float>();
 
-            const rerun::Vec3D mins  {minx, miny, minz};
-            const rerun::Vec3D sizes {std::max(1e-6f, maxx-minx),
-                                      std::max(1e-6f, maxy-miny),
-                                      std::max(1e-6f, maxz-minz)};
+//             const rerun::Vec3D mins  {minx, miny, minz};
+//             const rerun::Vec3D sizes {std::max(1e-6f, maxx-minx),
+//                                       std::max(1e-6f, maxy-miny),
+//                                       std::max(1e-6f, maxz-minz)};
 
-            const bool is_raw = (tag.find("raw") != std::string::npos);
-            const rerun::Rgba32 col = is_raw ? rerun::Rgba32(255,0,0,255)   // raw = red
-                                             : rerun::Rgba32(0,255,0,255);  // used/union = green
+//             const bool is_raw = (tag.find("raw") != std::string::npos);
+//             const rerun::Rgba32 col = is_raw ? rerun::Rgba32(255,0,0,255)   // raw = red
+//                                              : rerun::Rgba32(0,255,0,255);  // used/union = green
 
-            std::ostringstream lbl; lbl << tag << "@" << iteration;
+//             std::ostringstream lbl; lbl << tag << "@" << iteration;
 
-            rr_->set_time_sequence("inc", inc);
-            rr_->log("world/boxes/" + tag_safe,
-                     rerun::Boxes3D::from_mins_and_sizes({mins}, {sizes})
-                        .with_labels({lbl.str()})
-                        .with_colors({col}));
-        }
-    }
-}
+//             rr_->set_time_sequence("inc", inc);
+//             rr_->log("world/boxes/" + tag_safe,
+//                      rerun::Boxes3D::from_mins_and_sizes({mins}, {sizes})
+//                         .with_labels({lbl.str()})
+//                         .with_colors({col}));
+//         }
+//     }
+// }
 
-void sv::VoxelModel::rrLogVoxelBoxes(
-    const at::Tensor& centers,     // [N,3], any device
-    const at::Tensor& size,        // [N],   any device (edge length per voxel)
-    int64_t max_boxes_for_viz,     // e.g., 20000
-    const std::string& tag,        // e.g., "vox_all", "vox_new"
-    int64_t inc
-){
-    rrInitOnce();
+// void sv::VoxelModel::rrLogVoxelBoxes(
+//     const at::Tensor& centers,     // [N,3], any device
+//     const at::Tensor& size,        // [N],   any device (edge length per voxel)
+//     int64_t max_boxes_for_viz,     // e.g., 20000
+//     const std::string& tag,        // e.g., "vox_all", "vox_new"
+//     int64_t inc
+// ){
+//     rrInitOnce();
 
-    if (!centers.defined() || !size.defined()) return;
-    at::Tensor C = centers.detach().to(at::kCPU).to(at::kFloat).contiguous();
-    at::Tensor S = size   .detach().to(at::kCPU).to(at::kFloat).contiguous();
+//     if (!centers.defined() || !size.defined()) return;
+//     at::Tensor C = centers.detach().to(at::kCPU).to(at::kFloat).contiguous();
+//     at::Tensor S = size   .detach().to(at::kCPU).to(at::kFloat).contiguous();
 
-    TORCH_CHECK(C.dim()==2 && C.size(1)==3, "centers must be [N,3]");
-    TORCH_CHECK(S.dim()==1 && S.size(0)==C.size(0), "size must be [N]");
+//     TORCH_CHECK(C.dim()==2 && C.size(1)==3, "centers must be [N,3]");
+//     TORCH_CHECK(S.dim()==1 && S.size(0)==C.size(0), "size must be [N]");
 
-    int64_t N = C.size(0);
-    int64_t stride = (max_boxes_for_viz>0 && N>max_boxes_for_viz)
-                     ? ((N + max_boxes_for_viz - 1) / max_boxes_for_viz)
-                     : 1;
+//     int64_t N = C.size(0);
+//     int64_t stride = (max_boxes_for_viz>0 && N>max_boxes_for_viz)
+//                      ? ((N + max_boxes_for_viz - 1) / max_boxes_for_viz)
+//                      : 1;
 
-    std::vector<rerun::Vec3D> mins;  mins.reserve((N + stride - 1) / stride);
-    std::vector<rerun::Vec3D> sizes; sizes.reserve((N + stride - 1) / stride);
+//     std::vector<rerun::Vec3D> mins;  mins.reserve((N + stride - 1) / stride);
+//     std::vector<rerun::Vec3D> sizes; sizes.reserve((N + stride - 1) / stride);
 
-    const float* pc = C.data_ptr<float>();
-    const float* ps = S.data_ptr<float>();
-    for (int64_t i=0; i<N; i+=stride) {
-        float sz = std::max(1e-6f, ps[i]);
-        float hx = 0.5f * sz;
-        mins.emplace_back(pc[3*i+0] - hx, pc[3*i+1] - hx, pc[3*i+2] - hx);
-        sizes.emplace_back(sz, sz, sz);
-    }
+//     const float* pc = C.data_ptr<float>();
+//     const float* ps = S.data_ptr<float>();
+//     for (int64_t i=0; i<N; i+=stride) {
+//         float sz = std::max(1e-6f, ps[i]);
+//         float hx = 0.5f * sz;
+//         mins.emplace_back(pc[3*i+0] - hx, pc[3*i+1] - hx, pc[3*i+2] - hx);
+//         sizes.emplace_back(sz, sz, sz);
+//     }
 
-    // color: orange for "new", translucent blue otherwise
-    const rerun::Rgba32 col = (tag.find("new") != std::string::npos)
-        ? rerun::Rgba32(255, 165,   0, 128)  // orange, semi
-        : rerun::Rgba32(  0, 128, 255,  64); // blue, more translucent
+//     // color: orange for "new", translucent blue otherwise
+//     const rerun::Rgba32 col = (tag.find("new") != std::string::npos)
+//         ? rerun::Rgba32(255, 165,   0, 128)  // orange, semi
+//         : rerun::Rgba32(  0, 128, 255,  64); // blue, more translucent
 
-    rr_->set_time_sequence("inc", inc);
-    rr_->log("world/voxels/" + rrSanitize(tag),
-             rerun::Boxes3D::from_mins_and_sizes(mins, sizes)
-                 .with_colors({col}));
-}
+//     rr_->set_time_sequence("inc", inc);
+//     rr_->log("world/voxels/" + rrSanitize(tag),
+//              rerun::Boxes3D::from_mins_and_sizes(mins, sizes)
+//                  .with_colors({col}));
+// }
 
-inline void sv::VoxelModel::rrLogGlobalSceneAABB(int64_t inc)
-{
-    rrInitOnce();
-    const float e = global_scene_extent_;
-    const rerun::Vec3D mins {
-        global_scene_center_[0] - 0.5f*e,
-        global_scene_center_[1] - 0.5f*e,
-        global_scene_center_[2] - 0.5f*e,
-    };
-    const rerun::Vec3D sizes { std::max(1e-6f, e), std::max(1e-6f, e), std::max(1e-6f, e) };
+// inline void sv::VoxelModel::rrLogGlobalSceneAABB(int64_t inc)
+// {
+//     rrInitOnce();
+//     const float e = global_scene_extent_;
+//     const rerun::Vec3D mins {
+//         global_scene_center_[0] - 0.5f*e,
+//         global_scene_center_[1] - 0.5f*e,
+//         global_scene_center_[2] - 0.5f*e,
+//     };
+//     const rerun::Vec3D sizes { std::max(1e-6f, e), std::max(1e-6f, e), std::max(1e-6f, e) };
 
-    rr_->set_time_sequence("inc", inc);
-    rr_->log("world/boxes/global_scene",
-             rerun::Boxes3D::from_mins_and_sizes({mins}, {sizes})
-                 .with_labels({"global_scene"})
-                 .with_colors({rerun::Rgba32(0,255,0,255)})); // solid green
-}
+//     rr_->set_time_sequence("inc", inc);
+//     rr_->log("world/boxes/global_scene",
+//              rerun::Boxes3D::from_mins_and_sizes({mins}, {sizes})
+//                  .with_labels({"global_scene"})
+//                  .with_colors({rerun::Rgba32(0,255,0,255)})); // solid green
+// }
+
+// void sv::VoxelModel::rrLogVoxelBoxesWithShColor(
+//     const at::Tensor& centers,   // [N,3]
+//     const at::Tensor& size,      // [N] or [N,1]
+//     const at::Tensor& sh0,       // [N,3] (DC SH -> RGB)
+//     int64_t max_points_for_viz,  // e.g. 50'000
+//     const std::string& tag,      // e.g. "vox_all", "vox_pruned_final"
+//     int64_t inc
+// ) {
+//     rrInitOnce();  // make sure rr_ is created (offline .rrd file)
+
+//     if (!centers.defined() || !size.defined() || !sh0.defined())
+//         return;
+
+//     TORCH_CHECK(centers.dim() == 2 && centers.size(1) == 3,
+//                 "centers must be [N,3]");
+//     TORCH_CHECK(sh0.dim() == 2 && sh0.size(1) == 3,
+//                 "sh0 must be [N,3]");
+
+//     int64_t N = centers.size(0);
+//     TORCH_CHECK(size.dim() == 1 || (size.dim() == 2 && size.size(1) == 1),
+//                 "size must be [N] or [N,1]");
+//     TORCH_CHECK(sh0.size(0) == N,
+//                 "sh0 and centers must have same length");
+
+//     if (N == 0) return;
+
+//     // --- Move to CPU & prepare tensors --------------------------------------
+//     at::Tensor C = centers.detach().to(at::kCPU).to(at::kFloat).contiguous(); // [N,3]
+//     at::Tensor S = size   .detach().to(at::kCPU).to(at::kFloat).contiguous(); // [N] or [N,1]
+//     if (S.dim() == 2 && S.size(1) == 1)
+//         S = S.view({S.size(0)});  // [N]
+
+//     // SH0 -> RGB via your Python helper
+//     at::Tensor rgb_cpu;
+//     {
+//         py::gil_scoped_acquire gil;
+//         static py::module act_mod =
+//             py::module::import("src.utils.activation_utils");
+//         at::Tensor sh0_cpu = sh0.detach()
+//                                    .to(at::kCPU)
+//                                    .to(at::kFloat)
+//                                    .contiguous();  // [N,3]
+
+//         py::object rgb_py = act_mod.attr("shzero2rgb")(py::cast(sh0_cpu));
+//         rgb_cpu = rgb_py.cast<at::Tensor>().contiguous().to(at::kFloat); // [N,3]
+//     }
+//     TORCH_CHECK(rgb_cpu.dim() == 2 && rgb_cpu.size(0) == N && rgb_cpu.size(1) == 3,
+//                 "shzero2rgb returned wrong shape");
+
+//     // --- Subsample if needed -------------------------------------------------
+//     int64_t stride = (max_points_for_viz > 0 && N > max_points_for_viz)
+//                      ? ((N + max_points_for_viz - 1) / max_points_for_viz)
+//                      : 1;
+
+//     std::vector<rerun::datatypes::Vec3D> points;
+//     std::vector<float> radii;
+//     std::vector<rerun::datatypes::Rgba32> colors;
+
+//     points.reserve((N + stride - 1) / stride);
+//     radii .reserve((N + stride - 1) / stride);
+//     colors.reserve((N + stride - 1) / stride);
+
+//     const float* pc = C.data_ptr<float>();        // [N,3]
+//     const float* ps = S.data_ptr<float>();        // [N]
+//     const float* pr = rgb_cpu.data_ptr<float>();  // [N,3]
+
+//     for (int64_t i = 0; i < N; i += stride) {
+//         float sz = std::max(1e-6f, ps[i]);   // voxel edge length
+//         float r  = sz * 0.5f;                // radius for visualization
+
+//         float x = pc[3 * i + 0];
+//         float y = pc[3 * i + 1];
+//         float z = pc[3 * i + 2];
+
+//         points.emplace_back(x, y, z);
+//         radii.emplace_back(r);
+
+//         float cr = std::clamp(pr[3 * i + 0], 0.0f, 1.0f);
+//         float cg = std::clamp(pr[3 * i + 1], 0.0f, 1.0f);
+//         float cb = std::clamp(pr[3 * i + 2], 0.0f, 1.0f);
+
+//         colors.emplace_back(
+//             static_cast<uint8_t>(std::lround(255.f * cr)),
+//             static_cast<uint8_t>(std::lround(255.f * cg)),
+//             static_cast<uint8_t>(std::lround(255.f * cb)),
+//             200  // alpha
+//         );
+//     }
+
+//     // --- Log as Points3D -----------------------------------------------------
+//     rr_->set_time_sequence("inc", inc);
+
+//     auto pts = rerun::archetypes::Points3D(points)
+//                    .with_radii(radii)
+//                    .with_colors(colors);
+
+//     rr_->log(
+//         "world/voxels/" + rrSanitize(tag),
+//         pts
+//     );
+// }
 
 // void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams)
 // {
@@ -938,6 +1070,214 @@ inline void sv::VoxelModel::rrLogGlobalSceneAABB(int64_t inc)
 //               << "Total now: " << this->oct_path_.size(0) << "\n";
 // }
 
+void VoxelModel::applyTsdfTransparency(const torch::Tensor& tsdf_mask, float geo_value)
+{
+    TORCH_CHECK(tsdf_mask.defined(),
+                "applyTsdfTransparency: tsdf_mask must be defined");
+    TORCH_CHECK(tsdf_mask.dim() == 1,
+                "applyTsdfTransparency: tsdf_mask must be 1D [N]");
+    TORCH_CHECK(tsdf_mask.size(0) == center_.size(0),
+                "applyTsdfTransparency: tsdf_mask.size(0) must equal num voxels");
+
+    TORCH_CHECK(vox_key_.defined(),
+                "applyTsdfTransparency: vox_key_ must be defined");
+    TORCH_CHECK(_geo_grid_pts_.defined(),
+                "applyTsdfTransparency: _geo_grid_pts_ must be defined");
+
+    // [N] bool mask over voxels
+    torch::Tensor mask = tsdf_mask.to(torch::kBool);
+    if (!mask.any().item<bool>()) {
+        std::cout << "[TSDF TRANS] no TSDF voxels marked, nothing to do.\n";
+        return;
+    }
+
+    if (mask.device() != vox_key_.device()) {
+        mask = mask.to(vox_key_.device());
+    }
+
+    torch::Tensor vox_key = vox_key_;  // [N,K]
+    TORCH_CHECK(vox_key.dim() == 2,
+                "applyTsdfTransparency: vox_key_ expected to be [N,K]");
+
+    const auto N = vox_key.size(0);
+    const auto K = vox_key.size(1);
+    TORCH_CHECK(mask.size(0) == N,
+                "applyTsdfTransparency: tsdf_mask and vox_key_ N mismatch");
+
+    // ---- voxel-level stats ----
+    int64_t n_vox_tsdf = mask.sum().item<int64_t>();   // #voxels marked by TSDF
+
+    // Expand voxel mask to [N,K], then select all grid indices of marked voxels
+    torch::Tensor mask2d   = mask.view({N, 1}).expand_as(vox_key); // [N,K]
+    torch::Tensor flat_idx = vox_key.masked_select(mask2d);        // [M]
+
+    if (flat_idx.numel() == 0) {
+        std::cout << "[TSDF TRANS] tsdf_mask has true entries but flat_idx is empty – check vox_key_.\n";
+        return;
+    }
+
+    // ---- unique grid indices (because grid points are shared by voxels) ----
+    // 1) sort the flat indices
+    auto sort_res          = flat_idx.sort();              // (values, indices)
+    torch::Tensor sorted   = std::get<0>(sort_res);        // [M]
+    auto M                 = sorted.size(0);
+
+    // 2) build a mask that keeps only the first occurrence of each value
+    torch::Tensor flat_idx_unique;
+    if (M == 0) {
+        flat_idx_unique = sorted;
+    } else {
+        auto opts_bool = torch::TensorOptions()
+                            .dtype(torch::kBool)
+                            .device(sorted.device());
+        torch::Tensor mask = torch::empty({M}, opts_bool);
+
+        // mask[0] = true (always keep first element)
+        mask.index_put_({0}, true);
+
+        if (M > 1) {
+            // tail = sorted[1:]
+            auto tail = sorted.slice(/*dim=*/0, /*start=*/1, /*end=*/M);
+            // head = sorted[:-1]
+            auto head = sorted.slice(/*dim=*/0, /*start=*/0, /*end=*/M - 1);
+            // neq = (tail != head)
+            auto neq  = tail.ne(head);                      // [M-1] bool
+
+            // mask[1:] = neq
+            using torch::indexing::Slice;
+            mask.index_put_({Slice(1, torch::indexing::None)}, neq);
+        }
+
+        // 3) select unique values
+        flat_idx_unique = sorted.masked_select(mask);       // [M_unique]
+    }
+
+    // geometry field: [Mg,1]
+    torch::Tensor geo = _geo_grid_pts_;
+    TORCH_CHECK(geo.dim() == 2 && geo.size(1) == 1,
+                "applyTsdfTransparency: _geo_grid_pts_ must be [Mg,1]");
+    TORCH_CHECK(flat_idx.dtype() == torch::kLong,
+                "applyTsdfTransparency: vox_key_ must be int64 indices");
+
+    if (flat_idx_unique.device() != geo.device()) {
+        flat_idx_unique = flat_idx_unique.to(geo.device());
+    }
+
+    // ---- BEFORE modification stats ----
+    torch::Tensor geo_sel_before      = geo.index_select(0, flat_idx_unique); // [M_unique,1]
+    torch::Tensor geo_sel_before_flat = geo_sel_before.view({-1});           // [M_unique]
+
+    float dens_min_before = geo_sel_before_flat.min().item().toFloat();
+    float dens_max_before = geo_sel_before_flat.max().item().toFloat();
+
+    double avg_grid_per_voxel =
+        static_cast<double>(flat_idx_unique.numel()) /
+        std::max<int64_t>(1, n_vox_tsdf);
+
+    std::cout << "[TSDF TRANS] voxels_marked=" << n_vox_tsdf
+              << "  K_per_voxel=" << K
+              << "  grid_pts_selected=" << flat_idx.numel()
+              << "  unique_grid_pts=" << flat_idx_unique.numel()
+              << "  avg_unique_grid_per_voxel=" << avg_grid_per_voxel << "\n";
+
+    std::cout << "[TSDF TRANS] BEFORE: density in those grid pts: "
+              << "min=" << dens_min_before
+              << ", max=" << dens_max_before
+              << "  -> setting all to " << geo_value << "\n";
+
+    // ---- Apply transparency without autograd tracking ----
+    {
+        torch::NoGradGuard no_grad;
+        // geo: [Mg,1]; we write along dim=0, using flat_idx_unique as row indices
+        geo.index_fill_(0, flat_idx_unique, geo_value);
+    }
+
+    // ---- AFTER modification stats ----
+    torch::Tensor geo_sel_after      = geo.index_select(0, flat_idx_unique);
+    torch::Tensor geo_sel_after_flat = geo_sel_after.view({-1});
+
+    float dens_min_after = geo_sel_after_flat.min().item().toFloat();
+    float dens_max_after = geo_sel_after_flat.max().item().toFloat();
+
+    std::cout << "[TSDF TRANS] AFTER: density in those grid pts: "
+              << "min=" << dens_min_after
+              << ", max=" << dens_max_after << "\n";
+
+    // write back
+    _geo_grid_pts_ = geo;
+}
+
+void VoxelModel::applySingleVoxelTsdfTransparency(int64_t voxel_idx, float geo_value)
+{
+    TORCH_CHECK(vox_key_.defined(),
+                "applySingleVoxelTsdfTransparency: vox_key_ must be defined");
+    TORCH_CHECK(_geo_grid_pts_.defined(),
+                "applySingleVoxelTsdfTransparency: _geo_grid_pts_ must be defined");
+    TORCH_CHECK(voxel_idx >= 0 && voxel_idx < vox_key_.size(0),
+                "applySingleVoxelTsdfTransparency: voxel_idx out of range");
+
+    torch::Tensor geo = _geo_grid_pts_;  // [Mg,1]
+    TORCH_CHECK(geo.dim() == 2 && geo.size(1) == 1,
+                "applySingleVoxelTsdfTransparency: _geo_grid_pts_ must be [Mg,1]");
+
+    torch::Tensor vox_key = vox_key_;    // [N, K]
+    TORCH_CHECK(vox_key.dim() == 2,
+                "applySingleVoxelTsdfTransparency: vox_key_ must be [N,K]");
+
+    const auto N = vox_key.size(0);
+    const auto K = vox_key.size(1);
+
+    TORCH_CHECK(voxel_idx < N,
+                "applySingleVoxelTsdfTransparency: voxel_idx >= N");
+
+    // --- Get the K grid indices for this voxel ---
+    auto idx_options = torch::TensorOptions().dtype(torch::kLong).device(vox_key.device());
+    torch::Tensor vox_idx_tensor = torch::tensor({voxel_idx}, idx_options);  // [1]
+
+    // row: [1, K] -> flatten to [K]
+    torch::Tensor grid_idx_row = vox_key.index_select(0, vox_idx_tensor).view({-1}); // [K]
+    TORCH_CHECK(grid_idx_row.dtype() == torch::kLong,
+                "applySingleVoxelTsdfTransparency: vox_key_ must contain int64 indices");
+
+    if (grid_idx_row.device() != geo.device()) {
+        grid_idx_row = grid_idx_row.to(geo.device());
+    }
+
+    // ---- BEFORE modification stats ----
+    torch::Tensor geo_sel_before      = geo.index_select(0, grid_idx_row);  // [K,1]
+    torch::Tensor geo_sel_before_flat = geo_sel_before.view({-1});         // [K]
+
+    float dens_min_before = geo_sel_before_flat.min().item<float>();
+    float dens_max_before = geo_sel_before_flat.max().item<float>();
+
+    std::cout << "[TSDF DEBUG] single voxel_idx=" << voxel_idx
+              << " grid_pts=" << grid_idx_row.numel()
+              << "  BEFORE density: min=" << dens_min_before
+              << " max=" << dens_max_before
+              << "  -> setting all to " << geo_value << "\n";
+
+    // ---- Apply transparency without autograd tracking ----
+    {
+        torch::NoGradGuard no_grad;
+        // geo: [Mg,1]; write along dim=0, using grid_idx_row as row indices
+        geo.index_fill_(0, grid_idx_row, geo_value);
+    }
+
+    // ---- AFTER modification stats ----
+    torch::Tensor geo_sel_after      = geo.index_select(0, grid_idx_row);
+    torch::Tensor geo_sel_after_flat = geo_sel_after.view({-1});
+
+    float dens_min_after = geo_sel_after_flat.min().item<float>();
+    float dens_max_after = geo_sel_after_flat.max().item<float>();
+
+    std::cout << "[TSDF DEBUG] single voxel_idx=" << voxel_idx
+              << " AFTER density: min=" << dens_min_after
+              << " max=" << dens_max_after << "\n";
+
+    // write back
+    _geo_grid_pts_ = geo;
+}
+
 void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams)
 {
     namespace py = pybind11;
@@ -993,6 +1333,27 @@ void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const
             rgb[i][2] = P.color_(2);
             ++i;
         }
+    }
+    // ------------------------------------------------------------------------
+    // 0.5) Initialize global PCD bounds (for later gating of fill_empty_cells_)
+    // ------------------------------------------------------------------------
+    {
+        // Work on CPU for simplicity; this runs only once at initialization.
+        auto xyz_cpu = xyz.to(torch::kCPU).contiguous();  // [N,3]
+
+        auto min_res = xyz_cpu.min(/*dim=*/0, /*keepdim=*/false);
+        auto max_res = xyz_cpu.max(/*dim=*/0, /*keepdim=*/false);
+
+        torch::Tensor min_cpu = std::get<0>(min_res).contiguous();   // [3]
+        torch::Tensor max_cpu = std::get<0>(max_res).contiguous();   // [3]
+
+        // Store as CUDA tensors so they match the rest of the model state
+        global_pcd_min_ = min_cpu.to(dev).contiguous();              // [3]
+        global_pcd_max_ = max_cpu.to(dev).contiguous();              // [3]
+        has_global_pcd_bb_ = true;
+
+        std::cout << "[createFromPcd] global_pcd_min=" << global_pcd_min_
+                  << " global_pcd_max=" << global_pcd_max_ << std::endl;
     }
     // ------------------------------------------------------------------------
     // 1) Compute octlevel from vox_size using utils.vox_size_2_level
@@ -1093,94 +1454,94 @@ void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const
                                                             py::cast(L_u.contiguous()));
     auto octpath = octpath_py.cast<torch::Tensor>().contiguous();            // [Nu,1] int64
 
-    if (!cams.empty())
-    {
-        py::gil_scoped_acquire gil;
-        static py::module oct_utils = py::module::import("src.utils.octree_utils");
-        static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
+    // if (!cams.empty())
+    // {
+    //     py::gil_scoped_acquire gil;
+    //     static py::module oct_utils = py::module::import("src.utils.octree_utils");
+    //     static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
 
-        // Decode voxel centers/sizes for filtering
-        py::tuple dec = oct_utils.attr("octpath_decoding")(
-            py::cast(octpath.contiguous()),
-            py::cast(L_u.contiguous()),
-            py::cast(scene_center_.contiguous()),
-            py::cast(scene_extent_.contiguous())
-        );
-        at::Tensor vox_center = dec[0].cast<at::Tensor>(); // [Nu,3]
-        at::Tensor vox_size   = dec[1].cast<at::Tensor>(); // [Nu,1]
-        std::cout << "octpath dev="   << (octpath.is_cuda() ? "cuda" : "cpu") 
-            << " dtype="        << octpath.dtype() << "\n";
-        std::cout << "vox_center dev="<< (vox_center.is_cuda() ? "cuda" : "cpu")
-                << " dtype="        << vox_center.dtype() << "\n";
-        std::cout << "vox_size dev="  << (vox_size.is_cuda() ? "cuda" : "cpu")
-                << " dtype="        << vox_size.dtype() << "\n";
+    //     // Decode voxel centers/sizes for filtering
+    //     py::tuple dec = oct_utils.attr("octpath_decoding")(
+    //         py::cast(octpath.contiguous()),
+    //         py::cast(L_u.contiguous()),
+    //         py::cast(scene_center_.contiguous()),
+    //         py::cast(scene_extent_.contiguous())
+    //     );
+    //     at::Tensor vox_center = dec[0].cast<at::Tensor>(); // [Nu,3]
+    //     at::Tensor vox_size   = dec[1].cast<at::Tensor>(); // [Nu,1]
+    //     std::cout << "octpath dev="   << (octpath.is_cuda() ? "cuda" : "cpu") 
+    //         << " dtype="        << octpath.dtype() << "\n";
+    //     std::cout << "vox_center dev="<< (vox_center.is_cuda() ? "cuda" : "cpu")
+    //             << " dtype="        << vox_center.dtype() << "\n";
+    //     std::cout << "vox_size dev="  << (vox_size.is_cuda() ? "cuda" : "cpu")
+    //             << " dtype="        << vox_size.dtype() << "\n";
 
-        // Build Python list of MiniCams (ensure CUDA tensors)
-        py::list py_cams;
-        py::module torch_mod = py::module::import("torch");
-        py::object py_cuda = torch_mod.attr("device")("cuda");
-        auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
-            if (py::hasattr(obj, name)) {
-                py::object t = obj.attr(name);
-                // Only tensors have .is_cuda/.to; defensive check:
-                if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                    obj.attr(name) = t.attr("to")(py_cuda);  // or t.attr("to")("cuda")
-                }
-            }
-        };
-        for (const auto& c : cams) {
-            py::object py_cam = MiniCam_to_py(c);
-            // matrices
-            move_attr_to_cuda_if_tensor(py_cam, "w2c");
-            move_attr_to_cuda_if_tensor(py_cam, "c2w");
-            // vectors used by mark_near / other helpers
-            move_attr_to_cuda_if_tensor(py_cam, "position");
-            move_attr_to_cuda_if_tensor(py_cam, "lookat");
-            py_cams.append(py_cam);
-        }
+    //     // Build Python list of MiniCams (ensure CUDA tensors)
+    //     py::list py_cams;
+    //     py::module torch_mod = py::module::import("torch");
+    //     py::object py_cuda = torch_mod.attr("device")("cuda");
+    //     auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
+    //         if (py::hasattr(obj, name)) {
+    //             py::object t = obj.attr(name);
+    //             // Only tensors have .is_cuda/.to; defensive check:
+    //             if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
+    //                 obj.attr(name) = t.attr("to")(py_cuda);  // or t.attr("to")("cuda")
+    //             }
+    //         }
+    //     };
+    //     for (const auto& c : cams) {
+    //         py::object py_cam = MiniCam_to_py(c);
+    //         // matrices
+    //         move_attr_to_cuda_if_tensor(py_cam, "w2c");
+    //         move_attr_to_cuda_if_tensor(py_cam, "c2w");
+    //         // vectors used by mark_near / other helpers
+    //         move_attr_to_cuda_if_tensor(py_cam, "position");
+    //         move_attr_to_cuda_if_tensor(py_cam, "lookat");
+    //         py_cams.append(py_cam);
+    //     }
 
-        auto Nu_before = octpath.size(0);
-        // mark_max_samp_rate -> keep rate>0
-        at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-            py_cams,
-            py::cast(octpath),
-            py::cast(vox_center),
-            py::cast(vox_size)
-        ).cast<at::Tensor>();
+    //     auto Nu_before = octpath.size(0);
+    //     // mark_max_samp_rate -> keep rate>0
+    //     at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
+    //         py_cams,
+    //         py::cast(octpath),
+    //         py::cast(vox_center),
+    //         py::cast(vox_size)
+    //     ).cast<at::Tensor>();
 
-        at::Tensor kept = rate > 0;
-        int64_t n_rate_pos = kept.sum().item<int64_t>();
-        // optional near filtering
-        const float near_thresh = 0.2f;
-        int64_t n_near_hit = 0;
-        if (near_thresh > 0.0f) {
-            at::Tensor is_near = svr_mod.attr("mark_near")(
-                py_cams,
-                py::cast(octpath),
-                py::cast(vox_center),
-                py::cast(vox_size),
-                py::float_(near_thresh)
-            ).cast<at::Tensor>();
-            kept = kept & (~is_near);
-            n_near_hit = is_near.sum().item<int64_t>();
-        }
+    //     at::Tensor kept = rate > 0;
+    //     int64_t n_rate_pos = kept.sum().item<int64_t>();
+    //     // optional near filtering
+    //     const float near_thresh = 1.0f;
+    //     int64_t n_near_hit = 0;
+    //     if (near_thresh > 0.0f) {
+    //         at::Tensor is_near = svr_mod.attr("mark_near")(
+    //             py_cams,
+    //             py::cast(octpath),
+    //             py::cast(vox_center),
+    //             py::cast(vox_size),
+    //             py::float_(near_thresh)
+    //         ).cast<at::Tensor>();
+    //         kept = kept & (~is_near);
+    //         n_near_hit = is_near.sum().item<int64_t>();
+    //     }
 
-        auto idx = torch::nonzero(kept).view({-1});
-        int64_t K = idx.size(0);
-        // Apply mask (all tensors together, no reshapes)
-        if (K > 0 && K < octpath.size(0)) {
-            octpath = octpath.index_select(0, idx).contiguous();   // [K,1]
-            L_u     = L_u.index_select(0, idx).contiguous();       // [K,1] already
-            rgb_u   = rgb_u.index_select(0, idx).contiguous();     // [K,3]
-        }
-        // Recompute sizes and assert consistency
-        Nu = octpath.size(0);
-        // Debug prints
-        std::cout << "[filter] Nu_before=" << Nu_before
-                << " rate>0=" << n_rate_pos
-                << " near_hit=" << n_near_hit
-                << " kept_final=" << Nu << std::endl;
-    }
+    //     auto idx = torch::nonzero(kept).view({-1});
+    //     int64_t K = idx.size(0);
+    //     // Apply mask (all tensors together, no reshapes)
+    //     if (K > 0 && K < octpath.size(0)) {
+    //         octpath = octpath.index_select(0, idx).contiguous();   // [K,1]
+    //         L_u     = L_u.index_select(0, idx).contiguous();       // [K,1] already
+    //         rgb_u   = rgb_u.index_select(0, idx).contiguous();     // [K,3]
+    //     }
+    //     // Recompute sizes and assert consistency
+    //     Nu = octpath.size(0);
+    //     // Debug prints
+    //     std::cout << "[filter] Nu_before=" << Nu_before
+    //             << " rate>0=" << n_rate_pos
+    //             << " near_hit=" << n_near_hit
+    //             << " kept_final=" << Nu << std::endl;
+    // }
 
     // Create/reuse SVM (DO NOT call model_init/points_init/...)
     if (!py_->svm || py_->svm.is_none()) {
@@ -1252,7 +1613,7 @@ void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const
     VOXEL_MODEL_TENSORS_TO_VEC
 
     // inc = 0 for the initial snapshot (or any monotonic counter you keep)
-    const int64_t inc0 = 0;
+    // const int64_t inc0 = 0;
     // 1) Log the global fixed scene AABB once
     // rrLogGlobalSceneAABB(inc0);
     // 2) Log ALL voxels after creation
@@ -1433,91 +1794,91 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
     py::object octpath_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_u), py::cast(L_u));
     auto octpath_new = octpath_py.cast<torch::Tensor>().contiguous();                                   // [Nu,1] int64
 
-    // ---- (NEW) SVR-style filtering with cameras ----
-    if (!cams.empty()) {
-        py::gil_scoped_acquire gil;
-        static py::module oct_utils = py::module::import("src.utils.octree_utils");
-        static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
-        static py::module torch_mod = py::module::import("torch");
+    // // ---- (NEW) SVR-style filtering with cameras ----
+    // if (!cams.empty()) {
+    //     py::gil_scoped_acquire gil;
+    //     static py::module oct_utils = py::module::import("src.utils.octree_utils");
+    //     static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
+    //     static py::module torch_mod = py::module::import("torch");
 
-        // Decode voxel centers/sizes
-        py::tuple dec = oct_utils.attr("octpath_decoding")(
-            py::cast(octpath_new),
-            py::cast(L_u),
-            py::cast(scene_center_.contiguous()),
-            py::cast(scene_extent_.contiguous())
-        );
-        at::Tensor vox_center = dec[0].cast<at::Tensor>(); // [Nu,3] cuda
-        at::Tensor vox_size   = dec[1].cast<at::Tensor>(); // [Nu,1] cuda
+    //     // Decode voxel centers/sizes
+    //     py::tuple dec = oct_utils.attr("octpath_decoding")(
+    //         py::cast(octpath_new),
+    //         py::cast(L_u),
+    //         py::cast(scene_center_.contiguous()),
+    //         py::cast(scene_extent_.contiguous())
+    //     );
+    //     at::Tensor vox_center = dec[0].cast<at::Tensor>(); // [Nu,3] cuda
+    //     at::Tensor vox_size   = dec[1].cast<at::Tensor>(); // [Nu,1] cuda
 
-        // Build Python list of CUDA MiniCams
-        py::list py_cams;
-        py::object py_cuda = torch_mod.attr("device")("cuda");
-        auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
-            if (py::hasattr(obj, name)) {
-                py::object t = obj.attr(name);
-                if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                    obj.attr(name) = t.attr("to")(py_cuda);
-                }
-            }
-        };
-        for (const auto& c : cams) {
-            py::object py_cam = MiniCam_to_py(c);
-            move_attr_to_cuda_if_tensor(py_cam, "w2c");
-            move_attr_to_cuda_if_tensor(py_cam, "c2w");
-            move_attr_to_cuda_if_tensor(py_cam, "position");
-            move_attr_to_cuda_if_tensor(py_cam, "lookat");
-            py_cams.append(py_cam);
-        }
+    //     // Build Python list of CUDA MiniCams
+    //     py::list py_cams;
+    //     py::object py_cuda = torch_mod.attr("device")("cuda");
+    //     auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
+    //         if (py::hasattr(obj, name)) {
+    //             py::object t = obj.attr(name);
+    //             if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
+    //                 obj.attr(name) = t.attr("to")(py_cuda);
+    //             }
+    //         }
+    //     };
+    //     for (const auto& c : cams) {
+    //         py::object py_cam = MiniCam_to_py(c);
+    //         move_attr_to_cuda_if_tensor(py_cam, "w2c");
+    //         move_attr_to_cuda_if_tensor(py_cam, "c2w");
+    //         move_attr_to_cuda_if_tensor(py_cam, "position");
+    //         move_attr_to_cuda_if_tensor(py_cam, "lookat");
+    //         py_cams.append(py_cam);
+    //     }
 
-        auto Nu_before = octpath_new.size(0);
+    //     auto Nu_before = octpath_new.size(0);
 
-        // rate > 0
-        at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-            py_cams, py::cast(octpath_new), py::cast(vox_center), py::cast(vox_size)
-        ).cast<at::Tensor>();
-        at::Tensor kept = rate > 0;
-        int64_t n_rate_pos = kept.sum().item<int64_t>();
+    //     // rate > 0
+    //     at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
+    //         py_cams, py::cast(octpath_new), py::cast(vox_center), py::cast(vox_size)
+    //     ).cast<at::Tensor>();
+    //     at::Tensor kept = rate > 0;
+    //     int64_t n_rate_pos = kept.sum().item<int64_t>();
 
-        // near filtering (same threshold you used in createFromPcd)
-        const float near_thresh = 0.2f;
-        int64_t n_near_hit = 0;
-        if (near_thresh > 0.0f) {
-            at::Tensor is_near = svr_mod.attr("mark_near")(
-                py_cams, py::cast(octpath_new), py::cast(vox_center), py::cast(vox_size),
-                py::float_(near_thresh)
-            ).cast<at::Tensor>();
-            kept = kept & (~is_near);
-            n_near_hit = is_near.sum().item<int64_t>();
-        }
+    //     // near filtering (same threshold you used in createFromPcd)
+    //     const float near_thresh = 1.0f;
+    //     int64_t n_near_hit = 0;
+    //     if (near_thresh > 0.0f) {
+    //         at::Tensor is_near = svr_mod.attr("mark_near")(
+    //             py_cams, py::cast(octpath_new), py::cast(vox_center), py::cast(vox_size),
+    //             py::float_(near_thresh)
+    //         ).cast<at::Tensor>();
+    //         kept = kept & (~is_near);
+    //         n_near_hit = is_near.sum().item<int64_t>();
+    //     }
 
-        auto idx = torch::nonzero(kept).view({-1});
-        int64_t K = idx.size(0);
+    //     auto idx = torch::nonzero(kept).view({-1});
+    //     int64_t K = idx.size(0);
 
-        if (K == 0) {
-            std::cout << "[increasePcd/filter] all candidates filtered out, nothing to add.\n";
-            return;
-        }
+    //     if (K == 0) {
+    //         std::cout << "[increasePcd/filter] all candidates filtered out, nothing to add.\n";
+    //         return;
+    //     }
 
-        if (K < octpath_new.size(0)) {
-            // Apply mask to ALL aligned tensors
-            octpath_new = octpath_new.index_select(0, idx).contiguous(); // [K,1]
-            L_u         = L_u.index_select(0, idx).contiguous();         // [K,1]
-            rgb_u       = rgb_u.index_select(0, idx).contiguous();       // [K,3]
-        }
+    //     if (K < octpath_new.size(0)) {
+    //         // Apply mask to ALL aligned tensors
+    //         octpath_new = octpath_new.index_select(0, idx).contiguous(); // [K,1]
+    //         L_u         = L_u.index_select(0, idx).contiguous();         // [K,1]
+    //         rgb_u       = rgb_u.index_select(0, idx).contiguous();       // [K,3]
+    //     }
 
-        Nu = octpath_new.size(0); // update Nu after filtering
+    //     Nu = octpath_new.size(0); // update Nu after filtering
 
-        // Sanity
-        TORCH_CHECK(L_u.sizes() == torch::IntArrayRef({Nu,1}), "L_u shape mismatch after filtering");
-        TORCH_CHECK(rgb_u.sizes() == torch::IntArrayRef({Nu,3}), "rgb_u shape mismatch after filtering");
+    //     // Sanity
+    //     TORCH_CHECK(L_u.sizes() == torch::IntArrayRef({Nu,1}), "L_u shape mismatch after filtering");
+    //     TORCH_CHECK(rgb_u.sizes() == torch::IntArrayRef({Nu,3}), "rgb_u shape mismatch after filtering");
 
-        std::cout << "[increasePcd/filter] Nu_before=" << Nu_before
-                << " rate>0=" << n_rate_pos
-                << " near_hit=" << n_near_hit
-                << " kept_final=" << Nu << std::endl;
-    }
-    // ---- end filtering ----
+    //     std::cout << "[increasePcd/filter] Nu_before=" << Nu_before
+    //             << " rate>0=" << n_rate_pos
+    //             << " near_hit=" << n_near_hit
+    //             << " kept_final=" << Nu << std::endl;
+    // }
+    // // ---- end filtering ----
 
     // ── 5) Dedup against existing voxels (across-batch) ─────────────────────
     auto octpath_old  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();                    // [No,1] int64
@@ -1676,249 +2037,402 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
     }
 
     if (fill_empty_cells_) {
-        // --- A) Build a bbox from the pcd via Python heuristic (median + density) ---
-        // Use the raw batch on CPU (xyz_cpu); the function expects an object with a `.points` ndarray
-        static py::module bound_utils = py::module::import("src.utils.bounding_utils");
-        static py::module types       = py::module::import("types");
-        static py::module torch_mod   = py::module::import("torch");
+        // ---- 0) Early-exit heuristic: only fill when global PCD bounds expand ----
+        // xyz_cpu is already [N,3] on CPU for this batch
+        auto xyz_cpu_contig = xyz_cpu.contiguous();
+        auto local_min_res = xyz_cpu_contig.min(/*dim=*/0, /*keepdim=*/false);
+        auto local_max_res = xyz_cpu_contig.max(/*dim=*/0, /*keepdim=*/false);
+        torch::Tensor local_min_cpu = std::get<0>(local_min_res); // [3], CPU
+        torch::Tensor local_max_cpu = std::get<0>(local_max_res); // [3], CPU
 
-        py::object xyz_cpu_py = py::cast(xyz_cpu.contiguous());             // torch CPU tensor
-        py::object ns         = types.attr("SimpleNamespace")(
-                                "points"_a = xyz_cpu_py.attr("numpy")()); // pcd.points = numpy
+        bool  should_fill = false;
+        float margin = 2.0f * vox_eff_.item<float>();   // e.g. twice base voxel size
 
-        // Call Python heuristic
-        // py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(
-        //     ns, py::float_(0.1)   // expose a float member/const for this
-        // );
+        if (!has_global_pcd_bb_) {
+            // First time: we don't have bounds yet → we must fill once and initialize bbox.
+            should_fill       = true;
+            global_pcd_min_   = local_min_cpu.to(torch::kCUDA).contiguous();
+            global_pcd_max_   = local_max_cpu.to(torch::kCUDA).contiguous();
+            has_global_pcd_bb_ = true;
 
-        torch::Tensor center_t;   // CUDA tensor [3]
-        float          radius_f;  // scalar radius
-        try {
-            // Try Python heuristic
-            py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(ns, py::float_(0.1f));
-            if (py::len(cr) == 2) {
-                // cr[0]: numpy array (shape [3]), cr[1]: float
-                py::object center_t_py = torch_mod.attr("from_numpy")(cr[0]); // torch CPU
-                center_t = center_t_py.cast<torch::Tensor>().to(torch::kCUDA).contiguous();
-                radius_f = cr[1].cast<float>();
+            std::cout << "[increasePcd] fill_empty_cells_: initializing global bbox\n";
+        } else {
+            // Compare against current global bounds
+            auto gmin_cpu = global_pcd_min_.to(torch::kCPU).contiguous();
+            auto gmax_cpu = global_pcd_max_.to(torch::kCPU).contiguous();
+
+            auto acc_gmin = gmin_cpu.accessor<float, 1>();  // [3]
+            auto acc_gmax = gmax_cpu.accessor<float, 1>();
+            auto acc_lmin = local_min_cpu.accessor<float, 1>();
+            auto acc_lmax = local_max_cpu.accessor<float, 1>();
+
+            bool expanded = false;
+            for (int d = 0; d < 3; ++d) {
+                if (acc_lmin[d] < acc_gmin[d] - margin ||
+                    acc_lmax[d] > acc_gmax[d] + margin) {
+                    expanded = true;
+                    break;
+                }
+            }
+
+            if (!expanded) {
+                // Entire new PCD is inside (or very close to) existing global bbox.
+                // → Skip fill_empty_cells_ to avoid re-creating pruned padding voxels.
+                std::cout << "[increasePcd] fill_empty_cells_: skipped (pcd inside global bbox)\n";
+                // IMPORTANT: do *not* return from increasePcd; just skip filling.
+                should_fill = false;
             } else {
-                throw std::runtime_error("heuristic returned unexpected output");
+                // New batch extends global bbox → update it and allow filling.
+                torch::Tensor new_gmin = torch::min(gmin_cpu, local_min_cpu);
+                torch::Tensor new_gmax = torch::max(gmax_cpu, local_max_cpu);
+                global_pcd_min_ = new_gmin.to(torch::kCUDA).contiguous();
+                global_pcd_max_ = new_gmax.to(torch::kCUDA).contiguous();
+
+                should_fill = true;
+                std::cout << "[increasePcd] fill_empty_cells_: global bbox expanded\n";
             }
-        } catch (...) {
-            std::cout << "[increasePcd] fill_empty_cells_: Python heuristic failed, using C++ fallback.\n";
-            // ----- Fallback: compute center/radius purely in C++ -----
-            // center = mean of points (CPU -> CUDA)
-            auto center_cpu = xyz_cpu.mean(/*dim=*/0, /*keepdim=*/false).contiguous();    // [3], CPU
-            center_t = center_cpu.to(torch::kCUDA);
-            // radius = max L2 distance to center, with a floor of 3 * vox_size
-            torch::Tensor diffs = (xyz_cpu - center_cpu).contiguous();                   // [N,3], CPU
-            torch::Tensor dists = diffs.norm(2, /*dim=*/1);                              // [N], CPU
-            float maxdist = dists.numel() ? dists.max().item<float>() : 0.0f;
-            radius_f = std::max(3.0f * vox_eff_.item<float>(), maxdist);
         }
 
-        // Convert back to Torch (CUDA) so we can do all math in tensors
-        // py::object center_t_py = torch_mod.attr("from_numpy")(cr[0]);
-        // auto center_t = center_t_py.cast<torch::Tensor>().to(torch::kCUDA).contiguous();      // [3]
-        // float radius_f = cr[1].cast<float>();
-        auto radius_t  = torch::full({3}, radius_f, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        // If we decided not to fill, just skip the rest of this block.
+        if (!should_fill) {
+            // Nothing else to do for fill_empty_cells_; rest of increasePcd continues.
+        } else {
+            // --- A) Build a bbox from the pcd via Python heuristic (median + density) ---
+            // Use the raw batch on CPU (xyz_cpu); the function expects an object with a `.points` ndarray
+            static py::module bound_utils = py::module::import("src.utils.bounding_utils");
+            static py::module types       = py::module::import("types");
+            static py::module torch_mod   = py::module::import("torch");
 
-        auto bb_min = (center_t - radius_t).contiguous();   // [3], world coords
-        auto bb_max = (center_t + radius_t).contiguous();   // [3]
+            py::object xyz_cpu_py = py::cast(xyz_cpu.contiguous());             // torch CPU tensor
+            py::object ns         = types.attr("SimpleNamespace")(
+                                    "points"_a = xyz_cpu_py.attr("numpy")()); // pcd.points = numpy
 
-        // --- B) Convert bbox (world) -> dense ijk box at cached level/voxel size ---
-        // Use cached scene_min_t_ and vox_eff_ (scalar size, but we kept it as [1,1]):
-        auto vox_t = vox_eff_.mean()        // 0-dim CUDA float tensor
-                        .view({1})
-                        .repeat({3})       // [3]
-                        .contiguous();     // CUDA float
+            // Call Python heuristic
+            // py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(
+            //     ns, py::float_(0.1)   // expose a float member/const for this
+            // );
 
-        // Convert to indices, clamp to grid range [0, 2^L - 1]
-        const int64_t grid_limit = (1LL << static_cast<int>(octlevel_)); // 2^L
-        auto ijk_min = ((bb_min - scene_min_t_) / vox_t).floor().to(torch::kLong);
-        auto ijk_max = ((bb_max - scene_min_t_) / vox_t).ceil().to(torch::kLong) - 1;
-        // auto ijk_min = ((bb_min - scene_min_t_) / vox_t).to(torch::kLong);
-        // auto ijk_max = ((bb_max - scene_min_t_) / vox_t).to(torch::kLong);
-        // auto ijk_min = (((bb_min - scene_min_t_) / vox_t) - 0.5f).ceil().to(torch::kLong); // for not getting out of the bounding box
-        // auto ijk_max = (((bb_max - scene_min_t_) / vox_t) - 0.5f).floor().to(torch::kLong);
-
-        // Clamp to valid grid
-        auto zero = torch::zeros_like(ijk_min);
-        auto lim  = torch::full_like(ijk_max, grid_limit - 1);
-        // auto lim  = torch::full_like(ijk_max, grid_limit);
-        ijk_min = torch::maximum(ijk_min, zero);
-        ijk_max = torch::minimum(ijk_max, lim);
-
-        auto lens = (ijk_max - ijk_min + 1);        // [3] Long on CUDA
-        int64_t nx = lens[0].item<int64_t>();
-        int64_t ny = lens[1].item<int64_t>();
-        int64_t nz = lens[2].item<int64_t>();
-        long double Nc_est = (long double)nx * ny * nz;
-
-        int64_t cap = std::max<int64_t>(1, max_artifact_cells_);    // set a sensible default (e.g., 200k)
-        int64_t stride = 1;
-        if (Nc_est > cap) {
-            long double s = std::cbrt(Nc_est / (long double)cap);
-            stride = std::max<int64_t>(1, (int64_t)std::ceil(s));
-        }
-
-        // If degenerate (all out), skip
-        if ((ijk_min <= ijk_max).all().item<bool>()) {
-            // --- C) Enumerate dense cells & set-diff vs current SVM topology ---
-            auto ir = torch::arange(ijk_min[0].item<int64_t>(), ijk_max[0].item<int64_t>() + 1,
-                                    stride, torch::dtype(torch::kLong).device(torch::kCUDA));
-            auto jr = torch::arange(ijk_min[1].item<int64_t>(), ijk_max[1].item<int64_t>() + 1,
-                                    stride, torch::dtype(torch::kLong).device(torch::kCUDA));
-            auto kr = torch::arange(ijk_min[2].item<int64_t>(), ijk_max[2].item<int64_t>() + 1,
-                                    stride, torch::dtype(torch::kLong).device(torch::kCUDA));
-            auto grids = torch::meshgrid({ir, jr, kr}, /*indexing=*/"ij");
-            auto ijk_box = torch::stack(
-                { grids[0].contiguous().view({-1}),
-                grids[1].contiguous().view({-1}),
-                grids[2].contiguous().view({-1}) }, 1).contiguous(); // [Nc,3]
-
-            if (max_artifact_cells_ > 0 && ijk_box.size(0) > max_artifact_cells_) {
-                std::cout << "[increasePcd] fill_empty_cells_: limiting artifact cells"<< std::endl;
-                ijk_box = ijk_box.index({torch::indexing::Slice(0, max_artifact_cells_)});
+            torch::Tensor center_t;   // CUDA tensor [3]
+            float          radius_f;  // scalar radius
+            try {
+                // Try Python heuristic
+                py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(ns, py::float_(0.1f));
+                if (py::len(cr) == 2) {
+                    // cr[0]: numpy array (shape [3]), cr[1]: float
+                    py::object center_t_py = torch_mod.attr("from_numpy")(cr[0]); // torch CPU
+                    center_t = center_t_py.cast<torch::Tensor>().to(torch::kCUDA).contiguous();
+                    radius_f = cr[1].cast<float>();
+                } else {
+                    throw std::runtime_error("heuristic returned unexpected output");
+                }
+            } catch (...) {
+                std::cout << "[increasePcd] fill_empty_cells_: Python heuristic failed, using C++ fallback.\n";
+                // ----- Fallback: compute center/radius purely in C++ -----
+                // center = mean of points (CPU -> CUDA)
+                auto center_cpu = xyz_cpu.mean(/*dim=*/0, /*keepdim=*/false).contiguous();    // [3], CPU
+                center_t = center_cpu.to(torch::kCUDA);
+                // radius = max L2 distance to center, with a floor of 3 * vox_size
+                torch::Tensor diffs = (xyz_cpu - center_cpu).contiguous();                   // [N,3], CPU
+                torch::Tensor dists = diffs.norm(2, /*dim=*/1);                              // [N], CPU
+                float maxdist = dists.numel() ? dists.max().item<float>() : 0.0f;
+                radius_f = std::max(3.0f * vox_eff_.item<float>(), maxdist);
             }
 
-            auto dev = ijk_box.device();
-            auto L_box = torch::full({ijk_box.size(0),1}, octlevel_, torch::dtype(torch::kInt8).device(dev)).contiguous();
+            // Convert back to Torch (CUDA) so we can do all math in tensors
+            // py::object center_t_py = torch_mod.attr("from_numpy")(cr[0]);
+            // auto center_t = center_t_py.cast<torch::Tensor>().to(torch::kCUDA).contiguous();      // [3]
+            // float radius_f = cr[1].cast<float>();
+            auto radius_t  = torch::full({3}, radius_f, torch::dtype(torch::kFloat32).device(torch::kCUDA));
 
-            // Build morton/octpath for those cells
-            py::object octpath_box_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_box), py::cast(L_box));
-            auto octpath_box = octpath_box_py.cast<torch::Tensor>().contiguous(); // [Nc,1] int64
-            
-            // Compare with CURRENT topology (which already includes real additions above)
-            auto octpath_cur  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-            auto octlevel_cur = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+            auto bb_min = (center_t - radius_t).contiguous();   // [3], world coords
+            auto bb_max = (center_t + radius_t).contiguous();   // [3]
 
-            auto key_box = octpath_box.view({-1}).to(torch::kInt64).mul(256)
-                        + L_box.view({-1}).to(torch::kInt64);
-            auto key_cur = octpath_cur.view({-1}).to(torch::kInt64).mul(256)
-                        + octlevel_cur.view({-1}).to(torch::kInt64);
+            // --- B) Convert bbox (world) -> dense ijk box at cached level/voxel size ---
+            // Use cached scene_min_t_ and vox_eff_ (scalar size, but we kept it as [1,1]):
+            auto vox_t = vox_eff_.mean()        // 0-dim CUDA float tensor
+                            .view({1})
+                            .repeat({3})       // [3]
+                            .contiguous();     // CUDA float
 
-            py::object isin_py = torch_mod.attr("isin")(py::cast(key_box), py::cast(key_cur));
-            auto is_dup   = isin_py.cast<torch::Tensor>().to(torch::kBool);
-            auto new_mask_box = ~is_dup;
+            // Convert to indices, clamp to grid range [0, 2^L - 1]
+            const int64_t grid_limit = (1LL << static_cast<int>(octlevel_)); // 2^L
+            auto ijk_min = ((bb_min - scene_min_t_) / vox_t).floor().to(torch::kLong);
+            auto ijk_max = ((bb_max - scene_min_t_) / vox_t).ceil().to(torch::kLong) - 1;
+            // auto ijk_min = ((bb_min - scene_min_t_) / vox_t).to(torch::kLong);
+            // auto ijk_max = ((bb_max - scene_min_t_) / vox_t).to(torch::kLong);
+            // auto ijk_min = (((bb_min - scene_min_t_) / vox_t) - 0.5f).ceil().to(torch::kLong); // for not getting out of the bounding box
+            // auto ijk_max = (((bb_max - scene_min_t_) / vox_t) - 0.5f).floor().to(torch::kLong);
 
-            // --- Also drop base-level parents of already-subdivided regions (L_old > base_L) ---
-            {
-                const int MAX_L  = max_num_levels_;
-                const int base_L = static_cast<int>(octlevel_);
+            // Clamp to valid grid
+            auto zero = torch::zeros_like(ijk_min);
+            auto lim  = torch::full_like(ijk_max, grid_limit - 1);
+            // auto lim  = torch::full_like(ijk_max, grid_limit);
+            ijk_min = torch::maximum(ijk_min, zero);
+            ijk_max = torch::minimum(ijk_max, lim);
 
-                if (octpath_cur.numel() > 0) {
-                    auto Lold_i64     = octlevel_cur.view({-1}).to(torch::kInt64);   // [No]
-                    auto has_children = (Lold_i64 > base_L);                         // [No] bool
+            auto lens = (ijk_max - ijk_min + 1);        // [3] Long on CUDA
+            int64_t nx = lens[0].item<int64_t>();
+            int64_t ny = lens[1].item<int64_t>();
+            int64_t nz = lens[2].item<int64_t>();
+            long double Nc_est = (long double)nx * ny * nz;
 
-                    if (has_children.any().item<bool>()) {
-                        // Build mask to zero out octant bits below base_L
-                        const int levels_below  = std::max(0, MAX_L - base_L);
-                        const int bits_to_clear = 3 * levels_below;
-                        long long lower_mask    = (bits_to_clear > 0) ? ((1LL << bits_to_clear) - 1LL) : 0LL;
-                        long long keep_mask_ll  = ~lower_mask;
+            int64_t cap = std::max<int64_t>(1, max_artifact_cells_);    // set a sensible default (e.g., 200k)
+            int64_t stride = 1;
+            if (Nc_est > cap) {
+                long double s = std::cbrt(Nc_est / (long double)cap);
+                stride = std::max<int64_t>(1, (int64_t)std::ceil(s));
+            }
 
-                        auto dev = octpath_cur.device();
-                        auto keep_mask = torch::full(
-                            {1},
-                            static_cast<int64_t>(keep_mask_ll),
-                            torch::TensorOptions().dtype(torch::kInt64).device(dev)
-                        );
+            // If degenerate (all out), skip
+            if ((ijk_min <= ijk_max).all().item<bool>()) {
+                // --- C) Enumerate dense cells & set-diff vs current SVM topology ---
+                auto ir = torch::arange(ijk_min[0].item<int64_t>(), ijk_max[0].item<int64_t>() + 1,
+                                        stride, torch::dtype(torch::kLong).device(torch::kCUDA));
+                auto jr = torch::arange(ijk_min[1].item<int64_t>(), ijk_max[1].item<int64_t>() + 1,
+                                        stride, torch::dtype(torch::kLong).device(torch::kCUDA));
+                auto kr = torch::arange(ijk_min[2].item<int64_t>(), ijk_max[2].item<int64_t>() + 1,
+                                        stride, torch::dtype(torch::kLong).device(torch::kCUDA));
+                auto grids = torch::meshgrid({ir, jr, kr}, /*indexing=*/"ij");
+                auto ijk_box = torch::stack(
+                    { grids[0].contiguous().view({-1}),
+                    grids[1].contiguous().view({-1}),
+                    grids[2].contiguous().view({-1}) }, 1).contiguous(); // [Nc,3]
 
-                        // Compute ancestors at base_L for all L_old > base_L
-                        auto op_old_i64  = octpath_cur.view({-1}).to(torch::kInt64);  // [No]
-                        auto op_anc_base = (op_old_i64 & keep_mask);                  // [No]
-                        auto sel_child   = torch::nonzero(has_children).view({-1});   // [K]
-                        op_anc_base      = op_anc_base.index_select(0, sel_child);    // [K]
+                if (max_artifact_cells_ > 0 && ijk_box.size(0) > max_artifact_cells_) {
+                    std::cout << "[increasePcd] fill_empty_cells_: limiting artifact cells"<< std::endl;
+                    ijk_box = ijk_box.index({torch::indexing::Slice(0, max_artifact_cells_)});
+                }
 
-                        // Keys for those parents at base_L
-                        auto key_children_as_parent = op_anc_base.mul(256)
-                                                    .add(torch::full_like(op_anc_base,
-                                                                        static_cast<int64_t>(base_L)));
+                auto dev = ijk_box.device();
+                auto L_box = torch::full({ijk_box.size(0),1}, octlevel_, torch::dtype(torch::kInt8).device(dev)).contiguous();
 
-                        // small helper
-                        auto unique_sorted_1d = [](const at::Tensor& t)->at::Tensor {
-                            TORCH_CHECK(t.dim() == 1, "unique_sorted_1d expects a 1-D tensor");
-                            if (t.numel() <= 1) return t.contiguous();
-                            auto sort_res = t.sort(0);
-                            auto sorted   = std::get<0>(sort_res);
-                            using torch::indexing::Slice;
-                            auto keep = torch::empty_like(sorted, torch::kBool);
-                            keep.index_put_({0}, true);
-                            auto neq = sorted.index({Slice(1, torch::indexing::None)})
-                                    != sorted.index({Slice(torch::indexing::None, -1)});
-                            keep.index_put_({Slice(1, torch::indexing::None)}, neq);
-                            auto idx = torch::nonzero(keep).view({-1});
-                            return sorted.index_select(0, idx).contiguous();
-                        };
+                // Build morton/octpath for those cells
+                py::object octpath_box_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_box), py::cast(L_box));
+                auto octpath_box = octpath_box_py.cast<torch::Tensor>().contiguous(); // [Nc,1] int64
+                
+                // // ------------------------------------------------------------------------
+                // // B) OPTIONAL: camera-based filtering (mark_max_samp_rate + mark_near)
+                // //     so artifact voxels are also consistent with SVRaster camera logic
+                // // ------------------------------------------------------------------------
+                // if (!cams.empty()) {
+                //     py::gil_scoped_acquire gil;
+                //     static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
+                //     static py::module oct_utils = py::module::import("src.utils.octree_utils");
+                //     // torch_mod already defined as static at top of increasePcd
 
-                        key_children_as_parent = unique_sorted_1d(key_children_as_parent);
+                //     // Decode voxel centers/sizes for artifact voxels
+                //     py::tuple dec_box = oct_utils.attr("octpath_decoding")(
+                //         py::cast(octpath_box.contiguous()),
+                //         py::cast(L_box.contiguous()),
+                //         py::cast(scene_center_.contiguous()),
+                //         py::cast(scene_extent_.contiguous())
+                //     );
+                //     at::Tensor vox_center_box = dec_box[0].cast<at::Tensor>(); // [Nc,3] cuda
+                //     at::Tensor vox_size_box   = dec_box[1].cast<at::Tensor>(); // [Nc,1] cuda
 
-                        // Any base-level candidate that equals one of these parents must be skipped
-                        py::object isin_py2 = torch_mod.attr("isin")(
-                            py::cast(key_box), py::cast(key_children_as_parent));
-                        auto would_collide_parent = isin_py2.cast<torch::Tensor>().to(torch::kBool); // [Nc]
+                //     // Build Python list of CUDA MiniCams (same pattern as above)
+                //     py::list py_cams;
+                //     py::object py_cuda = torch_mod.attr("device")("cuda");
+                //     auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
+                //         if (py::hasattr(obj, name)) {
+                //             py::object t = obj.attr(name);
+                //             if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
+                //                 obj.attr(name) = t.attr("to")(py_cuda);
+                //             }
+                //         }
+                //     };
+                //     for (const auto& c : cams) {
+                //         py::object py_cam = MiniCam_to_py(c);
+                //         move_attr_to_cuda_if_tensor(py_cam, "w2c");
+                //         move_attr_to_cuda_if_tensor(py_cam, "c2w");
+                //         move_attr_to_cuda_if_tensor(py_cam, "position");
+                //         move_attr_to_cuda_if_tensor(py_cam, "lookat");
+                //         py_cams.append(py_cam);
+                //     }
 
-                        new_mask_box = new_mask_box & (~would_collide_parent);
+                //     auto Nc_before = octpath_box.size(0);
+
+                //     // 1) Visibility / sampling rate
+                //     at::Tensor rate_box = svr_mod.attr("mark_max_samp_rate")(
+                //         py_cams,
+                //         py::cast(octpath_box),
+                //         py::cast(vox_center_box),
+                //         py::cast(vox_size_box)
+                //     ).cast<at::Tensor>();
+                //     at::Tensor kept_cam = rate_box > 0;
+                //     int64_t n_rate_pos_box = kept_cam.sum().item<int64_t>();
+
+                //     // 2) Near filtering with same threshold as for PCD voxels
+                //     //    (you can pull this out as a const float near_thresh = ... at top)
+                //     const float near_thresh = 1.0f;    // or 5.0f if you prefer
+                //     int64_t n_near_hit_box = 0;
+                //     if (near_thresh > 0.0f) {
+                //         at::Tensor is_near_box = svr_mod.attr("mark_near")(
+                //             py_cams,
+                //             py::cast(octpath_box),
+                //             py::cast(vox_center_box),
+                //             py::cast(vox_size_box),
+                //             py::float_(near_thresh)
+                //         ).cast<at::Tensor>();
+                //         kept_cam = kept_cam & (~is_near_box);
+                //         n_near_hit_box = is_near_box.sum().item<int64_t>();
+                //     }
+
+                //     auto idx_box = torch::nonzero(kept_cam).view({-1});
+                //     int64_t K_box = idx_box.size(0);
+
+                //     if (K_box == 0) {
+                //         std::cout << "[increasePcd/fill_empty_cells] "
+                //                 << "all artifact voxels filtered out by camera visibility / near; skipping."
+                //                 << std::endl;
+                //         return;
+                //     }
+
+                //     if (K_box < octpath_box.size(0)) {
+                //         // Apply mask consistently to topology + ijk_box
+                //         octpath_box = octpath_box.index_select(0, idx_box).contiguous(); // [K_box,1]
+                //         L_box       = L_box.index_select(0, idx_box).contiguous();       // [K_box,1]
+                //         ijk_box     = ijk_box.index_select(0, idx_box).contiguous();     // [K_box,3]
+                //     }
+
+                //     std::cout << "[increasePcd/fill_empty_cells_cam] Nc_before=" << Nc_before
+                //             << " rate>0=" << n_rate_pos_box
+                //             << " near_hit=" << n_near_hit_box
+                //             << " kept_final=" << octpath_box.size(0) << std::endl;
+                // }
+
+                // Compare with CURRENT topology (which already includes real additions above)
+                auto octpath_cur  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
+                auto octlevel_cur = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+
+                auto key_box = octpath_box.view({-1}).to(torch::kInt64).mul(256)
+                            + L_box.view({-1}).to(torch::kInt64);
+                auto key_cur = octpath_cur.view({-1}).to(torch::kInt64).mul(256)
+                            + octlevel_cur.view({-1}).to(torch::kInt64);
+
+                py::object isin_py = torch_mod.attr("isin")(py::cast(key_box), py::cast(key_cur));
+                auto is_dup   = isin_py.cast<torch::Tensor>().to(torch::kBool);
+                auto new_mask_box = ~is_dup;
+
+                // --- Also drop base-level parents of already-subdivided regions (L_old > base_L) ---
+                {
+                    const int MAX_L  = max_num_levels_;
+                    const int base_L = static_cast<int>(octlevel_);
+
+                    if (octpath_cur.numel() > 0) {
+                        auto Lold_i64     = octlevel_cur.view({-1}).to(torch::kInt64);   // [No]
+                        auto has_children = (Lold_i64 > base_L);                         // [No] bool
+
+                        if (has_children.any().item<bool>()) {
+                            // Build mask to zero out octant bits below base_L
+                            const int levels_below  = std::max(0, MAX_L - base_L);
+                            const int bits_to_clear = 3 * levels_below;
+                            long long lower_mask    = (bits_to_clear > 0) ? ((1LL << bits_to_clear) - 1LL) : 0LL;
+                            long long keep_mask_ll  = ~lower_mask;
+
+                            auto dev = octpath_cur.device();
+                            auto keep_mask = torch::full(
+                                {1},
+                                static_cast<int64_t>(keep_mask_ll),
+                                torch::TensorOptions().dtype(torch::kInt64).device(dev)
+                            );
+
+                            // Compute ancestors at base_L for all L_old > base_L
+                            auto op_old_i64  = octpath_cur.view({-1}).to(torch::kInt64);  // [No]
+                            auto op_anc_base = (op_old_i64 & keep_mask);                  // [No]
+                            auto sel_child   = torch::nonzero(has_children).view({-1});   // [K]
+                            op_anc_base      = op_anc_base.index_select(0, sel_child);    // [K]
+
+                            // Keys for those parents at base_L
+                            auto key_children_as_parent = op_anc_base.mul(256)
+                                                        .add(torch::full_like(op_anc_base,
+                                                                            static_cast<int64_t>(base_L)));
+
+                            // small helper
+                            auto unique_sorted_1d = [](const at::Tensor& t)->at::Tensor {
+                                TORCH_CHECK(t.dim() == 1, "unique_sorted_1d expects a 1-D tensor");
+                                if (t.numel() <= 1) return t.contiguous();
+                                auto sort_res = t.sort(0);
+                                auto sorted   = std::get<0>(sort_res);
+                                using torch::indexing::Slice;
+                                auto keep = torch::empty_like(sorted, torch::kBool);
+                                keep.index_put_({0}, true);
+                                auto neq = sorted.index({Slice(1, torch::indexing::None)})
+                                        != sorted.index({Slice(torch::indexing::None, -1)});
+                                keep.index_put_({Slice(1, torch::indexing::None)}, neq);
+                                auto idx = torch::nonzero(keep).view({-1});
+                                return sorted.index_select(0, idx).contiguous();
+                            };
+
+                            key_children_as_parent = unique_sorted_1d(key_children_as_parent);
+
+                            // Any base-level candidate that equals one of these parents must be skipped
+                            py::object isin_py2 = torch_mod.attr("isin")(
+                                py::cast(key_box), py::cast(key_children_as_parent));
+                            auto would_collide_parent = isin_py2.cast<torch::Tensor>().to(torch::kBool); // [Nc]
+
+                            new_mask_box = new_mask_box & (~would_collide_parent);
+                        }
                     }
                 }
-            }
 
-            // Proceed with the filtered candidates
-            if (new_mask_box.any().item<bool>()) {
-                auto sel = torch::nonzero(new_mask_box).view({-1});
-                Nm_added = sel.size(0);
+                // Proceed with the filtered candidates
+                if (new_mask_box.any().item<bool>()) {
+                    auto sel = torch::nonzero(new_mask_box).view({-1});
+                    Nm_added = sel.size(0);
 
-                bb_min_viz       = bb_min;         // [3] (CUDA)
-                bb_max_viz       = bb_max;         // [3] (CUDA)
-                sel_artifacts_viz= sel.clone();    // [Nm] indices into ijk_box
-                ijk_box_viz      = ijk_box.clone();// [Nc,3] (CUDA)
+                    bb_min_viz       = bb_min;         // [3] (CUDA)
+                    bb_max_viz       = bb_max;         // [3] (CUDA)
+                    sel_artifacts_viz= sel.clone();    // [Nm] indices into ijk_box
+                    ijk_box_viz      = ijk_box.clone();// [Nc,3] (CUDA)
 
-                auto octpath_add2 = octpath_box.index_select(0, sel); // [Nm,1]
-                auto L_add2       = L_box.index_select(0, sel);       // [Nm,1]
+                    auto octpath_add2 = octpath_box.index_select(0, sel); // [Nm,1]
+                    auto L_add2       = L_box.index_select(0, sel);       // [Nm,1]
 
-                // Append topology
-                py_->svm.attr("octpath")  = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
-                py_->svm.attr("octlevel") = torch::cat({octlevel_cur, L_add2},       0).contiguous();
+                    // Append topology
+                    py_->svm.attr("octpath")  = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
+                    py_->svm.attr("octlevel") = torch::cat({octlevel_cur, L_add2},       0).contiguous();
 
-                // Prepare learnables for artifacts
-                const int n_sh_rest = (max_sh_degree_ + 1)*(max_sh_degree_ + 1) - 1;
-                auto shs_add2    = torch::zeros({Nm_added, n_sh_rest, 3}, torch::dtype(torch::kFloat32).device(dev)).contiguous();
-                auto subdiv_add2 = torch::ones({Nm_added,1},             torch::dtype(torch::kFloat32).device(dev)).contiguous();
+                    // Prepare learnables for artifacts
+                    const int n_sh_rest = (max_sh_degree_ + 1)*(max_sh_degree_ + 1) - 1;
+                    auto shs_add2    = torch::zeros({Nm_added, n_sh_rest, 3}, torch::dtype(torch::kFloat32).device(dev)).contiguous();
+                    auto subdiv_add2 = torch::ones({Nm_added,1},             torch::dtype(torch::kFloat32).device(dev)).contiguous();
 
-                auto rgb_add2 = torch::empty({Nm_added,3}, torch::dtype(torch::kFloat32).device(dev));
-                rgb_add2.index_put_({torch::indexing::Slice(),0}, artifact_bg_rgb_[0]);
-                rgb_add2.index_put_({torch::indexing::Slice(),1}, artifact_bg_rgb_[1]);
-                rgb_add2.index_put_({torch::indexing::Slice(),2}, artifact_bg_rgb_[2]);
+                    auto rgb_add2 = torch::empty({Nm_added,3}, torch::dtype(torch::kFloat32).device(dev));
+                    rgb_add2.index_put_({torch::indexing::Slice(),0}, artifact_bg_rgb_[0]);
+                    rgb_add2.index_put_({torch::indexing::Slice(),1}, artifact_bg_rgb_[1]);
+                    rgb_add2.index_put_({torch::indexing::Slice(),2}, artifact_bg_rgb_[2]);
 
-                py::object sh0_add2_py = act_mod.attr("rgb2shzero")(py::cast(rgb_add2.contiguous()));
-                auto sh0_add2 = sh0_add2_py.cast<torch::Tensor>().contiguous();
+                    py::object sh0_add2_py = act_mod.attr("rgb2shzero")(py::cast(rgb_add2.contiguous()));
+                    auto sh0_add2 = sh0_add2_py.cast<torch::Tensor>().contiguous();
 
-                // Grid growth and optimizer-preserving appends
-                auto grid_pts_key_new = py_->svm.attr("grid_pts_key").cast<torch::Tensor>();
-                const int64_t M_prev = grid_pts_key_.defined() ? grid_pts_key_.size(0) : 0;
-                const int64_t M_curr = grid_pts_key_new.size(0);
-                if (M_curr > M_prev) {
-                    auto grow = torch::full({M_curr - M_prev, 1}, -10.0f,
-                                torch::dtype(torch::kFloat32).device(dev))
-                                .contiguous().detach().requires_grad_();
-                    appendGroup_(/*group_idx=*/0, grow, "_geo_grid_pts", &this->_geo_grid_pts_);
+                    // Grid growth and optimizer-preserving appends
+                    auto grid_pts_key_new = py_->svm.attr("grid_pts_key").cast<torch::Tensor>();
+                    const int64_t M_prev = grid_pts_key_.defined() ? grid_pts_key_.size(0) : 0;
+                    const int64_t M_curr = grid_pts_key_new.size(0);
+                    if (M_curr > M_prev) {
+                        auto grow = torch::full({M_curr - M_prev, 1}, -10.0f,
+                                    torch::dtype(torch::kFloat32).device(dev))
+                                    .contiguous().detach().requires_grad_();
+                        appendGroup_(/*group_idx=*/0, grow, "_geo_grid_pts", &this->_geo_grid_pts_);
+                    }
+                    appendGroup_(/*group_idx=*/1, sh0_add2, "_sh0", &this->sh0_);
+                    appendGroup_(/*group_idx=*/2, shs_add2, "_shs", &this->shs_);
+
+                    // subdiv_p (not in optimizer groups)
+                    auto subdiv_old2 = py_->svm.attr("_subdiv_p").cast<torch::Tensor>();
+                    py_->svm.attr("_subdiv_p") = torch::cat({subdiv_old2, subdiv_add2}, 0)
+                                                .contiguous().detach().requires_grad_();
+                    this->subdiv_p_ = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
+                    // std::cout << "[increasePcd] Added " << Nm_added << " artifact voxels (pcd bbox).\n";
+                    
+                    // NEW: mark that we actually added artifact voxels this call
+                    artifact_fill_happened_ = true;
                 }
-                appendGroup_(/*group_idx=*/1, sh0_add2, "_sh0", &this->sh0_);
-                appendGroup_(/*group_idx=*/2, shs_add2, "_shs", &this->shs_);
-
-                // subdiv_p (not in optimizer groups)
-                auto subdiv_old2 = py_->svm.attr("_subdiv_p").cast<torch::Tensor>();
-                py_->svm.attr("_subdiv_p") = torch::cat({subdiv_old2, subdiv_add2}, 0)
-                                            .contiguous().detach().requires_grad_();
-                this->subdiv_p_ = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
-
-                // std::cout << "[increasePcd] Added " << Nm_added << " artifact voxels (pcd bbox).\n";
-            }
-
-            // Keep your existing “new voxels” logging in sync by adding Nm_added to Nk (as noted earlier)
-            // ... (use last_added = Nk + Nm_added later)
-        } // valid bbox
+                // Keep your existing “new voxels” logging in sync by adding Nm_added to Nk (as noted earlier)
+                // ... (use last_added = Nk + Nm_added later)
+            } // valid bbox
+        } //should_fill
     } // fill_empty_cells_
 
     // ── 10) Pull back the rest for renderer (topology/derived fields) ───────
@@ -1964,8 +2478,8 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
         std::vector<torch::Tensor> aabb_list{bb_min_viz, bb_max_viz};
         at::Tensor aabb = torch::stack(aabb_list).contiguous();
 
-        rrLogPointsAndAABB(0, xyz, rgb, aabb,
-            "viz/pcd_and_bbox", 1000000, /*log_points=*/true, /*log_box=*/true, inc_counter);
+        // rrLogPointsAndAABB(0, xyz, rgb, aabb,
+        //     "viz/pcd_and_bbox", 1000000, /*log_points=*/true, /*log_box=*/true, inc_counter);
 
         auto ijk_art  = ijk_box_viz.index_select(0, sel_artifacts_viz).to(torch::kFloat32);
         auto vox_t_viz= vox_eff_.mean().view({1}).repeat({3});
@@ -1977,8 +2491,8 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
         art_rgb.index_put_({torch::indexing::Slice(),1}, artifact_bg_rgb_[1]);
         art_rgb.index_put_({torch::indexing::Slice(),2}, artifact_bg_rgb_[2]);
 
-        rrLogPointsAndAABB(0, art_pts, art_rgb, aabb,
-            "viz/artifact_points", 200000, /*log_points=*/true, /*log_box=*/false, inc_counter);
+        // rrLogPointsAndAABB(0, art_pts, art_rgb, aabb,
+        //     "viz/artifact_points", 200000, /*log_points=*/true, /*log_box=*/false, inc_counter);
 
         const int64_t total = this->center_.size(0);
         const int64_t last_added = Nk + Nm_added;
@@ -1991,16 +2505,16 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
                 ? torch::arange(total - Nm_added, total, optsL)
                 : torch::empty({0}, optsL);
 
-            if (idx_real_new.numel() > 0) {
-                auto c_real = this->center_.index_select(0, idx_real_new);
-                auto s_real = this->size_.index_select(0,   idx_real_new);
-                rrLogVoxelBoxes(c_real, s_real, 200000, "viz/vox_new_real", inc_counter);
-            }
-            if (idx_art_new.numel() > 0) {
-                auto c_art = this->center_.index_select(0, idx_art_new);
-                auto s_art = this->size_.index_select(0,   idx_art_new);
-                rrLogVoxelBoxes(c_art, s_art, 200000, "viz/vox_new_artifacts", inc_counter);
-            }
+            // if (idx_real_new.numel() > 0) {
+            //     auto c_real = this->center_.index_select(0, idx_real_new);
+            //     auto s_real = this->size_.index_select(0,   idx_real_new);
+            //     rrLogVoxelBoxes(c_real, s_real, 200000, "viz/vox_new_real", inc_counter);
+            // }
+            // if (idx_art_new.numel() > 0) {
+            //     auto c_art = this->center_.index_select(0, idx_art_new);
+            //     auto s_art = this->size_.index_select(0,   idx_art_new);
+            //     rrLogVoxelBoxes(c_art, s_art, 200000, "viz/vox_new_artifacts", inc_counter);
+            // }
         }
         viz_once_done = true;
     }
@@ -2012,6 +2526,74 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
     //       << " voxels this call (real=" << Nk
     //       << ", artifact=" << Nm_added << "). Total now: "
     //       << this->oct_path_.size(0) << "\n";
+}
+
+void VoxelModel::increasePcd(torch::Tensor& new_point_cloud,
+                             torch::Tensor& new_colors,
+                             const int iteration)
+{
+    // Follow GaussianModel::increasePcd(tensor) pattern, but reuse
+    // our existing vector-based VoxelModel::increasePcd(..., cams).
+
+    if (!new_point_cloud.defined() || !new_colors.defined())
+        return;
+
+    TORCH_CHECK(
+        new_point_cloud.dim() == 2 && new_point_cloud.size(1) == 3,
+        "VoxelModel::increasePcd(tensor): new_point_cloud must be [N,3]"
+    );
+    TORCH_CHECK(
+        new_colors.dim() == 2 && new_colors.size(1) == 3,
+        "VoxelModel::increasePcd(tensor): new_colors must be [N,3]"
+    );
+    TORCH_CHECK(
+        new_point_cloud.size(0) == new_colors.size(0),
+        "VoxelModel::increasePcd(tensor): points/colors size mismatch"
+    );
+
+    const int64_t N = new_point_cloud.size(0);
+    if (N == 0)
+        return;
+
+    // Ensure CPU + contiguous
+    auto xyz_cpu = new_point_cloud.to(torch::kCPU).contiguous();
+    auto rgb_cpu = new_colors.to(torch::kCPU).contiguous();
+
+    TORCH_CHECK(
+        xyz_cpu.scalar_type() == torch::kFloat32 &&
+        rgb_cpu.scalar_type() == torch::kFloat32,
+        "VoxelModel::increasePcd(tensor): tensors must be float32"
+    );
+
+    // Flatten to 1D [3*N]
+    auto xyz_flat = xyz_cpu.view({-1});  // [3N]
+    auto rgb_flat = rgb_cpu.view({-1});  // [3N]
+
+    std::vector<float> points(3 * N);
+    std::vector<float> cols(3 * N);
+
+    // Copy XYZ directly
+    std::memcpy(
+        points.data(),
+        xyz_flat.data_ptr<float>(),
+        points.size() * sizeof(float)
+    );
+
+    // Colors: current pipeline (RGBD branch) gives us [0,1] floats.
+    // The existing vector-based increasePcd expects 0..255 and divides by 255.0f.
+    // So we scale up to 0..255 here to keep behaviour consistent.
+    const float* rgb_ptr = rgb_flat.data_ptr<float>();
+    for (int64_t i = 0; i < static_cast<int64_t>(cols.size()); ++i) {
+        cols[i] = rgb_ptr[i] * 255.0f;
+    }
+
+    // For inactive geo densify we can safely pass an empty cam list:
+    // we already know points are valid (near keypoints with good depth),
+    // so we do not need extra mark_max_samp_rate / mark_near filtering.
+    std::vector<sv::MiniCam> empty_cams;
+
+    // Reuse the main SVRaster-aware pipeline
+    increasePcd(points, cols, iteration, empty_cams);
 }
 
 void VoxelModel::syncFromPython_() {

@@ -8,7 +8,9 @@ endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(FetchContent)
-FetchContent_Declare(rerun_sdk URL https://github.com/rerun-io/rerun/releases/download/0.24.1/rerun_cpp_sdk.zip)
+# FetchContent_Declare(rerun_sdk URL https://github.com/rerun-io/rerun/releases/download/0.24.1/rerun_cpp_sdk.zip)
+FetchContent_Declare(rerun_sdk URL
+https://github.com/rerun-io/rerun/releases/latest/download/rerun_cpp_sdk.zip)
 FetchContent_MakeAvailable(rerun_sdk)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -56,9 +58,38 @@ find_package(glfw3 REQUIRED)
 
 find_package(realsense2)
 
+find_package(glog REQUIRED)
+
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+
+# ------------------------------------------------------------------
+# nvblox (TSDF/ESDF) – already built in third_party/nvblox/build
+# ------------------------------------------------------------------
+set(NVBLOX_ROOT_DIR  "${PROJECT_SOURCE_DIR}/third_party/nvblox")
+set(NVBLOX_BUILD_DIR "${NVBLOX_ROOT_DIR}/build")
+set(NVBLOX_SRC_DIR   "${NVBLOX_ROOT_DIR}/nvblox")
+
+# Headers: third_party/nvblox/nvblox/include
+set(NVBLOX_INCLUDE_DIR "${NVBLOX_SRC_DIR}/include")
+
+# Library: third_party/nvblox/build/nvblox/libnvblox_lib.so
+set(NVBLOX_LIB_DIR "${NVBLOX_BUILD_DIR}/nvblox")
+
+# Make headers visible to all targets
+include_directories(${NVBLOX_INCLUDE_DIR})
+
+# Locate the core nvblox library built above
+find_library(NVBLOX_LIB
+    NAMES nvblox_lib
+    PATHS "${NVBLOX_LIB_DIR}"
+    NO_DEFAULT_PATH
+)
+
+if(NOT NVBLOX_LIB)
+    message(FATAL_ERROR "Could not find nvblox_lib in ${NVBLOX_LIB_DIR}")
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}
@@ -244,6 +275,8 @@ add_library(voxel_core
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
+        src_voxel/rerun_utils.cpp
+        ${NVBLOX_SRC_DIR}/src/io/mesh_io.cpp
         third_party/tinyply/tinyply.h
         third_party/tinyply/tinyply.cpp)
         
@@ -260,7 +293,9 @@ target_link_libraries (voxel_core
             Python3::Python
             pybind11::embed
             ${OpenCV_LIBRARIES}
-            rerun_sdk)
+            rerun_sdk
+            ${NVBLOX_LIB}
+            glog::glog)
 
 add_library(voxel_viewer SHARED
     viewer/drawer_utils.h

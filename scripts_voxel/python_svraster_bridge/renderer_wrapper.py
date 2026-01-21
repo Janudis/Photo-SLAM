@@ -262,7 +262,6 @@ def render(
         need_normal=output_normal,
         track_max_w=track_max_w,
         **other_opt)
-    
     torch.cuda.synchronize()
     t_rast0 = time.perf_counter()
 

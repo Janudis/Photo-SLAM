@@ -120,5 +120,7 @@ public:
     std::vector<Point2D> points2D_;
     std::vector<float> kps_pixel_;
     std::vector<float> kps_point_local_;
+
+    bool done_inactive_geo_densify_ = false;
 };
 

@@ -14,7 +14,11 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 ##############################################################################
 
 Camera.z_near: 0.01
+RGBD.min_depth: 0.0000000001
+RGBD.max_depth: 40.0
 
+Mapper.inactive_geo_densify: 1  # 0:false, 1 or other integer:true
+Mapper.depth_cache: 10
 Mapper.min_num_initial_map_kfs:        20
 Mapper.new_keyframe_times_of_use:      2 #8 #2
 Mapper.local_BA_increased_times_of_use: 0       
@@ -56,14 +60,11 @@ Optimization.optim_eps: 1e-15
 Optimization.lr_decay_ckpt: [19000] # [24]
 Optimization.lr_decay_mult: 0.1
 
-# Photometric loss blend used in your mapper (L1 + DSSIM)
-Optimization.lambda_dssim: 0.2
-
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 800
-Optimization.adapt_every: 800
+Optimization.adapt_from: 600
+Optimization.adapt_every: 600
 # Pruning
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.0001
@@ -76,6 +77,7 @@ Optimization.subdivide_samp_thres: 1.0 #0.7 #1.0
 Optimization.subdivide_prop: 0.05 #0.1 #0.05
 Optimization.subdivide_max_num: 3000000 #10000000
 
+# Regularization weights (set to 0 to disable)
 Optimization.lambda_tv_density: 0 #1e-10
 Optimization.tv_from: 0
 Optimization.tv_until: 1000
@@ -84,6 +86,11 @@ Optimization.ss_aug_max: 0 #1.5 #axristo
 Optimization.lambda_R_concen: 0 #0.01 #axristo
 Optimization.lambda_dist: 0 #0.1 #axristo
 Optimization.lambda_T_inside: 0 #0.01 #axristo
+
+Optimization.lambda_dssim: 0.2
+Optimization.lambda_ssim : 0.0 #0.02
+Optimization.lambda_sparse_depth : 0.0
+Optimization.sparse_depth_until : 1500
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

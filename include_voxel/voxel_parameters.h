@@ -74,7 +74,10 @@ public:
         float ss_aug_max = 1.5,
         float lambda_R_concen = 0.01,
         float lambda_dist = 0.1,
-        float lambda_T_inside = 0.01
+        float lambda_T_inside = 0.01,
+        float lambda_ssim = 0.02f,
+        float lambda_sparse_depth = 0.0f,
+        int   sparse_depth_until = 1000
     );
 
 public:
@@ -105,4 +108,7 @@ public:
     float lambda_R_concen_;
     float lambda_dist_;
     float lambda_T_inside_;
+    float lambda_ssim_;
+    float lambda_sparse_depth_;
+    int   sparse_depth_until_;
 };

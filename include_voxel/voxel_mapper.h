@@ -1,11 +1,15 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <jsoncpp/json/json.h>
 #include <pybind11/numpy.h>
 #include <pybind11/embed.h>
 #include <pybind11/gil.h>
 #include <pybind11/pybind11.h>     //  ← for gil_scoped_release
 #include <opencv2/opencv.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudastereo.hpp>
+#include <opencv2/cudawarping.hpp>
 
 #include <filesystem>
 #include <vector>
@@ -23,6 +27,8 @@
 #include <thread>
 #include <limits>
 #include <optional>
+#include <regex>
+#include <iomanip>
 
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_keyframe.h"
@@ -37,10 +43,26 @@
 #include "include_voxel/voxel_model.h"
 #include "include_voxel/py_utils.h"
 #include "include_voxel/render_opts.h"  
+// #include "include/stereo_vision.h"
+// #include "include/operate_points.h"
 
 // ORB_SLAM3::System
 #include "ORB-SLAM3/include/System.h"
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
+
+#include <nvblox/mapper/mapper.h>
+#include <nvblox/map/blox.h>              // for BlockMemoryPoolParams
+#include <nvblox/mapper/mapper_params.h>  // for MapperParams
+#include <nvblox/sensors/camera.h>
+#include <nvblox/sensors/image.h>   // DepthImage, ColorImage
+#include <nvblox/map/layer.h>  // TsdfLayer, TsdfVoxel
+#include <nvblox/core/types.h>      // Vector3f alias
+#include <nvblox/map/voxels.h>        // TsdfVoxel
+#include <nvblox/map/common_names.h>  // TsdfLayer alias
+#include "rerun_utils.h" 
+#include <nvblox/io/mesh_io.h>   // for io::outputColorMeshLayerToPly
+#include "nvblox/integrators/tsdf_decay_integrator.h"
+#include "nvblox/integrators/freespace_integrator.h"
 
 pybind11::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat& img);
 
@@ -70,16 +92,18 @@ enum SystemSensorType {
     RGBD = 3
 };
 
-// struct VariableParameters {
-//     float position_lr_init;
-//     float lambda_photo;
-//     float lambda_dssim;
-//     int new_kf_times_of_use;
-//     int   stable_num_iter_existence;
-
-//     bool  keep_training;
-//     bool  do_inactive_geo_densify;
-// };
+ struct VariableParameters
+ {
+     float geo_lr;
+     float sh0_lr;
+     float shs_lr;
+     float lambda_dssim;
+     int densify_interval;
+     int new_kf_times_of_use;
+     int stable_num_iter_existence; ///< loop closure correction
+     bool keep_training;
+     bool do_gaus_pyramid_training;
+ };
 
 class VoxelMapper {
 public:
@@ -89,17 +113,70 @@ public:
         std::filesystem::path result_dir = "",
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
-
+    
+    std::shared_ptr<nvblox::Mapper> sdf_mapper_;
+    bool use_tsdf_mapping_ = true; 
+    float sdf_voxel_size_m_ = 0.05f;   // example, configurable via YAML
+    void initializeNvbloxMapper();
+    void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
+                                    const cv::Mat& depth_meters);
+    // torch::Tensor sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
+    struct TsdfSample {
+        torch::Tensor tsdf;    // [N]
+        torch::Tensor weight;  // [N]
+        torch::Tensor success; // [N]
+    };
+    TsdfSample sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
+    struct TsdfCornerSample {
+        torch::Tensor tsdf;    // [N,8] float32
+        torch::Tensor weight;  // [N,8] float32
+        torch::Tensor success; // [N,8] bool
+    };
+    TsdfCornerSample sampleTsdfAtVoxelCornersWorld(
+        const torch::Tensor& centers_world,  // [N,3]
+        const torch::Tensor& sizes_world     // [N,1] or [N]
+    );
+    TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld();
+    
     // ~VoxelMapper();
     void readConfigFromFile(const std::filesystem::path& cfg_path);
 
     void run();
+
+    void saveDepthTensorAsPng(
+        const torch::Tensor& depth_in,
+        const std::filesystem::path& out_path);
+    bool buildSparseDepthFromRGBD(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        torch::Tensor& sparse_uv,
+        torch::Tensor& sparse_depth);
+    torch::Tensor computeSparseDepthLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    bool buildSparseDepthFromMapPoints(
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        torch::Tensor& sparse_uv,     // [N,2]
+        torch::Tensor& sparse_depth); // [N]
+    torch::Tensor computeSparseDepthLoss_Points(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    void debugDepthStats(const cv::Mat& depth_meters, int kf_id);
+
     void trainForOneIteration();
 
     // graceful stop
     bool isStopped() const;
     // void signalStop(bool stop = true);
     void signalStop(const bool going_to_stop = true);
+
+    void applyFinalTsdfTransparency();
 
     // rendering / dumping -----------------------------------------------------
     cv::Mat renderFromPose(
@@ -112,6 +189,7 @@ public:
     int  getIteration();
     void increaseIteration(const int inc=1);
     
+    float geoLearningRateInit();
     float sh0LearningRate();
     float shsLearningRate();
     float lambdaDssim();
@@ -119,17 +197,21 @@ public:
     int newKeyframeTimesOfUse();
     bool isKeepingTraining();
     int stableNumIterExistence();
-    bool isdoingInactiveGeoDensify();
     bool isdoingGausPyramidTraining();
+    bool isdoingInactiveGeoDensify();
 
-    void setGeoLearningRateInit(const float lr);
+    void setgeoLearningRateInit(const float lr);
+    void setsh0LearningRate(const float lr);
+    void setshsLearningRate(const float lr);
+    void setLambdaDssim(const float lambda_dssim);
+    void setDensifyInterval(const int interval);
+    void setNewKeyframeTimesOfUse(const int times);
+    void setKeepTraining(const bool keep);
+    void setStableNumIterExistence(const int niter);
+    void setDoGausPyramidTraining(const bool gaus_pyramid);
 
-    // VariableParameters getVariableParameters() const;
-    // void setVariableParameters(const VariableParameters& p);
-
-    // void setKeepTraining(const bool keep);
-
-    std::shared_ptr<sv::VoxelTrainer> getTrainer() const;
+    VariableParameters getVaribleParameters();
+    void setVaribleParameters(const VariableParameters& params);
 
 protected:    
     // SLAM‑pipeline logic -----------------------------------------------------
@@ -172,6 +254,7 @@ protected:
         const std::filesystem::path& img_dir,
         const std::filesystem::path& gt_dir,
         const std::filesystem::path& loss_dir,
+        const std::filesystem::path& result_depth_dir,
         const std::string&  name_suffix = "");
     void renderAndRecordAllKeyframes(
         const std::string& name_suffix = "");
@@ -185,6 +268,9 @@ protected:
                             const at::Tensor& gt_img,
                             int fid,
                             const std::string& base_dir);
+    void savePhotometricErrorHeatmapAsPng(
+        const torch::Tensor& error_tensor,
+        const std::filesystem::path& out_path);
 
 public:
     std::vector<float> best_loss_per_kf_;          // size == #key-frames
@@ -265,11 +351,15 @@ protected:
     int stereo_min_disparity_ = 0;
     int stereo_num_disparity_ = 128;
     cv::Mat stereo_Q_;
-    // cv::Ptr<cv::cuda::StereoSGM> stereo_cv_sgm_;
+    cv::Ptr<cv::cuda::StereoSGM> stereo_cv_sgm_;
     float RGBD_min_depth_ = 0.0f;
     float RGBD_max_depth_ = 100.0f;
 
-    bool do_inactive_geo_densify = true;
+    bool inactive_geo_densify_ = true;
+    int depth_cached_ = 0;
+    int max_depth_cached_ = 1;
+    torch::Tensor depth_cache_points_;
+    torch::Tensor depth_cache_colors_;
 
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;
@@ -309,4 +399,7 @@ protected:
 
     // (optional) Python thread‑state holder ----------------------------------
     PyThreadState* m_savedState = nullptr;
+
+    int64_t last_artifact_fill_iter_ = -1;
+    int64_t last_densify_iter_       = -1;  // NEW: last prune/subdivide iteration
 };

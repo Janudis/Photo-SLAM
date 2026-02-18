@@ -1,0 +1,54 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+# From scripts/data/statues/transforms.json
+Camera1.fx: 527.8128041912385
+Camera1.fy: 525.6646299076452
+Camera1.cx: 281.2544383166407
+Camera1.cy: 153.83129815079727
+
+Camera1.k1: 0.056565055133704856
+Camera1.k2: -0.09168313393694635
+Camera1.p1: -0.00015246473720950438
+Camera1.p2: -0.0010919265121742759
+Camera1.k3: 0.0
+
+# Transforms.json doesn't define fps explicitly; keep 30 unless you know otherwise
+Camera.fps: 30
+
+# Your runner converts BGR->RGB, so keep RGB=1
+Camera.RGB: 1
+
+# Resolution from transforms.json
+Camera.width: 568
+Camera.height: 320
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 2000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+  

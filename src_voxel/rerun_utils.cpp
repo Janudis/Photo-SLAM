@@ -558,4 +558,137 @@ void RerunVisualizerBridge::visualizeSVRasterMesh(
     }
 }
 
+void RerunVisualizerBridge::visualizePoints3D(
+    const torch::Tensor& points_xyz,
+    const torch::Tensor& colors,
+    int iteration,
+    const std::string& entity_path,
+    float radius
+) {
+    ensureInitialized();
+    if (!impl_) return;
+    if (!points_xyz.defined() || points_xyz.numel() == 0) return;
+
+    py::gil_scoped_acquire gil;
+
+    auto p_cpu = points_xyz.contiguous().to(torch::kCPU);
+    TORCH_CHECK(p_cpu.dim() == 2 && p_cpu.size(1) == 3, "points_xyz must be [N,3]");
+
+    auto ps = p_cpu.sizes();
+    std::vector<ssize_t> p_shape{ps[0], ps[1]};
+    std::vector<ssize_t> p_strides{
+        static_cast<ssize_t>(sizeof(float) * ps[1]),
+        static_cast<ssize_t>(sizeof(float))
+    };
+
+    py::array points_np(py::buffer_info(
+        p_cpu.data_ptr<float>(),
+        sizeof(float),
+        py::format_descriptor<float>::format(),
+        2,
+        p_shape,
+        p_strides
+    ));
+
+    py::object colors_np = py::none();
+    if (colors.defined() && colors.numel() > 0) {
+        auto c_cpu = colors.contiguous().to(torch::kCPU);
+        TORCH_CHECK(c_cpu.dim() == 2, "colors must be 2D [N,3] or [N,4]");
+        TORCH_CHECK(c_cpu.size(0) == p_cpu.size(0),
+                    "colors must have same N as points_xyz");
+        TORCH_CHECK(c_cpu.size(1) == 3 || c_cpu.size(1) == 4,
+                    "colors must be [N,3] or [N,4]");
+
+        auto cs = c_cpu.sizes();
+        std::vector<ssize_t> c_shape{cs[0], cs[1]};
+        std::vector<ssize_t> c_strides{
+            static_cast<ssize_t>(c_cpu.element_size() * cs[1]),
+            static_cast<ssize_t>(c_cpu.element_size())
+        };
+
+        py::array c_np(py::buffer_info(
+            c_cpu.data_ptr(),
+            c_cpu.element_size(),
+            c_cpu.dtype() == torch::kUInt8
+                ? py::format_descriptor<uint8_t>::format()
+                : py::format_descriptor<float>::format(),
+            2,
+            c_shape,
+            c_strides
+        ));
+        colors_np = c_np;
+    }
+
+    impl_->visualizer.attr("visualize_points3d")(
+        points_np,
+        colors_np,
+        radius,
+        py::str(entity_path),
+        iteration
+    );
+}
+
+void RerunVisualizerBridge::visualizeLineStrip3D(
+    const torch::Tensor& points_xyz,
+    const torch::Tensor& color_rgb,
+    int iteration,
+    const std::string& entity_path,
+    float radius
+) {
+    ensureInitialized();
+    if (!impl_) return;
+    if (!points_xyz.defined() || points_xyz.numel() == 0) return;
+
+    py::gil_scoped_acquire gil;
+
+    auto p_cpu = points_xyz.contiguous().to(torch::kCPU);
+    TORCH_CHECK(p_cpu.dim() == 2 && p_cpu.size(1) == 3, "points_xyz must be [N,3]");
+
+    auto ps = p_cpu.sizes();
+    std::vector<ssize_t> p_shape{ps[0], ps[1]};
+    std::vector<ssize_t> p_strides{
+        static_cast<ssize_t>(sizeof(float) * ps[1]),
+        static_cast<ssize_t>(sizeof(float))
+    };
+
+    py::array points_np(py::buffer_info(
+        p_cpu.data_ptr<float>(),
+        sizeof(float),
+        py::format_descriptor<float>::format(),
+        2,
+        p_shape,
+        p_strides
+    ));
+
+    py::object color_np = py::none();
+    if (color_rgb.defined() && color_rgb.numel() > 0) {
+        auto c = color_rgb.contiguous().to(torch::kCPU).view({-1});
+        TORCH_CHECK(c.numel() >= 3, "color_rgb must have at least 3 values");
+        // pass as numpy [3]
+        py::array_t<uint8_t> cu8({3});
+        if (c.dtype() == torch::kUInt8) {
+            auto cptr = c.data_ptr<uint8_t>();
+            auto b = cu8.mutable_unchecked<1>();
+            b(0)=cptr[0]; b(1)=cptr[1]; b(2)=cptr[2];
+        } else {
+            // assume float-ish [0,1], convert safely
+            auto cf = c.to(torch::kFloat32);
+            auto cptr = cf.data_ptr<float>();
+            auto b = cu8.mutable_unchecked<1>();
+            b(0)=uint8_t(std::max(0.f,std::min(1.f,cptr[0]))*255.f);
+            b(1)=uint8_t(std::max(0.f,std::min(1.f,cptr[1]))*255.f);
+            b(2)=uint8_t(std::max(0.f,std::min(1.f,cptr[2]))*255.f);
+        }
+        color_np = cu8;
+    }
+
+    impl_->visualizer.attr("visualize_linestrip3d")(
+        points_np,
+        color_np,
+        radius,
+        py::str(entity_path),
+        iteration
+    );
+}
+
 } // namespace sv

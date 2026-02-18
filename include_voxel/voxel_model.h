@@ -140,6 +140,8 @@ public:
     /// Save only sparse voxels to PLY (not implemented here).
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
+    void savePlannerNPZ(const std::filesystem::path& npz_path, int target_max_voxels = 1000000);
+
     std::unordered_map<std::string, torch::Tensor>
     // render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss = 1.0f, bool track_max_w = false) const;
     render(const sv::MiniCam& cam,

@@ -81,6 +81,20 @@ public:
         int iteration
     );
 
+    void visualizePoints3D(
+    const torch::Tensor& points_xyz,     // [N,3] float32
+    const torch::Tensor& colors,         // optional [N,3] uint8 or float
+    int iteration,
+    const std::string& entity_path,
+    float radius = 0.02f);
+
+    void visualizeLineStrip3D(
+        const torch::Tensor& points_xyz,     // [N,3] float32
+        const torch::Tensor& color_rgb,      // optional [3] uint8/float
+        int iteration,
+        const std::string& entity_path,
+        float radius = 0.01f);
+
 private:
     RerunVisualizerBridge();
     void ensureInitialized();

@@ -64,6 +64,8 @@
 #include "nvblox/integrators/tsdf_decay_integrator.h"
 #include "nvblox/integrators/freespace_integrator.h"
 
+#include "voxel_planner.h"
+
 pybind11::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat& img);
 
 #define CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(dir)                                       \
@@ -114,13 +116,18 @@ public:
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
     
+    std::unique_ptr<VoxelPlanner> planner_;
+    bool planned_once_ = false;
+    Eigen::Vector3f offline_goal_W_ = Eigen::Vector3f(10,5,0); // from YAML later
+    float planner_clearance_m_ = 0.3f;
+    bool queryEsdfAtWorld(const Eigen::Vector3d& p_W, float& dist_out) const;
+    
     std::shared_ptr<nvblox::Mapper> sdf_mapper_;
-    bool use_tsdf_mapping_ = true; 
+    bool use_tsdf_mapping_ = false; 
     float sdf_voxel_size_m_ = 0.05f;   // example, configurable via YAML
     void initializeNvbloxMapper();
     void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
                                     const cv::Mat& depth_meters);
-    // torch::Tensor sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
     struct TsdfSample {
         torch::Tensor tsdf;    // [N]
         torch::Tensor weight;  // [N]
@@ -271,6 +278,8 @@ protected:
     void savePhotometricErrorHeatmapAsPng(
         const torch::Tensor& error_tensor,
         const std::filesystem::path& out_path);
+
+    void savePlannerNPZ(std::filesystem::path result_dir);
 
 public:
     std::vector<float> best_loss_per_kf_;          // size == #key-frames

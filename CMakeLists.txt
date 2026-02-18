@@ -60,6 +60,8 @@ find_package(realsense2)
 
 find_package(glog REQUIRED)
 
+find_package(ompl REQUIRED)
+
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
@@ -278,14 +280,16 @@ add_library(voxel_core
         src_voxel/rerun_utils.cpp
         ${NVBLOX_SRC_DIR}/src/io/mesh_io.cpp
         third_party/tinyply/tinyply.h
-        third_party/tinyply/tinyply.cpp)
+        third_party/tinyply/tinyply.cpp
+        src_voxel/voxel_planner.cpp)
         
-target_include_directories (voxel_core
+target_include_directories(voxel_core
         PUBLIC
             include_voxel
             ${Python3_INCLUDE_DIRS}
             ${OpenCV_INCLUDE_DIRS}
-            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
+            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus
+            ${OMPL_INCLUDE_DIRS} )
 target_link_libraries (voxel_core
         PUBLIC
             # voxel_rasterizer           # call kernels directly if needed
@@ -295,7 +299,8 @@ target_link_libraries (voxel_core
             ${OpenCV_LIBRARIES}
             rerun_sdk
             ${NVBLOX_LIB}
-            glog::glog)
+            glog::glog
+            ${OMPL_LIBRARIES})
 
 add_library(voxel_viewer SHARED
     viewer/drawer_utils.h
@@ -400,6 +405,24 @@ target_link_libraries(tum_rgbd_voxel
 )
 target_link_directories(tum_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# SplatNav / statues monocular (transforms.json -> rgb.txt -> ORB-SLAM3 TrackMonocular)
+add_executable(statues_voxel examples/statues_voxel.cpp)
+target_include_directories(statues_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        ${Python3_INCLUDE_DIRS}
+)
+target_link_libraries(statues_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        jsoncpp_lib
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(statues_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 # # EuRoC Stereo
 # add_executable(euroc_stereo examples/euroc_stereo.cpp)

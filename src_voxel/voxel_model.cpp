@@ -95,6 +95,46 @@ torch::Tensor VoxelModel::voxelDensityMean() const
     return geo_per_voxel;  // pre-activation densities per voxel
 }
 
+torch::Tensor VoxelModel::voxSize() const {
+    torch::Tensor out = (size_.dim() == 1) ? size_.unsqueeze(1) : size_; // [N,1]
+    // Light stats; item<>() syncs but is fine occasionally
+    auto flat = out.view(-1);
+    float minv = flat.min().item<float>();
+    float maxv = flat.max().item<float>();
+    float mean = flat.mean().item<float>();
+    // std::cout << "[DBG][voxSize] shape=" << out.sizes()
+    //           << " N=" << out.size(0)
+    //           << " min/mean/max=" << minv << "/" << mean << "/" << maxv
+    //           << std::endl;
+    return out;
+}
+
+torch::Tensor VoxelModel::octLevel() const {
+    // ensure [N,1] int8
+    if (oct_level_.dim() == 1) return oct_level_.unsqueeze(1);
+    return oct_level_;
+}
+
+torch::Tensor VoxelModel::octPath() const {
+    return oct_path_;
+}
+
+int VoxelModel::numVoxels() const {
+    return static_cast<int>(center_.size(0));
+}
+
+int VoxelModel::maxNumLevels() const {
+    return max_num_levels_;
+}
+
+torch::Tensor VoxelModel::SceneCenter() const {
+    return this->scene_center_;
+}
+
+torch::Tensor VoxelModel::SceneExtent() const {
+    return this->scene_extent_;
+}
+
 void VoxelModel::oneUpShDegree()
 {
     // '''
@@ -1453,96 +1493,7 @@ void VoxelModel::createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const
     py::object octpath_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_u.contiguous()),
                                                             py::cast(L_u.contiguous()));
     auto octpath = octpath_py.cast<torch::Tensor>().contiguous();            // [Nu,1] int64
-
-    // if (!cams.empty())
-    // {
-    //     py::gil_scoped_acquire gil;
-    //     static py::module oct_utils = py::module::import("src.utils.octree_utils");
-    //     static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
-
-    //     // Decode voxel centers/sizes for filtering
-    //     py::tuple dec = oct_utils.attr("octpath_decoding")(
-    //         py::cast(octpath.contiguous()),
-    //         py::cast(L_u.contiguous()),
-    //         py::cast(scene_center_.contiguous()),
-    //         py::cast(scene_extent_.contiguous())
-    //     );
-    //     at::Tensor vox_center = dec[0].cast<at::Tensor>(); // [Nu,3]
-    //     at::Tensor vox_size   = dec[1].cast<at::Tensor>(); // [Nu,1]
-    //     std::cout << "octpath dev="   << (octpath.is_cuda() ? "cuda" : "cpu") 
-    //         << " dtype="        << octpath.dtype() << "\n";
-    //     std::cout << "vox_center dev="<< (vox_center.is_cuda() ? "cuda" : "cpu")
-    //             << " dtype="        << vox_center.dtype() << "\n";
-    //     std::cout << "vox_size dev="  << (vox_size.is_cuda() ? "cuda" : "cpu")
-    //             << " dtype="        << vox_size.dtype() << "\n";
-
-    //     // Build Python list of MiniCams (ensure CUDA tensors)
-    //     py::list py_cams;
-    //     py::module torch_mod = py::module::import("torch");
-    //     py::object py_cuda = torch_mod.attr("device")("cuda");
-    //     auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
-    //         if (py::hasattr(obj, name)) {
-    //             py::object t = obj.attr(name);
-    //             // Only tensors have .is_cuda/.to; defensive check:
-    //             if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-    //                 obj.attr(name) = t.attr("to")(py_cuda);  // or t.attr("to")("cuda")
-    //             }
-    //         }
-    //     };
-    //     for (const auto& c : cams) {
-    //         py::object py_cam = MiniCam_to_py(c);
-    //         // matrices
-    //         move_attr_to_cuda_if_tensor(py_cam, "w2c");
-    //         move_attr_to_cuda_if_tensor(py_cam, "c2w");
-    //         // vectors used by mark_near / other helpers
-    //         move_attr_to_cuda_if_tensor(py_cam, "position");
-    //         move_attr_to_cuda_if_tensor(py_cam, "lookat");
-    //         py_cams.append(py_cam);
-    //     }
-
-    //     auto Nu_before = octpath.size(0);
-    //     // mark_max_samp_rate -> keep rate>0
-    //     at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-    //         py_cams,
-    //         py::cast(octpath),
-    //         py::cast(vox_center),
-    //         py::cast(vox_size)
-    //     ).cast<at::Tensor>();
-
-    //     at::Tensor kept = rate > 0;
-    //     int64_t n_rate_pos = kept.sum().item<int64_t>();
-    //     // optional near filtering
-    //     const float near_thresh = 1.0f;
-    //     int64_t n_near_hit = 0;
-    //     if (near_thresh > 0.0f) {
-    //         at::Tensor is_near = svr_mod.attr("mark_near")(
-    //             py_cams,
-    //             py::cast(octpath),
-    //             py::cast(vox_center),
-    //             py::cast(vox_size),
-    //             py::float_(near_thresh)
-    //         ).cast<at::Tensor>();
-    //         kept = kept & (~is_near);
-    //         n_near_hit = is_near.sum().item<int64_t>();
-    //     }
-
-    //     auto idx = torch::nonzero(kept).view({-1});
-    //     int64_t K = idx.size(0);
-    //     // Apply mask (all tensors together, no reshapes)
-    //     if (K > 0 && K < octpath.size(0)) {
-    //         octpath = octpath.index_select(0, idx).contiguous();   // [K,1]
-    //         L_u     = L_u.index_select(0, idx).contiguous();       // [K,1] already
-    //         rgb_u   = rgb_u.index_select(0, idx).contiguous();     // [K,3]
-    //     }
-    //     // Recompute sizes and assert consistency
-    //     Nu = octpath.size(0);
-    //     // Debug prints
-    //     std::cout << "[filter] Nu_before=" << Nu_before
-    //             << " rate>0=" << n_rate_pos
-    //             << " near_hit=" << n_near_hit
-    //             << " kept_final=" << Nu << std::endl;
-    // }
-
+    
     // Create/reuse SVM (DO NOT call model_init/points_init/...)
     if (!py_->svm || py_->svm.is_none()) {
         py::object SVM = svm_mod.attr("SparseVoxelModel");
@@ -1679,8 +1630,8 @@ void VoxelModel::increasePcd(std::vector<float> pcd_full,
     const int MAX_L = max_num_levels_;
 
     auto vox_effN  = vox_eff_.expand({N,1});                                                         // [N,1]
-    // torch::Tensor ijk = ((xyz - scene_min_t_) / vox_effN).floor().to(torch::kLong);                  // [N,3]
-    torch::Tensor ijk = ((xyz - scene_min_t_) / vox_effN).to(torch::kLong); 
+    torch::Tensor ijk = ((xyz - scene_min_t_) / vox_effN).floor().to(torch::kLong);                  // [N,3]
+    // torch::Tensor ijk = ((xyz - scene_min_t_) / vox_effN).to(torch::kLong); 
 
     auto octlevelN = torch::full({N,1}, octlevel_, torch::dtype(torch::kInt8).device(dev)).contiguous(); // [N,1]
     auto L_long    = octlevelN.to(torch::kLong);
@@ -3136,46 +3087,6 @@ VoxelModel::camPixSize_(const MiniCam& cam) {
     return std::max(inv_fx, inv_fy);
 }
 
-torch::Tensor VoxelModel::voxSize() const {
-    torch::Tensor out = (size_.dim() == 1) ? size_.unsqueeze(1) : size_; // [N,1]
-    // Light stats; item<>() syncs but is fine occasionally
-    auto flat = out.view(-1);
-    float minv = flat.min().item<float>();
-    float maxv = flat.max().item<float>();
-    float mean = flat.mean().item<float>();
-    // std::cout << "[DBG][voxSize] shape=" << out.sizes()
-    //           << " N=" << out.size(0)
-    //           << " min/mean/max=" << minv << "/" << mean << "/" << maxv
-    //           << std::endl;
-    return out;
-}
-
-torch::Tensor VoxelModel::octLevel() const {
-    // ensure [N,1] int8
-    if (oct_level_.dim() == 1) return oct_level_.unsqueeze(1);
-    return oct_level_;
-}
-
-torch::Tensor VoxelModel::octPath() const {
-    return oct_path_;
-}
-
-int VoxelModel::numVoxels() const {
-    return static_cast<int>(center_.size(0));
-}
-
-int VoxelModel::maxNumLevels() const {
-    return max_num_levels_;
-}
-
-torch::Tensor VoxelModel::SceneCenter() const {
-    return this->scene_center_;
-}
-
-torch::Tensor VoxelModel::SceneExtent() const {
-    return this->scene_extent_;
-}
-
 float VoxelModel::paramL2(const char* name) {
     py::gil_scoped_acquire gil;
     auto t = py_->svm.attr(name).cast<torch::Tensor>();
@@ -3640,6 +3551,120 @@ void VoxelModel::savePly(const std::filesystem::path& result_path)
               << "  (viewer SH degree=1). "
               << (M>1200000 ? "NOTE: Consider lowering to ≤1M for FPS." : "")
               << "\n";
+}
+
+void VoxelModel::savePlannerNPZ(const std::filesystem::path& npz_path,
+                               int target_max_voxels /*=1000000*/)
+{
+    torch::NoGradGuard ng;
+    namespace fs = std::filesystem;
+    namespace py = pybind11;
+
+    if (!npz_path.parent_path().empty())
+        fs::create_directories(npz_path.parent_path());
+
+    // We export the *SVRaster model state* from the embedded Python SparseVoxelModel.
+    py::gil_scoped_acquire gil;
+
+    if (!py_ || py_->svm.is_none()) {
+        std::cerr << "[savePlannerNPZ] ERROR: py_->svm is None. Nothing to export.\n";
+        return;
+    }
+
+    py::object svm = py_->svm;
+    py::module_ np = py::module_::import("numpy");
+
+    auto to_numpy = [](py::handle t) -> py::object {
+        // Expect torch.Tensor-like objects.
+        py::object x = py::reinterpret_borrow<py::object>(t);
+
+        if (py::hasattr(x, "detach")) x = x.attr("detach")();
+        if (py::hasattr(x, "contiguous")) x = x.attr("contiguous")();
+        if (py::hasattr(x, "cpu")) x = x.attr("cpu")();
+        if (py::hasattr(x, "numpy")) return x.attr("numpy")();
+
+        throw std::runtime_error("to_numpy(): object has no .numpy() (not a torch.Tensor?)");
+    };
+
+    // ---- Required SVRaster state (needed to render) ----
+    // These attributes exist in your pipeline because you assign them in createFromPcd().
+    py::object scene_center   = to_numpy(svm.attr("scene_center"));
+    py::object scene_extent   = to_numpy(svm.attr("scene_extent"));
+    py::object inside_extent  = to_numpy(svm.attr("inside_extent"));
+
+    py::object octpath        = to_numpy(svm.attr("octpath"));
+    py::object octlevel       = to_numpy(svm.attr("octlevel"));
+
+    py::object geo_grid_pts   = to_numpy(svm.attr("_geo_grid_pts"));
+    py::object sh0            = to_numpy(svm.attr("_sh0"));
+    py::object shs            = to_numpy(svm.attr("_shs"));
+    py::object subdiv_p       = to_numpy(svm.attr("_subdiv_p"));
+
+    int active_sh_degree = 0;
+    int max_sh_degree    = this->max_sh_degree_;
+    try { active_sh_degree = svm.attr("active_sh_degree").cast<int>(); } catch (...) {}
+    try { max_sh_degree    = svm.attr("max_sh_degree").cast<int>(); }    catch (...) {}
+
+    // ---- Optional planner caches (useful for quick box/occupancy visualizations) ----
+    // We export these too, but they are *not* sufficient to render SVRaster by themselves.
+    py::object vox_center   = py::none();
+    py::object vox_halfsize = py::none();
+    py::object vox_level_u8 = py::none();
+
+    try {
+        // vox_center: [N,3] float
+        py::object vc_t = svm.attr("vox_center");
+        // vox_size:   [N,1] float (or [N])
+        py::object vs_t = svm.attr("vox_size");
+
+        // Convert to torch tensors on CPU first, then numpy.
+        // We also compute half-size.
+        py::object vc_cpu = vc_t.attr("detach")().attr("contiguous")().attr("cpu")();
+        py::object vs_cpu = vs_t.attr("detach")().attr("contiguous")().attr("cpu")();
+
+        // half-size = 0.5 * vox_size
+        py::object half_cpu = py::module_::import("torch").attr("mul")(vs_cpu, 0.5);
+
+        // level as uint8 for planner
+        py::object lv_cpu = svm.attr("octlevel").attr("detach")().attr("contiguous")().attr("cpu")();
+        py::object lv_u8  = lv_cpu.attr("to")(py::module_::import("torch").attr("uint8"));
+
+        // NOTE: We intentionally DO NOT downsample the model state here.
+        // If you want downsampling for planner only, do it downstream in Python/OMPL code.
+
+        vox_center   = vc_cpu.attr("numpy")();
+        vox_halfsize = half_cpu.attr("numpy")();
+        vox_level_u8 = lv_u8.attr("numpy")();
+    } catch (...) {
+        // If vox_center/vox_size are not available, we still export the full SVRaster state.
+    }
+
+    try {
+        np.attr("savez_compressed")(
+            npz_path.string(),
+            // --- SVRaster reconstruction keys ---
+            py::arg("scene_center")      = scene_center,
+            py::arg("scene_extent")      = scene_extent,
+            py::arg("inside_extent")     = inside_extent,
+            py::arg("octpath")           = octpath,
+            py::arg("octlevel")          = octlevel,
+            py::arg("geo_grid_pts")      = geo_grid_pts,
+            py::arg("sh0")               = sh0,
+            py::arg("shs")               = shs,
+            py::arg("subdiv_p")          = subdiv_p,
+            py::arg("active_sh_degree")  = active_sh_degree,
+            py::arg("max_sh_degree")     = max_sh_degree,
+            // --- Optional planner caches ---
+            py::arg("vox_center")        = vox_center,
+            py::arg("vox_half_size")     = vox_halfsize,
+            py::arg("vox_level_u8")      = vox_level_u8
+        );
+
+        std::cout << "[savePlannerNPZ] Wrote SVRaster model state to " << npz_path << "\n";
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[savePlannerNPZ] ERROR: numpy savez_compressed failed: " << e.what() << "\n";
+    }
 }
 
 // void VoxelModel::initOptimizer(float geo_lr, float sh0_lr, float shs_lr,

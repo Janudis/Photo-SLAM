@@ -626,3 +626,61 @@ class RerunVisualizer:
             vcolors,
             entity_path="world/svraster_mesh",
         )
+
+    #path planning   
+    def visualize_points3d(
+        self,
+        points_xyz: npt.NDArray,
+        colors: Optional[npt.NDArray] = None,
+        radii: float = 0.02,
+        entity_path: str = "world/points",
+        iteration: Optional[int] = None,
+    ) -> None:
+        if iteration is not None:
+            rr.set_time_sequence("iter", int(iteration))
+
+        pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            return
+
+        col = None
+        if colors is not None:
+            col = np.asarray(colors)
+            if col.dtype != np.uint8:
+                col = np.clip(col, 0.0, 1.0)
+                col = (col * 255.0).astype(np.uint8)
+            col = col.reshape(pts.shape[0], -1)
+            if col.shape[1] not in (3, 4):
+                col = None
+
+        rr.log(entity_path, rr.Points3D(pts, colors=col, radii=radii))
+
+    def visualize_linestrip3d(
+        self,
+        points_xyz: npt.NDArray,
+        color: Optional[npt.NDArray] = None,
+        radius: float = 0.01,
+        entity_path: str = "world/path",
+        iteration: Optional[int] = None,
+    ) -> None:
+        if iteration is not None:
+            rr.set_time_sequence("iter", int(iteration))
+
+        pts = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            return
+
+        col = None
+        if color is not None:
+            c = np.asarray(color)
+            if c.dtype != np.uint8:
+                c = np.clip(c, 0.0, 1.0)
+                c = (c * 255.0).astype(np.uint8)
+            c = c.reshape(-1)
+            if c.size >= 3:
+                col = c[:3]
+
+        rr.log(
+            entity_path,
+            rr.LineStrips3D([pts], colors=[col] if col is not None else None, radii=radius),
+        )

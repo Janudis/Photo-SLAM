@@ -34,31 +34,46 @@ static void LoadImagesRGBD(
     std::vector<std::string> &vstrImageFilenamesD,
     std::vector<double> &vTimestamps)
 {
-    std::ifstream fAssociation(strAssociationFilename.c_str());
+    const std::filesystem::path assoc_path(strAssociationFilename);
+    if (!std::filesystem::exists(assoc_path) || !std::filesystem::is_regular_file(assoc_path))
+    {
+        std::cerr << "[LoadImagesRGBD] association path is not a regular file: "
+                  << strAssociationFilename << std::endl;
+        return;
+    }
+
+    std::ifstream fAssociation(assoc_path);
     if (!fAssociation.is_open())
     {
         std::cerr << "[LoadImagesRGBD] couldn't open: " << strAssociationFilename << std::endl;
         return;
     }
 
-    while (!fAssociation.eof())
+    std::string s;
+    int malformed_lines = 0;
+    while (std::getline(fAssociation, s))
     {
-        std::string s;
-        std::getline(fAssociation, s);
-        if (s.empty()) continue;
+        if (s.empty() || s[0] == '#')
+            continue;
 
-        std::stringstream ss;
-        ss << s;
+        std::stringstream ss(s);
 
-        double t_rgb, t_d;
+        double t_rgb = 0.0, t_d = 0.0;
         std::string sRGB, sD;
-        ss >> t_rgb;
+        if (!(ss >> t_rgb >> sRGB >> t_d >> sD))
+        {
+            malformed_lines++;
+            continue;
+        }
+
         vTimestamps.push_back(t_rgb); // use RGB timestamp as frame time
-        ss >> sRGB;
         vstrImageFilenamesRGB.push_back(sRGB);
-        ss >> t_d;    // depth timestamp (not actually used separately here)
-        ss >> sD;
         vstrImageFilenamesD.push_back(sD);
+    }
+
+    if (malformed_lines > 0)
+    {
+        std::cerr << "[LoadImagesRGBD] skipped malformed lines: " << malformed_lines << std::endl;
     }
 }
 

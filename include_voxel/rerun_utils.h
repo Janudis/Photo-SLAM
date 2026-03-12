@@ -23,6 +23,9 @@ class RerunVisualizerBridge {
 public:
     static RerunVisualizerBridge& instance();
 
+    void setEnabled(bool enabled) { enabled_ = enabled; }
+    bool isEnabled() const { return enabled_; }
+
     // Initialize Python-side RerunVisualizer (no-op if already initialized).
     void init(const std::string& app_id = "PhotoSLAM-SVRaster",
               bool spawn_viewer = true);
@@ -99,6 +102,7 @@ private:
     RerunVisualizerBridge();
     void ensureInitialized();
 
+    bool enabled_ = true;
     bool initialized_ = false;
 
     // Python object: instance of python_rerun_bridge.visualizer_wrapper.RerunVisualizer

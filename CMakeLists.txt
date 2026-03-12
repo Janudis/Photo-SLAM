@@ -290,7 +290,7 @@ target_include_directories(voxel_core
             ${OpenCV_INCLUDE_DIRS}
             ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus
             ${OMPL_INCLUDE_DIRS} )
-target_link_libraries (voxel_core
+target_link_libraries(voxel_core
         PUBLIC
             # voxel_rasterizer           # call kernels directly if needed
             "${TORCH_LIBRARIES}"
@@ -423,6 +423,18 @@ target_link_libraries(statues_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 target_link_directories(statues_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+# Mesh evaluation utility (reconstruction mesh vs GT mesh)
+add_executable(mesh_eval
+        examples/mesh_eval.cpp
+        third_party/tinyply/tinyply.h
+        third_party/tinyply/tinyply.cpp)
+target_include_directories(mesh_eval PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(mesh_eval
+        ${OpenCV_LIBRARIES}
+        jsoncpp_lib)
 
 # # EuRoC Stereo
 # add_executable(euroc_stereo examples/euroc_stereo.cpp)

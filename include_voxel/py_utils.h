@@ -53,6 +53,10 @@ namespace sv {
                 cam.cy,
                 cam.cam_mode
             );
+
+            // Keep the Python-side camera contract aligned with SVRaster.
+            py_cam.attr("near") = py::float_(cam.near);
+            py_cam.attr("frame_id") = py::int_(cam.frame_id);
     
             return py_cam;
     

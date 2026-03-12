@@ -57,16 +57,40 @@ public:
         // --- Adaptive procedure (SV style) ---
         int   adapt_from_            = 800,
         int   adapt_every_           = 1000,
+        int   prune_every_           = 0,         // 0: fallback to adapt_every_
+        int   subdivide_every_       = 0,         // 0: fallback to adapt_every_
+        int   densify_cooldown_iters_ = 0,      // skip prune/subdivide for very recent voxels
+        bool  filter_near_voxels_ = true,
+        bool  filter_far_voxels_on_insert_ = true,
+        bool  prune_far_voxels_ = true,
+        bool  prune_near_voxels_geometric_ = false,
+        bool  prune_recompute_dense_core_ = true, // 1: recompute at prune time, 0: reuse latest cached bbox
+        bool  prune_recent_unstable_ = false,
+        int   prune_recent_keyframes_ = 3,      // GS-SLAM style: "inserted within last K keyframes"
+        int   prune_recent_min_views_real_ = 0,
+        int   prune_recent_min_views_artificial_ = 0,
+        int   prune_min_kf_age_ = 0,            // prune only if current_kf - exist_since_kf >= this
+        bool  prune_surface_keep_enable_ = true,
+        bool  prune_surface_keep_use_view_ = true,
+        bool  prune_surface_keep_use_size_ = true,
+        bool  final_special_prune_enable_ = true,
         // Pruning
         int   prune_until_           = 18000,
         float prune_thres_init_      = 1e-4f,
         float prune_thres_final_     = 5e-2f,
+        float prune_thres_final_at_target_ = 5e-2f,
+        float prune_thres_init_artificial_ = 3e-4f,
+        float prune_thres_final_artificial_ = 1e-1f,
         // Subdivision
         int   subdivide_until_       = 15000,
         int   subdivide_all_until_   = 0,
         float subdivide_samp_thres_  = 1.0f,
         float subdivide_prop_        = 0.05f,        // top 5% by priority
+        float subdivide_samp_thres_at_target_ = 1.0f,
+        float subdivide_prop_at_target_ = 0.05f,
         int   subdivide_max_num_     = 10000000,   // hard cap
+        bool  subdivide_force_to_target_size_ = false,
+        float subdivide_target_vox_size_ = 0.05f,
         float lambda_dssim = 0.2f,
         float lambda_tv_density = 1e-10f,
         int   tv_from = 0,
@@ -74,7 +98,17 @@ public:
         float ss_aug_max = 1.5,
         float lambda_R_concen = 0.01,
         float lambda_dist = 0.1,
+        float lambda_T_concen = 0.01,
         float lambda_T_inside = 0.01,
+        int   T_sharp_from = 0,
+        int   T_sharp_until = 0,
+        float lambda_T_concen_end_mult = 1.0f,
+        float lambda_T_inside_end_mult = 1.0f,
+        float lambda_normal_dmean = 0.0f,
+        int   n_dmean_from = 10000,
+        int   n_dmean_end = 20000,
+        int   n_dmean_ks = 3,
+        float n_dmean_tol_deg = 90.0f,
         float lambda_ssim = 0.02f,
         float lambda_sparse_depth = 0.0f,
         int   sparse_depth_until = 1000
@@ -92,14 +126,38 @@ public:
     float lr_decay_mult_;
     int adapt_from_;
     int adapt_every_;
+    int prune_every_;
+    int subdivide_every_;
+    int densify_cooldown_iters_;
+    bool filter_near_voxels_;
+    bool filter_far_voxels_on_insert_;
+    bool prune_far_voxels_;
+    bool prune_near_voxels_geometric_;
+    bool prune_recompute_dense_core_;
+    bool prune_recent_unstable_;
+    int prune_recent_keyframes_;
+    int prune_recent_min_views_real_;
+    int prune_recent_min_views_artificial_;
+    int prune_min_kf_age_;
+    bool prune_surface_keep_enable_;
+    bool prune_surface_keep_use_view_;
+    bool prune_surface_keep_use_size_;
+    bool final_special_prune_enable_;
     int prune_until_;
     float prune_thres_init_;
     float prune_thres_final_;
+    float prune_thres_final_at_target_;
+    float prune_thres_init_artificial_;
+    float prune_thres_final_artificial_;
     int subdivide_until_;
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
+    float subdivide_samp_thres_at_target_;
+    float subdivide_prop_at_target_;
     int subdivide_max_num_;
+    bool subdivide_force_to_target_size_;
+    float subdivide_target_vox_size_;
     float lambda_dssim_;
     float lambda_tv_density_;
     int   tv_from_;
@@ -107,7 +165,17 @@ public:
     float ss_aug_max_;
     float lambda_R_concen_;
     float lambda_dist_;
+    float lambda_T_concen_;
     float lambda_T_inside_;
+    int   T_sharp_from_;
+    int   T_sharp_until_;
+    float lambda_T_concen_end_mult_;
+    float lambda_T_inside_end_mult_;
+    float lambda_normal_dmean_;
+    int   n_dmean_from_;
+    int   n_dmean_end_;
+    int   n_dmean_ks_;
+    float n_dmean_tol_deg_;
     float lambda_ssim_;
     float lambda_sparse_depth_;
     int   sparse_depth_until_;

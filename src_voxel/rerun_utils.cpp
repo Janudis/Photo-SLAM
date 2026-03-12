@@ -47,6 +47,9 @@ RerunVisualizerBridge& RerunVisualizerBridge::instance() {
 RerunVisualizerBridge::RerunVisualizerBridge() = default;
 
 void RerunVisualizerBridge::init(const std::string& app_id, bool spawn_viewer) {
+    if (!enabled_) {
+        return;
+    }
     if (initialized_) {
         return;
     }
@@ -67,6 +70,9 @@ void RerunVisualizerBridge::init(const std::string& app_id, bool spawn_viewer) {
 }
 
 void RerunVisualizerBridge::ensureInitialized() {
+    if (!enabled_) {
+        return;
+    }
     if (!initialized_) {
         init();
     }

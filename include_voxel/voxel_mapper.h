@@ -257,6 +257,8 @@ protected:
         std::shared_ptr<VoxelKeyframe> pkf,
         float&  dssim,
         float&  psnr,
+        float&  depth_l1,
+        float&  depth_f1,
         double& render_ms,
         const std::filesystem::path& img_dir,
         const std::filesystem::path& gt_dir,
@@ -266,6 +268,9 @@ protected:
     void renderAndRecordAllKeyframes(
         const std::string& name_suffix = "");
 
+    void saveRenderedTsdfMeshPly(const std::filesystem::path& result_path);
+    void saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::path& result_path);
+    void saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path);
     void savePly(std::filesystem::path result_dir);         
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
@@ -391,6 +396,12 @@ protected:
     bool record_rendered_image_;
     bool record_ground_truth_image_;
     bool record_loss_image_;
+    bool enable_rerun_ = true;
+    bool rerun_final_only_ = false;
+    int rerun_max_keyframes_ = -1; // <=0: all keyframes, >0: only keyframes in [150, 150+N) in rerun camera stream
+    int rendered_mesh_backend_ = 0; // 0: current SVRaster Python exporter, 1: shared C++ sparse TSDF exporter
+    bool record_depth_metrics_ = false;
+    float depth_f1_threshold_m_ = 0.01f;
 
     int   training_report_interval_;   
     
@@ -409,6 +420,6 @@ protected:
     // (optional) Python thread‑state holder ----------------------------------
     PyThreadState* m_savedState = nullptr;
 
-    int64_t last_artifact_fill_iter_ = -1;
+    int64_t last_artificial_fill_iter_ = -1;
     int64_t last_densify_iter_       = -1;  // NEW: last prune/subdivide iteration
 };

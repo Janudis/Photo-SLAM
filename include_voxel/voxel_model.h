@@ -79,10 +79,44 @@ public:
     torch::Tensor voxelDensityMean() const;
     torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
     torch::Tensor voxKey() const { return this->vox_key_; }
+    
+    torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
+    torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
+    torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
+    torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
+    torch::Tensor geometricallyUnstableMask() const { return this->geometrically_unstable_voxel_; } // [N] bool
+    bool hasDenseCoreBB() const { return has_dense_core_bb_; }
+    torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
+    torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
+    bool refreshDenseCoreBBFromCurrentVoxels();
+    void setGeometricallyUnstableMask(const torch::Tensor& mask);
+    void setEnableArtificialPromotion(const bool enable) { enable_artificial_promotion_ = enable; }
+    bool enableArtificialPromotion() const { return enable_artificial_promotion_; }
+    void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
+    bool filterNearVoxels() const { return filter_near_voxels_; }
+    void setFilterFarVoxelsOnInsert(const bool enable) { filter_far_voxels_on_insert_ = enable; }
+    bool filterFarVoxelsOnInsert() const { return filter_far_voxels_on_insert_; }
+    int64_t totalPromotedartificialCount() const { return total_promoted_artificial_voxels_; }
 
-    void createFromPcd(const std::map<point3D_id_t, Point3D>& pcd, const std::vector<sv::MiniCam>& cams);
-    void increasePcd(std::vector<float> points, std::vector<float> colors, const int iteration, const std::vector<sv::MiniCam>& cams);
-    void increasePcd(torch::Tensor& new_point_cloud, torch::Tensor& new_colors, const int iteration);
+    void createFromPcd(
+        const std::map<point3D_id_t, Point3D>& pcd,
+        const std::vector<sv::MiniCam>& cams);
+    void increasePcd(
+        std::vector<float> points,
+        std::vector<float> colors,
+        const int iteration,
+        const std::vector<sv::MiniCam>& cams);
+    void increasePcd(
+        torch::Tensor& new_point_cloud,
+        torch::Tensor& new_colors,
+        const int iteration,
+        const std::vector<sv::MiniCam>& cams);
+    void setTopologyBirthContext(const int iteration, const int kf_count) {
+        topology_birth_iter_ = static_cast<int32_t>(iteration);
+        topology_birth_kf_ = static_cast<int32_t>(kf_count);
+    }
+    void logFinalartificialVoxels(const int iteration);
+    void logFinalPromotedartificialVoxels(const int iteration);
 
     // ───────── Optimizer setup ─────────
     void setGeoLearningRate(float geo_lr);
@@ -128,6 +162,8 @@ public:
     int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
     torch::Tensor SceneCenter() const;  
     torch::Tensor SceneExtent() const;
+    float         fixedVoxSize() const { return fixed_vox_size_; }
+    int           baseOctLevel() const { return static_cast<int>(octlevel_); }
     // Maintenance
     void resetSubdivisionPriority();
     void freezeVoxGeo();
@@ -137,6 +173,8 @@ public:
     void loadPly(const std::filesystem::path& ply_file);
     /// Save all voxel data to a PLY file with full attributes.
     void savePly(const std::filesystem::path& result_path);
+    /// Save a triangle surface mesh extracted from voxel occupancy (PLY with faces).
+    void saveSurfaceMeshPly(const std::filesystem::path& result_path);
     /// Save only sparse voxels to PLY (not implemented here).
     void saveSparsePointsPly(const std::filesystem::path& result_path);
 
@@ -205,6 +243,8 @@ private:
     std::vector<std::string>   rr_acc_labels_;
     bool rr_initialized_ = false;
     int64_t rr_inc_step_ = 0;  // unique per increasePcd() call
+    int last_artificial_iter_ = -1;
+    torch::Tensor art_key_before_iter_; // [K] int64 artificial keys at start of current iter
 
 public:
     torch::DeviceType device_type_;
@@ -248,27 +288,53 @@ public:
     int8_t  octlevel_ = 0; 
     torch::Tensor inside_extent_; // [1], CUDA
 
-    float global_scene_extent_ = 200.0f;  // example: 200 m cube
+    float global_scene_extent_ = 100.0f;  // example: 100 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
-    float fixed_vox_size_ = 0.05f;        // your chosen voxel size
+    float fixed_vox_size_ = 0.2f;     
 
-    bool   fill_empty_cells_ = true;
-    int64_t max_artifact_cells_ = 1000000; // safety cap
-    std::array<float,3> artifact_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
+    bool   fill_empty_cells_ = false;
+    int    fill_empty_cells_warmup_iters_ = 300; // delay one-shot bbox fill until this iteration
+    bool   use_local_frontier_fill_ = false;  // preferred over dense bbox fill
+    bool   use_dense_core_neighbor_fill_ = false; // controlled fill in dense-core region
+    float  dense_core_pcd_density_rate_ = 0.1f; // same meaning as SVRaster heuristic - smaller the bigger the area
+    int64_t max_dense_core_fill_cells_ = 50000; // cap dense-core support cells per call
+    int64_t max_real_pcd_points_ = 800000;      // cap accumulated real PCD points
+    int64_t max_artificial_cells_ = 1000000; // safety cap
+    std::array<float,3> artificial_bg_rgb_{0.5f,0.5f,0.5f}; // gray (or 1,1,1 for white)
 
-    torch::Tensor bb_min_viz, bb_max_viz, sel_artifacts_viz, ijk_box_viz;
+    torch::Tensor bb_min_viz, bb_max_viz, sel_artificials_viz, ijk_box_viz;
+    torch::Tensor artificial_centers_accum_viz_; // [K,3] accumulated artificial centers
+    torch::Tensor artificial_sizes_accum_viz_;   // [K,1] accumulated artificial sizes
+    torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
+    torch::Tensor is_artificial_voxel_;          // [N] bool provenance: false=real, true=artificial/support
+    torch::Tensor is_promoted_artificial_voxel_; // [N] bool provenance: true if voxel was artificial and got promoted to real
+    torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
+    torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
+    torch::Tensor geometrically_unstable_voxel_;      // [N] bool unstable real/art flags (updated at densification)
+    int64_t max_artificial_viz_accum_ = 300000;  // cap to keep rerun responsive
     py::object svm() const;
 
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
     torch::Tensor global_pcd_max_;   // [3], CPU or CUDA
+    torch::Tensor dense_core_bb_min_; // [3], fixed dense-core min from createFromPcd
+    torch::Tensor dense_core_bb_max_; // [3], fixed dense-core max from createFromPcd
     
     bool has_global_pcd_bb_ = false;
-    bool consumeArtifactFillFlag() {
-        bool v = artifact_fill_happened_;
-        artifact_fill_happened_ = false;
+    bool has_dense_core_bb_ = false;
+    bool fill_empty_cells_done_ = false; // run dense bbox fill once per createFromPcd()
+    bool fill_empty_cells_warmup_notified_ = false;
+    bool enable_artificial_promotion_ = true;
+    bool filter_near_voxels_ = true;
+    bool filter_far_voxels_on_insert_ = true;
+    int64_t total_promoted_artificial_voxels_ = 0;
+    int32_t topology_birth_iter_ = -1;
+    int32_t topology_birth_kf_ = -1;
+    bool consumeartificialFillFlag() {
+        bool v = artificial_fill_happened_;
+        artificial_fill_happened_ = false;
         return v;
     }
-    bool artifact_fill_happened_ = false;  // default false
+    bool artificial_fill_happened_ = false;  // default false
 
 protected:
     /// The Adam optimizer

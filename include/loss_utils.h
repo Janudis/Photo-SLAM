@@ -150,6 +150,12 @@ inline torch::Tensor fast_ssim_loss(torch::Tensor x, torch::Tensor y)
     return 1.0f - ssim_val;
 }
 
+inline torch::Tensor prob_concen_loss(torch::Tensor prob)
+{
+    // SVRaster: (prob^2 * (1-prob)^2).mean()
+    return (prob.square() * (1.0f - prob).square()).mean();
+}
+
 struct SparseDepthLoss
 {
     // Last iteration where this loss is active (inclusive)

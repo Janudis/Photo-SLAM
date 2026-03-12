@@ -30,23 +30,24 @@ inline MiniCam fromCamera(const Camera& cam,
                           int frame_id = -1)
 {
     MiniCam m;
-    // m.width   = cam.width();
-    // m.height  = cam.height();
     m.width   = im_width;
     m.height  = im_height;
-    m.fx = cam.fx();  m.fy = cam.fy();
-    // m.cx = cam.cx();  m.cy = cam.cy();
-    m.cx = im_width * 0.5;  m.cy = im_height * 0.5;
-    
-    // float w_ss = static_cast<float>(im_width) / static_cast<float>(cam.width());
-    // float h_ss = static_cast<float>(im_height) / static_cast<float>(cam.height());
-    // m.cx = cam.cx() * w_ss;  m.cy = cam.cy() * h_ss;
-    // std::cout << "cx,cy= " << m.cx << "," << m.cy << " tested cx, cy= " << im_width * 0.5 << "," << im_height * 0.5 << std::endl; // cx,cy= 79.66075897,63.82849884 tested cx, cy= 80.00000000,60.00000000
 
-    // float fovx = graphics_utils::focal2fov(m.fx, m.width);
-    // float fovy = graphics_utils::focal2fov(m.fy, m.height);
-    const float fovx = graphics_utils::focal2fov(cam.fx(), cam.width());
-    const float fovy = graphics_utils::focal2fov(cam.fy(), cam.height());
+    // Pyramid-aware intrinsics:
+    // scale native camera intrinsics to the render/training resolution.
+    // This keeps consistency for both full-res and Gaussian-Pyramid levels.
+    const int native_w = (cam.width()  > 0) ? cam.width()  : im_width;
+    const int native_h = (cam.height() > 0) ? cam.height() : im_height;
+    const float w_ss = static_cast<float>(im_width)  / static_cast<float>(native_w);
+    const float h_ss = static_cast<float>(im_height) / static_cast<float>(native_h);
+
+    m.fx = cam.fx() * w_ss;
+    m.fy = cam.fy() * h_ss;
+    m.cx = cam.cx() * w_ss;
+    m.cy = cam.cy() * h_ss;
+
+    const float fovx = graphics_utils::focal2fov(m.fx, m.width);
+    const float fovy = graphics_utils::focal2fov(m.fy, m.height);
     m.tanfovx = std::tan(fovx * 0.5f);
     m.tanfovy = std::tan(fovy * 0.5f);
 

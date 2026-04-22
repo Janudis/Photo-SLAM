@@ -82,6 +82,8 @@ public:
     std::string img_filename_;
     cv::Mat img_undist_, img_auxiliary_undist_;
     torch::Tensor original_image_; ///< image
+    torch::Tensor depthanythingv2_; ///< cached dense relative depth prior on CPU
+    int depthanythingv2_prepare_iter_ = -1; ///< mapper iteration when the prior was first attached in this run
     int image_width_;              ///< image
     int image_height_;             ///< image
 
@@ -123,4 +125,3 @@ public:
 
     bool done_inactive_geo_densify_ = false;
 };
-

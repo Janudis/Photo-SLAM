@@ -1,5 +1,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/flann.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <jsoncpp/json/json.h>
 
@@ -60,6 +62,21 @@ struct DepthEvalStats
     double depth_precision = -1.0;
     double depth_recall = -1.0;
     double depth_f1 = -1.0;
+};
+
+struct DepthHeatmapSettings
+{
+    bool enabled = false;
+    std::filesystem::path out_dir;
+    int max_saved_frames = 0;     // 0 = save all evaluated frames
+    float clip_max_m = 0.0f;      // optional upper clamp before per-image min/max normalization
+};
+
+struct DepthHeatmapVizRange
+{
+    bool valid = false;
+    float min_m = 0.0f;
+    float max_m = 0.0f;
 };
 
 enum class EvalMode
@@ -1786,6 +1803,217 @@ void renderDepthFromMesh(
     }
 }
 
+float clampDepthHeatmapError(float err_m, float clip_max_m)
+{
+    if (clip_max_m > 0.0f)
+    {
+        return std::min(err_m, clip_max_m);
+    }
+    return err_m;
+}
+
+DepthHeatmapVizRange computeDepthHeatmapVizRange(
+    const cv::Mat1f& abs_err,
+    const cv::Mat1b& valid_mask,
+    float clip_max_m)
+{
+    CV_Assert(abs_err.size() == valid_mask.size());
+
+    DepthHeatmapVizRange range;
+    float min_err = std::numeric_limits<float>::max();
+    float max_err = 0.0f;
+    for (int y = 0; y < abs_err.rows; ++y)
+    {
+        const float* err_row = abs_err.ptr<float>(y);
+        const uchar* mask_row = valid_mask.ptr<uchar>(y);
+        for (int x = 0; x < abs_err.cols; ++x)
+        {
+            if (!mask_row[x]) continue;
+            const float err = clampDepthHeatmapError(err_row[x], clip_max_m);
+            min_err = std::min(min_err, err);
+            max_err = std::max(max_err, err);
+            range.valid = true;
+        }
+    }
+
+    if (!range.valid)
+    {
+        return range;
+    }
+
+    range.min_m = min_err;
+    range.max_m = max_err;
+    if (range.max_m - range.min_m < 1e-6f)
+    {
+        range.max_m = range.min_m + 1e-6f;
+    }
+    return range;
+}
+
+cv::Mat renderDepthL1HeatmapBgr(
+    const cv::Mat1f& abs_err,
+    const cv::Mat1b& valid_mask,
+    const DepthHeatmapVizRange& viz_range,
+    float clip_max_m)
+{
+    CV_Assert(abs_err.size() == valid_mask.size());
+
+    cv::Mat1b gray(abs_err.rows, abs_err.cols, uchar(0));
+    for (int y = 0; y < abs_err.rows; ++y)
+    {
+        const float* err_row = abs_err.ptr<float>(y);
+        const uchar* mask_row = valid_mask.ptr<uchar>(y);
+        uchar* gray_row = gray.ptr<uchar>(y);
+        for (int x = 0; x < abs_err.cols; ++x)
+        {
+            if (!mask_row[x]) continue;
+            const float err = clampDepthHeatmapError(err_row[x], clip_max_m);
+            const float norm =
+                std::clamp((err - viz_range.min_m) / (viz_range.max_m - viz_range.min_m), 0.0f, 1.0f);
+            gray_row[x] = static_cast<uchar>(std::lround(norm * 255.0f));
+        }
+    }
+
+    cv::Mat heat_bgr;
+    cv::applyColorMap(gray, heat_bgr, cv::COLORMAP_JET);
+    heat_bgr.setTo(cv::Scalar(0, 0, 0), valid_mask == 0);
+    return heat_bgr;
+}
+
+cv::Mat appendDepthHeatmapLegend(
+    const cv::Mat& heat_bgr,
+    const DepthHeatmapVizRange& viz_range,
+    float clip_max_m)
+{
+    if (heat_bgr.empty()) return heat_bgr;
+
+    const int legend_pad = 16;
+    const int legend_bar_w = 28;
+    const int legend_w = 190;
+    const int canvas_w = heat_bgr.cols + legend_w;
+    cv::Mat canvas(heat_bgr.rows, canvas_w, CV_8UC3, cv::Scalar(20, 20, 20));
+    heat_bgr.copyTo(canvas(cv::Rect(0, 0, heat_bgr.cols, heat_bgr.rows)));
+
+    const int bar_h = std::max(80, heat_bgr.rows - 2 * legend_pad);
+    const int bar_x = heat_bgr.cols + 20;
+    const int bar_y = (heat_bgr.rows - bar_h) / 2;
+
+    cv::Mat1b legend_gray(bar_h, 1);
+    for (int y = 0; y < bar_h; ++y)
+    {
+        const float t = bar_h > 1 ? (1.0f - static_cast<float>(y) / static_cast<float>(bar_h - 1)) : 1.0f;
+        legend_gray(y, 0) = static_cast<uchar>(std::lround(t * 255.0f));
+    }
+    cv::Mat legend_gray_resized;
+    cv::resize(legend_gray, legend_gray_resized, cv::Size(legend_bar_w, bar_h), 0.0, 0.0, cv::INTER_LINEAR);
+    cv::Mat legend_bgr;
+    cv::applyColorMap(legend_gray_resized, legend_bgr, cv::COLORMAP_JET);
+    legend_bgr.copyTo(canvas(cv::Rect(bar_x, bar_y, legend_bar_w, bar_h)));
+    cv::rectangle(canvas, cv::Rect(bar_x, bar_y, legend_bar_w, bar_h), cv::Scalar(255, 255, 255), 1);
+
+    const int text_x = bar_x + legend_bar_w + 12;
+    const auto put = [&](const std::string& s, int x, int y, double scale = 0.5)
+    {
+        cv::putText(
+            canvas,
+            s,
+            cv::Point(x, y),
+            cv::FONT_HERSHEY_SIMPLEX,
+            scale,
+            cv::Scalar(255, 255, 255),
+            1,
+            cv::LINE_AA);
+    };
+
+    std::ostringstream ss_max;
+    ss_max << std::fixed << std::setprecision(4) << viz_range.max_m << " m";
+    std::ostringstream ss_min;
+    ss_min << std::fixed << std::setprecision(4) << viz_range.min_m << " m";
+
+    put("High", text_x, bar_y + 14);
+    put(ss_max.str(), text_x, bar_y + 34);
+    put("Low", text_x, bar_y + bar_h - 18);
+    put(ss_min.str(), text_x, bar_y + bar_h);
+    put("red = high", bar_x - 4, std::max(18, bar_y - 26));
+    put("blue = low", bar_x - 4, std::min(canvas.rows - 8, bar_y + bar_h + 24));
+    if (clip_max_m > 0.0f)
+    {
+        std::ostringstream ss_cap;
+        ss_cap << "cap " << std::fixed << std::setprecision(3) << clip_max_m << " m";
+        put(ss_cap.str(), bar_x - 4, std::min(canvas.rows - 28, bar_y + bar_h + 46));
+    }
+
+    return canvas;
+}
+
+void annotateDepthHeatmap(
+    cv::Mat& heat_bgr,
+    const std::string& label,
+    double mean_l1_m,
+    const DepthHeatmapVizRange& viz_range,
+    float clip_max_m)
+{
+    if (heat_bgr.empty()) return;
+    std::ostringstream ss0;
+    ss0 << label << "  mean_l1=" << std::fixed << std::setprecision(4) << mean_l1_m << "m";
+    std::ostringstream ss1;
+    ss1 << "viz min=" << std::fixed << std::setprecision(4) << viz_range.min_m
+        << "m  max=" << std::fixed << std::setprecision(4) << viz_range.max_m
+        << "m  blue=low  red=high";
+    if (clip_max_m > 0.0f)
+    {
+        ss1 << "  cap=" << std::fixed << std::setprecision(3) << clip_max_m << "m";
+    }
+    cv::putText(
+        heat_bgr,
+        ss0.str(),
+        cv::Point(12, 24),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(255, 255, 255),
+        2,
+        cv::LINE_AA);
+    cv::putText(
+        heat_bgr,
+        ss1.str(),
+        cv::Point(12, 48),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(255, 255, 255),
+        2,
+        cv::LINE_AA);
+}
+
+void saveDepthL1Heatmap(
+    const cv::Mat1f& abs_err,
+    const cv::Mat1b& valid_mask,
+    float clip_max_m,
+    const std::filesystem::path& out_path,
+    const std::string& label)
+{
+    double sum_err = 0.0;
+    uint64_t count = 0;
+    for (int y = 0; y < abs_err.rows; ++y)
+    {
+        const float* err_row = abs_err.ptr<float>(y);
+        const uchar* mask_row = valid_mask.ptr<uchar>(y);
+        for (int x = 0; x < abs_err.cols; ++x)
+        {
+            if (!mask_row[x]) continue;
+            sum_err += static_cast<double>(err_row[x]);
+            ++count;
+        }
+    }
+
+    const double mean_l1_m = count > 0 ? (sum_err / static_cast<double>(count)) : 0.0;
+    const DepthHeatmapVizRange viz_range = computeDepthHeatmapVizRange(abs_err, valid_mask, clip_max_m);
+    cv::Mat heat_bgr = renderDepthL1HeatmapBgr(abs_err, valid_mask, viz_range, clip_max_m);
+    cv::Mat heat_annotated = appendDepthHeatmapLegend(heat_bgr, viz_range, clip_max_m);
+    annotateDepthHeatmap(heat_annotated, label, mean_l1_m, viz_range, clip_max_m);
+    std::filesystem::create_directories(out_path.parent_path());
+    cv::imwrite(out_path.string(), heat_annotated);
+}
+
 bool evaluateDepthMetricsFromMeshes(
     const MeshData& recon_mesh,
     const MeshData& gt_mesh,
@@ -1798,6 +2026,7 @@ bool evaluateDepthMetricsFromMeshes(
     uint32_t seed,
     float near_z,
     float far_z,
+    const DepthHeatmapSettings& heatmap_settings,
     DepthEvalStats& stats)
 {
     if (recon_mesh.faces.empty() || gt_mesh.faces.empty())
@@ -1820,6 +2049,7 @@ bool evaluateDepthMetricsFromMeshes(
     }
 
     stats = DepthEvalStats{};
+    int heat_saved = 0;
     const int stride = std::max(1, frame_stride);
     std::vector<int> eval_indices;
     eval_indices.reserve((traj.size() + static_cast<size_t>(stride) - 1) / static_cast<size_t>(stride));
@@ -1852,6 +2082,13 @@ bool evaluateDepthMetricsFromMeshes(
         uint64_t both_count = 0;
         uint64_t tp = 0;
         double abs_sum = 0.0;
+        cv::Mat1f abs_err_frame;
+        cv::Mat1b valid_mask;
+        if (heatmap_settings.enabled)
+        {
+            abs_err_frame = cv::Mat1f(K.h, K.w, 0.0f);
+            valid_mask = cv::Mat1b(K.h, K.w, uchar(0));
+        }
 
         for (int y = 0; y < K.h; ++y)
         {
@@ -1871,8 +2108,28 @@ bool evaluateDepthMetricsFromMeshes(
                     const float err = std::abs(zr - zg);
                     abs_sum += static_cast<double>(err);
                     if (err < tau_m) ++tp;
+                    if (heatmap_settings.enabled)
+                    {
+                        abs_err_frame(y, x) = err;
+                        valid_mask(y, x) = 255;
+                    }
                 }
             }
+        }
+
+        if (heatmap_settings.enabled &&
+            both_count > 0 &&
+            (heatmap_settings.max_saved_frames <= 0 || heat_saved < heatmap_settings.max_saved_frames))
+        {
+            std::ostringstream name;
+            name << "frame_" << std::setw(6) << std::setfill('0') << i << "_l1.png";
+            saveDepthL1Heatmap(
+                abs_err_frame,
+                valid_mask,
+                heatmap_settings.clip_max_m,
+                heatmap_settings.out_dir / "depth_l1_heatmaps" / name.str(),
+                "frame " + std::to_string(i));
+            ++heat_saved;
         }
 
         stats.pred_pixels += pred_count;
@@ -1899,6 +2156,7 @@ bool evaluateDepthMetricsFromMeshes(
     stats.depth_recall = static_cast<double>(stats.tp_pixels) / static_cast<double>(stats.gt_pixels);
     const double d = stats.depth_precision + stats.depth_recall;
     stats.depth_f1 = d > 0.0 ? (2.0 * stats.depth_precision * stats.depth_recall / d) : 0.0;
+
     return true;
 }
 
@@ -1908,6 +2166,7 @@ bool evaluateDepthMetricsGaussianSlamStyle(
     const GaussianSlamDepthSettings& gs,
     const std::vector<cv::Point3f>& unseen_pts,
     uint32_t seed,
+    const DepthHeatmapSettings& heatmap_settings,
     DepthEvalStats& stats)
 {
     if (recon_mesh.faces.empty() || gt_mesh.faces.empty())
@@ -1933,6 +2192,7 @@ bool evaluateDepthMetricsGaussianSlamStyle(
     }
 
     stats = DepthEvalStats{};
+    int heat_saved = 0;
     for (size_t i = 0; i < views.size(); ++i)
     {
         cv::Mat1f d_recon, d_gt;
@@ -1942,6 +2202,13 @@ bool evaluateDepthMetricsGaussianSlamStyle(
         double abs_sum = 0.0;
         uint64_t both_count = 0;
         uint64_t pred_count = 0;
+        cv::Mat1f abs_err_frame;
+        cv::Mat1b valid_mask;
+        if (heatmap_settings.enabled)
+        {
+            abs_err_frame = cv::Mat1f(K.h, K.w, 0.0f);
+            valid_mask = cv::Mat1b(K.h, K.w, uchar(0));
+        }
         for (int y = 0; y < K.h; ++y)
         {
             const float* pr = d_recon.ptr<float>(y);
@@ -1953,13 +2220,32 @@ bool evaluateDepthMetricsGaussianSlamStyle(
                 ++pred_count;
                 if (pg[x] > 0.0f)
                 {
-                    abs_sum += std::abs(static_cast<double>(pg[x]) - static_cast<double>(pr[x]));
+                    const float err = std::abs(static_cast<float>(pg[x]) - static_cast<float>(pr[x]));
+                    abs_sum += static_cast<double>(err);
                     ++both_count;
+                    if (heatmap_settings.enabled)
+                    {
+                        abs_err_frame(y, x) = err;
+                        valid_mask(y, x) = 255;
+                    }
                 }
             }
         }
 
         if (pred_count == 0 || both_count == 0) continue;
+        if (heatmap_settings.enabled &&
+            (heatmap_settings.max_saved_frames <= 0 || heat_saved < heatmap_settings.max_saved_frames))
+        {
+            std::ostringstream name;
+            name << "view_" << std::setw(6) << std::setfill('0') << i << "_l1.png";
+            saveDepthL1Heatmap(
+                abs_err_frame,
+                valid_mask,
+                heatmap_settings.clip_max_m,
+                heatmap_settings.out_dir / "depth_l1_heatmaps" / name.str(),
+                "view " + std::to_string(i));
+            ++heat_saved;
+        }
         stats.abs_l1_sum += abs_sum / static_cast<double>(both_count);
         ++stats.frames_used;
         stats.pred_pixels += pred_count;
@@ -1976,6 +2262,7 @@ bool evaluateDepthMetricsGaussianSlamStyle(
     stats.depth_precision = -1.0;
     stats.depth_recall = -1.0;
     stats.depth_f1 = -1.0;
+
     return true;
 }
 } // namespace
@@ -1993,6 +2280,9 @@ int main(int argc, char** argv)
         "{seed          |0| random seed }"
         "{eval_mode     |current| evaluation mode: current, gaussian_slam, or gaussian_slam_sim3 }"
         "{eval_depth_mesh|0| evaluate depth L1/F1 by rendering both meshes }"
+        "{save_depth_heatmaps|0| save per-view depth L1 heatmaps for mesh-depth evaluation }"
+        "{depth_heatmap_max_frames|50| max number of per-view heatmaps to save (0=all evaluated views) }"
+        "{depth_heatmap_clip_m|0.0| optional upper clamp in meters before per-image min/max normalization (<=0 disables) }"
         "{traj          | | trajectory txt (Nx16 row-major matrices) }"
         "{traj_mode     |c2w| trajectory mode: c2w or w2c }"
         "{cam_json      | | camera json with keys camera.w camera.h camera.fx camera.fy camera.cx camera.cy }"
@@ -2039,6 +2329,9 @@ int main(int argc, char** argv)
     const std::string eval_mode_str = parser.get<std::string>("eval_mode");
 
     const bool eval_depth_mesh = parser.get<int>("eval_depth_mesh") != 0;
+    const bool save_depth_heatmaps = parser.get<int>("save_depth_heatmaps") != 0;
+    const int depth_heatmap_max_frames = parser.get<int>("depth_heatmap_max_frames");
+    const float depth_heatmap_clip_m = parser.get<float>("depth_heatmap_clip_m");
     const std::string traj_path = parser.get<std::string>("traj");
     const std::string traj_mode = parser.get<std::string>("traj_mode");
     const std::string cam_json = parser.get<std::string>("cam_json");
@@ -2052,6 +2345,13 @@ int main(int argc, char** argv)
     const int align_max_pairs = parser.get<int>("align_max_pairs");
     const bool save_aligned_mesh = parser.get<int>("save_aligned_mesh") != 0;
     const std::string gs_unseen_npy = parser.get<std::string>("gs_unseen_npy");
+
+    std::filesystem::create_directories(out_dir);
+    DepthHeatmapSettings heatmap_settings;
+    heatmap_settings.enabled = eval_depth_mesh && save_depth_heatmaps;
+    heatmap_settings.out_dir = out_dir;
+    heatmap_settings.max_saved_frames = depth_heatmap_max_frames;
+    heatmap_settings.clip_max_m = depth_heatmap_clip_m;
     GaussianSlamDepthSettings gs_settings;
     gs_settings.n_views = parser.get<int>("gs_depth_views");
     gs_settings.width = parser.get<int>("gs_depth_w");
@@ -2324,7 +2624,9 @@ int main(int argc, char** argv)
                       << " max_frames=" << max_frames
                       << " seed=" << seed
                       << " near=" << near_z
-                      << " far=" << far_z << "\n";
+                      << " far=" << far_z
+                      << " save_heatmaps=" << (heatmap_settings.enabled ? 1 : 0)
+                      << "\n";
 
             depth_ok = evaluateDepthMetricsFromMeshes(
                 recon_mesh,
@@ -2338,6 +2640,7 @@ int main(int argc, char** argv)
                 static_cast<uint32_t>(seed),
                 near_z,
                 far_z,
+                heatmap_settings,
                 depth_stats);
         }
         else
@@ -2356,7 +2659,9 @@ int main(int argc, char** argv)
                       << ",cy=" << (static_cast<float>(gs_settings.height) * 0.5f - 0.5f) << ")"
                       << " unseen_pts=" << unseen_pts.size()
                       << " near=" << gs_settings.near_z
-                      << " far=" << gs_settings.far_z << "\n";
+                      << " far=" << gs_settings.far_z
+                      << " save_heatmaps=" << (heatmap_settings.enabled ? 1 : 0)
+                      << "\n";
 
             depth_ok = evaluateDepthMetricsGaussianSlamStyle(
                 recon_mesh,
@@ -2364,6 +2669,7 @@ int main(int argc, char** argv)
                 gs_settings,
                 unseen_pts,
                 static_cast<uint32_t>(seed),
+                heatmap_settings,
                 depth_stats);
         }
 
@@ -2373,7 +2679,6 @@ int main(int argc, char** argv)
         }
     }
 
-    std::filesystem::create_directories(out_dir);
     const std::filesystem::path json_path = std::filesystem::path(out_dir) / "mesh_eval.json";
     const std::filesystem::path txt_path = std::filesystem::path(out_dir) / "mesh_eval.txt";
     const std::filesystem::path aligned_mesh_path =
@@ -2434,6 +2739,13 @@ int main(int argc, char** argv)
 
     root["depth_from_mesh_enabled"] = eval_depth_mesh;
     root["depth_from_mesh_success"] = depth_ok;
+    root["save_depth_heatmaps"] = heatmap_settings.enabled;
+    root["depth_heatmap_clip_m"] = heatmap_settings.clip_max_m;
+    root["depth_heatmap_max_frames"] = heatmap_settings.max_saved_frames;
+    if (heatmap_settings.enabled)
+    {
+        root["depth_heatmap_dir"] = (std::filesystem::path(out_dir) / "depth_l1_heatmaps").string();
+    }
     if (eval_depth_mesh)
     {
         root["depth_frames_used"] = static_cast<Json::UInt64>(depth_stats.frames_used);
@@ -2490,6 +2802,13 @@ int main(int argc, char** argv)
 
         f << "depth_from_mesh_enabled " << (eval_depth_mesh ? 1 : 0) << "\n";
         f << "depth_from_mesh_success " << (depth_ok ? 1 : 0) << "\n";
+        f << "save_depth_heatmaps " << (heatmap_settings.enabled ? 1 : 0) << "\n";
+        f << "depth_heatmap_clip_m " << heatmap_settings.clip_max_m << "\n";
+        f << "depth_heatmap_max_frames " << heatmap_settings.max_saved_frames << "\n";
+        if (heatmap_settings.enabled)
+        {
+            f << "depth_heatmap_dir " << (std::filesystem::path(out_dir) / "depth_l1_heatmaps").string() << "\n";
+        }
         if (eval_depth_mesh)
         {
             f << "depth_frames_used " << depth_stats.frames_used << "\n";
@@ -2546,6 +2865,11 @@ int main(int argc, char** argv)
         if (depth_ok)
         {
             std::cout << "Depth L1 (mesh-rendered): " << depth_stats.depth_l1_m << " m\n";
+            if (heatmap_settings.enabled)
+            {
+                std::cout << "Depth heatmaps: "
+                          << (std::filesystem::path(out_dir) / "depth_l1_heatmaps") << "\n";
+            }
             if (depth_stats.depth_precision >= 0.0)
             {
                 std::cout << "Depth Precision@" << tau_cm << "cm: " << depth_stats.depth_precision << "\n";
@@ -2568,9 +2892,9 @@ int main(int argc, char** argv)
 
 // voxel photoslam
 // ./bin/mesh_eval \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/5071_shutdown/ply/voxel_model/iteration_5071/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
 //   --gt=scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/5071_shutdown/mesh_eval \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval \
 //   --tau_cm=5.0 \
 //   --recon_samples=500000 \
 //   --gt_samples=500000 \
@@ -2588,9 +2912,9 @@ int main(int argc, char** argv)
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/5071_shutdown/ply/voxel_model/iteration_5071/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/5071_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
@@ -2599,3 +2923,20 @@ int main(int argc, char** argv)
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
 
+
+// ./bin/mesh_eval \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval_aligned \
+//   --tau_cm=5.0 \
+//   --eval_depth_mesh=1 \
+//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --cam_json=/home/dimitris/Photo-SLAM/scripts/data/Replica/cam_params.json \
+//   --align_recon_to_gt=1 \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/CameraTrajectory_TUM.txt \
+//   --save_aligned_mesh=1 \
+//   --save_depth_heatmaps=1 \
+//   --frame_stride=1 --max_frames=1000 --depth_heatmap_max_frames=50
+
+  

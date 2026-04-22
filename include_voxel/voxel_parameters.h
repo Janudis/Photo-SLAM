@@ -69,6 +69,8 @@ public:
         int   prune_recent_keyframes_ = 3,      // GS-SLAM style: "inserted within last K keyframes"
         int   prune_recent_min_views_real_ = 0,
         int   prune_recent_min_views_artificial_ = 0,
+        int   rendered_depth_candidate_promote_min_support_ = 3,
+        int   rendered_depth_candidate_prune_kf_age_ = 3,
         int   prune_min_kf_age_ = 0,            // prune only if current_kf - exist_since_kf >= this
         bool  prune_surface_keep_enable_ = true,
         bool  prune_surface_keep_use_view_ = true,
@@ -92,18 +94,18 @@ public:
         bool  subdivide_force_to_target_size_ = false,
         float subdivide_target_vox_size_ = 0.05f,
         float lambda_dssim = 0.2f,
+        bool  use_l1 = false,
+        bool  use_huber = false,
+        float huber_thres = 0.03f,
         float lambda_tv_density = 1e-10f,
         int   tv_from = 0,
         int   tv_until = 10000,
         float ss_aug_max = 1.5,
         float lambda_R_concen = 0.01,
         float lambda_dist = 0.1,
+        int   dist_from = 10000,
         float lambda_T_concen = 0.01,
         float lambda_T_inside = 0.01,
-        int   T_sharp_from = 0,
-        int   T_sharp_until = 0,
-        float lambda_T_concen_end_mult = 1.0f,
-        float lambda_T_inside_end_mult = 1.0f,
         float lambda_normal_dmean = 0.0f,
         int   n_dmean_from = 10000,
         int   n_dmean_end = 20000,
@@ -111,7 +113,15 @@ public:
         float n_dmean_tol_deg = 90.0f,
         float lambda_ssim = 0.02f,
         float lambda_sparse_depth = 0.0f,
-        int   sparse_depth_until = 1000
+        int   sparse_depth_until = 1000,
+        float lambda_depthanythingv2 = 0.0f,
+        int   depthanythingv2_from = 3000,
+        int   depthanythingv2_end = 20000,
+        float depthanythingv2_end_mult = 0.1f,
+        float lambda_depthanythingv2_normal = 0.0f,
+        int   depthanythingv2_normal_from = 3000,
+        int   depthanythingv2_normal_end = 20000,
+        float depthanythingv2_normal_end_mult = 0.1f
     );
 
 public:
@@ -138,6 +148,8 @@ public:
     int prune_recent_keyframes_;
     int prune_recent_min_views_real_;
     int prune_recent_min_views_artificial_;
+    int rendered_depth_candidate_promote_min_support_;
+    int rendered_depth_candidate_prune_kf_age_;
     int prune_min_kf_age_;
     bool prune_surface_keep_enable_;
     bool prune_surface_keep_use_view_;
@@ -156,21 +168,22 @@ public:
     float subdivide_samp_thres_at_target_;
     float subdivide_prop_at_target_;
     int subdivide_max_num_;
+    bool subdivide_artificial_requires_promotion_ = false;
     bool subdivide_force_to_target_size_;
     float subdivide_target_vox_size_;
     float lambda_dssim_;
+    bool use_l1_;
+    bool use_huber_;
+    float huber_thres_;
     float lambda_tv_density_;
     int   tv_from_;
     int   tv_until_;
     float ss_aug_max_;
     float lambda_R_concen_;
     float lambda_dist_;
+    int   dist_from_;
     float lambda_T_concen_;
     float lambda_T_inside_;
-    int   T_sharp_from_;
-    int   T_sharp_until_;
-    float lambda_T_concen_end_mult_;
-    float lambda_T_inside_end_mult_;
     float lambda_normal_dmean_;
     int   n_dmean_from_;
     int   n_dmean_end_;
@@ -179,4 +192,12 @@ public:
     float lambda_ssim_;
     float lambda_sparse_depth_;
     int   sparse_depth_until_;
+    float lambda_depthanythingv2_;
+    int   depthanythingv2_from_;
+    int   depthanythingv2_end_;
+    float depthanythingv2_end_mult_;
+    float lambda_depthanythingv2_normal_;
+    int   depthanythingv2_normal_from_;
+    int   depthanythingv2_normal_end_;
+    float depthanythingv2_normal_end_mult_;
 };

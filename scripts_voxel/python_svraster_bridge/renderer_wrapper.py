@@ -58,6 +58,221 @@ def safe_stat(x, name):
         print(f"[PY] {name}: ERROR: {e}")
 print("=== LOADING voxel_bridge!!! ===")
 
+
+class _RasterizeVoxelsWithState(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        raster_settings,
+        geomBuffer,
+        octree_paths,
+        vox_centers,
+        vox_lengths,
+        geos,
+        rgbs,
+        subdiv_p,
+    ):
+        need_distortion = raster_settings.lambda_dist > 0
+
+        args = (
+            raster_settings.n_samp_per_vox,
+            raster_settings.image_width,
+            raster_settings.image_height,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.cx,
+            raster_settings.cy,
+            raster_settings.w2c_matrix,
+            raster_settings.c2w_matrix,
+            raster_settings.bg_color,
+            raster_settings.need_depth,
+            need_distortion,
+            raster_settings.need_normal,
+            raster_settings.track_max_w,
+            octree_paths,
+            vox_centers,
+            vox_lengths,
+            geos,
+            rgbs,
+            geomBuffer,
+            raster_settings.debug,
+        )
+
+        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w = (
+            svr._C.rasterize_voxels(*args)
+        )
+        _, _, n_contrib = svr._C.unpack_ImageState(
+            raster_settings.image_width,
+            raster_settings.image_height,
+            imgBuffer,
+        )
+
+        ctx.raster_settings = raster_settings
+        ctx.num_rendered = num_rendered
+        ctx.save_for_backward(
+            octree_paths,
+            vox_centers,
+            vox_lengths,
+            geos,
+            rgbs,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            out_T,
+            out_depth,
+            out_normal,
+        )
+        ctx.mark_non_differentiable(max_w, n_contrib)
+        return out_color, out_depth, out_normal, out_T, max_w, n_contrib
+
+    @staticmethod
+    def backward(
+        ctx,
+        dL_dout_color,
+        dL_dout_depth,
+        dL_dout_normal,
+        dL_dout_T,
+        dL_dmax_w,
+        dL_dn_contrib,
+    ):
+        raster_settings = ctx.raster_settings
+        num_rendered = ctx.num_rendered
+        (
+            octree_paths,
+            vox_centers,
+            vox_lengths,
+            geos,
+            rgbs,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            out_T,
+            out_depth,
+            out_normal,
+        ) = ctx.saved_tensors
+
+        args = (
+            num_rendered,
+            raster_settings.n_samp_per_vox,
+            raster_settings.image_width,
+            raster_settings.image_height,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.cx,
+            raster_settings.cy,
+            raster_settings.w2c_matrix,
+            raster_settings.c2w_matrix,
+            raster_settings.bg_color,
+            octree_paths,
+            vox_centers,
+            vox_lengths,
+            geos,
+            rgbs,
+            geomBuffer,
+            binningBuffer,
+            imgBuffer,
+            out_T,
+            dL_dout_color,
+            dL_dout_depth,
+            dL_dout_normal,
+            dL_dout_T,
+            raster_settings.lambda_R_concen,
+            raster_settings.gt_color,
+            raster_settings.lambda_ascending,
+            raster_settings.lambda_dist,
+            raster_settings.need_depth,
+            raster_settings.need_normal,
+            out_depth,
+            out_normal,
+            raster_settings.debug,
+        )
+
+        dL_dgeos, dL_drgbs, subdiv_p_bw = svr._C.rasterize_voxels_backward(*args)
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            dL_dgeos,
+            dL_drgbs,
+            subdiv_p_bw,
+        )
+
+
+def rasterize_voxels_with_state(
+    raster_settings,
+    octree_paths,
+    vox_centers,
+    vox_lengths,
+    vox_fn,
+):
+    if not isinstance(raster_settings, svr.RasterSettings):
+        raise Exception("Expect RasterSettings as first argument.")
+    if raster_settings.n_samp_per_vox > svr._C.MAX_N_SAMP or raster_settings.n_samp_per_vox < 1:
+        raise Exception(f"n_samp_per_vox should be in range [1, {svr._C.MAX_N_SAMP}].")
+
+    N = octree_paths.numel()
+    device = octree_paths.device
+    if vox_centers.shape[0] != N or vox_lengths.numel() != N:
+        raise Exception("Size mismatched.")
+    if len(vox_centers.shape) != 2 or vox_centers.shape[1] != 3:
+        raise Exception("Expect vox_centers in shape [N, 3].")
+    if (
+        raster_settings.w2c_matrix.device != device
+        or raster_settings.c2w_matrix.device != device
+        or vox_centers.device != device
+        or vox_lengths.device != device
+    ):
+        raise Exception("Device mismatch.")
+
+    n_duplicates, geomBuffer = svr._C.rasterize_preprocess(
+        raster_settings.image_width,
+        raster_settings.image_height,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.cx,
+        raster_settings.cy,
+        raster_settings.w2c_matrix,
+        raster_settings.c2w_matrix,
+        raster_settings.near,
+        octree_paths,
+        vox_centers,
+        vox_lengths,
+        raster_settings.debug,
+    )
+    in_frusts_idx = torch.where(n_duplicates > 0)[0]
+
+    cam_pos = raster_settings.c2w_matrix[:3, 3]
+    vox_params = vox_fn(in_frusts_idx, cam_pos, raster_settings.color_mode)
+    geos = vox_params["geos"]
+    rgbs = vox_params["rgbs"]
+    subdiv_p = vox_params["subdiv_p"]
+
+    if geos.shape != (N, 8):
+        raise Exception(f"Expect geos in ({N}, 8) but got {geos.shape}")
+    if rgbs.shape[0] != N:
+        raise Exception(f"Expect rgbs in ({N}, 3) but got {rgbs.shape}")
+    if subdiv_p.shape[0] != N:
+        raise Exception(f"Expect subdiv_p in ({N}, 1) but got {subdiv_p.shape}")
+    if geos.device != device:
+        raise Exception("Device mismatch: geos.")
+    if rgbs.device != device:
+        raise Exception("Device mismatch: rgbs.")
+    if subdiv_p.device != device:
+        raise Exception("Device mismatch: subdiv_p.")
+
+    return _RasterizeVoxelsWithState.apply(
+        raster_settings,
+        geomBuffer,
+        octree_paths,
+        vox_centers,
+        vox_lengths,
+        geos,
+        rgbs,
+        subdiv_p,
+    )
+
 # def render(cam, voxel_data, gt_image, im_height, im_width, ss, track_max_w):
 def render(
     voxel_data,
@@ -99,8 +314,14 @@ def render(
     seen = set()
 
     def resize_rendering(render, size, mode='bilinear', align_corners=False):
-        return torch.nn.functional.interpolate(
-            render[None], size=size, mode=mode, align_corners=align_corners, antialias=True)[0]
+        kwargs = {
+            "size": size,
+            "mode": mode,
+        }
+        if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            kwargs["align_corners"] = align_corners
+            kwargs["antialias"] = True
+        return torch.nn.functional.interpolate(render[None], **kwargs)[0]
     
     # def freeze_vox_geo(self):
     #     '''
@@ -266,7 +487,7 @@ def render(
     t_rast0 = time.perf_counter()
 
     try:
-        color, depth, normal, T, max_w = svr.rasterize_voxels(
+        color, depth, normal, T, max_w, n_contrib = rasterize_voxels_with_state(
             rs,
             voxel_data["octpath"],
             voxel_data["center"],
@@ -307,14 +528,22 @@ def render(
         'normal': normal if output_normal else None,
         'T': T if output_T else None,
         'max_w': max_w,
+        'n_contrib': n_contrib,
     }
 
-    for k in ['color', 'depth', 'normal', 'T']:
+    for k in ['color', 'depth', 'normal', 'T', 'n_contrib']:
         render_pkg[f'raw_{k}'] = render_pkg[k]
 
         # Post process super-sampling
         if render_pkg[k] is not None and render_pkg[k].shape[-2:] != (h_src, w_src):
-            render_pkg[k] = resize_rendering(render_pkg[k], size=(h_src, w_src))
+            if k == 'n_contrib':
+                resized = resize_rendering(
+                    render_pkg[k].to(torch.float32),
+                    size=(h_src, w_src),
+                    mode='nearest')
+                render_pkg[k] = resized.round().to(torch.int32)
+            else:
+                render_pkg[k] = resize_rendering(render_pkg[k], size=(h_src, w_src))
 
     # Clip intensity
     render_pkg['color'] = render_pkg['color'].clamp(0, 1)

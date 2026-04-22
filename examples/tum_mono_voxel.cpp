@@ -162,7 +162,8 @@ int main(int argc, char **argv)
         if (pSLAM->isShutDown())
             break;
 
-        cv::Mat im = cv::imread(std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni], cv::IMREAD_UNCHANGED);
+        const std::string image_path = std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni];
+        cv::Mat im = cv::imread(image_path, cv::IMREAD_UNCHANGED);
         cv::cvtColor(im, im, cv::COLOR_BGR2RGB);
         double tframe = vTimestamps[ni];
 
@@ -170,7 +171,7 @@ int main(int argc, char **argv)
         {
             std::cerr << std::endl
                       << "Failed to load image at: "
-                      << std::string(argv[4]) << "/" << vstrImageFilenamesRGB[ni] << std::endl;
+                      << image_path << std::endl;
             return 1;
         }
 
@@ -183,7 +184,7 @@ int main(int argc, char **argv)
 
         auto t1 = std::chrono::steady_clock::now();
 
-        pSLAM->TrackMonocular(im, tframe, std::vector<ORB_SLAM3::IMU::Point>(), vstrImageFilenamesRGB[ni]);
+        pSLAM->TrackMonocular(im, tframe, std::vector<ORB_SLAM3::IMU::Point>(), image_path);
 
         auto t2 = std::chrono::steady_clock::now();
 

@@ -271,6 +271,7 @@ target_link_libraries(imgui glfw OpenGL::GL)
 
 ### 3.2  C++ core / optimiser  ---------------------------------------
 add_library(voxel_core
+        src/stereo_vision.cu
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
         src_voxel/voxel_parameters.cpp

@@ -64,6 +64,17 @@ namespace sv {
 class VoxelModel 
 {
 public:
+    struct IncreasePcdStats {
+        int64_t raw_points_in = 0;
+        int64_t points_after_far_filter = 0;
+        int64_t unique_voxel_candidates_before_insert_filter = 0;
+        int64_t unique_voxel_candidates_after_insert_filter = 0;
+        int64_t duplicate_existing_voxels = 0;
+        int64_t new_voxels = 0;
+        int64_t pending_promotions = 0;
+        int64_t pending_support_updates = 0;
+    };
+
     VoxelModel(const int sh_degree);
     VoxelModel(const VoxelModelParams& model_params);
     ~VoxelModel();  
@@ -85,10 +96,17 @@ public:
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
     torch::Tensor geometricallyUnstableMask() const { return this->geometrically_unstable_voxel_; } // [N] bool
+    torch::Tensor renderedDepthCandidateMask() const { return this->rendered_depth_candidate_voxel_; } // [N] bool
+    torch::Tensor renderedDepthCandidateSupportCount() const { return this->rendered_depth_candidate_support_count_; } // [N] int32
+    torch::Tensor renderedDepthCandidateLastSeenKf() const { return this->rendered_depth_candidate_last_seen_kf_; } // [N] int32
+    torch::Tensor renderedDepthCandidateSourceKind() const { return this->rendered_depth_candidate_source_kind_; } // [N] int32
     bool hasDenseCoreBB() const { return has_dense_core_bb_; }
     torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
     torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
-    bool refreshDenseCoreBBFromCurrentVoxels();
+    bool refreshDenseCoreBBFromCurrentVoxels(bool exclude_hole_fill_real_voxels = false);
+    void logDenseCoreBBoxToRerun(
+        int iteration,
+        const std::string& entity_path = "world/dense_core/used_for_prune") const;
     void setGeometricallyUnstableMask(const torch::Tensor& mask);
     void setEnableArtificialPromotion(const bool enable) { enable_artificial_promotion_ = enable; }
     bool enableArtificialPromotion() const { return enable_artificial_promotion_; }
@@ -96,6 +114,33 @@ public:
     bool filterNearVoxels() const { return filter_near_voxels_; }
     void setFilterFarVoxelsOnInsert(const bool enable) { filter_far_voxels_on_insert_ = enable; }
     bool filterFarVoxelsOnInsert() const { return filter_far_voxels_on_insert_; }
+    void setRenderedDepthCandidateRealAdjacency(
+        const bool enable,
+        const int radius_cells = 1)
+    {
+        rendered_depth_candidate_require_real_adjacency_ = enable;
+        rendered_depth_candidate_adjacency_radius_cells_ = std::max(1, radius_cells);
+    }
+    bool renderedDepthCandidateRealAdjacency() const {
+        return rendered_depth_candidate_require_real_adjacency_;
+    }
+    int renderedDepthCandidateAdjacencyRadiusCells() const {
+        return rendered_depth_candidate_adjacency_radius_cells_;
+    }
+    void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
+        pending_real_insert_rr_entity_path_ = entity_path;
+    }
+    void setNextRenderedDepthCandidateInsertion(const bool enable,
+                                                const std::string& entity_path = "",
+                                                const int source_kind = 1,
+                                                const bool insert_as_real_protected = false) {
+        pending_insert_rendered_depth_candidate_ = enable;
+        pending_artificial_insert_rr_entity_path_ = enable ? entity_path : "";
+        pending_insert_rendered_depth_candidate_source_kind_ =
+            enable ? std::max(1, source_kind) : 0;
+        pending_insert_rendered_depth_candidate_as_real_protected_ =
+            enable && insert_as_real_protected;
+    }
     int64_t totalPromotedartificialCount() const { return total_promoted_artificial_voxels_; }
 
     void createFromPcd(
@@ -111,10 +156,12 @@ public:
         torch::Tensor& new_colors,
         const int iteration,
         const std::vector<sv::MiniCam>& cams);
+    IncreasePcdStats lastIncreasePcdStats() const { return last_increase_pcd_stats_; }
     void setTopologyBirthContext(const int iteration, const int kf_count) {
         topology_birth_iter_ = static_cast<int32_t>(iteration);
         topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
+    void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
     void logFinalartificialVoxels(const int iteration);
     void logFinalPromotedartificialVoxels(const int iteration);
 
@@ -243,6 +290,7 @@ private:
     std::vector<std::string>   rr_acc_labels_;
     bool rr_initialized_ = false;
     int64_t rr_inc_step_ = 0;  // unique per increasePcd() call
+    IncreasePcdStats last_increase_pcd_stats_;
     int last_artificial_iter_ = -1;
     torch::Tensor art_key_before_iter_; // [K] int64 artificial keys at start of current iter
 
@@ -288,15 +336,15 @@ public:
     int8_t  octlevel_ = 0; 
     torch::Tensor inside_extent_; // [1], CUDA
 
-    float global_scene_extent_ = 100.0f;  // example: 100 m cube
+    float global_scene_extent_ = 200.0f;  // example: 100 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
-    float fixed_vox_size_ = 0.2f;     
+    float fixed_vox_size_ = 0.1f;     
 
     bool   fill_empty_cells_ = false;
     int    fill_empty_cells_warmup_iters_ = 300; // delay one-shot bbox fill until this iteration
     bool   use_local_frontier_fill_ = false;  // preferred over dense bbox fill
     bool   use_dense_core_neighbor_fill_ = false; // controlled fill in dense-core region
-    float  dense_core_pcd_density_rate_ = 0.1f; // same meaning as SVRaster heuristic - smaller the bigger the area
+    float  dense_core_pcd_density_rate_ = 0.001f; // same meaning as SVRaster heuristic - smaller the bigger the area
     int64_t max_dense_core_fill_cells_ = 50000; // cap dense-core support cells per call
     int64_t max_real_pcd_points_ = 800000;      // cap accumulated real PCD points
     int64_t max_artificial_cells_ = 1000000; // safety cap
@@ -305,13 +353,37 @@ public:
     torch::Tensor bb_min_viz, bb_max_viz, sel_artificials_viz, ijk_box_viz;
     torch::Tensor artificial_centers_accum_viz_; // [K,3] accumulated artificial centers
     torch::Tensor artificial_sizes_accum_viz_;   // [K,1] accumulated artificial sizes
+    torch::Tensor inactive_geo_centers_accum_viz_; // [K,3] accumulated real voxels created by inactive geo densify
+    torch::Tensor inactive_geo_sizes_accum_viz_;   // [K,1] accumulated sizes for inactive geo densify voxels
+    torch::Tensor inactive_geo_rgba_accum_viz_;    // [K,4] accumulated colors for inactive geo densify voxels
+    torch::Tensor depthanything_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything densify
+    torch::Tensor depthanything_created_sizes_accum_viz_;   // [K,1]
+    torch::Tensor depthanything_created_rgba_accum_viz_;    // [K,4]
+    torch::Tensor depthanything_fill_holes_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything hole fill
+    torch::Tensor depthanything_fill_holes_created_sizes_accum_viz_;   // [K,1]
+    torch::Tensor depthanything_fill_holes_created_rgba_accum_viz_;    // [K,4]
+    torch::Tensor rendered_depth_created_centers_accum_viz_; // [K,3] accumulated artificial voxels from rendered depth insertion
+    torch::Tensor rendered_depth_created_sizes_accum_viz_;   // [K,1]
+    torch::Tensor rendered_depth_created_rgba_accum_viz_;    // [K,4]
+    torch::Tensor rendered_hole_fill_created_centers_accum_viz_; // [K,3] accumulated artificial voxels from rendered hole fill
+    torch::Tensor rendered_hole_fill_created_sizes_accum_viz_;   // [K,1]
+    torch::Tensor rendered_hole_fill_created_rgba_accum_viz_;    // [K,4]
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_artificial_voxel_;          // [N] bool provenance: false=real, true=artificial/support
     torch::Tensor is_promoted_artificial_voxel_; // [N] bool provenance: true if voxel was artificial and got promoted to real
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
     torch::Tensor geometrically_unstable_voxel_;      // [N] bool unstable real/art flags (updated at densification)
+    torch::Tensor rendered_depth_candidate_voxel_;      // [N] bool artificial candidates inserted from rendered depth
+    torch::Tensor rendered_depth_candidate_support_count_; // [N] int32 support count across keyframes
+    torch::Tensor rendered_depth_candidate_last_seen_kf_; // [N] int32 last keyframe count that supported the candidate
+    // [N] int32 source id for rendered-depth-origin provenance.
+    // This is kept after promotion so live debug views can trace current voxels
+    // back to their insertion path (depth-insert vs hole-fill).
+    torch::Tensor rendered_depth_candidate_source_kind_;
     int64_t max_artificial_viz_accum_ = 300000;  // cap to keep rerun responsive
+    int64_t max_inactive_geo_viz_accum_ = 300000;  // cap to keep rerun responsive
+    int64_t max_rendered_depth_viz_accum_ = 300000;  // cap to keep rerun responsive
     py::object svm() const;
 
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
@@ -326,6 +398,13 @@ public:
     bool enable_artificial_promotion_ = true;
     bool filter_near_voxels_ = true;
     bool filter_far_voxels_on_insert_ = true;
+    bool rendered_depth_candidate_require_real_adjacency_ = true;
+    int rendered_depth_candidate_adjacency_radius_cells_ = 1;
+    std::string pending_real_insert_rr_entity_path_;
+    std::string pending_artificial_insert_rr_entity_path_;
+    bool pending_insert_rendered_depth_candidate_ = false;
+    int pending_insert_rendered_depth_candidate_source_kind_ = 0;
+    bool pending_insert_rendered_depth_candidate_as_real_protected_ = false;
     int64_t total_promoted_artificial_voxels_ = 0;
     int32_t topology_birth_iter_ = -1;
     int32_t topology_birth_kf_ = -1;

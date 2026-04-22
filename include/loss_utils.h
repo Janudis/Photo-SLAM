@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include <torch/torch.h>
@@ -36,6 +38,21 @@ inline torch::Tensor l2_loss(torch::Tensor &network_output, torch::Tensor &gt) {
     // return diff.mul(diff).mean();
     return torch::nn::functional::mse_loss(network_output, gt);
 }
+
+inline torch::Tensor huber_loss(torch::Tensor &network_output,
+                                torch::Tensor &gt,
+                                float thres = 0.03f)
+{
+    auto abs_err = (network_output - gt).abs();
+    auto l1 = abs_err.mean(0);
+    auto l2 = abs_err.square().mean(0);
+    auto loss = torch::where(
+        l1 < thres,
+        l2,
+        2.0f * thres * l1 - thres * thres);
+    return loss.mean();
+}
+
 inline torch::Tensor psnr(torch::Tensor &img1, torch::Tensor &img2)
 {
     auto mse = torch::pow(img1 - img2, 2).mean();
@@ -324,6 +341,139 @@ struct SparseDepthLoss
             torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kMean));
 
         return loss;
+    }
+};
+
+struct DepthAnythingv2Loss
+{
+    int iter_from_;
+    int iter_end_;
+    float end_mult_;
+
+    DepthAnythingv2Loss(int iter_from, int iter_end, float end_mult)
+        : iter_from_(iter_from),
+          iter_end_(iter_end),
+          end_mult_(end_mult)
+    {}
+
+    inline bool isActive(int iteration) const
+    {
+        return iteration >= iter_from_ && iteration <= iter_end_;
+    }
+
+    inline torch::Tensor operator()(const torch::Tensor& raw_T,
+                                    const torch::Tensor& raw_depth,
+                                    const torch::Tensor& mono_depth,
+                                    float cam_near,
+                                    int iteration) const
+    {
+        TORCH_CHECK(raw_T.defined(), "DepthAnythingv2Loss: raw_T is undefined");
+        TORCH_CHECK(raw_depth.defined(), "DepthAnythingv2Loss: raw_depth is undefined");
+        TORCH_CHECK(mono_depth.defined(), "DepthAnythingv2Loss: mono_depth is undefined");
+
+        if (!isActive(iteration))
+        {
+            return torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(raw_depth.device()));
+        }
+
+        torch::Tensor depth = raw_depth;
+        if (depth.dim() == 4 && depth.size(0) == 1)
+        {
+            depth = depth.squeeze(0);
+        }
+        if (depth.dim() == 2)
+        {
+            depth = depth.unsqueeze(0);
+        }
+        TORCH_CHECK(depth.dim() == 3,
+                    "DepthAnythingv2Loss: raw_depth must be [C,H,W] or [1,C,H,W], got ",
+                    depth.sizes());
+
+        torch::Tensor T = raw_T;
+        if (T.dim() == 4 && T.size(0) == 1)
+        {
+            T = T.squeeze(0);
+        }
+        if (T.dim() == 2)
+        {
+            T = T.unsqueeze(0);
+        }
+        TORCH_CHECK(T.dim() == 3,
+                    "DepthAnythingv2Loss: raw_T must be [C,H,W] or [1,C,H,W], got ",
+                    T.sizes());
+
+        torch::Tensor invdepth = 1.0f / depth.unsqueeze(1).clamp_min(std::max(1e-6f, cam_near));
+        const int64_t ref_idx = std::min<int64_t>(2, invdepth.size(0) - 1);
+        torch::Tensor X = invdepth.index({0}).unsqueeze(0);
+        torch::Tensor Xref = invdepth.index({ref_idx}).unsqueeze(0);
+
+        torch::Tensor alpha = 1.0f - T.index({0}).unsqueeze(0).unsqueeze(0);
+
+        torch::Tensor Y = mono_depth;
+        if (Y.dim() == 4 && Y.size(0) == 1)
+        {
+            Y = Y.squeeze(0);
+        }
+        if (Y.dim() == 3 && Y.size(0) == 1)
+        {
+            Y = Y.squeeze(0);
+        }
+        if (Y.dim() == 2)
+        {
+            Y = Y.unsqueeze(0).unsqueeze(0);
+        }
+        else if (Y.dim() == 3 && Y.size(0) == 1)
+        {
+            Y = Y.unsqueeze(0);
+        }
+        TORCH_CHECK(Y.dim() == 4,
+                    "DepthAnythingv2Loss: mono_depth must be [H,W], [1,H,W], or [1,1,H,W], got ",
+                    mono_depth.sizes());
+
+        if (Y.sizes().slice(2) != X.sizes().slice(2))
+        {
+            Y = torch::nn::functional::interpolate(
+                Y,
+                torch::nn::functional::InterpolateFuncOptions()
+                    .size(std::vector<int64_t>{X.size(2), X.size(3)})
+                    .mode(torch::kBilinear)
+                    .align_corners(false));
+        }
+
+        X = X * alpha;
+
+        torch::Tensor target;
+        {
+            torch::NoGradGuard no_grad;
+            const torch::Tensor Ymed = Y.median();
+            const torch::Tensor Ys = (Y - Ymed).abs().mean().clamp_min(1e-6f);
+            const torch::Tensor Xmed = Xref.median();
+            const torch::Tensor Xs = (Xref - Xmed).abs().mean().clamp_min(1e-6f);
+            target = (Y - Ymed) * (Xs / Ys) + Xmed;
+        }
+
+        torch::Tensor mask = (target > 0.01f) & (alpha > 0.5f);
+        mask = mask.to(X.dtype());
+        X = X * mask;
+        target = target * mask;
+
+        torch::Tensor loss = torch::nn::functional::mse_loss(
+            X,
+            target,
+            torch::nn::functional::MSELossFuncOptions().reduction(torch::kMean));
+
+        if (iter_end_ <= iter_from_ || end_mult_ == 1.0f)
+        {
+            return loss;
+        }
+
+        const float ratio = std::clamp(
+            static_cast<float>(iteration - iter_from_) /
+                static_cast<float>(iter_end_ - iter_from_),
+            0.0f,
+            1.0f);
+        const float mult = std::pow(end_mult_, ratio);
+        return loss * mult;
     }
 };
 

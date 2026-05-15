@@ -16,9 +16,11 @@ import imageio
 import math
 import inspect
 import time
+import re
 import faulthandler, threading, signal
 import importlib.util
 import imageio
+from typing import NamedTuple
 
 # Dynamically load installed 'svraster_cuda.renderer'
 spec = importlib.util.find_spec("svraster_cuda.renderer")
@@ -26,8 +28,14 @@ if spec is None:
     raise ImportError("Cannot find 'svraster_cuda.renderer'. Make sure it's pip-installed.")
 svr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(svr)
-print("svraster_cuda.renderer loaded from:", svr.__file__)
-print(" underlying C extension:", svr._C.__file__)
+_RASTERIZE_VOXELS_BACKWARD_DOC = getattr(svr._C.rasterize_voxels_backward, "__doc__", "") or ""
+_BACKWARD_ARG_IDS = [
+    int(m.group(1))
+    for m in re.finditer(r"arg(\d+):", _RASTERIZE_VOXELS_BACKWARD_DOC)
+]
+_BACKWARD_SUPPORTS_SCALING_PENALTY = bool(_BACKWARD_ARG_IDS) and max(_BACKWARD_ARG_IDS) >= 34
+# print("svraster_cuda.renderer loaded from:", svr.__file__)
+# print(" underlying C extension:", svr._C.__file__)
 faulthandler.enable(file=sys.__stderr__)           # full C‑level dump on SIGUSR1
 
 # -- Watchdog thread control --
@@ -36,7 +44,7 @@ _watchdog_stop = False
 def watchdog():
     while not _watchdog_stop:
         time.sleep(5)
-        print("[PY]  watchdog: threads =", threading.enumerate(), flush=True)
+        # print("[PY]  watchdog: threads =", threading.enumerate(), flush=True)
 def start_watchdog():
     global _watchdog_thread, _watchdog_stop
     _watchdog_stop = False
@@ -56,7 +64,33 @@ def safe_stat(x, name):
         print(f"[PY] {name}: shape={x.shape}, dtype={x.dtype}, min={x.min()}, max={x.max()}, device={x.device}")
     except Exception as e:
         print(f"[PY] {name}: ERROR: {e}")
-print("=== LOADING voxel_bridge!!! ===")
+# print("=== LOADING voxel_bridge!!! ===")
+
+
+class BridgeRasterSettings(NamedTuple):
+    color_mode: str
+    n_samp_per_vox: int
+    image_width: int
+    image_height: int
+    tanfovx: float
+    tanfovy: float
+    cx: float
+    cy: float
+    w2c_matrix: torch.Tensor
+    c2w_matrix: torch.Tensor
+    bg_color: float = 0
+    near: float = 0.02
+    need_depth: bool = False
+    need_normal: bool = False
+    track_max_w: bool = False
+    lambda_R_concen: float = 0
+    lambda_ascending: float = 0
+    lambda_scaling_penalty: float = 0
+    min_voxel_size: float = 0
+    lambda_dist: float = 0
+    gt_color: torch.Tensor = torch.empty(0)
+    vox_feats: torch.Tensor = torch.empty([0, 0])
+    debug: bool = False
 
 
 class _RasterizeVoxelsWithState(torch.autograd.Function):
@@ -70,6 +104,7 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
         vox_lengths,
         geos,
         rgbs,
+        vox_feats,
         subdiv_p,
     ):
         need_distortion = raster_settings.lambda_dist > 0
@@ -94,11 +129,12 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
             vox_lengths,
             geos,
             rgbs,
+            vox_feats,
             geomBuffer,
             raster_settings.debug,
         )
 
-        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w = (
+        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w, out_feat = (
             svr._C.rasterize_voxels(*args)
         )
         _, _, n_contrib = svr._C.unpack_ImageState(
@@ -123,7 +159,7 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
             out_normal,
         )
         ctx.mark_non_differentiable(max_w, n_contrib)
-        return out_color, out_depth, out_normal, out_T, max_w, n_contrib
+        return out_color, out_depth, out_normal, out_T, max_w, n_contrib, out_feat
 
     @staticmethod
     def backward(
@@ -134,6 +170,7 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
         dL_dout_T,
         dL_dmax_w,
         dL_dn_contrib,
+        dL_dout_feat,
     ):
         raster_settings = ctx.raster_settings
         num_rendered = ctx.num_rendered
@@ -151,41 +188,86 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
             out_normal,
         ) = ctx.saved_tensors
 
-        args = (
-            num_rendered,
-            raster_settings.n_samp_per_vox,
-            raster_settings.image_width,
-            raster_settings.image_height,
-            raster_settings.tanfovx,
-            raster_settings.tanfovy,
-            raster_settings.cx,
-            raster_settings.cy,
-            raster_settings.w2c_matrix,
-            raster_settings.c2w_matrix,
-            raster_settings.bg_color,
-            octree_paths,
-            vox_centers,
-            vox_lengths,
-            geos,
-            rgbs,
-            geomBuffer,
-            binningBuffer,
-            imgBuffer,
-            out_T,
-            dL_dout_color,
-            dL_dout_depth,
-            dL_dout_normal,
-            dL_dout_T,
-            raster_settings.lambda_R_concen,
-            raster_settings.gt_color,
-            raster_settings.lambda_ascending,
-            raster_settings.lambda_dist,
-            raster_settings.need_depth,
-            raster_settings.need_normal,
-            out_depth,
-            out_normal,
-            raster_settings.debug,
-        )
+        if _BACKWARD_SUPPORTS_SCALING_PENALTY:
+            args = (
+                num_rendered,
+                raster_settings.n_samp_per_vox,
+                raster_settings.image_width,
+                raster_settings.image_height,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                raster_settings.cx,
+                raster_settings.cy,
+                raster_settings.w2c_matrix,
+                raster_settings.c2w_matrix,
+                raster_settings.bg_color,
+                octree_paths,
+                vox_centers,
+                vox_lengths,
+                geos,
+                rgbs,
+                geomBuffer,
+                binningBuffer,
+                imgBuffer,
+                out_T,
+                dL_dout_color,
+                dL_dout_depth,
+                dL_dout_normal,
+                dL_dout_T,
+                raster_settings.lambda_R_concen,
+                raster_settings.gt_color,
+                raster_settings.lambda_ascending,
+                raster_settings.lambda_scaling_penalty,
+                raster_settings.min_voxel_size,
+                raster_settings.lambda_dist,
+                raster_settings.need_depth,
+                raster_settings.need_normal,
+                out_depth,
+                out_normal,
+                raster_settings.debug,
+            )
+        else:
+            if abs(float(raster_settings.lambda_scaling_penalty)) > 0.0 or \
+               abs(float(raster_settings.min_voxel_size)) > 0.0:
+                raise RuntimeError(
+                    "Loaded svraster_cuda backend does not support GeoSVR scaling penalty "
+                    "in rasterize_voxels_backward(); rebuild /home/dimitris/svraster/cuda "
+                    "or disable Optimization.lambda_scaling_penalty.")
+            args = (
+                num_rendered,
+                raster_settings.n_samp_per_vox,
+                raster_settings.image_width,
+                raster_settings.image_height,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                raster_settings.cx,
+                raster_settings.cy,
+                raster_settings.w2c_matrix,
+                raster_settings.c2w_matrix,
+                raster_settings.bg_color,
+                octree_paths,
+                vox_centers,
+                vox_lengths,
+                geos,
+                rgbs,
+                geomBuffer,
+                binningBuffer,
+                imgBuffer,
+                out_T,
+                dL_dout_color,
+                dL_dout_depth,
+                dL_dout_normal,
+                dL_dout_T,
+                raster_settings.lambda_R_concen,
+                raster_settings.gt_color,
+                raster_settings.lambda_ascending,
+                raster_settings.lambda_dist,
+                raster_settings.need_depth,
+                raster_settings.need_normal,
+                out_depth,
+                out_normal,
+                raster_settings.debug,
+            )
 
         dL_dgeos, dL_drgbs, subdiv_p_bw = svr._C.rasterize_voxels_backward(*args)
         return (
@@ -196,6 +278,7 @@ class _RasterizeVoxelsWithState(torch.autograd.Function):
             None,
             dL_dgeos,
             dL_drgbs,
+            None,
             subdiv_p_bw,
         )
 
@@ -207,8 +290,8 @@ def rasterize_voxels_with_state(
     vox_lengths,
     vox_fn,
 ):
-    if not isinstance(raster_settings, svr.RasterSettings):
-        raise Exception("Expect RasterSettings as first argument.")
+    if not isinstance(raster_settings, BridgeRasterSettings):
+        raise Exception("Expect BridgeRasterSettings as first argument.")
     if raster_settings.n_samp_per_vox > svr._C.MAX_N_SAMP or raster_settings.n_samp_per_vox < 1:
         raise Exception(f"n_samp_per_vox should be in range [1, {svr._C.MAX_N_SAMP}].")
 
@@ -262,6 +345,16 @@ def rasterize_voxels_with_state(
     if subdiv_p.device != device:
         raise Exception("Device mismatch: subdiv_p.")
 
+    vox_feats = raster_settings.vox_feats
+    if not torch.is_tensor(vox_feats) or vox_feats.numel() == 0:
+        vox_feats = torch.empty([N, 0], dtype=torch.float32, device=device)
+    else:
+        if vox_feats.shape[0] != N:
+            raise Exception(f"Expect vox_feats in ({N}, C) but got {vox_feats.shape}")
+        if vox_feats.device != device:
+            raise Exception("Device mismatch: vox_feats.")
+        vox_feats = vox_feats.contiguous()
+
     return _RasterizeVoxelsWithState.apply(
         raster_settings,
         geomBuffer,
@@ -270,6 +363,7 @@ def rasterize_voxels_with_state(
         vox_lengths,
         geos,
         rgbs,
+        vox_feats,
         subdiv_p,
     )
 
@@ -466,7 +560,11 @@ def render(
     #         near = 0.01,
     #         track_max_w = track_max_w
     #     )
-    rs = svr.RasterSettings(
+    vox_feats = other_opt.pop('vox_feats', torch.empty([0, 0], dtype=torch.float32, device=device))
+    if torch.is_tensor(vox_feats):
+        vox_feats = vox_feats.to(device, non_blocking=True).contiguous()
+
+    rs = BridgeRasterSettings(
         color_mode=color_mode,
         n_samp_per_vox=n_samp_per_vox,
         image_width=w,
@@ -482,12 +580,13 @@ def render(
         need_depth=output_depth,
         need_normal=output_normal,
         track_max_w=track_max_w,
+        vox_feats=vox_feats,
         **other_opt)
     torch.cuda.synchronize()
     t_rast0 = time.perf_counter()
 
     try:
-        color, depth, normal, T, max_w, n_contrib = rasterize_voxels_with_state(
+        color, depth, normal, T, max_w, n_contrib, feat = rasterize_voxels_with_state(
             rs,
             voxel_data["octpath"],
             voxel_data["center"],
@@ -529,9 +628,10 @@ def render(
         'T': T if output_T else None,
         'max_w': max_w,
         'n_contrib': n_contrib,
+        'feat': feat if feat is not None and feat.numel() > 0 else None,
     }
 
-    for k in ['color', 'depth', 'normal', 'T', 'n_contrib']:
+    for k in ['color', 'depth', 'normal', 'T', 'n_contrib', 'feat']:
         render_pkg[f'raw_{k}'] = render_pkg[k]
 
         # Post process super-sampling
@@ -542,6 +642,11 @@ def render(
                     size=(h_src, w_src),
                     mode='nearest')
                 render_pkg[k] = resized.round().to(torch.int32)
+            elif k == 'feat':
+                render_pkg[k] = resize_rendering(
+                    render_pkg[k],
+                    size=(h_src, w_src),
+                    mode='nearest')
             else:
                 render_pkg[k] = resize_rendering(render_pkg[k], size=(h_src, w_src))
 

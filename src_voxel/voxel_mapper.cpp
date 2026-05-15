@@ -3,13 +3,19 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <Eigen/Eigenvalues>
 #include <numeric>
+#include <opencv2/flann.hpp>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "ORB-SLAM3/include/Atlas.h"
+#include "ORB-SLAM3/include/MapPoint.h"
 
 namespace py = pybind11;
 std::ofstream loss_log_;
@@ -19,8 +25,98 @@ std::ofstream loss_l2_log_;
 
 namespace {
 constexpr int kRenderedCandidateSourceDepthInsert = 1;
-constexpr int kRenderedCandidateSourceHoleFill = 2;
-constexpr int kRenderedCandidateSourceDepthAnything = 3;
+constexpr int kRenderedCandidateSourceMonoPrior = 3;
+constexpr float kMonoPriorFillHolesEmptyDepthEps = 1e-6f;
+constexpr float kMonoPriorAlignInitialInlierRelErr = 0.50f;
+constexpr float kMonoPriorAlignFinalInlierRelErr = 0.30f;
+
+struct MonoPriorAlignmentStats {
+    int64_t num_valid_anchors = 0;
+    int64_t num_fit_anchors = 0;
+    float sparse_depth_q05 = std::numeric_limits<float>::quiet_NaN();
+    float sparse_depth_q95 = std::numeric_limits<float>::quiet_NaN();
+    float scale = std::numeric_limits<float>::quiet_NaN();
+    float shift = std::numeric_limits<float>::quiet_NaN();
+    float median_rel_depth_error = std::numeric_limits<float>::quiet_NaN();
+    float p90_rel_depth_error = std::numeric_limits<float>::quiet_NaN();
+    float final_inlier_ratio = std::numeric_limits<float>::quiet_NaN();
+};
+
+std::string toLowerCopy(std::string s) {
+    std::transform(
+        s.begin(),
+        s.end(),
+        s.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+bool isMetric3DModelId(const std::string& model_id) {
+    const std::string model = toLowerCopy(model_id);
+    return model.find("metric3d") != std::string::npos ||
+           (model.find("depth-anything") != std::string::npos &&
+            model.find("metric") != std::string::npos);
+}
+
+std::string monoPriorDebugStemFromModelId(const std::string& model_id) {
+    (void)model_id;
+    return "mono_prior";
+}
+
+const char* monoPriorLogPrefix(const std::string& model_id) {
+    return isMetric3DModelId(model_id) ? "[MetricDepth]" : "[DepthAnythingV2]";
+}
+
+std::string normalizeMonoPriorLossMode(std::string mode) {
+    mode = toLowerCopy(std::move(mode));
+    if (mode == "orb_aligned" || mode == "orb-aligned" || mode == "slam" ||
+        mode == "systems") {
+        return "aligned";
+    }
+    if (mode == "sv" || mode == "svraster") {
+        return "svraster";
+    }
+    if (mode == "geo" || mode == "geosvr") {
+        return "geosvr";
+    }
+    return mode;
+}
+
+std::string normalizeMonoPriorNormalMode(std::string mode) {
+    mode = toLowerCopy(std::move(mode));
+    if (mode == "orb" || mode == "orb_aligned" || mode == "orb-aligned" ||
+        mode == "anchors" || mode == "keyframe" || mode == "aligned") {
+        return "aligned";
+    }
+    if (mode == "geo" || mode == "geosvr") {
+        return "geosvr";
+    }
+    return mode;
+}
+
+std::string normalizeMonoPriorDensifyAlignmentMode(std::string mode) {
+    mode = toLowerCopy(std::move(mode));
+    if (mode == "render" || mode == "rendered_depth" || mode == "svraster") {
+        return "rendered";
+    }
+    if (mode == "orb_aligned" || mode == "orb-aligned" || mode == "anchors" ||
+        mode == "keyframe") {
+        return "orb";
+    }
+    if (mode == "da_prior" || mode == "prior_da" ||
+        mode == "prior-depth-anything" || mode == "prior_depth_anything" ||
+        mode == "priorda") {
+        return "da_prior";
+    }
+    return mode;
+}
+
+int sampleGeoSvrPatchSize()
+{
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(17, 31);
+    return dist(rng);
+}
 
 torch::Tensor squeezeRenderMap2D(torch::Tensor t) {
     if (!t.defined()) {
@@ -31,128 +127,58 @@ torch::Tensor squeezeRenderMap2D(torch::Tensor t) {
     return t.contiguous();
 }
 
-cv::Mat chwFloatRgbToBgr8(torch::Tensor chw_rgb_cpu) {
-    chw_rgb_cpu = chw_rgb_cpu.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-    if (chw_rgb_cpu.dim() != 3 || chw_rgb_cpu.size(0) < 3) {
-        return cv::Mat();
-    }
-    if (chw_rgb_cpu.size(0) > 3) {
-        chw_rgb_cpu = chw_rgb_cpu.index({torch::indexing::Slice(0, 3)}).contiguous();
-    }
-
-    const int h = static_cast<int>(chw_rgb_cpu.size(1));
-    const int w = static_cast<int>(chw_rgb_cpu.size(2));
-    cv::Mat bgr(h, w, CV_8UC3);
-    auto acc = chw_rgb_cpu.accessor<float, 3>();
-    for (int y = 0; y < h; ++y) {
-        auto* row = bgr.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < w; ++x) {
-            const uint8_t r = static_cast<uint8_t>(
-                std::lround(std::clamp(acc[0][y][x], 0.0f, 1.0f) * 255.0f));
-            const uint8_t g = static_cast<uint8_t>(
-                std::lround(std::clamp(acc[1][y][x], 0.0f, 1.0f) * 255.0f));
-            const uint8_t b = static_cast<uint8_t>(
-                std::lround(std::clamp(acc[2][y][x], 0.0f, 1.0f) * 255.0f));
-            row[x] = cv::Vec3b(b, g, r);
-        }
-    }
-    return bgr;
-}
-
-void saveRenderedHoleFillDebugImages(
-    const std::filesystem::path& result_dir,
-    int iter,
-    unsigned long kf_id,
-    const torch::Tensor& render_color_cpu,
-    const std::vector<uint8_t>& hole_mask,
-    int h,
-    int w)
+bool renderPkgToMonoPriorAlignmentMaps(
+    const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+    int expected_h,
+    int expected_w,
+    torch::Tensor& depth_cpu,
+    torch::Tensor& alpha_cpu,
+    torch::Tensor& n_contrib_cpu)
 {
-    namespace fs = std::filesystem;
+    depth_cpu = torch::Tensor();
+    alpha_cpu = torch::Tensor();
+    n_contrib_cpu = torch::Tensor();
 
-    if (h <= 0 || w <= 0 || hole_mask.size() != static_cast<size_t>(h) * static_cast<size_t>(w)) {
-        return;
+    auto it_depth = render_pkg.find("raw_depth");
+    if (it_depth == render_pkg.end()) it_depth = render_pkg.find("depth");
+    auto it_T = render_pkg.find("raw_T");
+    if (it_T == render_pkg.end()) it_T = render_pkg.find("T");
+    auto it_n_contrib = render_pkg.find("n_contrib");
+    if (it_n_contrib == render_pkg.end()) it_n_contrib = render_pkg.find("raw_n_contrib");
+    if (it_depth == render_pkg.end() || it_T == render_pkg.end() ||
+        it_n_contrib == render_pkg.end() ||
+        !it_depth->second.defined() || !it_T->second.defined() ||
+        !it_n_contrib->second.defined()) {
+        return false;
     }
 
-    const cv::Mat rendered_bgr = chwFloatRgbToBgr8(render_color_cpu);
-    if (rendered_bgr.empty()) {
-        return;
+    torch::Tensor raw_depth = it_depth->second;
+    if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) raw_depth = raw_depth.squeeze(0);
+    if (raw_depth.dim() != 3 || raw_depth.size(0) < 1) {
+        return false;
     }
 
-    const fs::path base_dir = result_dir / "debug" / "rendered_hole_fill";
-    const fs::path rendered_dir = base_dir / "rendered_rgb";
-    const fs::path overlay_dir = base_dir / "hole_overlay";
-    const fs::path mask_dir = base_dir / "hole_mask";
-    fs::create_directories(rendered_dir);
-    fs::create_directories(overlay_dir);
-    fs::create_directories(mask_dir);
-
-    std::ostringstream name;
-    name << "iter_" << std::setw(6) << std::setfill('0') << iter
-         << "_kf_" << std::setw(6) << std::setfill('0') << kf_id
-         << ".png";
-
-    cv::Mat overlay_bgr = rendered_bgr.clone();
-    cv::Mat mask_img(h, w, CV_8UC1, cv::Scalar(0));
-    for (int y = 0; y < h; ++y) {
-        auto* overlay_row = overlay_bgr.ptr<cv::Vec3b>(y);
-        auto* mask_row = mask_img.ptr<uint8_t>(y);
-        for (int x = 0; x < w; ++x) {
-            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
-            if (!hole_mask[idx]) continue;
-            mask_row[x] = 255;
-            cv::Vec3b& px = overlay_row[x];
-            px[0] = static_cast<uint8_t>(std::lround(0.35f * static_cast<float>(px[0])));
-            px[1] = static_cast<uint8_t>(std::lround(0.35f * static_cast<float>(px[1])));
-            px[2] = static_cast<uint8_t>(std::lround(0.35f * static_cast<float>(px[2]) + 0.65f * 255.0f));
-        }
+    torch::Tensor render_depth_raw =
+        raw_depth.index({0}).detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor render_T =
+        squeezeRenderMap2D(it_T->second).detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor render_n_contrib =
+        squeezeRenderMap2D(it_n_contrib->second).detach().to(torch::kCPU).to(torch::kInt32).contiguous();
+    if (render_depth_raw.dim() != 2 || render_T.dim() != 2 || render_n_contrib.dim() != 2) {
+        return false;
+    }
+    if (render_depth_raw.size(0) != expected_h || render_depth_raw.size(1) != expected_w ||
+        render_T.size(0) != expected_h || render_T.size(1) != expected_w ||
+        render_n_contrib.size(0) != expected_h || render_n_contrib.size(1) != expected_w) {
+        return false;
     }
 
-    cv::imwrite((rendered_dir / name.str()).string(), rendered_bgr);
-    cv::imwrite((overlay_dir / name.str()).string(), overlay_bgr);
-    cv::imwrite((mask_dir / name.str()).string(), mask_img);
+    alpha_cpu = (1.0f - render_T).contiguous();
+    depth_cpu = (render_depth_raw / alpha_cpu.clamp_min(1e-6f)).contiguous();
+    n_contrib_cpu = render_n_contrib.contiguous();
+    return true;
 }
 
-void moveRenderedHoleFillDebugToShutdownDir(
-    const std::filesystem::path& result_dir,
-    int final_iter)
-{
-    namespace fs = std::filesystem;
-
-    const fs::path src_dir = result_dir / "debug" / "rendered_hole_fill";
-    if (!fs::exists(src_dir)) {
-        return;
-    }
-
-    const fs::path dst_dir =
-        result_dir / (std::to_string(final_iter) + "_shutdown") / "debug" / "rendered_hole_fill";
-    std::error_code ec;
-    fs::create_directories(dst_dir.parent_path(), ec);
-    ec.clear();
-    fs::remove_all(dst_dir, ec);
-    ec.clear();
-    fs::rename(src_dir, dst_dir, ec);
-    if (!ec) {
-        // std::cout << "[rendered_hole_fill/debug] moved to " << dst_dir << "\n";
-        return;
-    }
-
-    ec.clear();
-    fs::copy(
-        src_dir,
-        dst_dir,
-        fs::copy_options::recursive | fs::copy_options::overwrite_existing,
-        ec);
-    if (ec) {
-        std::cerr << "[rendered_hole_fill/debug] failed to move debug directory to "
-                  << dst_dir << ": " << ec.message() << "\n";
-        return;
-    }
-
-    ec.clear();
-    fs::remove_all(src_dir, ec);
-    // std::cout << "[rendered_hole_fill/debug] copied to " << dst_dir << "\n";
-}
 }
 
 void saveTensor(const torch::Tensor &t,
@@ -1406,51 +1432,27 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     //           << " prune_kf_age=" << opt_params_.rendered_depth_candidate_prune_kf_age_
     //           << " rerun=" << (rerun_rendered_depth_insert_ ? 1 : 0)
     //           << std::endl;
-    std::cout << "[depthanything_densify/config] enabled=" << depthanything_densify_
-              << " sensor=" << sensorTypeToString(sensor_type_)
-              << " stride=" << depthanything_densify_stride_
-              << " max_points_per_kf=" << depthanything_densify_max_points_per_kf_
-              << " min_sparse_anchors=" << depthanything_densify_min_sparse_anchors_
-              << " require_real_adjacency=" << (depthanything_densify_require_real_adjacency_ ? 1 : 0)
-              << " adjacency_radius_cells=" << depthanything_densify_adjacency_radius_cells_
-              << std::endl;
-    std::cout << "[depthanything_fill_holes/config] enabled=" << depthanything_fill_holes_
-              << " sensor=" << sensorTypeToString(sensor_type_)
-              << " stride=" << depthanything_densify_stride_
-              << " max_points_per_kf=" << depthanything_densify_max_points_per_kf_
-              << " min_sparse_anchors=" << depthanything_densify_min_sparse_anchors_
-              << " require_real_adjacency=" << (depthanything_densify_require_real_adjacency_ ? 1 : 0)
-              << " adjacency_radius_cells=" << depthanything_densify_adjacency_radius_cells_
-              << " initial_backfill=" << (depthanything_fill_holes_initial_backfill_ ? 1 : 0)
-              << " orb_support_mask=" << (depthanything_fill_holes_orb_support_mask_ ? 1 : 0)
-              << " orb_support_radius_px=" << depthanything_fill_holes_orb_support_radius_px_
-              << " hole_rgb_error_min=" << rendered_hole_fill_hole_rgb_error_min_
-              << " empty_depth_eps=" << rendered_hole_fill_empty_depth_eps_
-              << std::endl;
-    std::cout << "[rendered_hole_fill/config] enabled=" << rendered_hole_fill_
-              << " sensor=" << sensorTypeToString(sensor_type_)
-              << " stride=" << rendered_hole_fill_stride_
-              << " max_points_per_kf=" << rendered_hole_fill_max_points_per_kf_
-              << " support_min_n_contrib=" << rendered_hole_fill_support_min_n_contrib_
-              << " hole_rgb_error_min=" << rendered_hole_fill_hole_rgb_error_min_
-              << " empty_depth_eps=" << rendered_hole_fill_empty_depth_eps_
-              << " surface_patch=" << (rendered_hole_fill_surface_patch_ ? 1 : 0)
-              << " surface_support_radius_px=" << rendered_hole_fill_surface_support_radius_px_
-              << " surface_min_support_points=" << rendered_hole_fill_surface_min_support_points_
-              << " surface_plane_rms_thresh_m=" << rendered_hole_fill_surface_plane_rms_thresh_m_
-              << " surface_depth_margin_rel=" << rendered_hole_fill_surface_depth_margin_rel_
-              << " surface_propagate_interior=" << (rendered_hole_fill_surface_propagate_interior_ ? 1 : 0)
-              << " surface_propagation_uncertainty_rel="
-              << rendered_hole_fill_surface_propagation_uncertainty_rel_
-              << " surface_propagation_max_depth_layers="
-              << rendered_hole_fill_surface_propagation_max_depth_layers_
-              << " require_real_adjacency=" << (rendered_hole_fill_require_real_adjacency_ ? 1 : 0)
-              << " adjacency_radius_cells=" << rendered_hole_fill_adjacency_radius_cells_
-              << " insert_as_real_protected=" << (rendered_hole_fill_insert_as_real_protected_ ? 1 : 0)
-              << " voxel_rendering_checking=" << (voxel_rendering_checking_ ? 1 : 0)
-              << " save_debug_images=" << (save_rendered_hole_fill_debug_images_ ? 1 : 0)
-              << " rerun=" << (rerun_rendered_hole_fill_ ? 1 : 0)
-              << std::endl;
+    // std::cout << "[mono_prior_densify/config] enabled=" << depthanything_densify_
+    //           << " sensor=" << sensorTypeToString(sensor_type_)
+    //           << " stride=" << depthanything_densify_stride_
+    //           << " min_sparse_anchors=" << depthanything_densify_min_sparse_anchors_
+    //           << " alignment_mode=" << depthanything_densify_alignment_mode_
+    //           << std::endl;
+    // std::cout << "[mono_prior_fill_holes/config] enabled=" << depthanything_fill_holes_
+    //           << " sensor=" << sensorTypeToString(sensor_type_)
+    //           << " stride=" << depthanything_densify_stride_
+    //           << " min_sparse_anchors=" << depthanything_densify_min_sparse_anchors_
+    //           << " alignment_mode=" << depthanything_densify_alignment_mode_
+    //           << " initial_backfill=" << (depthanything_fill_holes_initial_backfill_ ? 1 : 0)
+    //           << " empty_depth_eps=" << kMonoPriorFillHolesEmptyDepthEps
+    //           << std::endl;
+    // std::cout << "[mono_prior_regularization/config] loss_mode="
+    //           << mono_prior_loss_mode_
+    //           << " normal_mode=" << mono_prior_normal_mode_
+    //           << " model_id=" << mono_prior_model_id_
+    //           << " lambda_depth=" << opt_params_.lambda_depthanythingv2_
+    //           << " lambda_normal=" << opt_params_.lambda_depthanythingv2_normal_
+    //           << std::endl;
 
     // /* Load every ORB-SLAM3 camera, convert to Camera, pre–compute            */
     auto settings = pSLAM->getSettings();   
@@ -1622,22 +1624,35 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         depthanything_densify_stride_ = n.empty() ? 8 : std::max(1, static_cast<int>(n));
     }
     {
-        cv::FileNode n = settings_file["Mapper.depthanything_densify_max_points_per_kf"];
-        depthanything_densify_max_points_per_kf_ = n.empty() ? 1500 : std::max(0, static_cast<int>(n));
-    }
-    {
         cv::FileNode n = settings_file["Mapper.depthanything_densify_min_sparse_anchors"];
         depthanything_densify_min_sparse_anchors_ = n.empty() ? 64 : std::max(2, static_cast<int>(n));
     }
     {
-        cv::FileNode n = settings_file["Mapper.depthanything_densify_require_real_adjacency"];
-        depthanything_densify_require_real_adjacency_ =
-            n.empty() ? true : ((n.operator int()) != 0);
+        cv::FileNode n = settings_file["Mapper.depthanything_densify_alignment_mode"];
+        depthanything_densify_alignment_mode_ =
+            normalizeMonoPriorDensifyAlignmentMode(
+                n.empty() ? std::string("orb") : static_cast<std::string>(n));
+        if (depthanything_densify_alignment_mode_ != "orb" &&
+            depthanything_densify_alignment_mode_ != "rendered" &&
+            depthanything_densify_alignment_mode_ != "da_prior") {
+            std::cerr << "[MonoPrior] Unknown Mapper.depthanything_densify_alignment_mode='"
+                      << depthanything_densify_alignment_mode_
+                      << "', falling back to 'orb'. Supported: orb, rendered, da_prior."
+                      << std::endl;
+            depthanything_densify_alignment_mode_ = "orb";
+        }
     }
     {
-        cv::FileNode n = settings_file["Mapper.depthanything_densify_adjacency_radius_cells"];
-        depthanything_densify_adjacency_radius_cells_ =
-            n.empty() ? 1 : std::max(1, static_cast<int>(n));
+        cv::FileNode n = settings_file["Mapper.depthanything_da_prior_knn_k"];
+        depthanything_da_prior_knn_k_ = n.empty() ? 5 : std::max(2, static_cast<int>(n));
+    }
+    {
+        cv::FileNode n = settings_file["Mapper.depthanything_da_prior_distance_weighting"];
+        depthanything_da_prior_distance_weighting_ = n.empty() ? true : ((n.operator int()) != 0);
+    }
+    {
+        cv::FileNode n = settings_file["Mapper.depthanything_da_prior_max_pixel_dist"];
+        depthanything_da_prior_max_pixel_dist_ = n.empty() ? 0.0f : std::max(0.0f, static_cast<float>(n));
     }
     {
         cv::FileNode n = settings_file["Mapper.depthanything_fill_holes"];
@@ -1649,14 +1664,16 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             n.empty() ? true : ((n.operator int()) != 0);
     }
     {
-        cv::FileNode n = settings_file["Mapper.depthanything_fill_holes_orb_support_mask"];
-        depthanything_fill_holes_orb_support_mask_ =
-            n.empty() ? true : ((n.operator int()) != 0);
+        cv::FileNode n = settings_file["Mapper.depthanything_fill_holes_warmup_iter"];
+        depthanything_fill_holes_warmup_iter_ =
+            n.empty() ? 0 : std::max(0, static_cast<int>(n));
     }
     {
-        cv::FileNode n = settings_file["Mapper.depthanything_fill_holes_orb_support_radius_px"];
-        depthanything_fill_holes_orb_support_radius_px_ =
-            n.empty() ? 6 : std::max(0, static_cast<int>(n));
+        cv::FileNode n = settings_file["Mapper.depthanything_fill_holes_warmup"];
+        depthanything_fill_holes_warmup_ =
+            n.empty()
+                ? (depthanything_fill_holes_warmup_iter_ > 0)
+                : ((n.operator int()) != 0);
     }
     {
         cv::FileNode n = settings_file["Mapper.rendered_depth_insert"];
@@ -1687,139 +1704,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         cv::FileNode n = settings_file["Mapper.rendered_depth_insert_adjacency_radius_cells"];
         rendered_depth_insert_adjacency_radius_cells_ =
             n.empty() ? 1 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill"];
-        rendered_hole_fill_ = n.empty() ? false : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_stride"];
-        rendered_hole_fill_stride_ = n.empty() ? 4 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_boundary_radius_px"];
-        rendered_hole_fill_boundary_radius_px_ = n.empty() ? 1 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_neighbor_radius_px"];
-        rendered_hole_fill_neighbor_radius_px_ = n.empty() ? 2 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_min_neighbors"];
-        rendered_hole_fill_min_neighbors_ = n.empty() ? 3 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_max_points_per_kf"];
-        rendered_hole_fill_max_points_per_kf_ = n.empty() ? 3000 : std::max(0, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_hole_max_n_contrib"];
-        rendered_hole_fill_hole_max_n_contrib_ = n.empty() ? 0 : std::max(0, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_support_min_n_contrib"];
-        rendered_hole_fill_support_min_n_contrib_ = n.empty() ? 1 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_support_alpha_min"];
-        rendered_hole_fill_support_alpha_min_ =
-            n.empty() ? 0.05f : std::clamp(static_cast<float>(n), 0.0f, 1.0f);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_hole_rgb_error_min"];
-        rendered_hole_fill_hole_rgb_error_min_ =
-            n.empty() ? 0.12f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_empty_depth_eps"];
-        rendered_hole_fill_empty_depth_eps_ =
-            n.empty() ? 1e-6f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_depth_rel_spread_thresh"];
-        rendered_hole_fill_depth_rel_spread_thresh_ =
-            n.empty() ? 0.15f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_patch"];
-        rendered_hole_fill_surface_patch_ =
-            n.empty() ? false : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_support_radius_px"];
-        rendered_hole_fill_surface_support_radius_px_ =
-            n.empty() ? 8 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_min_support_points"];
-        rendered_hole_fill_surface_min_support_points_ =
-            n.empty() ? 12 : std::max(3, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_plane_rms_thresh_m"];
-        rendered_hole_fill_surface_plane_rms_thresh_m_ =
-            n.empty() ? 0.05f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_depth_margin_rel"];
-        rendered_hole_fill_surface_depth_margin_rel_ =
-            n.empty() ? 0.25f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_propagate_interior"];
-        rendered_hole_fill_surface_propagate_interior_ =
-            n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_propagation_full_band_distance_px"];
-        rendered_hole_fill_surface_propagation_full_band_distance_px_ =
-            n.empty() ? 24 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_propagation_uncertainty_rel"];
-        rendered_hole_fill_surface_propagation_uncertainty_rel_ =
-            n.empty() ? 0.20f : std::max(0.0f, static_cast<float>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_propagation_max_depth_layers"];
-        rendered_hole_fill_surface_propagation_max_depth_layers_ =
-            n.empty() ? 3 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_component_min_pixels"];
-        rendered_hole_fill_surface_component_min_pixels_ =
-            n.empty() ? 4 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_component_max_pixels"];
-        rendered_hole_fill_surface_component_max_pixels_ =
-            n.empty() ? 25000 : std::max(0, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_surface_skip_border_components"];
-        rendered_hole_fill_surface_skip_border_components_ =
-            n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_require_real_adjacency"];
-        rendered_hole_fill_require_real_adjacency_ =
-            n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_adjacency_radius_cells"];
-        rendered_hole_fill_adjacency_radius_cells_ =
-            n.empty() ? 1 : std::max(1, static_cast<int>(n));
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.rendered_hole_fill_insert_as_real_protected"];
-        const bool requested_insert_as_real_protected =
-            n.empty() ? false : ((n.operator int()) != 0);
-        rendered_hole_fill_insert_as_real_protected_ = requested_insert_as_real_protected;
-    }
-    {
-        cv::FileNode n = settings_file["Mapper.voxel_rendering_checking"];
-        voxel_rendering_checking_ =
-            n.empty() ? false : ((n.operator int()) != 0);
     }
 
     pipe_params_.convert_SHs_ =
@@ -1925,18 +1809,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     opt_params_.prune_min_kf_age_ =
         settings_file["Optimization.prune_min_kf_age"].operator int();
     {
-        cv::FileNode n = settings_file["Optimization.prune_surface_keep_enable"];
-        opt_params_.prune_surface_keep_enable_ = n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Optimization.prune_surface_keep_use_view"];
-        opt_params_.prune_surface_keep_use_view_ = n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Optimization.prune_surface_keep_use_size"];
-        opt_params_.prune_surface_keep_use_size_ = n.empty() ? true : ((n.operator int()) != 0);
-    }
-    {
         cv::FileNode n = settings_file["Optimization.final_special_prune_enable"];
         opt_params_.final_special_prune_enable_ = n.empty() ? true : ((n.operator int()) != 0);
     }
@@ -2040,6 +1912,94 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         opt_params_.depthanythingv2_end_mult_ = n.empty() ? 0.1f : static_cast<float>(n);
     }
     {
+        cv::FileNode n = settings_file["Optimization.depthanythingv2_overall"];
+        opt_params_.depthanythingv2_overall_ =
+            n.empty() ? false : (static_cast<int>(n) != 0);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.depthanythingv2_alpha_adjust"];
+        opt_params_.depthanythingv2_alpha_adjust_ =
+            n.empty() ? false : (static_cast<int>(n) != 0);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.enable_da2_uncertainty"];
+        opt_params_.enable_da2_uncertainty_ =
+            n.empty() ? true : (static_cast<int>(n) != 0);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.level_uncertainty_from"];
+        opt_params_.level_uncertainty_from_ = n.empty() ? 0 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.power_level_uncertainty"];
+        opt_params_.power_level_uncertainty_ = n.empty() ? 1.0f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.lambda_ascending"];
+        opt_params_.lambda_ascending_ = n.empty() ? 0.0f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.ascending_from"];
+        opt_params_.ascending_from_ = n.empty() ? 0 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.lambda_rectify"];
+        opt_params_.lambda_rectify_ = n.empty() ? 1e-6f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.rectifiy_from"];
+        opt_params_.rectifiy_from_ = n.empty() ? 0 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.lambda_scaling_penalty"];
+        opt_params_.lambda_scaling_penalty_ = n.empty() ? 1e-6f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.scaling_penalty_from"];
+        opt_params_.scaling_penalty_from_ = n.empty() ? 0 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.scaling_penalty_end"];
+        opt_params_.scaling_penalty_end_ = n.empty() ? 20000 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_weight_from_iter"];
+        opt_params_.multi_view_weight_from_iter_ =
+            n.empty() ? 1000000000 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_interval"];
+        opt_params_.multi_view_interval_ = n.empty() ? 1 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_anneal_scale"];
+        opt_params_.multi_view_anneal_scale_ = n.empty() ? 0.0f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_ncc_weight"];
+        opt_params_.multi_view_ncc_weight_ = n.empty() ? 0.05f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_geo_weight"];
+        opt_params_.multi_view_geo_weight_ = n.empty() ? 0.01f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_patch_size"];
+        opt_params_.multi_view_patch_size_ = n.empty() ? 3 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_sample_num"];
+        opt_params_.multi_view_sample_num_ = n.empty() ? 10240000 : static_cast<int>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.multi_view_pixel_noise_th"];
+        opt_params_.multi_view_pixel_noise_th_ = n.empty() ? 1.0f : static_cast<float>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.voxel_dropout_min"];
+        opt_params_.voxel_dropout_min_ = n.empty() ? 0.5f : static_cast<float>(n);
+    }
+    {
         cv::FileNode n = settings_file["Optimization.lambda_depthanythingv2_normal"];
         opt_params_.lambda_depthanythingv2_normal_ = n.empty() ? 0.0f : static_cast<float>(n);
     }
@@ -2056,10 +2016,70 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         opt_params_.depthanythingv2_normal_end_mult_ = n.empty() ? 0.1f : static_cast<float>(n);
     }
     {
-        cv::FileNode n = settings_file["Optimization.depthanythingv2_model_id"];
-        depthanythingv2_model_id_ =
+        cv::FileNode n = settings_file["Optimization.mono_prior_model_id"];
+        if (n.empty()) {
+            n = settings_file["Optimization.depthanythingv2_model_id"];
+        }
+        mono_prior_model_id_ =
             n.empty() ? std::string("depth-anything/Depth-Anything-V2-Small-hf")
                       : static_cast<std::string>(n);
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.mono_prior_loss_mode"];
+        if (n.empty()) {
+            n = settings_file["Optimization.depthanythingv2_loss_mode"];
+        }
+        mono_prior_loss_mode_ =
+            normalizeMonoPriorLossMode(n.empty() ? std::string("svraster")
+                                                     : static_cast<std::string>(n));
+        if (mono_prior_loss_mode_ != "svraster" &&
+            mono_prior_loss_mode_ != "aligned" &&
+            mono_prior_loss_mode_ != "geosvr") {
+            std::cerr << "[MonoPrior] Unknown Optimization.mono_prior_loss_mode='"
+                      << mono_prior_loss_mode_
+                      << "', falling back to 'svraster'. Supported: svraster, aligned, geosvr."
+                      << std::endl;
+            mono_prior_loss_mode_ = "svraster";
+        }
+    }
+    if (isMetric3DModelId(mono_prior_model_id_) &&
+        mono_prior_loss_mode_ == "svraster") {
+        std::cerr << "[Metric3D] Optimization.mono_prior_loss_mode='svraster' is not "
+                     "used for Metric3D priors. Falling back to 'aligned'."
+                  << std::endl;
+            mono_prior_loss_mode_ = "aligned";
+    }
+    {
+        cv::FileNode n = settings_file["Optimization.mono_prior_normal_mode"];
+        if (n.empty()) {
+            n = settings_file["Optimization.depthanythingv2_normal_mode"];
+        }
+        if (n.empty()) {
+            n = settings_file["Optimization.lambda_depthanythingv2_normal_mode"];
+        }
+        if (n.empty()) {
+            mono_prior_normal_mode_ =
+                (mono_prior_loss_mode_ == "geosvr") ? "geosvr" : "aligned";
+        } else {
+            mono_prior_normal_mode_ =
+                normalizeMonoPriorNormalMode(static_cast<std::string>(n));
+        }
+        if (mono_prior_normal_mode_ != "aligned" &&
+            mono_prior_normal_mode_ != "geosvr") {
+            std::cerr << "[MonoPrior] Unknown Optimization.mono_prior_normal_mode='"
+                      << mono_prior_normal_mode_
+                      << "', falling back to 'aligned'. Supported: aligned, geosvr."
+                      << std::endl;
+            mono_prior_normal_mode_ = "aligned";
+        }
+    }
+    if (opt_params_.multi_view_weight_from_iter_ < 1000000000 &&
+        (opt_params_.multi_view_ncc_weight_ > 0.0f ||
+         opt_params_.multi_view_geo_weight_ > 0.0f)) {
+        std::cerr << "[GeoSVR] Multi-view NCC/geometry regularization is configured, "
+                     "but it is not wired into the current Photo-SLAM training loop yet. "
+                     "The configs are parsed, but the term is currently inactive."
+                  << std::endl;
     }
 
     /* ───────── LOGGING PARAMETERS ───────── */
@@ -2076,10 +2096,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     record_loss_image_ =
         (settings_file["Record.record_loss_image"].operator int()) != 0;
     {
-        cv::FileNode n = settings_file["Record.save_rendered_hole_fill_debug_images"];
-        save_rendered_hole_fill_debug_images_ = n.empty() ? false : (static_cast<int>(n) != 0);
-    }
-    {
         cv::FileNode n = settings_file["Record.enable_rerun"];
         enable_rerun_ = n.empty() ? true : (static_cast<int>(n) != 0);
     }
@@ -2094,10 +2110,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     {
         cv::FileNode n = settings_file["Record.rerun_rendered_depth_insert"];
         rerun_rendered_depth_insert_ = n.empty() ? true : (static_cast<int>(n) != 0);
-    }
-    {
-        cv::FileNode n = settings_file["Record.rerun_rendered_hole_fill"];
-        rerun_rendered_hole_fill_ = n.empty() ? true : (static_cast<int>(n) != 0);
     }
     {
         cv::FileNode n = settings_file["Record.save_rendered_mesh_eval"];
@@ -2818,6 +2830,115 @@ static inline torch::Tensor color_u8(uint8_t r, uint8_t g, uint8_t b) {
     return torch::tensor({r, g, b}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 }
 
+static torch::Tensor normalizeRerunPointColors(torch::Tensor colors)
+{
+    if (!colors.defined() || colors.numel() == 0) {
+        return colors;
+    }
+    if (colors.max().item<float>() > 1.5f) {
+        colors = colors / 255.0f;
+    }
+    return colors.clamp(0.0f, 1.0f).contiguous();
+}
+
+void VoxelMapper::appendAndLogOrbRawMapPcdToRerun(
+    const std::map<point3D_id_t, Point3D>& pcd,
+    int iteration)
+{
+    if (pcd.empty()) {
+        return;
+    }
+
+    std::vector<float> pts;
+    std::vector<float> cols;
+    pts.reserve(pcd.size() * 3);
+    cols.reserve(pcd.size() * 3);
+    for (const auto& kv : pcd) {
+        const auto& P = kv.second;
+        pts.push_back(static_cast<float>(P.xyz_(0)));
+        pts.push_back(static_cast<float>(P.xyz_(1)));
+        pts.push_back(static_cast<float>(P.xyz_(2)));
+        cols.push_back(static_cast<float>(P.color_(0)));
+        cols.push_back(static_cast<float>(P.color_(1)));
+        cols.push_back(static_cast<float>(P.color_(2)));
+    }
+
+    auto points = torch::from_blob(
+        pts.data(),
+        {static_cast<int64_t>(pcd.size()), 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+    auto colors = torch::from_blob(
+        cols.data(),
+        {static_cast<int64_t>(pcd.size()), 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+    colors = normalizeRerunPointColors(colors);
+
+    if (!orb_raw_pcd_points_accum_cpu_.defined() || orb_raw_pcd_points_accum_cpu_.numel() == 0) {
+        orb_raw_pcd_points_accum_cpu_ = points.contiguous();
+        orb_raw_pcd_colors_accum_cpu_ = colors.contiguous();
+    } else {
+        orb_raw_pcd_points_accum_cpu_ =
+            torch::cat({orb_raw_pcd_points_accum_cpu_, points.contiguous()}, 0).contiguous();
+        orb_raw_pcd_colors_accum_cpu_ =
+            torch::cat({orb_raw_pcd_colors_accum_cpu_, colors.contiguous()}, 0).contiguous();
+    }
+
+    sv::RerunVisualizerBridge::instance().visualizePoints3D(
+        orb_raw_pcd_points_accum_cpu_,
+        orb_raw_pcd_colors_accum_cpu_,
+        iteration,
+        "world/orb/raw_pcd",
+        0.015f);
+    // std::cout << "[rerun/orb] appended_raw_pcd_points=" << pcd.size()
+    //           << " total_raw_pcd_points=" << orb_raw_pcd_points_accum_cpu_.size(0)
+    //           << " entity=world/orb/raw_pcd"
+    //           << " iter=" << iteration
+    //           << std::endl;
+}
+
+void VoxelMapper::appendAndLogOrbRawPointBatchToRerun(
+    const std::vector<float>& points_flat,
+    const std::vector<float>& colors_flat,
+    int iteration)
+{
+    const int64_t n_points = static_cast<int64_t>(points_flat.size() / 3);
+    if (n_points <= 0 || colors_flat.size() < static_cast<size_t>(3 * n_points)) {
+        return;
+    }
+
+    auto points = torch::from_blob(
+        const_cast<float*>(points_flat.data()),
+        {n_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+    auto colors = torch::from_blob(
+        const_cast<float*>(colors_flat.data()),
+        {n_points, 3},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+    colors = normalizeRerunPointColors(colors);
+
+    if (!orb_raw_pcd_points_accum_cpu_.defined() || orb_raw_pcd_points_accum_cpu_.numel() == 0) {
+        orb_raw_pcd_points_accum_cpu_ = points.contiguous();
+        orb_raw_pcd_colors_accum_cpu_ = colors.contiguous();
+    } else {
+        orb_raw_pcd_points_accum_cpu_ =
+            torch::cat({orb_raw_pcd_points_accum_cpu_, points.contiguous()}, 0).contiguous();
+        orb_raw_pcd_colors_accum_cpu_ =
+            torch::cat({orb_raw_pcd_colors_accum_cpu_, colors.contiguous()}, 0).contiguous();
+    }
+
+    sv::RerunVisualizerBridge::instance().visualizePoints3D(
+        orb_raw_pcd_points_accum_cpu_,
+        orb_raw_pcd_colors_accum_cpu_,
+        iteration,
+        "world/orb/raw_pcd",
+        0.015f);
+    // std::cout << "[rerun/orb] appended_raw_pcd_points=" << n_points
+    //           << " total_raw_pcd_points=" << orb_raw_pcd_points_accum_cpu_.size(0)
+    //           << " entity=world/orb/raw_pcd"
+    //           << " iter=" << iteration
+    //           << std::endl;
+}
+
 void VoxelMapper::run()
 {
     /* expose our helper scripts to the embedded Python side */
@@ -2967,11 +3088,13 @@ void VoxelMapper::run()
                             );
                         }
                     } catch (const c10::Error& e) {
-                        std::cerr << "[RERUN] Torch error in visualizeCamera (initial KFs): "
-                                << e.msg() << std::endl;
+                        (void)e;
+                        // std::cerr << "[RERUN] Torch error in visualizeCamera (initial KFs): "
+                        //         << e.msg() << std::endl;
                     } catch (const std::exception& e) {
-                        std::cerr << "[RERUN] Exception in visualizeCamera (initial KFs): "
-                                << e.what() << std::endl;
+                        (void)e;
+                        // std::cerr << "[RERUN] Exception in visualizeCamera (initial KFs): "
+                        //         << e.what() << std::endl;
                     }
 
                     // ─── nvblox: integrate this keyframe’s depth into TSDF ───
@@ -3047,6 +3170,11 @@ void VoxelMapper::run()
                 //         << std::endl;
             }
             // D) Create voxel model & trainer setup
+            if (enable_rerun_ && !rerun_final_only_) {
+                appendAndLogOrbRawMapPcdToRerun(
+                    scene_->cached_point_cloud_,
+                    getIteration());
+            }
             {
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
                 // scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
@@ -3081,18 +3209,24 @@ void VoxelMapper::run()
                     }
                 }
 
-                std::cout << "[depthanything_fill_holes/initial_backfill] start"
-                          << " kfs=" << initial_fill_kfs.size()
-                          << " min_initial_map_kfs=" << min_num_initial_map_kfs_
-                          << " iter=" << getIteration()
-                          << std::endl;
-                for (const auto& pkf : initial_fill_kfs) {
-                    increasePcdByKeyframeDepthAnythingFillHoles(pkf);
+                // std::cout << "[mono_prior_fill_holes/initial_backfill] start"
+                //           << " kfs=" << initial_fill_kfs.size()
+                //           << " min_initial_map_kfs=" << min_num_initial_map_kfs_
+                //           << " iter=" << getIteration()
+                //           << std::endl;
+                if (depthAnythingFillHolesWarmupReady()) {
+                    applyDepthAnythingFillHolesKeyframes(
+                        initial_fill_kfs,
+                        /*seed_global_alignment=*/true);
+                } else {
+                    for (const auto& pkf : initial_fill_kfs) {
+                        queueDepthAnythingFillHolesKeyframe(pkf);
+                    }
                 }
-                std::cout << "[depthanything_fill_holes/initial_backfill] done"
-                          << " kfs=" << initial_fill_kfs.size()
-                          << " iter=" << getIteration()
-                          << std::endl;
+                // std::cout << "[mono_prior_fill_holes/initial_backfill] done"
+                //           << " kfs=" << initial_fill_kfs.size()
+                //           << " iter=" << getIteration()
+                //           << std::endl;
             }
 
             // One warm-up optimization step
@@ -3122,6 +3256,8 @@ void VoxelMapper::run()
                 cullKeyframes();
         }
  
+        processDepthAnythingFillHolesWarmup();
+
         // Invoke training once
         trainForOneIteration();
 
@@ -3141,6 +3277,7 @@ void VoxelMapper::run()
         || (getIteration() % adapt_interval) <= n_delay_iters
         || isKeepingTraining() )
     {
+        processDepthAnythingFillHolesWarmup();
         trainForOneIteration();
         // Re-read in case user changed cfg at runtime
         adapt_interval = opt_params_.adapt_every_;
@@ -3174,8 +3311,7 @@ void VoxelMapper::run()
             if (use_far_final_special) {
                 if (opt_params_.prune_recompute_dense_core_) {
                     const bool refreshed_dense_core =
-                        voxel_model_->refreshDenseCoreBBFromCurrentVoxels(
-                            /*exclude_hole_fill_real_voxels=*/true);
+                        voxel_model_->refreshDenseCoreBBFromCurrentVoxels();
                     if (!voxel_model_->hasDenseCoreBB()) {
                         use_far_final_special = false;
                         std::cout << "[FINAL/special_prune] dense-core refresh unavailable; "
@@ -3312,8 +3448,6 @@ void VoxelMapper::run()
                 }
             }
 
-            const int64_t n_hole_fill_final_special_protected = 0;
-
             const int64_t n_selected_final_special =
                 prune_mask_final_special.to(torch::kBool).sum().item<int64_t>();
             if (n_selected_final_special > 0) {
@@ -3326,7 +3460,6 @@ void VoxelMapper::run()
                       << " far=" << (far_valid_final_special ? std::to_string(n_far_final_special) : std::string("N/A"))
                       << " near=" << (near_valid_final_special ? std::to_string(n_near_final_special) : std::string("N/A"))
                       << " above_target=" << n_above_target_final_special
-                      << " hole_fill_protected=" << n_hole_fill_final_special_protected
                       << "\n";
         }
     } else {
@@ -4016,7 +4149,6 @@ void VoxelMapper::run()
         }
     }
     savePlannerNPZ(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "planner.npz");
-    moveRenderedHoleFillDebugToShutdownDir(result_dir_, getIteration());
     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
 
     const auto rrd_dir  = result_dir_ / "rerun";
@@ -4344,7 +4476,7 @@ static bool renderPkgToSparseDepthLossMap(
     return pred_depth.defined();
 }
 
-static bool renderPkgToDepthAnythingv2DebugMaps(
+static bool renderPkgToMonoPriorDebugMaps(
     const std::unordered_map<std::string, torch::Tensor>& render_pkg,
     const torch::Tensor& mono_depth,
     float cam_near,
@@ -4894,6 +5026,273 @@ static bool sparseSamplesToDepthMat(
     return n_written > 0;
 }
 
+static const std::string& runtimeOrbDepthDebugRunTag()
+{
+    static const std::string tag = []() {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::to_string(now);
+    }();
+    return tag;
+}
+
+static std::filesystem::path runtimeOrbDepthDebugDir(
+    const std::filesystem::path& result_root)
+{
+    return result_root / (".orb_depth_debug_" + runtimeOrbDepthDebugRunTag());
+}
+
+static void copyPngFilesToDirectory(
+    const std::filesystem::path& source_dir,
+    const std::filesystem::path& target_dir)
+{
+    if (source_dir.empty() || target_dir.empty() ||
+        !std::filesystem::exists(source_dir) ||
+        !std::filesystem::is_directory(source_dir)) {
+        return;
+    }
+
+    std::filesystem::create_directories(target_dir);
+    for (const auto& entry : std::filesystem::directory_iterator(source_dir)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".png") {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::copy_file(
+            entry.path(),
+            target_dir / entry.path().filename(),
+            std::filesystem::copy_options::overwrite_existing,
+            ec);
+    }
+}
+
+static cv::Scalar relDepthErrorColorBgr(float rel_error)
+{
+    if (!std::isfinite(rel_error)) {
+        return cv::Scalar(255, 0, 255);
+    }
+    if (rel_error <= 0.05f) {
+        return cv::Scalar(0, 220, 0);
+    }
+    if (rel_error <= 0.15f) {
+        return cv::Scalar(0, 220, 220);
+    }
+    if (rel_error <= 0.30f) {
+        return cv::Scalar(0, 140, 255);
+    }
+    return cv::Scalar(0, 0, 255);
+}
+
+static bool saveAccumulatedOrbDepthProjectionPng(
+    const std::shared_ptr<ORB_SLAM3::System>& slam,
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const std::filesystem::path& output_dir,
+    int iteration,
+    float valid_min_depth,
+    float valid_max_depth,
+    const torch::Tensor& aligned_da_depth = torch::Tensor())
+{
+    if (!slam || !kf || output_dir.empty() ||
+        kf->image_width_ <= 0 || kf->image_height_ <= 0 || kf->intr_.size() < 4) {
+        return false;
+    }
+
+    ORB_SLAM3::Atlas* atlas = slam->getAtlas();
+    if (!atlas) {
+        return false;
+    }
+
+    const std::vector<ORB_SLAM3::MapPoint*> map_points = atlas->GetAllMapPoints();
+    if (map_points.empty()) {
+        return false;
+    }
+
+    const int W = kf->image_width_;
+    const int H = kf->image_height_;
+    const float fx = kf->intr_[0];
+    const float fy = kf->intr_[1];
+    const float cx = kf->intr_[2];
+    const float cy = kf->intr_[3];
+    if (!(fx > 1e-6f) || !(fy > 1e-6f)) {
+        return false;
+    }
+
+    const Sophus::SE3f Tcw = kf->getPosef();
+    const float z_min = std::max(valid_min_depth, std::max(kf->znear_, 1e-6f));
+    const bool use_z_max = std::isfinite(valid_max_depth) && valid_max_depth > z_min;
+    const float viz_valid_max_depth = use_z_max ? valid_max_depth : 1e6f;
+
+    cv::Mat depth_meters(H, W, CV_32FC1, cv::Scalar(std::numeric_limits<float>::quiet_NaN()));
+    int64_t projected_points = 0;
+    for (ORB_SLAM3::MapPoint* mp : map_points) {
+        if (!mp || mp->isBad()) {
+            continue;
+        }
+
+        const Eigen::Vector3f p_world = mp->GetWorldPos();
+        if (!std::isfinite(p_world.x()) ||
+            !std::isfinite(p_world.y()) ||
+            !std::isfinite(p_world.z())) {
+            continue;
+        }
+
+        const Eigen::Vector3f p_cam = Tcw * p_world;
+        const float z = p_cam.z();
+        if (!std::isfinite(z) || z <= z_min || (use_z_max && z >= valid_max_depth)) {
+            continue;
+        }
+
+        const float u = fx * p_cam.x() / z + cx;
+        const float v = fy * p_cam.y() / z + cy;
+        if (!std::isfinite(u) || !std::isfinite(v)) {
+            continue;
+        }
+
+        const int px = static_cast<int>(std::lround(u));
+        const int py = static_cast<int>(std::lround(v));
+        if (px < 0 || px >= W || py < 0 || py >= H) {
+            continue;
+        }
+
+        float& dst = depth_meters.at<float>(py, px);
+        if (!std::isfinite(dst) || z < dst) {
+            dst = z;
+        }
+        ++projected_points;
+    }
+
+    if (projected_points <= 0) {
+        return false;
+    }
+
+    const torch::Tensor depth_tensor = torch::from_blob(
+        depth_meters.data,
+        {H, W},
+        torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    float viz_min = 0.0f;
+    float viz_max = 1.0f;
+    if (!computeSharedDepthVizRange(
+            depth_tensor,
+            cv::Mat(),
+            valid_min_depth,
+            viz_valid_max_depth,
+            viz_min,
+            viz_max)) {
+        return false;
+    }
+
+    const cv::Mat depth_bgr = colorizeDepthMatJet(
+        depth_meters,
+        valid_min_depth,
+        viz_valid_max_depth,
+        viz_min,
+        viz_max);
+
+    std::ostringstream stem;
+    stem << "kf_" << std::setw(5) << std::setfill('0') << kf->fid_;
+    std::ostringstream iter_tag;
+    iter_tag << "_densification_iter_"
+             << std::setw(5) << std::setfill('0') << iteration;
+
+    std::filesystem::create_directories(output_dir);
+    bool wrote_any = cv::imwrite(
+        (output_dir / (stem.str() + "_orb_depth" + iter_tag.str() + ".png")).string(),
+        depth_bgr);
+
+    if (!aligned_da_depth.defined()) {
+        return wrote_any;
+    }
+
+    cv::Mat aligned_da_meters = depthTensorToCvMatFloat(aligned_da_depth);
+    if (aligned_da_meters.empty()) {
+        return wrote_any;
+    }
+    if (aligned_da_meters.rows != H || aligned_da_meters.cols != W) {
+        cv::resize(
+            aligned_da_meters,
+            aligned_da_meters,
+            cv::Size(W, H),
+            0.0,
+            0.0,
+            cv::INTER_LINEAR);
+    }
+
+    float da_viz_min = 0.0f;
+    float da_viz_max = 1.0f;
+    const torch::Tensor aligned_da_tensor = torch::from_blob(
+        aligned_da_meters.data,
+        {H, W},
+        torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    cv::Mat aligned_da_bgr;
+    if (computeSharedDepthVizRange(
+            aligned_da_tensor,
+            cv::Mat(),
+            valid_min_depth,
+            viz_valid_max_depth,
+            da_viz_min,
+            da_viz_max)) {
+        aligned_da_bgr = colorizeDepthMatJet(
+            aligned_da_meters,
+            valid_min_depth,
+            viz_valid_max_depth,
+            da_viz_min,
+            da_viz_max);
+    } else {
+        aligned_da_bgr = cv::Mat(H, W, CV_8UC3, cv::Scalar(0, 0, 0));
+    }
+
+    cv::Mat rel_error(H, W, CV_32FC1, cv::Scalar(std::numeric_limits<float>::quiet_NaN()));
+    cv::Mat orb_on_da = aligned_da_bgr.clone();
+
+    const int radius = std::clamp(std::min(W, H) / 260, 2, 4);
+    int64_t compared_points = 0;
+    for (int y = 0; y < H; ++y) {
+        const float* orb_row = depth_meters.ptr<float>(y);
+        const float* da_row = aligned_da_meters.ptr<float>(y);
+        float* err_row = rel_error.ptr<float>(y);
+        for (int x = 0; x < W; ++x) {
+            const float z_orb = orb_row[x];
+            if (!std::isfinite(z_orb) || z_orb <= valid_min_depth ||
+                z_orb >= viz_valid_max_depth) {
+                continue;
+            }
+
+            const float z_da = da_row[x];
+            float rel = std::numeric_limits<float>::quiet_NaN();
+            if (std::isfinite(z_da) && z_da > valid_min_depth &&
+                z_da < viz_valid_max_depth) {
+                rel = std::abs(z_orb - z_da) / std::max(z_orb, 1e-6f);
+                err_row[x] = rel;
+                ++compared_points;
+            }
+
+            cv::circle(
+                orb_on_da,
+                cv::Point(x, y),
+                radius,
+                relDepthErrorColorBgr(rel),
+                cv::FILLED,
+                cv::LINE_AA);
+        }
+    }
+
+    wrote_any |= cv::imwrite(
+        (output_dir / (stem.str() + "_orb_on_da_error" + iter_tag.str() + ".png")).string(),
+        orb_on_da);
+
+    if (compared_points > 0) {
+        const cv::Mat rel_error_bgr = appendJetLegendBar(
+            colorizeFiniteScalarMatJet(rel_error, 0.0f, 0.5f),
+            0.0f,
+            0.5f,
+            " rel");
+        wrote_any |= cv::imwrite(
+            (output_dir / (stem.str() + "_orb_vs_da_rel_error" + iter_tag.str() + ".png")).string(),
+            rel_error_bgr);
+    }
+
+    return wrote_any;
+}
+
 static bool sampleDenseDepthAtSparseUv(
     const torch::Tensor& dense_depth,
     const torch::Tensor& sparse_uv,
@@ -4935,6 +5334,203 @@ static bool sampleDenseDepthAtSparseUv(
     return sampled_depth.dim() == 1;
 }
 
+static bool fitAffineScaleShift1D(
+    const torch::Tensor& x,
+    const torch::Tensor& y,
+    float& scale,
+    float& shift)
+{
+    scale = std::numeric_limits<float>::quiet_NaN();
+    shift = std::numeric_limits<float>::quiet_NaN();
+    if (!x.defined() || !y.defined() || x.numel() < 2 || y.numel() != x.numel()) {
+        return false;
+    }
+
+    const torch::Tensor x_mean = x.mean();
+    const torch::Tensor y_mean = y.mean();
+    const torch::Tensor dx = x - x_mean;
+    const torch::Tensor dy = y - y_mean;
+    const torch::Tensor denom = (dx * dx).sum();
+    const float denom_f = denom.item<float>();
+    if (!std::isfinite(denom_f) || denom_f <= 1e-12f) {
+        return false;
+    }
+
+    const torch::Tensor scale_t = (dx * dy).sum() / denom;
+    const torch::Tensor shift_t = y_mean - scale_t * x_mean;
+    scale = scale_t.item<float>();
+    shift = shift_t.item<float>();
+    return std::isfinite(scale) && std::isfinite(shift);
+}
+
+static bool fitScale1D(
+    const torch::Tensor& x,
+    const torch::Tensor& y,
+    float& scale)
+{
+    scale = std::numeric_limits<float>::quiet_NaN();
+    if (!x.defined() || !y.defined() || x.numel() < 2 || y.numel() != x.numel()) {
+        return false;
+    }
+
+    const torch::Tensor denom = (x * x).sum();
+    const float denom_f = denom.item<float>();
+    if (!std::isfinite(denom_f) || denom_f <= 1e-12f) {
+        return false;
+    }
+
+    const torch::Tensor scale_t = (x * y).sum() / denom;
+    scale = scale_t.item<float>();
+    return std::isfinite(scale) && scale > 0.0f;
+}
+
+static float quantileVector(std::vector<float> values, float q)
+{
+    values.erase(
+        std::remove_if(
+            values.begin(),
+            values.end(),
+            [](float v) { return !std::isfinite(v); }),
+        values.end());
+    if (values.empty()) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    q = std::clamp(q, 0.0f, 1.0f);
+    std::sort(values.begin(), values.end());
+    const float pos = q * static_cast<float>(values.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi) {
+        return values[lo];
+    }
+    const float t = pos - static_cast<float>(lo);
+    return values[lo] * (1.0f - t) + values[hi] * t;
+}
+
+static bool fitAffineScaleShiftWeighted1D(
+    const std::vector<float>& x,
+    const std::vector<float>& y,
+    const std::vector<float>* weights,
+    float& scale,
+    float& shift)
+{
+    scale = std::numeric_limits<float>::quiet_NaN();
+    shift = std::numeric_limits<float>::quiet_NaN();
+    if (x.size() != y.size() || x.size() < 2) {
+        return false;
+    }
+
+    double w_sum = 0.0;
+    double x_sum = 0.0;
+    double y_sum = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) {
+            continue;
+        }
+        const double w = weights ? static_cast<double>((*weights)[i]) : 1.0;
+        if (!(w > 0.0) || !std::isfinite(w)) {
+            continue;
+        }
+        w_sum += w;
+        x_sum += w * static_cast<double>(x[i]);
+        y_sum += w * static_cast<double>(y[i]);
+    }
+    if (!(w_sum > 0.0)) {
+        return false;
+    }
+
+    const double x_mean = x_sum / w_sum;
+    const double y_mean = y_sum / w_sum;
+    double denom = 0.0;
+    double numer = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) {
+            continue;
+        }
+        const double w = weights ? static_cast<double>((*weights)[i]) : 1.0;
+        if (!(w > 0.0) || !std::isfinite(w)) {
+            continue;
+        }
+        const double dx = static_cast<double>(x[i]) - x_mean;
+        const double dy = static_cast<double>(y[i]) - y_mean;
+        denom += w * dx * dx;
+        numer += w * dx * dy;
+    }
+    if (!(denom > 1e-12) || !std::isfinite(denom)) {
+        return false;
+    }
+
+    const double s = numer / denom;
+    const double t = y_mean - s * x_mean;
+    scale = static_cast<float>(s);
+    shift = static_cast<float>(t);
+    return std::isfinite(scale) && std::isfinite(shift);
+}
+
+static bool applyDepthAnythingAffineAlignment(
+    const torch::Tensor& mono_prior,
+    float scale,
+    float shift,
+    torch::Tensor& aligned_depth)
+{
+    aligned_depth = torch::Tensor();
+    if (!mono_prior.defined() ||
+        !std::isfinite(scale) ||
+        !std::isfinite(shift) ||
+        scale <= 0.0f) {
+        return false;
+    }
+
+    torch::Tensor mono = mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    if (mono.dim() != 2) {
+        return false;
+    }
+
+    torch::Tensor aligned_inv = mono * scale + shift;
+    const torch::Tensor aligned_valid = torch::isfinite(aligned_inv) & (aligned_inv > 1e-6f);
+    aligned_depth = torch::where(
+        aligned_valid,
+        1.0f / aligned_inv.clamp_min(1e-6f),
+        torch::full_like(aligned_inv, std::numeric_limits<float>::quiet_NaN()));
+    aligned_depth = aligned_depth.to(torch::kCPU).contiguous();
+    return aligned_depth.defined() && aligned_depth.dim() == 2;
+}
+
+static bool applyMetricDepthAlignment(
+    const torch::Tensor& mono_prior,
+    float scale,
+    float shift,
+    torch::Tensor& aligned_depth)
+{
+    aligned_depth = torch::Tensor();
+    if (!mono_prior.defined() ||
+        !std::isfinite(scale) ||
+        !std::isfinite(shift) ||
+        scale <= 0.0f) {
+        return false;
+    }
+
+    torch::Tensor mono = mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    if (mono.dim() != 2) {
+        return false;
+    }
+
+    aligned_depth = mono * scale + shift;
+    const torch::Tensor aligned_valid = torch::isfinite(aligned_depth) & (aligned_depth > 1e-6f);
+    aligned_depth = torch::where(
+        aligned_valid,
+        aligned_depth,
+        torch::full_like(aligned_depth, std::numeric_limits<float>::quiet_NaN()));
+    aligned_depth = aligned_depth.to(torch::kCPU).contiguous();
+    return aligned_depth.defined() && aligned_depth.dim() == 2;
+}
+
 static bool alignDepthAnythingPriorToSparseAnchors(
     const torch::Tensor& mono_prior,
     const torch::Tensor& sparse_uv,
@@ -4942,14 +5538,10 @@ static bool alignDepthAnythingPriorToSparseAnchors(
     float cam_near,
     int min_sparse_anchors,
     torch::Tensor& aligned_depth,
-    int64_t& num_valid_anchors,
-    float& sparse_depth_q05,
-    float& sparse_depth_q95)
+    MonoPriorAlignmentStats& stats)
 {
     aligned_depth = torch::Tensor();
-    num_valid_anchors = 0;
-    sparse_depth_q05 = std::numeric_limits<float>::quiet_NaN();
-    sparse_depth_q95 = std::numeric_limits<float>::quiet_NaN();
+    stats = MonoPriorAlignmentStats();
 
     if (!mono_prior.defined() || !sparse_uv.defined() || !sparse_depth.defined()) {
         return false;
@@ -4982,40 +5574,918 @@ static bool alignDepthAnythingPriorToSparseAnchors(
         torch::isfinite(sparse_depth_1d) &
         (mono_samples > 0.0f) &
         (sparse_depth_1d > near_depth);
-    num_valid_anchors = valid.sum().item<int64_t>();
-    if (num_valid_anchors < std::max(2, min_sparse_anchors)) {
+    stats.num_valid_anchors = valid.sum().item<int64_t>();
+    if (stats.num_valid_anchors < std::max(2, min_sparse_anchors)) {
         return false;
     }
 
-    torch::Tensor Y = mono_samples.masked_select(valid);
+    torch::Tensor Y = mono_samples.masked_select(valid).contiguous();
     torch::Tensor sparse_depth_valid = sparse_depth_1d.masked_select(valid);
     torch::Tensor Xref = 1.0f / sparse_depth_valid.clamp_min(near_depth);
 
+    // Use the old robust median/MAD alignment only to identify obvious outlier anchors.
     const torch::Tensor Ymed = Y.median();
     const torch::Tensor Ys = (Y - Ymed).abs().mean().clamp_min(1e-6f);
     const torch::Tensor Xmed = Xref.median();
     const torch::Tensor Xs = (Xref - Xmed).abs().mean().clamp_min(1e-6f);
+    const torch::Tensor init_inv = (Y - Ymed) * (Xs / Ys) + Xmed;
+    const torch::Tensor init_depth = 1.0f / init_inv.clamp_min(1e-6f);
+    const torch::Tensor init_rel_err =
+        (init_depth - sparse_depth_valid).abs() / sparse_depth_valid.clamp_min(near_depth);
+    torch::Tensor fit_mask =
+        torch::isfinite(init_rel_err) &
+        torch::isfinite(init_inv) &
+        (init_inv > 1e-6f) &
+        (init_rel_err <= kMonoPriorAlignInitialInlierRelErr);
+    stats.num_fit_anchors = fit_mask.sum().item<int64_t>();
+    if (stats.num_fit_anchors < std::max(2, min_sparse_anchors)) {
+        fit_mask = torch::ones_like(fit_mask, torch::TensorOptions().dtype(torch::kBool));
+        stats.num_fit_anchors = stats.num_valid_anchors;
+    }
 
-    torch::Tensor aligned_inv = (mono - Ymed) * (Xs / Ys) + Xmed;
-    aligned_depth = 1.0f / aligned_inv.clamp_min(1e-6f);
-    aligned_depth = aligned_depth.to(torch::kCPU).contiguous();
+    const torch::Tensor Y_fit = Y.masked_select(fit_mask).contiguous();
+    const torch::Tensor Xref_fit = Xref.masked_select(fit_mask).contiguous();
+    if (!fitAffineScaleShift1D(Y_fit, Xref_fit, stats.scale, stats.shift)) {
+        return false;
+    }
+    if (stats.scale <= 0.0f) {
+        return false;
+    }
+
+    const torch::Tensor aligned_anchor_inv = Y * stats.scale + stats.shift;
+    const torch::Tensor positive_anchor_inv =
+        torch::isfinite(aligned_anchor_inv) & (aligned_anchor_inv > 1e-6f);
+    if (positive_anchor_inv.sum().item<int64_t>() < std::max(2, min_sparse_anchors)) {
+        return false;
+    }
+    const torch::Tensor aligned_anchor_depth =
+        1.0f / aligned_anchor_inv.masked_select(positive_anchor_inv).clamp_min(1e-6f);
+    const torch::Tensor sparse_depth_eval =
+        sparse_depth_valid.masked_select(positive_anchor_inv).clamp_min(near_depth);
+    torch::Tensor rel_err =
+        (aligned_anchor_depth - sparse_depth_eval).abs() / sparse_depth_eval;
+    rel_err = rel_err.masked_select(torch::isfinite(rel_err)).contiguous();
+    if (rel_err.numel() < std::max(2, min_sparse_anchors)) {
+        return false;
+    }
+    stats.median_rel_depth_error = rel_err.median().item<float>();
+    if (rel_err.numel() >= 10) {
+        stats.p90_rel_depth_error = torch::quantile(
+            rel_err,
+            torch::tensor(0.90f, torch::TensorOptions().dtype(torch::kFloat32)))
+            .item<float>();
+    } else {
+        stats.p90_rel_depth_error = rel_err.max().item<float>();
+    }
+    stats.final_inlier_ratio =
+        static_cast<float>((rel_err <= kMonoPriorAlignFinalInlierRelErr)
+                               .sum()
+                               .item<int64_t>()) /
+        static_cast<float>(stats.num_valid_anchors);
+    if (!std::isfinite(stats.median_rel_depth_error) ||
+        !std::isfinite(stats.p90_rel_depth_error) ||
+        !std::isfinite(stats.final_inlier_ratio)) {
+        return false;
+    }
+
+    if (!applyDepthAnythingAffineAlignment(mono, stats.scale, stats.shift, aligned_depth)) {
+        return false;
+    }
 
     if (sparse_depth_valid.numel() >= 10) {
         torch::Tensor q = torch::quantile(
             sparse_depth_valid,
             torch::tensor({0.05f, 0.95f}, torch::TensorOptions().dtype(torch::kFloat32)));
-        sparse_depth_q05 = q[0].item<float>();
-        sparse_depth_q95 = q[1].item<float>();
+        stats.sparse_depth_q05 = q[0].item<float>();
+        stats.sparse_depth_q95 = q[1].item<float>();
     } else {
-        sparse_depth_q05 = sparse_depth_valid.min().item<float>();
-        sparse_depth_q95 = sparse_depth_valid.max().item<float>();
+        stats.sparse_depth_q05 = sparse_depth_valid.min().item<float>();
+        stats.sparse_depth_q95 = sparse_depth_valid.max().item<float>();
     }
 
     return aligned_depth.defined() &&
            aligned_depth.dim() == 2 &&
-           std::isfinite(sparse_depth_q05) &&
-           std::isfinite(sparse_depth_q95) &&
-           sparse_depth_q95 > sparse_depth_q05;
+           std::isfinite(stats.sparse_depth_q05) &&
+           std::isfinite(stats.sparse_depth_q95) &&
+           stats.sparse_depth_q95 > stats.sparse_depth_q05;
+}
+
+static bool alignDepthAnythingPriorToRenderedDepth(
+    const torch::Tensor& mono_prior,
+    const torch::Tensor& rendered_depth,
+    const torch::Tensor& rendered_alpha,
+    const torch::Tensor& rendered_n_contrib,
+    float cam_near,
+    int min_rendered_anchors,
+    torch::Tensor& aligned_depth,
+    MonoPriorAlignmentStats& stats)
+{
+    aligned_depth = torch::Tensor();
+    stats = MonoPriorAlignmentStats();
+
+    if (!mono_prior.defined() || !rendered_depth.defined() ||
+        !rendered_alpha.defined() || !rendered_n_contrib.defined()) {
+        return false;
+    }
+
+    torch::Tensor mono =
+        mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    torch::Tensor depth =
+        rendered_depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor alpha =
+        rendered_alpha.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor n_contrib =
+        rendered_n_contrib.detach().to(torch::kCPU).to(torch::kInt32).contiguous();
+    if (mono.dim() != 2 || depth.dim() != 2 || alpha.dim() != 2 ||
+        n_contrib.dim() != 2 ||
+        mono.sizes() != depth.sizes() ||
+        mono.sizes() != alpha.sizes() ||
+        mono.sizes() != n_contrib.sizes()) {
+        return false;
+    }
+
+    const float near_depth = std::max(1e-6f, cam_near);
+    torch::Tensor valid =
+        torch::isfinite(mono) &
+        torch::isfinite(depth) &
+        torch::isfinite(alpha) &
+        (mono > 0.0f) &
+        (depth > near_depth) &
+        (alpha > 0.5f) &
+        (n_contrib > 0);
+    stats.num_valid_anchors = valid.sum().item<int64_t>();
+    if (stats.num_valid_anchors < std::max(2, min_rendered_anchors)) {
+        return false;
+    }
+
+    torch::Tensor Y = mono.masked_select(valid).contiguous();
+    torch::Tensor rendered_depth_valid = depth.masked_select(valid).contiguous();
+    torch::Tensor Xref = 1.0f / rendered_depth_valid.clamp_min(near_depth);
+
+    const torch::Tensor Ymed = Y.median();
+    const torch::Tensor Ys = (Y - Ymed).abs().mean().clamp_min(1e-6f);
+    const torch::Tensor Xmed = Xref.median();
+    const torch::Tensor Xs = (Xref - Xmed).abs().mean().clamp_min(1e-6f);
+    const torch::Tensor init_inv = (Y - Ymed) * (Xs / Ys) + Xmed;
+    const torch::Tensor init_depth = 1.0f / init_inv.clamp_min(1e-6f);
+    const torch::Tensor init_rel_err =
+        (init_depth - rendered_depth_valid).abs() /
+        rendered_depth_valid.clamp_min(near_depth);
+    torch::Tensor fit_mask =
+        torch::isfinite(init_rel_err) &
+        torch::isfinite(init_inv) &
+        (init_inv > 1e-6f) &
+        (init_rel_err <= kMonoPriorAlignInitialInlierRelErr);
+    stats.num_fit_anchors = fit_mask.sum().item<int64_t>();
+    if (stats.num_fit_anchors < std::max(2, min_rendered_anchors)) {
+        fit_mask = torch::ones_like(fit_mask, torch::TensorOptions().dtype(torch::kBool));
+        stats.num_fit_anchors = stats.num_valid_anchors;
+    }
+
+    const torch::Tensor Y_fit = Y.masked_select(fit_mask).contiguous();
+    const torch::Tensor Xref_fit = Xref.masked_select(fit_mask).contiguous();
+    if (!fitAffineScaleShift1D(Y_fit, Xref_fit, stats.scale, stats.shift)) {
+        return false;
+    }
+    if (stats.scale <= 0.0f) {
+        return false;
+    }
+
+    const torch::Tensor aligned_anchor_inv = Y * stats.scale + stats.shift;
+    const torch::Tensor positive_anchor_inv =
+        torch::isfinite(aligned_anchor_inv) & (aligned_anchor_inv > 1e-6f);
+    if (positive_anchor_inv.sum().item<int64_t>() < std::max(2, min_rendered_anchors)) {
+        return false;
+    }
+    const torch::Tensor aligned_anchor_depth =
+        1.0f / aligned_anchor_inv.masked_select(positive_anchor_inv).clamp_min(1e-6f);
+    const torch::Tensor rendered_depth_eval =
+        rendered_depth_valid.masked_select(positive_anchor_inv).clamp_min(near_depth);
+    torch::Tensor rel_err =
+        (aligned_anchor_depth - rendered_depth_eval).abs() / rendered_depth_eval;
+    rel_err = rel_err.masked_select(torch::isfinite(rel_err)).contiguous();
+    if (rel_err.numel() < std::max(2, min_rendered_anchors)) {
+        return false;
+    }
+
+    stats.median_rel_depth_error = rel_err.median().item<float>();
+    if (rel_err.numel() >= 10) {
+        stats.p90_rel_depth_error = torch::quantile(
+            rel_err,
+            torch::tensor(0.90f, torch::TensorOptions().dtype(torch::kFloat32)))
+            .item<float>();
+    } else {
+        stats.p90_rel_depth_error = rel_err.max().item<float>();
+    }
+    stats.final_inlier_ratio =
+        static_cast<float>((rel_err <= kMonoPriorAlignFinalInlierRelErr)
+                               .sum()
+                               .item<int64_t>()) /
+        static_cast<float>(stats.num_valid_anchors);
+    if (!std::isfinite(stats.median_rel_depth_error) ||
+        !std::isfinite(stats.p90_rel_depth_error) ||
+        !std::isfinite(stats.final_inlier_ratio)) {
+        return false;
+    }
+
+    if (!applyDepthAnythingAffineAlignment(mono, stats.scale, stats.shift, aligned_depth)) {
+        return false;
+    }
+
+    if (rendered_depth_valid.numel() >= 10) {
+        torch::Tensor q = torch::quantile(
+            rendered_depth_valid,
+            torch::tensor({0.05f, 0.95f}, torch::TensorOptions().dtype(torch::kFloat32)));
+        stats.sparse_depth_q05 = q[0].item<float>();
+        stats.sparse_depth_q95 = q[1].item<float>();
+    } else {
+        stats.sparse_depth_q05 = rendered_depth_valid.min().item<float>();
+        stats.sparse_depth_q95 = rendered_depth_valid.max().item<float>();
+    }
+
+    return aligned_depth.defined() &&
+           aligned_depth.dim() == 2 &&
+           std::isfinite(stats.sparse_depth_q05) &&
+           std::isfinite(stats.sparse_depth_q95) &&
+           stats.sparse_depth_q95 > stats.sparse_depth_q05;
+}
+
+static bool alignMetricDepthPriorToSparseAnchors(
+    const torch::Tensor& mono_prior,
+    const torch::Tensor& sparse_uv,
+    const torch::Tensor& sparse_depth,
+    float cam_near,
+    int min_sparse_anchors,
+    torch::Tensor& aligned_depth,
+    MonoPriorAlignmentStats& stats)
+{
+    aligned_depth = torch::Tensor();
+    stats = MonoPriorAlignmentStats();
+
+    if (!mono_prior.defined() || !sparse_uv.defined() || !sparse_depth.defined()) {
+        return false;
+    }
+
+    torch::Tensor mono = mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    if (mono.dim() != 2) {
+        return false;
+    }
+
+    torch::Tensor mono_samples;
+    if (!sampleDenseDepthAtSparseUv(mono, sparse_uv, mono_samples)) {
+        return false;
+    }
+
+    torch::Tensor sparse_depth_1d = sparse_depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (sparse_depth_1d.dim() == 2 && sparse_depth_1d.size(1) == 1) {
+        sparse_depth_1d = sparse_depth_1d.squeeze(1);
+    }
+    if (sparse_depth_1d.dim() != 1 || sparse_depth_1d.size(0) != mono_samples.size(0)) {
+        return false;
+    }
+
+    const float near_depth = std::max(1e-6f, cam_near);
+    torch::Tensor valid =
+        torch::isfinite(mono_samples) &
+        torch::isfinite(sparse_depth_1d) &
+        (mono_samples > near_depth) &
+        (sparse_depth_1d > near_depth);
+    stats.num_valid_anchors = valid.sum().item<int64_t>();
+    if (stats.num_valid_anchors < std::max(2, min_sparse_anchors)) {
+        return false;
+    }
+
+    torch::Tensor Y = mono_samples.masked_select(valid).contiguous();
+    torch::Tensor sparse_depth_valid = sparse_depth_1d.masked_select(valid).contiguous();
+
+    torch::Tensor init_scale_candidates =
+        sparse_depth_valid / Y.clamp_min(near_depth);
+    init_scale_candidates = init_scale_candidates.masked_select(
+        torch::isfinite(init_scale_candidates) & (init_scale_candidates > 0.0f));
+    if (!init_scale_candidates.defined() ||
+        init_scale_candidates.numel() < std::max<int64_t>(2, min_sparse_anchors)) {
+        return false;
+    }
+    const float init_scale = init_scale_candidates.median().item<float>();
+    if (!std::isfinite(init_scale) || init_scale <= 0.0f) {
+        return false;
+    }
+
+    const torch::Tensor init_depth = Y * init_scale;
+    const torch::Tensor init_rel_err =
+        (init_depth - sparse_depth_valid).abs() /
+        sparse_depth_valid.clamp_min(near_depth);
+    torch::Tensor fit_mask =
+        torch::isfinite(init_rel_err) &
+        (init_rel_err <= kMonoPriorAlignInitialInlierRelErr);
+    stats.num_fit_anchors = fit_mask.sum().item<int64_t>();
+    if (stats.num_fit_anchors < std::max(2, min_sparse_anchors)) {
+        fit_mask = torch::ones_like(fit_mask, torch::TensorOptions().dtype(torch::kBool));
+        stats.num_fit_anchors = stats.num_valid_anchors;
+    }
+
+    const torch::Tensor Y_fit = Y.masked_select(fit_mask).contiguous();
+    const torch::Tensor depth_fit = sparse_depth_valid.masked_select(fit_mask).contiguous();
+    stats.shift = 0.0f;
+    if (!fitScale1D(Y_fit, depth_fit, stats.scale)) {
+        return false;
+    }
+
+    const torch::Tensor aligned_anchor_depth = Y * stats.scale;
+    torch::Tensor rel_err =
+        (aligned_anchor_depth - sparse_depth_valid).abs() /
+        sparse_depth_valid.clamp_min(near_depth);
+    rel_err = rel_err.masked_select(torch::isfinite(rel_err)).contiguous();
+    if (rel_err.numel() < std::max(2, min_sparse_anchors)) {
+        return false;
+    }
+
+    stats.median_rel_depth_error = rel_err.median().item<float>();
+    if (rel_err.numel() >= 10) {
+        stats.p90_rel_depth_error = torch::quantile(
+            rel_err,
+            torch::tensor(0.90f, torch::TensorOptions().dtype(torch::kFloat32)))
+            .item<float>();
+    } else {
+        stats.p90_rel_depth_error = rel_err.max().item<float>();
+    }
+    stats.final_inlier_ratio =
+        static_cast<float>((rel_err <= kMonoPriorAlignFinalInlierRelErr)
+                               .sum()
+                               .item<int64_t>()) /
+        static_cast<float>(stats.num_valid_anchors);
+    if (!std::isfinite(stats.median_rel_depth_error) ||
+        !std::isfinite(stats.p90_rel_depth_error) ||
+        !std::isfinite(stats.final_inlier_ratio)) {
+        return false;
+    }
+
+    if (!applyMetricDepthAlignment(mono, stats.scale, stats.shift, aligned_depth)) {
+        return false;
+    }
+
+    if (sparse_depth_valid.numel() >= 10) {
+        torch::Tensor q = torch::quantile(
+            sparse_depth_valid,
+            torch::tensor({0.05f, 0.95f}, torch::TensorOptions().dtype(torch::kFloat32)));
+        stats.sparse_depth_q05 = q[0].item<float>();
+        stats.sparse_depth_q95 = q[1].item<float>();
+    } else {
+        stats.sparse_depth_q05 = sparse_depth_valid.min().item<float>();
+        stats.sparse_depth_q95 = sparse_depth_valid.max().item<float>();
+    }
+
+    return aligned_depth.defined() &&
+           aligned_depth.dim() == 2 &&
+           std::isfinite(stats.sparse_depth_q05) &&
+           std::isfinite(stats.sparse_depth_q95) &&
+           stats.sparse_depth_q95 > stats.sparse_depth_q05;
+}
+
+static bool alignMonoPriorToSparseAnchorsDaPrior(
+    const torch::Tensor& mono_prior,
+    const torch::Tensor& sparse_uv,
+    const torch::Tensor& sparse_depth,
+    const torch::Tensor& query_mask,
+    bool mono_prior_is_metric_depth,
+    float cam_near,
+    int min_sparse_anchors,
+    int knn_k,
+    bool distance_weighting,
+    float max_pixel_dist,
+    torch::Tensor& aligned_depth,
+    MonoPriorAlignmentStats& stats)
+{
+    aligned_depth = torch::Tensor();
+    stats = MonoPriorAlignmentStats();
+
+    if (!mono_prior.defined() || !sparse_uv.defined() || !sparse_depth.defined()) {
+        return false;
+    }
+
+    torch::Tensor mono = mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    if (mono.dim() != 2) {
+        return false;
+    }
+    const int H = static_cast<int>(mono.size(0));
+    const int W = static_cast<int>(mono.size(1));
+    if (H <= 0 || W <= 0) {
+        return false;
+    }
+
+    torch::Tensor mono_samples;
+    if (!sampleDenseDepthAtSparseUv(mono, sparse_uv, mono_samples)) {
+        return false;
+    }
+
+    torch::Tensor sparse_depth_1d = sparse_depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (sparse_depth_1d.dim() == 2 && sparse_depth_1d.size(1) == 1) {
+        sparse_depth_1d = sparse_depth_1d.squeeze(1);
+    }
+    torch::Tensor sparse_uv_cpu = sparse_uv.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (sparse_depth_1d.dim() != 1 ||
+        sparse_uv_cpu.dim() != 2 ||
+        sparse_uv_cpu.size(1) != 2 ||
+        sparse_depth_1d.size(0) != mono_samples.size(0) ||
+        sparse_uv_cpu.size(0) != mono_samples.size(0)) {
+        return false;
+    }
+
+    struct DaPriorAnchor {
+        float x = 0.0f;
+        float y = 0.0f;
+        float pred_disp = 0.0f;
+        float target_disp = 0.0f;
+        float target_depth = 0.0f;
+    };
+
+    const float near_depth = std::max(1e-6f, cam_near);
+    auto mono_sample_acc = mono_samples.accessor<float, 1>();
+    auto sparse_depth_acc = sparse_depth_1d.accessor<float, 1>();
+    auto sparse_uv_acc = sparse_uv_cpu.accessor<float, 2>();
+
+    std::vector<DaPriorAnchor> valid_anchors;
+    valid_anchors.reserve(static_cast<size_t>(mono_samples.size(0)));
+    std::vector<float> pred_disp_values;
+    std::vector<float> target_disp_values;
+    std::vector<float> sparse_depth_values;
+
+    for (int64_t i = 0; i < mono_samples.size(0); ++i) {
+        const float mono_value = mono_sample_acc[i];
+        const float z = sparse_depth_acc[i];
+        if (!std::isfinite(mono_value) || !std::isfinite(z) || z <= near_depth) {
+            continue;
+        }
+
+        float pred_disp = std::numeric_limits<float>::quiet_NaN();
+        if (mono_prior_is_metric_depth) {
+            if (mono_value <= near_depth) {
+                continue;
+            }
+            pred_disp = 1.0f / mono_value;
+        } else {
+            if (mono_value <= 0.0f) {
+                continue;
+            }
+            pred_disp = mono_value;
+        }
+        const float target_disp = 1.0f / std::max(z, near_depth);
+        if (!std::isfinite(pred_disp) || !std::isfinite(target_disp) ||
+            pred_disp <= 0.0f || target_disp <= 0.0f) {
+            continue;
+        }
+
+        const float x = 0.5f * (sparse_uv_acc[i][0] + 1.0f) * static_cast<float>(W);
+        const float y = 0.5f * (sparse_uv_acc[i][1] + 1.0f) * static_cast<float>(H);
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            x < 0.0f || x > static_cast<float>(W - 1) ||
+            y < 0.0f || y > static_cast<float>(H - 1)) {
+            continue;
+        }
+
+        valid_anchors.push_back({x, y, pred_disp, target_disp, z});
+        pred_disp_values.push_back(pred_disp);
+        target_disp_values.push_back(target_disp);
+        sparse_depth_values.push_back(z);
+    }
+
+    stats.num_valid_anchors = static_cast<int64_t>(valid_anchors.size());
+    if (stats.num_valid_anchors < std::max(2, min_sparse_anchors)) {
+        return false;
+    }
+
+    const float pred_med = quantileVector(pred_disp_values, 0.50f);
+    const float target_med = quantileVector(target_disp_values, 0.50f);
+    if (!std::isfinite(pred_med) || !std::isfinite(target_med)) {
+        return false;
+    }
+
+    double pred_mad = 0.0;
+    double target_mad = 0.0;
+    for (size_t i = 0; i < pred_disp_values.size(); ++i) {
+        pred_mad += std::abs(static_cast<double>(pred_disp_values[i]) - pred_med);
+        target_mad += std::abs(static_cast<double>(target_disp_values[i]) - target_med);
+    }
+    pred_mad = std::max(pred_mad / static_cast<double>(pred_disp_values.size()), 1e-6);
+    target_mad = std::max(target_mad / static_cast<double>(target_disp_values.size()), 1e-6);
+
+    std::vector<size_t> fit_indices;
+    fit_indices.reserve(valid_anchors.size());
+    for (size_t i = 0; i < valid_anchors.size(); ++i) {
+        const float init_disp =
+            (valid_anchors[i].pred_disp - pred_med) *
+                static_cast<float>(target_mad / pred_mad) +
+            target_med;
+        if (!std::isfinite(init_disp) || init_disp <= 1e-6f) {
+            continue;
+        }
+        const float init_depth = 1.0f / init_disp;
+        const float rel_err =
+            std::abs(init_depth - valid_anchors[i].target_depth) /
+            std::max(valid_anchors[i].target_depth, near_depth);
+        if (std::isfinite(rel_err) && rel_err <= kMonoPriorAlignInitialInlierRelErr) {
+            fit_indices.push_back(i);
+        }
+    }
+
+    stats.num_fit_anchors = static_cast<int64_t>(fit_indices.size());
+    if (stats.num_fit_anchors < std::max(2, min_sparse_anchors)) {
+        fit_indices.clear();
+        fit_indices.reserve(valid_anchors.size());
+        for (size_t i = 0; i < valid_anchors.size(); ++i) {
+            fit_indices.push_back(i);
+        }
+        stats.num_fit_anchors = stats.num_valid_anchors;
+    }
+
+    std::vector<float> fit_pred;
+    std::vector<float> fit_target;
+    fit_pred.reserve(fit_indices.size());
+    fit_target.reserve(fit_indices.size());
+    for (const size_t idx : fit_indices) {
+        fit_pred.push_back(valid_anchors[idx].pred_disp);
+        fit_target.push_back(valid_anchors[idx].target_disp);
+    }
+    if (!fitAffineScaleShiftWeighted1D(fit_pred, fit_target, nullptr, stats.scale, stats.shift)) {
+        return false;
+    }
+    if (!std::isfinite(stats.scale) || !std::isfinite(stats.shift)) {
+        return false;
+    }
+
+    std::vector<float> rel_errors;
+    rel_errors.reserve(valid_anchors.size());
+    int64_t final_inliers = 0;
+    for (const auto& anchor : valid_anchors) {
+        const float aligned_disp = anchor.pred_disp * stats.scale + stats.shift;
+        if (!std::isfinite(aligned_disp) || aligned_disp <= 1e-6f) {
+            continue;
+        }
+        const float aligned_z = 1.0f / aligned_disp;
+        const float rel_err =
+            std::abs(aligned_z - anchor.target_depth) /
+            std::max(anchor.target_depth, near_depth);
+        if (std::isfinite(rel_err)) {
+            rel_errors.push_back(rel_err);
+            if (rel_err <= kMonoPriorAlignFinalInlierRelErr) {
+                ++final_inliers;
+            }
+        }
+    }
+    if (rel_errors.size() < static_cast<size_t>(std::max(2, min_sparse_anchors))) {
+        return false;
+    }
+    stats.median_rel_depth_error = quantileVector(rel_errors, 0.50f);
+    stats.p90_rel_depth_error = quantileVector(rel_errors, 0.90f);
+    stats.final_inlier_ratio =
+        static_cast<float>(final_inliers) /
+        static_cast<float>(std::max<int64_t>(1, stats.num_valid_anchors));
+    stats.sparse_depth_q05 = quantileVector(sparse_depth_values, 0.05f);
+    stats.sparse_depth_q95 = quantileVector(sparse_depth_values, 0.95f);
+    if (!std::isfinite(stats.median_rel_depth_error) ||
+        !std::isfinite(stats.p90_rel_depth_error) ||
+        !std::isfinite(stats.final_inlier_ratio) ||
+        !std::isfinite(stats.sparse_depth_q05) ||
+        !std::isfinite(stats.sparse_depth_q95) ||
+        !(stats.sparse_depth_q95 > stats.sparse_depth_q05)) {
+        return false;
+    }
+
+    const int local_k = std::min<int>(
+        std::max(2, knn_k),
+        static_cast<int>(fit_indices.size()));
+    if (local_k < 2) {
+        return false;
+    }
+
+    cv::Mat anchor_mat(static_cast<int>(fit_indices.size()), 2, CV_32F);
+    std::vector<DaPriorAnchor> fit_anchors;
+    fit_anchors.reserve(fit_indices.size());
+    for (size_t i = 0; i < fit_indices.size(); ++i) {
+        const DaPriorAnchor& anchor = valid_anchors[fit_indices[i]];
+        fit_anchors.push_back(anchor);
+        anchor_mat.at<float>(static_cast<int>(i), 0) = anchor.x;
+        anchor_mat.at<float>(static_cast<int>(i), 1) = anchor.y;
+    }
+
+    torch::Tensor qmask;
+    if (query_mask.defined()) {
+        qmask = query_mask.detach().to(torch::kCPU).to(torch::kBool).contiguous();
+        if (qmask.dim() != 2 || qmask.size(0) != H || qmask.size(1) != W) {
+            return false;
+        }
+    }
+
+    torch::Tensor aligned =
+        torch::full({H, W}, std::numeric_limits<float>::quiet_NaN(),
+                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto aligned_acc = aligned.accessor<float, 2>();
+    auto mono_acc = mono.accessor<float, 2>();
+
+    auto pred_disp_at = [&](int y, int x, float& pred_disp) -> bool {
+        const float mono_value = mono_acc[y][x];
+        if (!std::isfinite(mono_value)) {
+            return false;
+        }
+        if (mono_prior_is_metric_depth) {
+            if (mono_value <= near_depth) {
+                return false;
+            }
+            pred_disp = 1.0f / mono_value;
+        } else {
+            if (mono_value <= 0.0f) {
+                return false;
+            }
+            pred_disp = mono_value;
+        }
+        return std::isfinite(pred_disp) && pred_disp > 0.0f;
+    };
+
+    std::vector<cv::Point> query_pixels;
+    query_pixels.reserve(query_mask.defined()
+                             ? static_cast<size_t>(std::max<int64_t>(1, qmask.sum().item<int64_t>()))
+                             : static_cast<size_t>(H) * static_cast<size_t>(W));
+    if (qmask.defined()) {
+        auto qmask_acc = qmask.accessor<bool, 2>();
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float pred_disp = 0.0f;
+                if (qmask_acc[y][x] && pred_disp_at(y, x, pred_disp)) {
+                    query_pixels.emplace_back(x, y);
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float pred_disp = 0.0f;
+                if (pred_disp_at(y, x, pred_disp)) {
+                    query_pixels.emplace_back(x, y);
+                }
+            }
+        }
+    }
+
+    if (query_pixels.empty()) {
+        return false;
+    }
+
+    cv::Mat query_mat(static_cast<int>(query_pixels.size()), 2, CV_32F);
+    for (size_t i = 0; i < query_pixels.size(); ++i) {
+        query_mat.at<float>(static_cast<int>(i), 0) = static_cast<float>(query_pixels[i].x);
+        query_mat.at<float>(static_cast<int>(i), 1) = static_cast<float>(query_pixels[i].y);
+    }
+
+    cv::flann::Index knn_index(anchor_mat, cv::flann::KDTreeIndexParams(4));
+    cv::Mat indices;
+    cv::Mat dists_sq;
+    knn_index.knnSearch(
+        query_mat,
+        indices,
+        dists_sq,
+        local_k,
+        cv::flann::SearchParams(32));
+
+    constexpr float kDirectAnchorDistPx = 1e-3f;
+    for (size_t qi = 0; qi < query_pixels.size(); ++qi) {
+        const int x = query_pixels[qi].x;
+        const int y = query_pixels[qi].y;
+        float query_pred_disp = 0.0f;
+        if (!pred_disp_at(y, x, query_pred_disp)) {
+            continue;
+        }
+
+        float direct_depth = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> local_pred;
+        std::vector<float> local_target;
+        std::vector<float> local_weights;
+        local_pred.reserve(static_cast<size_t>(local_k));
+        local_target.reserve(static_cast<size_t>(local_k));
+        local_weights.reserve(static_cast<size_t>(local_k));
+
+        double inv_dist_sum = 0.0;
+        for (int k = 0; k < local_k; ++k) {
+            const int anchor_idx = indices.at<int>(static_cast<int>(qi), k);
+            if (anchor_idx < 0 || anchor_idx >= static_cast<int>(fit_anchors.size())) {
+                continue;
+            }
+            const float dist =
+                std::sqrt(std::max(0.0f, dists_sq.at<float>(static_cast<int>(qi), k)));
+            if (max_pixel_dist > 0.0f && dist > max_pixel_dist) {
+                continue;
+            }
+            const DaPriorAnchor& anchor = fit_anchors[static_cast<size_t>(anchor_idx)];
+            if (dist <= kDirectAnchorDistPx) {
+                direct_depth = anchor.target_depth;
+                break;
+            }
+            const float inv_dist = 1.0f / std::max(dist, 1e-3f);
+            inv_dist_sum += inv_dist;
+            local_pred.push_back(anchor.pred_disp);
+            local_target.push_back(anchor.target_disp);
+            local_weights.push_back(inv_dist);
+        }
+
+        if (std::isfinite(direct_depth) && direct_depth > near_depth) {
+            aligned_acc[y][x] = direct_depth;
+            continue;
+        }
+
+        float local_scale = stats.scale;
+        float local_shift = stats.shift;
+        if (local_pred.size() >= 2) {
+            std::vector<float>* weights_ptr = nullptr;
+            if (distance_weighting && inv_dist_sum > 0.0) {
+                for (float& w : local_weights) {
+                    const float normalized = w / static_cast<float>(inv_dist_sum);
+                    w = normalized * normalized;
+                }
+                weights_ptr = &local_weights;
+            }
+            if (!fitAffineScaleShiftWeighted1D(
+                    local_pred,
+                    local_target,
+                    weights_ptr,
+                    local_scale,
+                    local_shift)) {
+                local_scale = stats.scale;
+                local_shift = stats.shift;
+            }
+        }
+
+        float aligned_disp = query_pred_disp * local_scale + local_shift;
+        if (!std::isfinite(aligned_disp) || aligned_disp <= 1e-6f) {
+            aligned_disp = query_pred_disp * stats.scale + stats.shift;
+        }
+        if (std::isfinite(aligned_disp) && aligned_disp > 1e-6f) {
+            const float z = 1.0f / aligned_disp;
+            if (std::isfinite(z) && z > near_depth) {
+                aligned_acc[y][x] = z;
+            }
+        }
+    }
+
+    for (const auto& anchor : fit_anchors) {
+        const int x = std::clamp(static_cast<int>(std::round(anchor.x)), 0, W - 1);
+        const int y = std::clamp(static_cast<int>(std::round(anchor.y)), 0, H - 1);
+        aligned_acc[y][x] = anchor.target_depth;
+    }
+
+    const int64_t aligned_count =
+        (torch::isfinite(aligned) & (aligned > near_depth)).sum().item<int64_t>();
+    if (aligned_count <= 0) {
+        return false;
+    }
+
+    aligned_depth = aligned.contiguous();
+    return true;
+}
+
+static bool alignMetricDepthPriorToRenderedDepth(
+    const torch::Tensor& mono_prior,
+    const torch::Tensor& rendered_depth,
+    const torch::Tensor& rendered_alpha,
+    const torch::Tensor& rendered_n_contrib,
+    float cam_near,
+    int min_rendered_anchors,
+    torch::Tensor& aligned_depth,
+    MonoPriorAlignmentStats& stats)
+{
+    aligned_depth = torch::Tensor();
+    stats = MonoPriorAlignmentStats();
+
+    if (!mono_prior.defined() || !rendered_depth.defined() ||
+        !rendered_alpha.defined() || !rendered_n_contrib.defined()) {
+        return false;
+    }
+
+    torch::Tensor mono =
+        mono_prior.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono.dim() == 3 && mono.size(0) == 1) {
+        mono = mono.squeeze(0);
+    }
+    torch::Tensor depth =
+        rendered_depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor alpha =
+        rendered_alpha.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor n_contrib =
+        rendered_n_contrib.detach().to(torch::kCPU).to(torch::kInt32).contiguous();
+    if (mono.dim() != 2 || depth.dim() != 2 || alpha.dim() != 2 ||
+        n_contrib.dim() != 2 ||
+        mono.sizes() != depth.sizes() ||
+        mono.sizes() != alpha.sizes() ||
+        mono.sizes() != n_contrib.sizes()) {
+        return false;
+    }
+
+    const float near_depth = std::max(1e-6f, cam_near);
+    torch::Tensor valid =
+        torch::isfinite(mono) &
+        torch::isfinite(depth) &
+        torch::isfinite(alpha) &
+        (mono > near_depth) &
+        (depth > near_depth) &
+        (alpha > 0.5f) &
+        (n_contrib > 0);
+    stats.num_valid_anchors = valid.sum().item<int64_t>();
+    if (stats.num_valid_anchors < std::max(2, min_rendered_anchors)) {
+        return false;
+    }
+
+    torch::Tensor Y = mono.masked_select(valid).contiguous();
+    torch::Tensor rendered_depth_valid = depth.masked_select(valid).contiguous();
+
+    torch::Tensor init_scale_candidates =
+        rendered_depth_valid / Y.clamp_min(near_depth);
+    init_scale_candidates = init_scale_candidates.masked_select(
+        torch::isfinite(init_scale_candidates) & (init_scale_candidates > 0.0f));
+    if (!init_scale_candidates.defined() ||
+        init_scale_candidates.numel() < std::max<int64_t>(2, min_rendered_anchors)) {
+        return false;
+    }
+    const float init_scale = init_scale_candidates.median().item<float>();
+    if (!std::isfinite(init_scale) || init_scale <= 0.0f) {
+        return false;
+    }
+
+    const torch::Tensor init_depth = Y * init_scale;
+    const torch::Tensor init_rel_err =
+        (init_depth - rendered_depth_valid).abs() /
+        rendered_depth_valid.clamp_min(near_depth);
+    torch::Tensor fit_mask =
+        torch::isfinite(init_rel_err) &
+        (init_rel_err <= kMonoPriorAlignInitialInlierRelErr);
+    stats.num_fit_anchors = fit_mask.sum().item<int64_t>();
+    if (stats.num_fit_anchors < std::max(2, min_rendered_anchors)) {
+        fit_mask = torch::ones_like(fit_mask, torch::TensorOptions().dtype(torch::kBool));
+        stats.num_fit_anchors = stats.num_valid_anchors;
+    }
+
+    const torch::Tensor Y_fit = Y.masked_select(fit_mask).contiguous();
+    const torch::Tensor depth_fit = rendered_depth_valid.masked_select(fit_mask).contiguous();
+    stats.shift = 0.0f;
+    if (!fitScale1D(Y_fit, depth_fit, stats.scale)) {
+        return false;
+    }
+
+    const torch::Tensor aligned_anchor_depth = Y * stats.scale;
+    torch::Tensor rel_err =
+        (aligned_anchor_depth - rendered_depth_valid).abs() /
+        rendered_depth_valid.clamp_min(near_depth);
+    rel_err = rel_err.masked_select(torch::isfinite(rel_err)).contiguous();
+    if (rel_err.numel() < std::max(2, min_rendered_anchors)) {
+        return false;
+    }
+
+    stats.median_rel_depth_error = rel_err.median().item<float>();
+    if (rel_err.numel() >= 10) {
+        stats.p90_rel_depth_error = torch::quantile(
+            rel_err,
+            torch::tensor(0.90f, torch::TensorOptions().dtype(torch::kFloat32)))
+            .item<float>();
+    } else {
+        stats.p90_rel_depth_error = rel_err.max().item<float>();
+    }
+    stats.final_inlier_ratio =
+        static_cast<float>((rel_err <= kMonoPriorAlignFinalInlierRelErr)
+                               .sum()
+                               .item<int64_t>()) /
+        static_cast<float>(stats.num_valid_anchors);
+    if (!std::isfinite(stats.median_rel_depth_error) ||
+        !std::isfinite(stats.p90_rel_depth_error) ||
+        !std::isfinite(stats.final_inlier_ratio)) {
+        return false;
+    }
+
+    if (!applyMetricDepthAlignment(mono, stats.scale, stats.shift, aligned_depth)) {
+        return false;
+    }
+
+    if (rendered_depth_valid.numel() >= 10) {
+        torch::Tensor q = torch::quantile(
+            rendered_depth_valid,
+            torch::tensor({0.05f, 0.95f}, torch::TensorOptions().dtype(torch::kFloat32)));
+        stats.sparse_depth_q05 = q[0].item<float>();
+        stats.sparse_depth_q95 = q[1].item<float>();
+    } else {
+        stats.sparse_depth_q05 = rendered_depth_valid.min().item<float>();
+        stats.sparse_depth_q95 = rendered_depth_valid.max().item<float>();
+    }
+
+    return aligned_depth.defined() &&
+           aligned_depth.dim() == 2 &&
+           std::isfinite(stats.sparse_depth_q05) &&
+           std::isfinite(stats.sparse_depth_q95) &&
+           stats.sparse_depth_q95 > stats.sparse_depth_q05;
 }
 
 static void saveDepthComparisonDebugPngs(
@@ -5058,19 +6528,6 @@ static void saveDepthComparisonDebugPngs(
         viz_max);
 
     std::filesystem::create_directories(rendered_path.parent_path());
-    if (used_alignment) {
-        const cv::Mat pred_depth_meters_raw = depthTensorToCvMatFloat(pred_depth);
-        const cv::Mat pred_bgr_raw = colorizeDepthMatJet(
-            pred_depth_meters_raw,
-            valid_min_depth,
-            valid_max_depth,
-            viz_min,
-            viz_max);
-        const std::filesystem::path raw_path =
-            rendered_path.parent_path() /
-            (rendered_path.stem().string() + "_raw" + rendered_path.extension().string());
-        cv::imwrite(raw_path.string(), pred_bgr_raw);
-    }
     cv::imwrite(rendered_path.string(), pred_bgr);
 
     if (gt_depth_meters.empty()) {
@@ -5377,90 +6834,6 @@ static bool buildSparseDepthFromKeyframeOrbAnchors(
     return true;
 }
 
-static int64_t buildOrbSupportMaskFromKeyframeAnchors(
-    const std::shared_ptr<VoxelKeyframe>& kf,
-    int image_width,
-    int image_height,
-    int radius_px,
-    float near_depth,
-    float max_depth,
-    std::vector<uint8_t>& support_mask,
-    int64_t& support_anchors)
-{
-    support_anchors = 0;
-    support_mask.assign(
-        static_cast<size_t>(std::max(0, image_width)) *
-            static_cast<size_t>(std::max(0, image_height)),
-        0);
-    if (!kf || image_width <= 0 || image_height <= 0) {
-        return 0;
-    }
-
-    const size_t n_pix = kf->kps_pixel_.size() / 2;
-    const size_t n_xyz = kf->kps_point_local_.size() / 3;
-    const size_t N = std::min(n_pix, n_xyz);
-    if (N == 0) {
-        return 0;
-    }
-
-    const float sx =
-        (kf->image_width_ > 0)
-            ? (static_cast<float>(image_width) / static_cast<float>(kf->image_width_))
-            : 1.0f;
-    const float sy =
-        (kf->image_height_ > 0)
-            ? (static_cast<float>(image_height) / static_cast<float>(kf->image_height_))
-            : 1.0f;
-    const int radius = std::max(0, radius_px);
-    const int radius_sq = radius * radius;
-    const float near_z = std::max(1e-6f, near_depth);
-    const bool has_max_depth = std::isfinite(max_depth) && max_depth > near_z;
-
-    int64_t support_pixels = 0;
-    for (size_t i = 0; i < N; ++i) {
-        const float u_f = kf->kps_pixel_[2 * i + 0] * sx;
-        const float v_f = kf->kps_pixel_[2 * i + 1] * sy;
-        const float z = kf->kps_point_local_[3 * i + 2];
-        if (!std::isfinite(u_f) || !std::isfinite(v_f) ||
-            !std::isfinite(z) || z <= near_z ||
-            (has_max_depth && z >= max_depth)) {
-            continue;
-        }
-
-        const int u0 = static_cast<int>(std::lround(u_f));
-        const int v0 = static_cast<int>(std::lround(v_f));
-        if (u0 < 0 || u0 >= image_width || v0 < 0 || v0 >= image_height) {
-            continue;
-        }
-
-        ++support_anchors;
-        for (int dy = -radius; dy <= radius; ++dy) {
-            const int y = v0 + dy;
-            if (y < 0 || y >= image_height) {
-                continue;
-            }
-            for (int dx = -radius; dx <= radius; ++dx) {
-                const int x = u0 + dx;
-                if (x < 0 || x >= image_width) {
-                    continue;
-                }
-                if (dx * dx + dy * dy > radius_sq) {
-                    continue;
-                }
-                const size_t idx =
-                    static_cast<size_t>(y) * static_cast<size_t>(image_width) +
-                    static_cast<size_t>(x);
-                if (support_mask[idx] == 0) {
-                    support_mask[idx] = 1;
-                    ++support_pixels;
-                }
-            }
-        }
-    }
-
-    return support_pixels;
-}
-
 static bool getKeyframeDepthMetersForEval(
     const std::shared_ptr<VoxelKeyframe>& pkf,
     int expected_h,
@@ -5499,15 +6872,16 @@ static bool getKeyframeDepthMetersForEval(
     return true;
 }
 
-bool VoxelMapper::ensureDepthAnythingv2ForKeyframe(
+bool VoxelMapper::ensureMonoPriorForKeyframe(
     const std::shared_ptr<VoxelKeyframe>& kf)
 {
+    const char* log_prefix = monoPriorLogPrefix(mono_prior_model_id_);
     if (!kf || !kf->original_image_.defined()) {
         return false;
     }
-    if (kf->depthanythingv2_.defined() && kf->depthanythingv2_.numel() > 0) {
-        if (kf->depthanythingv2_prepare_iter_ < 0) {
-            kf->depthanythingv2_prepare_iter_ = getIteration();
+    if (kf->mono_prior_.defined() && kf->mono_prior_.numel() > 0) {
+        if (kf->mono_prior_prepare_iter_ < 0) {
+            kf->mono_prior_prepare_iter_ = getIteration();
         }
         return true;
     }
@@ -5518,7 +6892,7 @@ bool VoxelMapper::ensureDepthAnythingv2ForKeyframe(
         if (!py_load_or_infer) {
             py_load_or_infer =
                 py::module_::import("scripts_voxel.python_svraster_bridge.mono_prior_helper")
-                    .attr("load_or_infer_depthanythingv2");
+                    .attr("load_or_infer_mono_prior");
         }
 
         const std::filesystem::path depth_root =
@@ -5533,8 +6907,9 @@ bool VoxelMapper::ensureDepthAnythingv2ForKeyframe(
             py::cast(image_cpu),
             py::str(depth_root.string()),
             py::str(cache_key),
-            py::str(depthanythingv2_model_id_),
-            py::bool_(false));
+            py::str(mono_prior_model_id_),
+            py::bool_(true),
+            py::float_(kf->intr_.empty() ? 0.0f : static_cast<double>(kf->intr_[0])));
 
         torch::Tensor depth = py_depth.cast<torch::Tensor>()
                                   .detach()
@@ -5545,23 +6920,238 @@ bool VoxelMapper::ensureDepthAnythingv2ForKeyframe(
             depth = depth.squeeze(0);
         }
         if (depth.dim() != 2) {
-            std::cerr << "[DepthAnythingV2] Unexpected prior shape for keyframe "
+            std::cerr << log_prefix << " Unexpected prior shape for keyframe "
                       << kf->fid_ << ": " << depth.sizes() << std::endl;
             return false;
         }
 
-        kf->depthanythingv2_ = depth;
-        kf->depthanythingv2_prepare_iter_ = getIteration();
+        kf->mono_prior_ = depth;
+        kf->mono_prior_prepare_iter_ = getIteration();
         return true;
     } catch (const py::error_already_set& e) {
-        std::cerr << "[DepthAnythingV2] Python exception while preparing prior for keyframe "
+        std::cerr << log_prefix << " Python exception while preparing prior for keyframe "
                   << kf->fid_ << ":\n" << e.what() << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "[DepthAnythingV2] Failed to prepare prior for keyframe "
+        std::cerr << log_prefix << " Failed to prepare prior for keyframe "
                   << kf->fid_ << ": " << e.what() << std::endl;
     }
 
     return false;
+}
+
+bool VoxelMapper::buildAlignedMonoPriorDepthForKeyframe(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const sv::MiniCam& cam,
+    int image_width,
+    int image_height,
+    torch::Tensor& aligned_depth)
+{
+    torch::NoGradGuard no_grad;
+    aligned_depth = torch::Tensor();
+
+    if (!kf || image_width <= 0 || image_height <= 0) {
+        return false;
+    }
+    if (!ensureMonoPriorForKeyframe(kf) ||
+        !kf->mono_prior_.defined() ||
+        kf->mono_prior_.numel() == 0) {
+        return false;
+    }
+
+    torch::Tensor mono_prior =
+        kf->mono_prior_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono_prior.dim() == 3 && mono_prior.size(0) == 1) {
+        mono_prior = mono_prior.squeeze(0);
+    }
+    if (mono_prior.dim() != 2) {
+        return false;
+    }
+    if (mono_prior.size(0) != image_height || mono_prior.size(1) != image_width) {
+        mono_prior = torch::nn::functional::interpolate(
+            mono_prior.unsqueeze(0).unsqueeze(0),
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{image_height, image_width})
+                .mode(torch::kBilinear)
+                .align_corners(false)).squeeze().to(torch::kCPU).contiguous();
+    }
+
+    if (depthanything_densify_alignment_mode_ == "da_prior" &&
+        kf->mono_prior_aligned_depth_cache_.defined() &&
+        kf->mono_prior_aligned_depth_cache_mode_ == "da_prior" &&
+        kf->mono_prior_aligned_depth_cache_.dim() == 2 &&
+        kf->mono_prior_aligned_depth_cache_.size(0) == image_height &&
+        kf->mono_prior_aligned_depth_cache_.size(1) == image_width) {
+        aligned_depth = kf->mono_prior_aligned_depth_cache_.detach()
+                            .to(torch::kCPU)
+                            .to(torch::kFloat32)
+                            .contiguous();
+        return true;
+    }
+
+    const bool use_metric3d = isMetric3DModelId(mono_prior_model_id_);
+    torch::Tensor sparse_uv;
+    torch::Tensor sparse_depth;
+    MonoPriorAlignmentStats stats;
+    if (buildSparseDepthFromKeyframeOrbAnchors(
+            kf,
+            image_width,
+            image_height,
+            sparse_uv,
+            sparse_depth) &&
+        (((depthanything_densify_alignment_mode_ == "da_prior") &&
+          alignMonoPriorToSparseAnchorsDaPrior(
+              mono_prior,
+              sparse_uv,
+              sparse_depth,
+              torch::Tensor(),
+              use_metric3d,
+              cam.near,
+              depthanything_densify_min_sparse_anchors_,
+              depthanything_da_prior_knn_k_,
+              depthanything_da_prior_distance_weighting_,
+              depthanything_da_prior_max_pixel_dist_,
+              aligned_depth,
+              stats)) ||
+         (use_metric3d &&
+          alignMetricDepthPriorToSparseAnchors(
+              mono_prior,
+              sparse_uv,
+              sparse_depth,
+              cam.near,
+              depthanything_densify_min_sparse_anchors_,
+              aligned_depth,
+              stats)) ||
+         (!use_metric3d &&
+          alignDepthAnythingPriorToSparseAnchors(
+              mono_prior,
+              sparse_uv,
+              sparse_depth,
+              cam.near,
+              depthanything_densify_min_sparse_anchors_,
+              aligned_depth,
+              stats)))) {
+        if (depthanything_densify_alignment_mode_ == "da_prior") {
+            kf->mono_prior_aligned_depth_cache_ =
+                aligned_depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+            kf->mono_prior_aligned_depth_cache_mode_ = "da_prior";
+            kf->mono_prior_aligned_depth_cache_iter_ = getIteration();
+        }
+        return aligned_depth.defined() && aligned_depth.dim() == 2;
+    }
+
+    if (depthanything_global_alignment_valid_ &&
+        ((use_metric3d &&
+          applyMetricDepthAlignment(
+              mono_prior,
+              depthanything_global_align_scale_,
+              depthanything_global_align_shift_,
+              aligned_depth)) ||
+         (!use_metric3d &&
+          applyDepthAnythingAffineAlignment(
+              mono_prior,
+              depthanything_global_align_scale_,
+              depthanything_global_align_shift_,
+              aligned_depth)))) {
+        return aligned_depth.defined() && aligned_depth.dim() == 2;
+    }
+
+    return false;
+}
+
+bool VoxelMapper::depthAnythingFillHolesWarmupReady()
+{
+    return !depthanything_fill_holes_warmup_ ||
+           depthanything_fill_holes_warmup_iter_ <= 0 ||
+           getIteration() >= depthanything_fill_holes_warmup_iter_;
+}
+
+void VoxelMapper::queueDepthAnythingFillHolesKeyframe(
+    const std::shared_ptr<VoxelKeyframe>& pkf)
+{
+    if (!pkf || pkf->mono_prior_first_apply_iter_ >= 0) {
+        return;
+    }
+    if (depthanything_fill_holes_pending_kfids_.insert(pkf->fid_).second) {
+        depthanything_fill_holes_pending_kfs_.push_back(pkf);
+    }
+}
+
+void VoxelMapper::applyDepthAnythingFillHolesKeyframes(
+    const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes,
+    bool seed_global_alignment)
+{
+    if (!depthanything_fill_holes_ || sensor_type_ != MONOCULAR || keyframes.empty()) {
+        return;
+    }
+
+    if (seed_global_alignment) {
+        for (const auto& pkf : keyframes) {
+            if (pkf && pkf->mono_prior_first_apply_iter_ < 0) {
+                updateMonoPriorGlobalAlignmentFromKeyframe(pkf);
+            }
+        }
+    }
+
+    for (const auto& pkf : keyframes) {
+        if (!pkf || pkf->mono_prior_first_apply_iter_ >= 0) {
+            continue;
+        }
+        const std::shared_ptr<VoxelKeyframe> scene_kf = scene_ ? scene_->getKeyframe(pkf->fid_) : nullptr;
+        if (scene_kf && scene_kf.get() == pkf.get()) {
+            increasePcdByKeyframeMonoPriorFillHoles(pkf);
+        }
+    }
+}
+
+void VoxelMapper::processDepthAnythingFillHolesWarmup()
+{
+    if (!depthanything_fill_holes_ ||
+        !depthanything_fill_holes_warmup_ ||
+        depthanything_fill_holes_warmup_flushed_ ||
+        !depthAnythingFillHolesWarmupReady()) {
+        return;
+    }
+
+    std::vector<std::shared_ptr<VoxelKeyframe>> pending;
+    pending.reserve(depthanything_fill_holes_pending_kfs_.size());
+    for (const auto& weak_pkf : depthanything_fill_holes_pending_kfs_) {
+        std::shared_ptr<VoxelKeyframe> pkf = weak_pkf.lock();
+        if (!pkf || pkf->mono_prior_first_apply_iter_ >= 0) {
+            continue;
+        }
+        const std::shared_ptr<VoxelKeyframe> scene_kf = scene_ ? scene_->getKeyframe(pkf->fid_) : nullptr;
+        if (scene_kf && scene_kf.get() == pkf.get()) {
+            pending.push_back(pkf);
+        }
+    }
+
+    depthanything_fill_holes_pending_kfs_.clear();
+    depthanything_fill_holes_pending_kfids_.clear();
+    depthanything_fill_holes_warmup_flushed_ = true;
+
+    applyDepthAnythingFillHolesKeyframes(
+        pending,
+        /*seed_global_alignment=*/true);
+}
+
+void VoxelMapper::scheduleDepthAnythingFillHoles(
+    const std::shared_ptr<VoxelKeyframe>& pkf)
+{
+    if (!depthanything_fill_holes_ || !pkf || pkf->mono_prior_first_apply_iter_ >= 0) {
+        return;
+    }
+
+    if (!depthAnythingFillHolesWarmupReady()) {
+        queueDepthAnythingFillHolesKeyframe(pkf);
+        return;
+    }
+
+    processDepthAnythingFillHolesWarmup();
+    if (pkf->mono_prior_first_apply_iter_ < 0) {
+        applyDepthAnythingFillHolesKeyframes(
+            std::vector<std::shared_ptr<VoxelKeyframe>>{pkf},
+            /*seed_global_alignment=*/false);
+    }
 }
 
 bool VoxelMapper::buildSparseDepthFromMapPoints(
@@ -5735,7 +7325,7 @@ torch::Tensor VoxelMapper::computeSparseDepthLoss_Points(
     return depth_loss;
 }
 
-torch::Tensor VoxelMapper::computeDepthAnythingv2Loss(
+torch::Tensor VoxelMapper::computeMonoPriorDepthLoss(
     const std::shared_ptr<VoxelKeyframe>& kf,
     const sv::MiniCam& cam,
     const std::unordered_map<std::string, torch::Tensor>& render_pkg,
@@ -5769,26 +7359,193 @@ torch::Tensor VoxelMapper::computeDepthAnythingv2Loss(
         return zero;
     }
 
-    if (!ensureDepthAnythingv2ForKeyframe(kf) ||
-        !kf->depthanythingv2_.defined() ||
-        kf->depthanythingv2_.numel() == 0) {
+    if (!ensureMonoPriorForKeyframe(kf) ||
+        !kf->mono_prior_.defined() ||
+        kf->mono_prior_.numel() == 0) {
         return zero;
     }
 
-    torch::Tensor raw_T = it_T->second.to(mDevice);
-    torch::Tensor raw_depth = it_depth->second.to(mDevice);
+    torch::Tensor raw_T = it_T->second.to(mDevice, torch::kFloat32).contiguous();
+    torch::Tensor raw_depth = it_depth->second.to(mDevice, torch::kFloat32).contiguous();
     torch::Tensor mono_depth =
-        kf->depthanythingv2_.to(mDevice, torch::kFloat32).contiguous();
+        kf->mono_prior_.to(mDevice, torch::kFloat32).contiguous();
 
+    if (mono_prior_loss_mode_ == "geosvr") {
+        loss_utils::DepthAnythingv2UncertaintyLoss geosvr_loss(
+            opt_params_.depthanythingv2_from_,
+            opt_params_.depthanythingv2_end_,
+            opt_params_.depthanythingv2_end_mult_,
+            opt_params_.depthanythingv2_overall_,
+            opt_params_.depthanythingv2_alpha_adjust_);
+        if (!geosvr_loss.isActive(iteration)) {
+            return zero;
+        }
+
+        torch::Tensor level_weight;
+        if (opt_params_.enable_da2_uncertainty_ &&
+            iteration >= opt_params_.level_uncertainty_from_) {
+            auto it_feat = render_pkg.find("raw_feat");
+            if (it_feat == render_pkg.end() || !it_feat->second.defined() ||
+                it_feat->second.numel() == 0) {
+                it_feat = render_pkg.find("feat");
+            }
+            auto it_level_T = render_pkg.find("raw_T");
+            if (it_level_T == render_pkg.end() || !it_level_T->second.defined()) {
+                it_level_T = render_pkg.find("T");
+            }
+
+            if (it_feat != render_pkg.end() && it_level_T != render_pkg.end() &&
+                it_feat->second.defined() && it_feat->second.numel() > 0 &&
+                it_level_T->second.defined() && it_level_T->second.numel() > 0 &&
+                !torch::isnan(it_feat->second).any().item<bool>()) {
+                using namespace torch::indexing;
+
+                torch::Tensor feat = it_feat->second.to(mDevice, torch::kFloat32).contiguous();
+                torch::Tensor T_for_level =
+                    it_level_T->second.to(mDevice, torch::kFloat32).contiguous();
+
+                if (feat.dim() == 4 && feat.size(0) == 1) {
+                    feat = feat.squeeze(0);
+                }
+                if (T_for_level.dim() == 4 && T_for_level.size(0) == 1) {
+                    T_for_level = T_for_level.squeeze(0);
+                }
+                if (T_for_level.dim() == 3 && T_for_level.size(0) >= 1) {
+                    T_for_level = T_for_level.index({0});
+                }
+                if (feat.dim() == 3 && feat.size(0) >= 1 && T_for_level.dim() == 2) {
+                    torch::Tensor level_map =
+                        (feat / (1.0f - T_for_level).clamp_min(0.1f)).squeeze().detach();
+                    if (level_map.dim() == 2 &&
+                        (level_map.size(0) != raw_depth.size(-2) ||
+                         level_map.size(1) != raw_depth.size(-1))) {
+                        level_map = torch::nn::functional::interpolate(
+                            level_map.unsqueeze(0).unsqueeze(0),
+                            torch::nn::functional::InterpolateFuncOptions()
+                                .size(std::vector<int64_t>{raw_depth.size(-2), raw_depth.size(-1)})
+                                .mode(torch::kNearest)).squeeze();
+                    }
+                    if (level_map.dim() == 2) {
+                        torch::Tensor level_min = level_map.min();
+                        torch::Tensor level_weight_2d =
+                            (level_map.max() - level_min) /
+                            (level_map - level_min).clamp_min(1.0f);
+                        level_weight =
+                            level_weight_2d.unsqueeze(0).pow(opt_params_.power_level_uncertainty_);
+                    }
+                }
+            }
+        }
+
+        if (kf->mono_prior_first_depth_loss_iter_ < 0) {
+            kf->mono_prior_first_depth_loss_iter_ = iteration;
+        }
+        return geosvr_loss(
+            raw_T,
+            raw_depth,
+            mono_depth,
+            cam.near,
+            iteration,
+            sampleGeoSvrPatchSize(),
+            level_weight);
+    }
+
+    if (mono_prior_loss_mode_ == "aligned") {
+        using namespace torch::indexing;
+
+        torch::Tensor depth = raw_depth;
+        if (depth.dim() == 4 && depth.size(0) == 1) {
+            depth = depth.squeeze(0);
+        }
+        if (depth.dim() == 2) {
+            depth = depth.unsqueeze(0);
+        }
+        if (depth.dim() != 3 || depth.size(0) < 1) {
+            return zero;
+        }
+
+        torch::Tensor T = raw_T;
+        if (T.dim() == 4 && T.size(0) == 1) {
+            T = T.squeeze(0);
+        }
+        if (T.dim() == 3 && T.size(0) >= 1) {
+            T = T.index({0});
+        }
+        if (T.dim() != 2) {
+            return zero;
+        }
+
+        const int H = static_cast<int>(depth.size(1));
+        const int W = static_cast<int>(depth.size(2));
+        torch::Tensor aligned_depth_cpu;
+        if (!buildAlignedMonoPriorDepthForKeyframe(kf, cam, W, H, aligned_depth_cpu)) {
+            return zero;
+        }
+
+        torch::Tensor target_depth =
+            aligned_depth_cpu.to(mDevice, torch::kFloat32).contiguous();
+        if (target_depth.dim() != 2) {
+            return zero;
+        }
+        if (target_depth.size(0) != H || target_depth.size(1) != W) {
+            target_depth = torch::nn::functional::interpolate(
+                target_depth.unsqueeze(0).unsqueeze(0),
+                torch::nn::functional::InterpolateFuncOptions()
+                    .size(std::vector<int64_t>{H, W})
+                    .mode(torch::kBilinear)
+                    .align_corners(false)).squeeze();
+        }
+
+        const float near_depth = std::max(1e-6f, cam.near);
+        torch::Tensor alpha = (1.0f - T).clamp(0.0f, 1.0f);
+        torch::Tensor render_depth = depth.index({0}) / alpha.clamp_min(1e-4f);
+        torch::Tensor valid =
+            torch::isfinite(render_depth) &
+            torch::isfinite(target_depth) &
+            (render_depth > near_depth) &
+            (target_depth > near_depth) &
+            (alpha > 0.5f);
+        if (!valid.any().item<bool>()) {
+            return zero;
+        }
+
+        torch::Tensor inv_render =
+            (1.0f / render_depth.clamp_min(near_depth)).masked_select(valid);
+        torch::Tensor inv_target =
+            (1.0f / target_depth.clamp_min(near_depth)).masked_select(valid);
+        torch::Tensor loss = (inv_render - inv_target).abs().mean();
+        if (kf->mono_prior_first_depth_loss_iter_ < 0) {
+            kf->mono_prior_first_depth_loss_iter_ = iteration;
+        }
+
+        if (opt_params_.depthanythingv2_end_ <= opt_params_.depthanythingv2_from_ ||
+            opt_params_.depthanythingv2_end_mult_ == 1.0f) {
+            return loss;
+        }
+
+        const float ratio = std::clamp(
+            static_cast<float>(iteration - opt_params_.depthanythingv2_from_) /
+                static_cast<float>(opt_params_.depthanythingv2_end_ -
+                                   opt_params_.depthanythingv2_from_),
+            0.0f,
+            1.0f);
+        const float mult = std::pow(opt_params_.depthanythingv2_end_mult_, ratio);
+        return loss * mult;
+    }
+
+    if (kf->mono_prior_first_depth_loss_iter_ < 0) {
+        kf->mono_prior_first_depth_loss_iter_ = iteration;
+    }
     return depthanything_loss(raw_T, raw_depth, mono_depth, cam.near, iteration);
 }
 
-torch::Tensor VoxelMapper::computeDepthAnythingv2NormalLoss(
+torch::Tensor VoxelMapper::computeMonoPriorNormalLoss(
     const std::shared_ptr<VoxelKeyframe>& kf,
     const sv::MiniCam& cam,
     const std::unordered_map<std::string, torch::Tensor>& render_pkg,
     int iteration)
 {
+    const bool use_geosvr_normal = (mono_prior_normal_mode_ == "geosvr");
     auto zero = torch::zeros(
         {1},
         torch::TensorOptions().dtype(torch::kFloat32).device(mDevice));
@@ -5817,16 +7574,16 @@ torch::Tensor VoxelMapper::computeDepthAnythingv2NormalLoss(
         return zero;
     }
 
-    if (!ensureDepthAnythingv2ForKeyframe(kf) ||
-        !kf->depthanythingv2_.defined() ||
-        kf->depthanythingv2_.numel() == 0) {
+    if (!ensureMonoPriorForKeyframe(kf) ||
+        !kf->mono_prior_.defined() ||
+        kf->mono_prior_.numel() == 0) {
         return zero;
     }
 
     torch::Tensor raw_T = it_T->second.to(mDevice, torch::kFloat32).contiguous();
     torch::Tensor raw_depth = it_depth->second.to(mDevice, torch::kFloat32).contiguous();
     torch::Tensor raw_normal = it_normal->second.to(mDevice, torch::kFloat32).contiguous();
-    torch::Tensor mono_depth = kf->depthanythingv2_.to(mDevice, torch::kFloat32).contiguous();
+    torch::Tensor mono_depth = kf->mono_prior_.to(mDevice, torch::kFloat32).contiguous();
 
     if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) {
         raw_depth = raw_depth.squeeze(0);
@@ -5874,64 +7631,83 @@ torch::Tensor VoxelMapper::computeDepthAnythingv2NormalLoss(
         return zero;
     }
 
-    torch::Tensor invdepth = 1.0f / raw_depth.unsqueeze(1).clamp_min(std::max(1e-6f, cam.near));
-    const int64_t ref_idx = std::min<int64_t>(2, invdepth.size(0) - 1);
-    torch::Tensor Xref = invdepth.index({ref_idx}).unsqueeze(0);
-    torch::Tensor alpha = 1.0f - raw_T.index({0}).unsqueeze(0).unsqueeze(0);
-
-    if (Y.sizes().slice(2) != Xref.sizes().slice(2)) {
-        Y = torch::nn::functional::interpolate(
-            Y,
-            torch::nn::functional::InterpolateFuncOptions()
-                .size(std::vector<int64_t>{Xref.size(2), Xref.size(3)})
-                .mode(torch::kBilinear)
-                .align_corners(false));
+    torch::Tensor alpha = 1.0f - raw_T.index({0});
+    if (alpha.dim() == 2) {
+        alpha = alpha.unsqueeze(0);
+    }
+    if (alpha.dim() != 3) {
+        return zero;
+    }
+    if (alpha.size(0) > 1) {
+        alpha = alpha.index({torch::indexing::Slice(0, 1)}).contiguous();
     }
 
-    torch::Tensor target_inv;
     torch::Tensor target_normal;
     {
         torch::NoGradGuard no_grad;
-        const torch::Tensor Ymed = Y.median();
-        const torch::Tensor Ys = (Y - Ymed).abs().mean().clamp_min(1e-6f);
-        const torch::Tensor Xmed = Xref.median();
-        const torch::Tensor Xs = (Xref - Xmed).abs().mean().clamp_min(1e-6f);
-        target_inv = (Y - Ymed) * (Xs / Ys) + Xmed;
-        torch::Tensor target_depth = 1.0f / target_inv.clamp_min(std::max(1e-6f, cam.near));
+        torch::Tensor target_depth;
+        if (!use_geosvr_normal) {
+            if (!buildAlignedMonoPriorDepthForKeyframe(
+                    kf,
+                    cam,
+                    static_cast<int>(raw_normal.size(2)),
+                    static_cast<int>(raw_normal.size(1)),
+                    target_depth) ||
+                !target_depth.defined() || target_depth.dim() != 2) {
+                return zero;
+            }
+            const float tol_cos = std::cos(
+                opt_params_.n_dmean_tol_deg_ * static_cast<float>(M_PI) / 180.0f);
+            target_normal = depth2normalSVRaster(
+                cam,
+                target_depth.to(mDevice, torch::kFloat32).contiguous(),
+                opt_params_.n_dmean_ks_,
+                tol_cos);
+        } else {
+            torch::Tensor mono = Y;
+            if (mono.sizes().slice(2) != raw_normal.sizes().slice(1)) {
+                mono = torch::nn::functional::interpolate(
+                    mono,
+                    torch::nn::functional::InterpolateFuncOptions()
+                        .size(std::vector<int64_t>{raw_normal.size(1), raw_normal.size(2)})
+                        .mode(torch::kBilinear)
+                        .align_corners(false));
+            }
 
-        constexpr float kPi = 3.14159265358979323846f;
-        const float tol_cos = std::cos(opt_params_.n_dmean_tol_deg_ * kPi / 180.0f);
-        target_normal = depth2normalSVRaster(
-            cam,
-            target_depth.squeeze(0).squeeze(0),
-            opt_params_.n_dmean_ks_,
-            tol_cos);
+            if (isMetric3DModelId(mono_prior_model_id_)) {
+                target_depth = mono.squeeze(0).squeeze(0).clamp_min(std::max(1e-6f, cam.near));
+            } else {
+                target_depth = (1.0f / mono.clamp_min(1e-3f)).squeeze(0).squeeze(0);
+            }
+
+            target_normal = depth2normalSVRaster(
+                cam,
+                target_depth,
+                3,
+                -1.0f);
+        }
     }
 
-    torch::Tensor render_normal = torch::nn::functional::normalize(
-        raw_normal,
-        torch::nn::functional::NormalizeFuncOptions().dim(0).eps(1e-12));
+    torch::Tensor render_normal = raw_normal;
 
-    torch::Tensor valid_mask =
-        (target_inv > 0.01f) &
-        (alpha > 0.5f) &
-        torch::isfinite(target_normal).all(0).unsqueeze(0).unsqueeze(0) &
-        (target_normal != 0).any(0).unsqueeze(0).unsqueeze(0);
-    torch::Tensor render_valid =
-        torch::isfinite(render_normal).all(0).unsqueeze(0).unsqueeze(0) &
-        (raw_normal.square().sum(0).sqrt() > 1e-6f).unsqueeze(0).unsqueeze(0);
-    valid_mask = valid_mask & render_valid;
-
-    if (!valid_mask.any().item<bool>()) {
+    torch::Tensor mask =
+        (target_normal != 0).any(0).unsqueeze(0).repeat({3, 1, 1}) &
+        (alpha > 0.8f).repeat({3, 1, 1});
+    mask = mask.to(render_normal.dtype());
+    if (!mask.any().item<bool>()) {
         return zero;
     }
 
-    torch::Tensor alpha_hw = alpha.squeeze(0).squeeze(0);
-    torch::Tensor mask_hw = valid_mask.squeeze(0).squeeze(0).to(render_normal.dtype());
     torch::Tensor dot =
         (render_normal * target_normal).sum(0).clamp(-1.0f, 1.0f);
-    torch::Tensor loss_map = (1.0f - dot) * mask_hw * alpha_hw;
-    torch::Tensor loss = loss_map.mean();
+    torch::Tensor loss_map = (1.0f - dot) * mask;
+    torch::Tensor loss_map_abs =
+        (render_normal - target_normal).abs().sum(0) * mask;
+    torch::Tensor loss = loss_map.mean() + loss_map_abs.mean();
+
+    if (use_geosvr_normal) {
+        return loss;
+    }
 
     if (opt_params_.depthanythingv2_normal_end_ <= opt_params_.depthanythingv2_normal_from_ ||
         opt_params_.depthanythingv2_normal_end_mult_ == 1.0f) {
@@ -6768,7 +8544,7 @@ void VoxelMapper::trainForOneIteration()
         (opt_params_.lambda_depthanythingv2_ > 0.0f) &&
         (iter >= opt_params_.depthanythingv2_from_) &&
         (iter <= opt_params_.depthanythingv2_end_);
-    const bool need_depthanythingv2_normal =
+    const bool need_mono_prior_normal =
         (opt_params_.lambda_depthanythingv2_normal_ > 0.0f) &&
         (iter >= opt_params_.depthanythingv2_normal_from_) &&
         (iter <= opt_params_.depthanythingv2_normal_end_);
@@ -6780,10 +8556,10 @@ void VoxelMapper::trainForOneIteration()
         (iter <= opt_params_.n_dmean_end_);
     ropts.output_T =
         need_T_concen || need_T_inside || need_sparse_depth || need_normal_dmean ||
-        need_depthanythingv2 || need_depthanythingv2_normal;
+        need_depthanythingv2 || need_mono_prior_normal;
     ropts.output_depth = need_sparse_depth || need_normal_dmean || need_depthanythingv2 ||
-                         need_depthanythingv2_normal;
-    ropts.output_normal = need_normal_dmean || need_depthanythingv2_normal;
+                         need_mono_prior_normal;
+    ropts.output_normal = need_normal_dmean || need_mono_prior_normal;
 
     // if (opt_params_.lambda_T_inside_ > 0.0f) {
     //     ropts.output_T = true;
@@ -6793,9 +8569,35 @@ void VoxelMapper::trainForOneIteration()
         ropts.lambda_dist = opt_params_.lambda_dist_;
     }
 
+    if (iter >= opt_params_.rectifiy_from_ &&
+        opt_params_.lambda_rectify_ > 0.0f) {
+        ropts.lambda_ascending = -opt_params_.lambda_rectify_;
+    } else if (iter >= opt_params_.ascending_from_ &&
+               opt_params_.lambda_ascending_ > 0.0f) {
+        ropts.lambda_ascending = opt_params_.lambda_ascending_;
+    }
+
+    if (iter > opt_params_.scaling_penalty_from_ &&
+        iter <= opt_params_.scaling_penalty_end_ &&
+        opt_params_.lambda_scaling_penalty_ > 0.0f) {
+        auto vox_size = voxel_model_->voxSize();
+        if (vox_size.defined() && vox_size.numel() > 0) {
+            ropts.lambda_scaling_penalty = opt_params_.lambda_scaling_penalty_;
+            ropts.min_voxel_size =
+                vox_size.to(torch::kFloat32).min().item<float>();
+        }
+    }
+
     if (opt_params_.lambda_R_concen_ > 0.0f) {
         ropts.lambda_R_concen = opt_params_.lambda_R_concen_;
         ropts.gt_color = gt_image;
+    }
+
+    if (mono_prior_loss_mode_ == "geosvr" &&
+        need_depthanythingv2 &&
+        opt_params_.enable_da2_uncertainty_ &&
+        iter >= opt_params_.level_uncertainty_from_) {
+        ropts.vox_feats = voxel_model_->octLevel().detach().to(torch::kFloat32).contiguous();
     }
 
     // ) build a MiniCam out of this keyframe
@@ -6902,7 +8704,7 @@ void VoxelMapper::trainForOneIteration()
         loss = loss + opt_params_.lambda_sparse_depth_ * depth_loss;
     }
     if (need_depthanythingv2) {
-        torch::Tensor dense_depth_loss = computeDepthAnythingv2Loss(
+        torch::Tensor dense_depth_loss = computeMonoPriorDepthLoss(
             viewpoint_cam,
             cam,
             render_pkg,
@@ -6914,8 +8716,8 @@ void VoxelMapper::trainForOneIteration()
         dbg_depthanything_on  = true;
         loss = loss + opt_params_.lambda_depthanythingv2_ * dense_depth_loss;
     }
-    if (need_depthanythingv2_normal) {
-        torch::Tensor dense_normal_loss = computeDepthAnythingv2NormalLoss(
+    if (need_mono_prior_normal) {
+        torch::Tensor dense_normal_loss = computeMonoPriorNormalLoss(
             viewpoint_cam,
             cam,
             render_pkg,
@@ -6999,9 +8801,6 @@ void VoxelMapper::trainForOneIteration()
     torch::Tensor debug_pruned_centers; // [K_prune,3]
     torch::Tensor debug_pruned_sizes;   // [K_prune,1] or [K_prune]
     bool debug_has_pruned = false;
-    torch::Tensor debug_hole_fill_pruned_centers; // [K_hole_prune,3]
-    torch::Tensor debug_hole_fill_pruned_sizes;   // [K_hole_prune,1] or [K_hole_prune]
-    bool debug_has_hole_fill_pruned = false;
     torch::Tensor debug_far_pruned_centers; // [K_far,3]
     torch::Tensor debug_far_pruned_sizes;   // [K_far,1] or [K_far]
     bool debug_has_far_pruned = false;
@@ -7228,45 +9027,8 @@ void VoxelMapper::trainForOneIteration()
                     (prune_mask_base_artificial_raw & (~rendered_depth_candidate_young_protect))
                         .to(torch::kBool);
 
-                // Surface-aware keep mask:
-                // Keep threshold-candidate voxels if they have enough multi-view support OR
-                // if their sampling-scale relation suggests they still represent meaningful surface detail.
-                auto keep_surface_real = torch::zeros(
-                    {N},
-                    torch::TensorOptions().dtype(torch::kBool).device(max_w_1d.device()));
-                auto keep_surface_artificial = torch::zeros(
-                    {N},
-                    torch::TensorOptions().dtype(torch::kBool).device(max_w_1d.device()));
-
-                if (opt_params_.prune_surface_keep_enable_) {
-                    auto view_cnt_1d = flatten_colvec(stat.view_cnt).to(max_w_1d.device()).to(torch::kFloat32).contiguous();
-                    if (opt_params_.prune_surface_keep_use_view_ && view_cnt_1d.numel() == N) {
-                        keep_surface_real =
-                            (view_cnt_1d >= static_cast<float>(std::max(1, opt_params_.prune_recent_min_views_real_)))
-                                .to(torch::kBool);
-                        keep_surface_artificial =
-                            (view_cnt_1d >= static_cast<float>(std::max(1, opt_params_.prune_recent_min_views_artificial_)))
-                                .to(torch::kBool);
-                    }
-
-                    auto min_itv_1d = flatten_colvec(stat.min_samp_interval)
-                        .to(max_w_1d.device()).to(torch::kFloat32).contiguous();
-                    if (opt_params_.prune_surface_keep_use_size_ &&
-                        vox_size_1d.defined() && vox_size_1d.numel() == N &&
-                        min_itv_1d.numel() == N) {
-                        auto size_support =
-                            ((vox_size_1d * 0.5f) >
-                             (min_itv_1d * static_cast<float>(opt_params_.subdivide_samp_thres_)))
-                                .to(torch::kBool);
-                        keep_surface_real = (keep_surface_real | size_support).to(torch::kBool);
-                        keep_surface_artificial = (keep_surface_artificial | size_support).to(torch::kBool);
-                    }
-                }
-
-                auto prune_mask_base_real =
-                    (prune_mask_base_real_raw & (~keep_surface_real)).to(torch::kBool);
-                auto prune_mask_base_artificial =
-                    (prune_mask_base_artificial_raw & (~keep_surface_artificial)).to(torch::kBool);
+                auto prune_mask_base_real = prune_mask_base_real_raw.to(torch::kBool);
+                auto prune_mask_base_artificial = prune_mask_base_artificial_raw.to(torch::kBool);
                 auto prune_mask_base_real_at_target =
                     (prune_mask_base_real & in_target_size_mask).to(torch::kBool);
                 auto prune_mask_base_artificial_at_target =
@@ -7603,9 +9365,6 @@ void VoxelMapper::trainForOneIteration()
                     ? prune_mask_base_artificial.sum().item<int64_t>() : 0;
                 int64_t n_prune_base_real_cand = prune_mask_base_real_raw.defined()
                     ? prune_mask_base_real_raw.sum().item<int64_t>() : 0;
-                int64_t n_prune_base_real_surface_kept =
-                    (prune_mask_base_real_raw.to(torch::kBool) &
-                     (~prune_mask_base_real.to(torch::kBool))).sum().item<int64_t>();
                 int64_t n_prune_real_outside_dense_core = 0;
                 int64_t n_prune_gslam_real = 0;
                 int64_t n_prune_gslam_artificial = 0;
@@ -7633,25 +9392,25 @@ void VoxelMapper::trainForOneIteration()
                     if (opt_params_.prune_far_voxels_) {
                         bool refreshed_dense_core = false;
                         if (opt_params_.prune_recompute_dense_core_) {
-                            std::cout << "[dense_core/refresh][prune] begin\n";
+                            // std::cout << "[dense_core/refresh][prune] begin\n";
                             refreshed_dense_core =
                                 voxel_model_->refreshDenseCoreBBFromCurrentVoxels();
-                            std::cout << "[dense_core/refresh][prune] done has_bb="
-                                      << (voxel_model_->hasDenseCoreBB() ? 1 : 0)
-                                      << " updated=" << (refreshed_dense_core ? 1 : 0) << "\n";
+                            // std::cout << "[dense_core/refresh][prune] done has_bb="
+                            //           << (voxel_model_->hasDenseCoreBB() ? 1 : 0)
+                            //           << " updated=" << (refreshed_dense_core ? 1 : 0) << "\n";
                             if (!voxel_model_->hasDenseCoreBB()) {
                                 use_far_prune_this_round = false;
-                                std::cout << "[PRUNE/far] dense-core refresh unavailable; skipping real_far pruning this round.\n";
+                                // std::cout << "[PRUNE/far] dense-core refresh unavailable; skipping real_far pruning this round.\n";
                             } else if (!refreshed_dense_core) {
-                                std::cout << "[PRUNE/far] dense-core refresh failed; using last available dense-core bbox.\n";
+                                // std::cout << "[PRUNE/far] dense-core refresh failed; using last available dense-core bbox.\n";
                             }
                         } else {
-                            std::cout << "[dense_core/refresh][prune] skipped (reuse cached bbox)\n";
+                            // std::cout << "[dense_core/refresh][prune] skipped (reuse cached bbox)\n";
                             if (!voxel_model_->hasDenseCoreBB()) {
                                 use_far_prune_this_round = false;
-                                std::cout << "[PRUNE/far] cached dense-core bbox unavailable; skipping real_far pruning this round.\n";
+                                // std::cout << "[PRUNE/far] cached dense-core bbox unavailable; skipping real_far pruning this round.\n";
                             } else {
-                                std::cout << "[PRUNE/far] using cached dense-core bbox (no recompute).\n";
+                                // std::cout << "[PRUNE/far] using cached dense-core bbox (no recompute).\n";
                             }
                         }
                         if (enable_rerun_ && !rerun_final_only_ && voxel_model_->hasDenseCoreBB()) {
@@ -7885,67 +9644,6 @@ void VoxelMapper::trainForOneIteration()
                     }
                 }
 
-                int64_t n_prune_hole_fill_real_protected = 0;
-                if (rendered_hole_fill_insert_as_real_protected_ && N > 0) {
-                    auto source_kind = voxel_model_->renderedDepthCandidateSourceKind();
-                    if (source_kind.defined()) {
-                        source_kind = flatten_colvec(
-                            source_kind.to(prune_mask.device()).to(torch::kInt32));
-                        if (source_kind.numel() == N) {
-                            auto hole_fill_real_protect_mask =
-                                ((source_kind == kRenderedCandidateSourceHoleFill) &
-                                 real_mask_for_base.to(prune_mask.device()).to(torch::kBool))
-                                    .to(torch::kBool);
-                            n_prune_hole_fill_real_protected =
-                                hole_fill_real_protect_mask.sum().item<int64_t>();
-                            if (n_prune_hole_fill_real_protected > 0) {
-                                auto keep_mask = (~hole_fill_real_protect_mask).to(torch::kBool);
-                                prune_mask_base_real =
-                                    (prune_mask_base_real.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_base_artificial =
-                                    (prune_mask_base_artificial.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_base_real_at_target =
-                                    (prune_mask_base_real_at_target.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_base_artificial_at_target =
-                                    (prune_mask_base_artificial_at_target.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_base_real_at_target_extra =
-                                    (prune_mask_base_real_at_target_extra.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_base_artificial_at_target_extra =
-                                    (prune_mask_base_artificial_at_target_extra.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                prune_mask_default =
-                                    (prune_mask_default.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                if (prune_mask_near.defined() && prune_mask_near.numel() == N) {
-                                    prune_mask_near =
-                                        (prune_mask_near.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                }
-                                if (prune_mask_real_outside_dense_core.defined() &&
-                                    prune_mask_real_outside_dense_core.numel() == N) {
-                                    prune_mask_real_outside_dense_core =
-                                        (prune_mask_real_outside_dense_core.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                }
-                                if (prune_mask_gslam_real.defined() && prune_mask_gslam_real.numel() == N) {
-                                    prune_mask_gslam_real =
-                                        (prune_mask_gslam_real.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                }
-                                if (prune_mask_gslam_artificial.defined() &&
-                                    prune_mask_gslam_artificial.numel() == N) {
-                                    prune_mask_gslam_artificial =
-                                        (prune_mask_gslam_artificial.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                }
-                                if (prune_mask_gslam_unstable.defined() &&
-                                    prune_mask_gslam_unstable.numel() == N) {
-                                    prune_mask_gslam_unstable =
-                                        (prune_mask_gslam_unstable.to(torch::kBool) & keep_mask).to(torch::kBool);
-                                }
-                                prune_mask = (prune_mask_default.to(torch::kBool) |
-                                              prune_mask_near.to(torch::kBool) |
-                                              prune_mask_real_outside_dense_core.to(torch::kBool) |
-                                              prune_mask_gslam_unstable.to(torch::kBool)).to(torch::kBool);
-                            }
-                        }
-                    }
-                }
-
                 n_prune_base_real = prune_mask_base_real.defined()
                     ? prune_mask_base_real.sum().item<int64_t>() : 0;
                 n_prune_base_artificial = prune_mask_base_artificial.defined()
@@ -7985,7 +9683,6 @@ void VoxelMapper::trainForOneIteration()
                           << " vox_at_target=" << n_real_at_target_total
                           << " vox_above_target=" << n_real_above_target_total
                           << " by_thres_cand=" << n_prune_base_real_cand
-                          << " by_surface_keep=" << n_prune_base_real_surface_kept
                           << " by_thres_pre_gates=" << n_prune_base_real_pre_gates
                           << " by_thres_at_target_pre_gates=" << n_prune_base_real_at_target_pre_gates
                           << " by_thres_above_target_pre_gates=" << n_prune_base_real_above_target_pre_gates
@@ -7998,7 +9695,6 @@ void VoxelMapper::trainForOneIteration()
                           << " near_front=" << n_prune_near_front
                           << " near_geom=" << n_prune_near_geom
                           << " real_far=" << n_prune_real_outside_dense_core
-                          << " hole_fill_protected=" << n_prune_hole_fill_real_protected
                           << " kf_age_blocked=" << n_prune_blocked_kf_age
                           << " cooldown_recent=" << n_real_recent_cooldown
                           << "\n";
@@ -8017,7 +9713,6 @@ void VoxelMapper::trainForOneIteration()
                           << "\n";
 
                 // Save final pruned voxels (all criteria merged) for rerun visualization.
-                debug_has_hole_fill_pruned = false;
                 if (prune_mask.defined() && prune_mask.numel() == N) {
                     auto prune_idx = prune_mask.to(torch::kBool).nonzero().squeeze(1); // [K]
                     if (prune_idx.numel() > 0) {
@@ -8033,32 +9728,6 @@ void VoxelMapper::trainForOneIteration()
                             debug_pruned_centers = centers_world.index({prune_idx}).clone();
                             debug_pruned_sizes   = sizes_world.index({prune_idx}).clone();
                             debug_has_pruned     = true;
-
-                            auto source_kind_world = voxel_model_->renderedDepthCandidateSourceKind();
-                            if (source_kind_world.defined()) {
-                                if (source_kind_world.dim() == 2 && source_kind_world.size(1) == 1) {
-                                    source_kind_world = source_kind_world.squeeze(1);
-                                }
-                                source_kind_world = source_kind_world
-                                    .to(prune_mask.device())
-                                    .to(torch::kInt32)
-                                    .contiguous()
-                                    .view({-1});
-                                if (source_kind_world.numel() == N) {
-                                    auto hole_fill_pruned_mask =
-                                        (prune_mask.to(torch::kBool) &
-                                         (source_kind_world == static_cast<int32_t>(kRenderedCandidateSourceHoleFill)))
-                                            .to(torch::kBool);
-                                    auto hole_fill_pruned_idx = hole_fill_pruned_mask.nonzero().squeeze(1);
-                                    if (hole_fill_pruned_idx.numel() > 0) {
-                                        debug_hole_fill_pruned_centers =
-                                            centers_world.index({hole_fill_pruned_idx}).clone();
-                                        debug_hole_fill_pruned_sizes =
-                                            sizes_world.index({hole_fill_pruned_idx}).clone();
-                                        debug_has_hole_fill_pruned = true;
-                                    }
-                                }
-                            }
 
                             // Save far-only pruned voxels for a dedicated rerun topic.
                             debug_has_far_pruned = false;
@@ -8078,17 +9747,14 @@ void VoxelMapper::trainForOneIteration()
                             }
                         } else {
                             debug_has_pruned = false;
-                            debug_has_hole_fill_pruned = false;
                             debug_has_far_pruned = false;
                         }
                     } else {
                         debug_has_pruned = false;
-                        debug_has_hole_fill_pruned = false;
                         debug_has_far_pruned = false;
                     }
                 } else {
                     debug_has_pruned = false;
-                    debug_has_hole_fill_pruned = false;
                     debug_has_far_pruned = false;
                 }
 
@@ -8618,6 +10284,7 @@ void VoxelMapper::trainForOneIteration()
         // Keep artificials/all synchronized with final topology state of this iteration.
         // increasePcd() logs artificial topics at insertion time (pre-adapt); this call
         // rewrites artificials/all after prune/subdivide so it matches /voxels.
+        voxel_model_->logLiveOrbVoxels(iter);
         voxel_model_->logFinalartificialVoxels(iter);
         voxel_model_->logFinalPromotedartificialVoxels(iter);
 
@@ -8718,40 +10385,7 @@ void VoxelMapper::trainForOneIteration()
             "world/voxels_tsdf"   // <-- separate entity path
         );
         }
-        // ----- 4) RENDERED-HOLE-FILL PRUNED VOXELS -----
-        if (debug_has_hole_fill_pruned &&
-            debug_hole_fill_pruned_centers.defined() &&
-            debug_hole_fill_pruned_centers.numel() > 0 &&
-            rerun_rendered_hole_fill_)
-        {
-            auto centers_hole_fill_pruned = debug_hole_fill_pruned_centers; // [K_hole_prune,3]
-            auto sizes_hole_fill_pruned   = debug_hole_fill_pruned_sizes;   // [K_hole_prune,1] or [K_hole_prune]
-
-            if (sizes_hole_fill_pruned.dim() == 1) {
-                sizes_hole_fill_pruned = sizes_hole_fill_pruned.view({sizes_hole_fill_pruned.size(0), 1});
-            } else if (sizes_hole_fill_pruned.dim() == 2 && sizes_hole_fill_pruned.size(1) == 1) {
-                // ok
-            } else {
-                sizes_hole_fill_pruned = sizes_hole_fill_pruned.reshape({sizes_hole_fill_pruned.size(0), 1});
-            }
-
-            auto Khp = centers_hole_fill_pruned.size(0);
-            torch::Tensor colors_hole_fill_pruned =
-                torch::zeros({Khp, 4}, centers_hole_fill_pruned.options());
-            colors_hole_fill_pruned.index_put_({torch::indexing::Slice(), 0}, 1.0f);
-            colors_hole_fill_pruned.index_put_({torch::indexing::Slice(), 1}, 0.2f);
-            colors_hole_fill_pruned.index_put_({torch::indexing::Slice(), 2}, 0.6f);
-            colors_hole_fill_pruned.index_put_({torch::indexing::Slice(), 3}, 0.85f);
-
-            sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                centers_hole_fill_pruned,
-                sizes_hole_fill_pruned,
-                colors_hole_fill_pruned,
-                iter,
-                "world/rendered_hole_fill/pruned");
-        }
-
-        // ----- 5) FINAL-PRUNED VOXELS (debug overlay) -----
+        // ----- 4) FINAL-PRUNED VOXELS (debug overlay) -----
         if (debug_has_pruned &&
             debug_pruned_centers.defined() &&
             debug_pruned_centers.numel() > 0)
@@ -8838,8 +10472,9 @@ void VoxelMapper::trainForOneIteration()
                 .visualizeNvbloxPlyMesh(ply_path, iter);
         }
         catch (const std::exception& e) {
-            std::cerr << "[TSDF/RERUN] exception in incremental TSDF mesh viz: "
-                      << e.what() << "\n";
+            (void)e;
+            // std::cerr << "[TSDF/RERUN] exception in incremental TSDF mesh viz: "
+            //           << e.what() << "\n";
         }
     }
 
@@ -8959,81 +10594,6 @@ void VoxelMapper::trainForOneIteration()
 
 void VoxelMapper::combineMappingOperations()
 {
-    auto run_post_increase_pcd_hole_fill =
-        [&](const std::vector<std::shared_ptr<VoxelKeyframe>>& new_kfs, int iter) {
-            if (!rendered_hole_fill_ || new_kfs.empty()) {
-                return;
-            }
-
-            auto sort_by_fid = [](std::vector<std::shared_ptr<VoxelKeyframe>>* kfs) {
-                std::sort(
-                    kfs->begin(),
-                    kfs->end(),
-                    [](const std::shared_ptr<VoxelKeyframe>& a,
-                       const std::shared_ptr<VoxelKeyframe>& b) {
-                        if (!a) return false;
-                        if (!b) return true;
-                        return a->fid_ < b->fid_;
-                    });
-            };
-
-            int64_t processed_existing_kfs = 0;
-            if (!rendered_hole_fill_bootstrap_done_) {
-                std::unordered_set<unsigned long> new_kf_ids;
-                new_kf_ids.reserve(new_kfs.size());
-                for (const auto& new_kf : new_kfs) {
-                    if (new_kf) {
-                        new_kf_ids.insert(new_kf->fid_);
-                    }
-                }
-
-                std::vector<std::shared_ptr<VoxelKeyframe>> existing_kfs;
-                existing_kfs.reserve(scene_->keyframes().size());
-                for (const auto& kv : scene_->keyframes()) {
-                    const auto& scene_kf = kv.second;
-                    if (!scene_kf) {
-                        continue;
-                    }
-                    if (new_kf_ids.count(scene_kf->fid_) != 0) {
-                        continue;
-                    }
-                    existing_kfs.push_back(scene_kf);
-                }
-                sort_by_fid(&existing_kfs);
-
-                for (const auto& existing_kf : existing_kfs) {
-                    increasePcdByKeyframeRenderedHoleFill(existing_kf);
-                    ++processed_existing_kfs;
-                }
-
-                rendered_hole_fill_bootstrap_done_ = true;
-                // std::cout << "[rendered_hole_fill/bootstrap] iter="
-                //           << iter
-                //           << " processed_existing_keyframes="
-                //           << processed_existing_kfs
-                //           << std::endl;
-            }
-
-            auto ordered_new_kfs = new_kfs;
-            sort_by_fid(&ordered_new_kfs);
-
-            int64_t processed_new_kfs = 0;
-            for (const auto& new_kf : ordered_new_kfs) {
-                if (!new_kf) {
-                    continue;
-                }
-                increasePcdByKeyframeRenderedHoleFill(new_kf);
-                ++processed_new_kfs;
-            }
-            if (processed_new_kfs > 0) {
-                // std::cout << "[rendered_hole_fill/post_increasePcd] iter="
-                //           << iter
-                //           << " processed_new_keyframes="
-                //           << processed_new_kfs
-                //           << std::endl;
-            }
-        };
-
     // Get Mapping Operations
     while (mpSLAM->getAtlas()->hasMappingOperation()) {
         ORB_SLAM3::MappingOperation opr =
@@ -9043,7 +10603,6 @@ void VoxelMapper::combineMappingOperations()
         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
         {
         bool kf_changed = false;
-            std::vector<std::shared_ptr<VoxelKeyframe>> rendered_hole_fill_new_kfs;
             // std::cout << "[Gaussian Mapper]Local BA Detected."
             //           << std::endl;
             // Get new keyframes
@@ -9070,9 +10629,6 @@ void VoxelMapper::combineMappingOperations()
                 // std::cout << "no pkf" << std::endl;
                 handleNewKeyframe(kf);                   // still void
                 pkf = scene_->getKeyframe(kfid);
-                if (rendered_hole_fill_ && pkf) {
-                    rendered_hole_fill_new_kfs.push_back(pkf);
-                }
                 if (pkf) {
                     // Its original_image_ is Float32 RGB in [0..1], shape (3,H,W)
                     torch::Tensor chw = pkf->original_image_.detach().cpu().clamp(0,1);
@@ -9096,7 +10652,6 @@ void VoxelMapper::combineMappingOperations()
 
             // Add new points to the model
             const int iter = getIteration();
-            bool inserted_orb_points = false;
             if (initial_mapped_ && points.size() >= 30) {
                 torch::NoGradGuard no_grad;
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
@@ -9117,12 +10672,22 @@ void VoxelMapper::combineMappingOperations()
                     }
                 }
                 if (points.size() >= 30) {
+                    if (enable_rerun_ && !rerun_final_only_) {
+                        appendAndLogOrbRawPointBatchToRerun(
+                            points,
+                            colors,
+                            iter);
+                        voxel_model_->setNextRealInsertionRerunEntityPath(
+                            "world/orb/voxels_created");
+                    }
                     voxel_model_->increasePcd(
                         points,
                         colors,
                         getIteration(),
                         tr_cams);
-                    inserted_orb_points = true;
+                    if (enable_rerun_ && !rerun_final_only_) {
+                        voxel_model_->setNextRealInsertionRerunEntityPath("");
+                    }
                     if (voxel_model_ && voxel_model_->consumeartificialFillFlag()) {
                         last_artificial_fill_iter_ = static_cast<int64_t>(iter);
                         std::cout << "[VoxelMapper] artificial fill happened at iter "
@@ -9139,10 +10704,6 @@ void VoxelMapper::combineMappingOperations()
                 //                             opt_params_.lr_decay_ckpt_,
                 //                             opt_params_.lr_decay_mult_);
                 // voxel_model_->schedulerLoadStateDict(sched_state);
-            }
-
-            if (inserted_orb_points && !rendered_hole_fill_new_kfs.empty()) {
-                run_post_increase_pcd_hole_fill(rendered_hole_fill_new_kfs, iter);
             }
 
             // // Only try to grow if model was initialized and we have any new points
@@ -9216,7 +10777,6 @@ void VoxelMapper::combineMappingOperations()
                     << std::endl;
 
             bool kf_changed = false;
-            std::vector<std::shared_ptr<VoxelKeyframe>> rendered_hole_fill_new_kfs;
             // Get the loop keyframe scale modification factor
             float loop_kf_scale = opr.mfScale;
 
@@ -9300,9 +10860,6 @@ void VoxelMapper::combineMappingOperations()
                     //  std::cout << "no pkf again" << std::endl;
                      handleNewKeyframe(kf);
                      pkf = scene_->getKeyframe(kfid);
-                     if (rendered_hole_fill_ && pkf) {
-                         rendered_hole_fill_new_kfs.push_back(pkf);
-                     }
                  }
              }
             //  if (record_loop_ply_)
@@ -9316,7 +10873,6 @@ void VoxelMapper::combineMappingOperations()
 
              // Add new points to the model
              const int iter = getIteration();
-             bool inserted_orb_points = false;
              if (initial_mapped_ && points.size() >= 30) {
                 std::cout << "adds new points" << std::endl;
                 extendAABB_with_flat_xyz(aabb_min_, aabb_max_, points);  // points = std::vector<float>
@@ -9336,12 +10892,22 @@ void VoxelMapper::combineMappingOperations()
                     }
                 }
                 if (points.size() >= 30) {
+                    if (enable_rerun_ && !rerun_final_only_) {
+                        appendAndLogOrbRawPointBatchToRerun(
+                            points,
+                            colors,
+                            iter);
+                        voxel_model_->setNextRealInsertionRerunEntityPath(
+                            "world/orb/voxels_created");
+                    }
                     voxel_model_->increasePcd(
                         points,
                         colors,
                         iter,
                         tr_cams);
-                    inserted_orb_points = true;
+                    if (enable_rerun_ && !rerun_final_only_) {
+                        voxel_model_->setNextRealInsertionRerunEntityPath("");
+                    }
                     if (voxel_model_ && voxel_model_->consumeartificialFillFlag()) {
                         last_artificial_fill_iter_ = static_cast<int64_t>(iter);
                         std::cout << "[VoxelMapper] artificial fill happened at iter "
@@ -9350,10 +10916,6 @@ void VoxelMapper::combineMappingOperations()
                 }
              }
 
-             if (inserted_orb_points && !rendered_hole_fill_new_kfs.empty()) {
-                run_post_increase_pcd_hole_fill(rendered_hole_fill_new_kfs, iter);
-             }
- 
             // Mark this iteration
             loop_closure_iteration_ = true;
             // if (kf_changed) {
@@ -9598,9 +11160,9 @@ void VoxelMapper::handleNewKeyframe(
     if (isdoingInactiveGeoDensify())
         increasePcdByKeyframeInactiveGeoDensify(pkf);
     if (depthanything_densify_)
-        increasePcdByKeyframeDepthAnything(pkf);
+        increasePcdByKeyframeMonoPrior(pkf);
     if (depthanything_fill_holes_)
-        increasePcdByKeyframeDepthAnythingFillHoles(pkf);
+        scheduleDepthAnythingFillHoles(pkf);
     if (rendered_depth_insert_)
         increasePcdByKeyframeRenderedDepthInsertion(pkf);
 
@@ -9679,11 +11241,13 @@ void VoxelMapper::handleNewKeyframe(
             );
         }
     } catch (const c10::Error& e) {
-        std::cerr << "[RERUN] Torch error in visualizeCamera: "
-                  << e.msg() << std::endl;
+        (void)e;
+        // std::cerr << "[RERUN] Torch error in visualizeCamera: "
+        //           << e.msg() << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "[RERUN] Exception in visualizeCamera: "
-                  << e.what() << std::endl;
+        (void)e;
+        // std::cerr << "[RERUN] Exception in visualizeCamera: "
+        //           << e.what() << std::endl;
     }
 
     // // ─── nvblox: integrate this new keyframe into TSDF ───
@@ -10186,7 +11750,139 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
     //           << completion_time << " ms" << std::endl;
 }
 
-void VoxelMapper::increasePcdByKeyframeDepthAnything(
+void VoxelMapper::accumulateMonoPriorGlobalAlignment(
+    float scale,
+    float shift,
+    float weight)
+{
+    if (!std::isfinite(scale) || !std::isfinite(shift) || scale <= 0.0f) {
+        return;
+    }
+
+    weight = std::max(1.0f, weight);
+    if (!depthanything_global_alignment_valid_ ||
+        !std::isfinite(depthanything_global_align_scale_) ||
+        !std::isfinite(depthanything_global_align_shift_) ||
+        depthanything_global_align_weight_ <= 0.0f) {
+        depthanything_global_align_scale_ = scale;
+        depthanything_global_align_shift_ = shift;
+        depthanything_global_align_weight_ = weight;
+        depthanything_global_align_observations_ = 1;
+        depthanything_global_alignment_valid_ = true;
+        return;
+    }
+
+    const float old_weight = depthanything_global_align_weight_;
+    const float new_weight = old_weight + weight;
+    depthanything_global_align_scale_ =
+        (depthanything_global_align_scale_ * old_weight + scale * weight) / new_weight;
+    depthanything_global_align_shift_ =
+        (depthanything_global_align_shift_ * old_weight + shift * weight) / new_weight;
+    depthanything_global_align_weight_ = new_weight;
+    ++depthanything_global_align_observations_;
+}
+
+bool VoxelMapper::updateMonoPriorGlobalAlignmentFromKeyframe(
+    const std::shared_ptr<VoxelKeyframe>& pkf)
+{
+    torch::NoGradGuard no_grad;
+
+    if (!pkf || sensor_type_ != MONOCULAR) {
+        return false;
+    }
+
+    const int H = pkf->image_height_;
+    const int W = pkf->image_width_;
+    if (H <= 0 || W <= 0) {
+        return false;
+    }
+    if (!ensureMonoPriorForKeyframe(pkf) ||
+        !pkf->mono_prior_.defined() ||
+        pkf->mono_prior_.numel() == 0) {
+        return false;
+    }
+
+    torch::Tensor mono_prior =
+        pkf->mono_prior_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (mono_prior.dim() == 3 && mono_prior.size(0) == 1) {
+        mono_prior = mono_prior.squeeze(0);
+    }
+    if (mono_prior.dim() != 2) {
+        return false;
+    }
+    if (mono_prior.size(0) != H || mono_prior.size(1) != W) {
+        mono_prior = torch::nn::functional::interpolate(
+            mono_prior.unsqueeze(0).unsqueeze(0),
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{H, W})
+                .mode(torch::kBilinear)
+                .align_corners(false)).squeeze().to(torch::kCPU).contiguous();
+    }
+
+    torch::Tensor sparse_uv;
+    torch::Tensor sparse_depth;
+    if (!buildSparseDepthFromKeyframeOrbAnchors(pkf, W, H, sparse_uv, sparse_depth)) {
+        // std::cout << "[mono_prior_align/global_seed] iter=" << getIteration()
+        //           << " kf=" << pkf->fid_
+        //           << " no valid ORB anchors"
+        //           << std::endl;
+        return false;
+    }
+
+    sv::MiniCam cam = pkf->toMiniCam(H, W);
+    const bool use_metric3d = isMetric3DModelId(mono_prior_model_id_);
+    torch::Tensor aligned_depth;
+    MonoPriorAlignmentStats stats;
+    const bool aligned_ok = use_metric3d
+        ? alignMetricDepthPriorToSparseAnchors(
+              mono_prior,
+              sparse_uv,
+              sparse_depth,
+              cam.near,
+              depthanything_densify_min_sparse_anchors_,
+              aligned_depth,
+              stats)
+        : alignDepthAnythingPriorToSparseAnchors(
+              mono_prior,
+              sparse_uv,
+              sparse_depth,
+              cam.near,
+              depthanything_densify_min_sparse_anchors_,
+              aligned_depth,
+              stats);
+    if (!aligned_ok) {
+        // std::cout << "[mono_prior_align/global_seed] iter=" << getIteration()
+        //           << " kf=" << pkf->fid_
+        //           << " failed num_valid_anchors=" << stats.num_valid_anchors
+        //           << " fit_anchors=" << stats.num_fit_anchors
+        //           << " scale=" << stats.scale
+        //           << " shift=" << stats.shift
+        //           << " med_rel_err=" << stats.median_rel_depth_error
+        //           << " p90_rel_err=" << stats.p90_rel_depth_error
+        //           << " inlier_ratio=" << stats.final_inlier_ratio
+        //           << std::endl;
+        return false;
+    }
+
+    accumulateMonoPriorGlobalAlignment(
+        stats.scale,
+        stats.shift,
+        static_cast<float>(std::max<int64_t>(1, stats.num_fit_anchors)));
+    // std::cout << "[mono_prior_align/global_seed] iter=" << getIteration()
+    //           << " kf=" << pkf->fid_
+    //           << " accepted scale=" << stats.scale
+    //           << " shift=" << stats.shift
+    //           << " med_rel_err=" << stats.median_rel_depth_error
+    //           << " p90_rel_err=" << stats.p90_rel_depth_error
+    //           << " inlier_ratio=" << stats.final_inlier_ratio
+    //           << " global_scale=" << depthanything_global_align_scale_
+    //           << " global_shift=" << depthanything_global_align_shift_
+    //           << " global_obs=" << depthanything_global_align_observations_
+    //           << std::endl;
+    return true;
+}
+
+void VoxelMapper::increasePcdByKeyframeMonoPrior(
     std::shared_ptr<VoxelKeyframe> pkf)
 {
     torch::NoGradGuard no_grad;
@@ -10208,9 +11904,9 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
         return;
     }
 
-    if (!ensureDepthAnythingv2ForKeyframe(pkf) ||
-        !pkf->depthanythingv2_.defined() ||
-        pkf->depthanythingv2_.numel() == 0) {
+    if (!ensureMonoPriorForKeyframe(pkf) ||
+        !pkf->mono_prior_.defined() ||
+        pkf->mono_prior_.numel() == 0) {
         updateRenderedDepthCandidateLifecycle();
         return;
     }
@@ -10241,15 +11937,15 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
         *mean_out = finite.mean().item<float>();
     };
 
-    torch::Tensor mono_prior = pkf->depthanythingv2_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor mono_prior = pkf->mono_prior_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
     if (mono_prior.dim() == 3 && mono_prior.size(0) == 1) {
         mono_prior = mono_prior.squeeze(0);
     }
     if (mono_prior.dim() != 2) {
-        std::cout << "[depthanything_densify/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " invalid prior shape=" << mono_prior.sizes()
-                  << std::endl;
+        // std::cout << "[mono_prior_densify/start] iter=" << iter
+        //           << " kf=" << pkf->fid_
+        //           << " invalid prior shape=" << mono_prior.sizes()
+        //           << std::endl;
         updateRenderedDepthCandidateLifecycle();
         return;
     }
@@ -10262,40 +11958,179 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
                 .align_corners(false)).squeeze().to(torch::kCPU).contiguous();
     }
 
+    const bool use_metric3d = isMetric3DModelId(mono_prior_model_id_);
+    torch::Tensor da_prior_query_mask;
+    if (depthanything_densify_alignment_mode_ == "da_prior") {
+        da_prior_query_mask = torch::zeros(
+            {H, W},
+            torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+        auto qmask_acc = da_prior_query_mask.accessor<bool, 2>();
+        const int stride = std::max(1, depthanything_densify_stride_);
+        for (int y = 0; y < H; y += stride) {
+            for (int x = 0; x < W; x += stride) {
+                qmask_acc[y][x] = true;
+            }
+        }
+    }
     torch::Tensor sparse_uv;
     torch::Tensor sparse_depth;
-    if (!buildSparseDepthFromKeyframeOrbAnchors(pkf, W, H, sparse_uv, sparse_depth)) {
-        std::cout << "[depthanything_densify/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " no valid ORB anchors"
-                  << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
     torch::Tensor aligned_depth;
-    int64_t num_valid_anchors = 0;
-    float sparse_depth_q05 = std::numeric_limits<float>::quiet_NaN();
-    float sparse_depth_q95 = std::numeric_limits<float>::quiet_NaN();
-    if (!alignDepthAnythingPriorToSparseAnchors(
-            mono_prior,
-            sparse_uv,
-            sparse_depth,
-            cam.near,
-            depthanything_densify_min_sparse_anchors_,
-            aligned_depth,
-            num_valid_anchors,
-            sparse_depth_q05,
-            sparse_depth_q95)) {
-        std::cout << "[depthanything_densify/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " failed alignment num_valid_anchors=" << num_valid_anchors
-                  << " min_required=" << depthanything_densify_min_sparse_anchors_
-                  << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
+    MonoPriorAlignmentStats align_stats;
+    bool used_rendered_alignment = false;
+    bool used_da_prior_alignment = false;
+    bool used_global_alignment = false;
+    bool alignment_ok = false;
+    torch::Tensor rendered_align_depth_cpu;
+    torch::Tensor rendered_align_alpha_cpu;
+    torch::Tensor rendered_align_n_contrib_cpu;
+    if (depthanything_densify_alignment_mode_ == "rendered") {
+        std::unordered_map<std::string, torch::Tensor> render_pkg;
+        {
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            render_pkg = voxel_model_->render(
+                cam,
+                H,
+                W,
+                torch::Tensor(),
+                "dontcare",
+                false,
+                std::nullopt,
+                true,
+                false,
+                true,
+                false,
+                false,
+                sv::RenderOpts{});
+        }
+        if (renderPkgToMonoPriorAlignmentMaps(
+                render_pkg,
+                H,
+                W,
+                rendered_align_depth_cpu,
+                rendered_align_alpha_cpu,
+                rendered_align_n_contrib_cpu)) {
+            alignment_ok = use_metric3d
+                ? alignMetricDepthPriorToRenderedDepth(
+                      mono_prior,
+                      rendered_align_depth_cpu,
+                      rendered_align_alpha_cpu,
+                      rendered_align_n_contrib_cpu,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats)
+                : alignDepthAnythingPriorToRenderedDepth(
+                      mono_prior,
+                      rendered_align_depth_cpu,
+                      rendered_align_alpha_cpu,
+                      rendered_align_n_contrib_cpu,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats);
+            used_rendered_alignment = alignment_ok;
+        }
     }
-
+    const bool has_sparse_anchors =
+        buildSparseDepthFromKeyframeOrbAnchors(pkf, W, H, sparse_uv, sparse_depth);
+    if (!alignment_ok && has_sparse_anchors) {
+        if (depthanything_densify_alignment_mode_ == "da_prior") {
+            alignment_ok = alignMonoPriorToSparseAnchorsDaPrior(
+                mono_prior,
+                sparse_uv,
+                sparse_depth,
+                da_prior_query_mask,
+                use_metric3d,
+                cam.near,
+                depthanything_densify_min_sparse_anchors_,
+                depthanything_da_prior_knn_k_,
+                depthanything_da_prior_distance_weighting_,
+                depthanything_da_prior_max_pixel_dist_,
+                aligned_depth,
+                align_stats);
+            used_da_prior_alignment = alignment_ok;
+        }
+        if (!alignment_ok) {
+            alignment_ok = use_metric3d
+                ? alignMetricDepthPriorToSparseAnchors(
+                      mono_prior,
+                      sparse_uv,
+                      sparse_depth,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats)
+                : alignDepthAnythingPriorToSparseAnchors(
+                      mono_prior,
+                      sparse_uv,
+                      sparse_depth,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats);
+        }
+        if (alignment_ok) {
+            accumulateMonoPriorGlobalAlignment(
+                align_stats.scale,
+                align_stats.shift,
+                static_cast<float>(std::max<int64_t>(1, align_stats.num_fit_anchors)));
+        }
+    }
+    if (!alignment_ok) {
+        if (depthanything_global_alignment_valid_ &&
+            ((use_metric3d &&
+              applyMetricDepthAlignment(
+                  mono_prior,
+                  depthanything_global_align_scale_,
+                  depthanything_global_align_shift_,
+                  aligned_depth)) ||
+             (!use_metric3d &&
+              applyDepthAnythingAffineAlignment(
+                  mono_prior,
+                  depthanything_global_align_scale_,
+                  depthanything_global_align_shift_,
+                  aligned_depth)))) {
+            used_global_alignment = true;
+            align_stats.scale = depthanything_global_align_scale_;
+            align_stats.shift = depthanything_global_align_shift_;
+        } else {
+            std::cout << "[mono_prior_alignment] path=densify"
+                      << " iter=" << iter
+                      << " kf=" << pkf->fid_
+                      << " requested=" << depthanything_densify_alignment_mode_
+                      << " used=none"
+                      << " fallback=0"
+                      << " failed=1"
+                      << " has_sparse_anchors=" << (has_sparse_anchors ? 1 : 0)
+                      << " anchors=" << align_stats.num_valid_anchors
+                      << " fit_anchors=" << align_stats.num_fit_anchors
+                      << " min_required=" << depthanything_densify_min_sparse_anchors_
+                      << " global_valid=" << (depthanything_global_alignment_valid_ ? 1 : 0)
+                      << std::endl;
+            updateRenderedDepthCandidateLifecycle();
+            return;
+        }
+    }
+    const char* densify_alignment_source =
+        used_rendered_alignment ? "rendered" :
+        (used_da_prior_alignment ? "da_prior" :
+         (used_global_alignment ? "global" : "orb"));
+    const bool densify_alignment_fallback =
+        depthanything_densify_alignment_mode_ != densify_alignment_source;
+    std::cout << "[mono_prior_alignment] path=densify"
+              << " iter=" << iter
+              << " kf=" << pkf->fid_
+              << " requested=" << depthanything_densify_alignment_mode_
+              << " used=" << densify_alignment_source
+              << " fallback=" << (densify_alignment_fallback ? 1 : 0)
+              << " anchors=" << align_stats.num_valid_anchors
+              << " fit_anchors=" << align_stats.num_fit_anchors
+              << " scale=" << align_stats.scale
+              << " shift=" << align_stats.shift
+              << " med_rel_err=" << align_stats.median_rel_depth_error
+              << " p90_rel_err=" << align_stats.p90_rel_depth_error
+              << " inlier_ratio=" << align_stats.final_inlier_ratio
+              << std::endl;
     int64_t prior_finite_count = 0;
     int64_t aligned_finite_count = 0;
     float prior_min = std::numeric_limits<float>::quiet_NaN();
@@ -10355,8 +12190,9 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
 
     const int stride = std::max(1, depthanything_densify_stride_);
     std::vector<int64_t> selected_idx;
-    selected_idx.reserve(static_cast<size_t>(
-        depthanything_densify_max_points_per_kf_ > 0 ? depthanything_densify_max_points_per_kf_ : 4096));
+    selected_idx.reserve(
+        static_cast<size_t>((H + stride - 1) / stride) *
+        static_cast<size_t>((W + stride - 1) / stride));
     auto valid_acc = valid_mask.accessor<bool, 2>();
     for (int y = 0; y < H; y += stride) {
         for (int x = 0; x < W; x += stride) {
@@ -10365,40 +12201,34 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
             }
         }
     }
-    const int64_t selected_pixels_before_cap = static_cast<int64_t>(selected_idx.size());
 
-    if (depthanything_densify_max_points_per_kf_ > 0 &&
-        static_cast<int>(selected_idx.size()) > depthanything_densify_max_points_per_kf_) {
-        std::vector<int64_t> keep;
-        keep.reserve(static_cast<size_t>(depthanything_densify_max_points_per_kf_));
-        if (depthanything_densify_max_points_per_kf_ == 1) {
-            keep.push_back(selected_idx[selected_idx.size() / 2]);
-        } else {
-            const double step = static_cast<double>(selected_idx.size() - 1) /
-                                static_cast<double>(depthanything_densify_max_points_per_kf_ - 1);
-            for (int i = 0; i < depthanything_densify_max_points_per_kf_; ++i) {
-                const size_t idx = static_cast<size_t>(std::llround(step * static_cast<double>(i)));
-                keep.push_back(selected_idx[std::min(idx, selected_idx.size() - 1)]);
-            }
-        }
-        selected_idx.swap(keep);
-    }
-
-    std::cout << "[depthanything_densify/start] iter=" << iter
-              << " kf=" << pkf->fid_
-              << " anchors=" << num_valid_anchors
-              << " prior_finite=" << prior_finite_count
-              << " prior_range=[" << prior_min << "," << prior_max << "]"
-              << " prior_mean=" << prior_mean
-              << " aligned_finite=" << aligned_finite_count
-              << " aligned_range=[" << aligned_min << "," << aligned_max << "]"
-              << " aligned_mean=" << aligned_mean
-              << " valid_pixels=" << valid_pixels_after_mask
-              << " selected_before_cap=" << selected_pixels_before_cap
-              << " selected_pixels=" << selected_idx.size()
-              << " stride=" << stride
-              << " anchor_depth_stats=[" << sparse_depth_q05 << "," << sparse_depth_q95 << "]"
-              << std::endl;
+    // std::cout << "[mono_prior_densify/start] iter=" << iter
+    //           << " kf=" << pkf->fid_
+    //           << " anchors=" << align_stats.num_valid_anchors
+    //           << " fit_anchors=" << align_stats.num_fit_anchors
+    //           << " prior_finite=" << prior_finite_count
+    //           << " prior_range=[" << prior_min << "," << prior_max << "]"
+    //           << " prior_mean=" << prior_mean
+    //           << " aligned_finite=" << aligned_finite_count
+    //           << " aligned_range=[" << aligned_min << "," << aligned_max << "]"
+    //           << " aligned_mean=" << aligned_mean
+    //           << " valid_pixels=" << valid_pixels_after_mask
+    //           << " selected_pixels=" << selected_idx.size()
+    //           << " stride=" << stride
+    //           << " alignment_source="
+    //           << (used_rendered_alignment ? "rendered" :
+    //               (used_global_alignment ? "global" : "orb"))
+    //           << " align_scale=" << align_stats.scale
+    //           << " align_shift=" << align_stats.shift
+    //           << " med_rel_err=" << align_stats.median_rel_depth_error
+    //           << " p90_rel_err=" << align_stats.p90_rel_depth_error
+    //           << " inlier_ratio=" << align_stats.final_inlier_ratio
+    //           << " global_scale=" << depthanything_global_align_scale_
+    //           << " global_shift=" << depthanything_global_align_shift_
+    //           << " global_obs=" << depthanything_global_align_observations_
+    //           << " anchor_depth_stats=[" << align_stats.sparse_depth_q05
+    //           << "," << align_stats.sparse_depth_q95 << "]"
+    //           << std::endl;
 
     if (selected_idx.empty()) {
         updateRenderedDepthCandidateLifecycle();
@@ -10465,30 +12295,30 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
     }
 
     const int64_t num_candidates = static_cast<int64_t>(candidate_points_world.size() / 3);
-    std::cout << "[depthanything_densify/candidates] iter=" << iter
-              << " kf=" << pkf->fid_
-              << " valid_candidates=" << num_candidates
-              << " depth_range=["
-              << (num_candidates > 0 ? candidate_depth_min : std::numeric_limits<float>::quiet_NaN())
-              << ","
-              << (num_candidates > 0 ? candidate_depth_max : std::numeric_limits<float>::quiet_NaN())
-              << "]"
-              << " world_bbox_min=["
-              << (num_candidates > 0 ? candidate_world_min.x() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_min.y() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_min.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
-              << " world_bbox_max=["
-              << (num_candidates > 0 ? candidate_world_max.x() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_max.y() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_max.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
-              << std::endl;
-    for (size_t i = 0; i < sample_candidates.size(); ++i) {
-        std::cout << "[depthanything_densify/sample] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " idx=" << i
-                  << " " << sample_candidates[i]
-                  << std::endl;
-    }
+    // std::cout << "[mono_prior_densify/candidates] iter=" << iter
+    //           << " kf=" << pkf->fid_
+    //           << " valid_candidates=" << num_candidates
+    //           << " depth_range=["
+    //           << (num_candidates > 0 ? candidate_depth_min : std::numeric_limits<float>::quiet_NaN())
+    //           << ","
+    //           << (num_candidates > 0 ? candidate_depth_max : std::numeric_limits<float>::quiet_NaN())
+    //           << "]"
+    //           << " world_bbox_min=["
+    //           << (num_candidates > 0 ? candidate_world_min.x() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_min.y() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_min.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
+    //           << " world_bbox_max=["
+    //           << (num_candidates > 0 ? candidate_world_max.x() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_max.y() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_max.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
+    //           << std::endl;
+    // for (size_t i = 0; i < sample_candidates.size(); ++i) {
+    //     std::cout << "[mono_prior_densify/sample] iter=" << iter
+    //               << " kf=" << pkf->fid_
+    //               << " idx=" << i
+    //               << " " << sample_candidates[i]
+    //               << std::endl;
+    // }
 
     if (num_candidates > 0) {
         auto points_tensor = torch::from_blob(
@@ -10514,39 +12344,42 @@ void VoxelMapper::increasePcdByKeyframeDepthAnything(
             enable_rerun_ && !rerun_final_only_;
         if (log_depthanything_created_voxels) {
             voxel_model_->setNextRealInsertionRerunEntityPath(
-                "world/depthanything_densify/created");
+                "world/mono_prior_densify/created");
         }
         voxel_model_->setRenderedDepthCandidateRealAdjacency(
-            depthanything_densify_require_real_adjacency_,
-            depthanything_densify_adjacency_radius_cells_);
+            false,
+            1);
         voxel_model_->setNextRenderedDepthCandidateInsertion(
             true,
             "",
-            kRenderedCandidateSourceDepthAnything,
+            kRenderedCandidateSourceMonoPrior,
             /*insert_as_real_protected=*/true);
         voxel_model_->increasePcd(points_tensor, colors_tensor, iter, tr_cams);
+        if (pkf->mono_prior_first_apply_iter_ < 0) {
+            pkf->mono_prior_first_apply_iter_ = iter;
+        }
         voxel_model_->setNextRenderedDepthCandidateInsertion(false);
         if (log_depthanything_created_voxels) {
             voxel_model_->setNextRealInsertionRerunEntityPath("");
         }
         const sv::VoxelModel::IncreasePcdStats insert_stats = voxel_model_->lastIncreasePcdStats();
-        std::cout << "[depthanything_densify/insert] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " raw_points_in=" << insert_stats.raw_points_in
-                  << " points_after_far_filter=" << insert_stats.points_after_far_filter
-                  << " unique_before_filter=" << insert_stats.unique_voxel_candidates_before_insert_filter
-                  << " unique_after_filter=" << insert_stats.unique_voxel_candidates_after_insert_filter
-                  << " duplicate_existing_voxels=" << insert_stats.duplicate_existing_voxels
-                  << " new_voxels=" << insert_stats.new_voxels
-                  << " pending_promotions=" << insert_stats.pending_promotions
-                  << " pending_support_updates=" << insert_stats.pending_support_updates
-                  << std::endl;
+        // std::cout << "[mono_prior_densify/insert] iter=" << iter
+        //           << " kf=" << pkf->fid_
+        //           << " raw_points_in=" << insert_stats.raw_points_in
+        //           << " points_after_far_filter=" << insert_stats.points_after_far_filter
+        //           << " unique_before_filter=" << insert_stats.unique_voxel_candidates_before_insert_filter
+        //           << " unique_after_filter=" << insert_stats.unique_voxel_candidates_after_insert_filter
+        //           << " duplicate_existing_voxels=" << insert_stats.duplicate_existing_voxels
+        //           << " new_voxels=" << insert_stats.new_voxels
+        //           << " pending_promotions=" << insert_stats.pending_promotions
+        //           << " pending_support_updates=" << insert_stats.pending_support_updates
+        //           << std::endl;
     }
 
     updateRenderedDepthCandidateLifecycle();
 }
 
-void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
+void VoxelMapper::increasePcdByKeyframeMonoPriorFillHoles(
     std::shared_ptr<VoxelKeyframe> pkf)
 {
     torch::NoGradGuard no_grad;
@@ -10564,13 +12397,6 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
     const int H = pkf->image_height_;
     const int W = pkf->image_width_;
     if (H <= 0 || W <= 0) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    if (!ensureDepthAnythingv2ForKeyframe(pkf) ||
-        !pkf->depthanythingv2_.defined() ||
-        pkf->depthanythingv2_.numel() == 0) {
         updateRenderedDepthCandidateLifecycle();
         return;
     }
@@ -10600,16 +12426,55 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
         *mean_out = finite.mean().item<float>();
     };
 
+    std::unordered_map<std::string, torch::Tensor> render_pkg;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        render_pkg = voxel_model_->render(
+            cam,
+            H,
+            W,
+            torch::Tensor(),
+            "dontcare",
+            false,
+            std::nullopt,
+            true,
+            false,
+            true,
+            false,
+            false,
+            sv::RenderOpts{});
+    }
+    torch::Tensor depth_cpu;
+    torch::Tensor alpha_cpu;
+    torch::Tensor n_contrib_cpu;
+    if (!renderPkgToMonoPriorAlignmentMaps(
+            render_pkg,
+            H,
+            W,
+            depth_cpu,
+            alpha_cpu,
+            n_contrib_cpu)) {
+        updateRenderedDepthCandidateLifecycle();
+        return;
+    }
+
+    if (!ensureMonoPriorForKeyframe(pkf) ||
+        !pkf->mono_prior_.defined() ||
+        pkf->mono_prior_.numel() == 0) {
+        updateRenderedDepthCandidateLifecycle();
+        return;
+    }
+
     torch::Tensor mono_prior =
-        pkf->depthanythingv2_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+        pkf->mono_prior_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
     if (mono_prior.dim() == 3 && mono_prior.size(0) == 1) {
         mono_prior = mono_prior.squeeze(0);
     }
     if (mono_prior.dim() != 2) {
-        std::cout << "[depthanything_fill_holes/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " invalid prior shape=" << mono_prior.sizes()
-                  << std::endl;
+        // std::cout << "[mono_prior_fill_holes/start] iter=" << iter
+        //           << " kf=" << pkf->fid_
+        //           << " invalid prior shape=" << mono_prior.sizes()
+        //           << std::endl;
         updateRenderedDepthCandidateLifecycle();
         return;
     }
@@ -10625,40 +12490,176 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
                          .contiguous();
     }
 
+    const bool use_metric3d = isMetric3DModelId(mono_prior_model_id_);
+
+    auto depth_acc = depth_cpu.accessor<float, 2>();
+    auto n_contrib_acc = n_contrib_cpu.accessor<int, 2>();
+
+    const int active_hole_max_n_contrib = 0;
+    std::vector<uint8_t> hole_mask(static_cast<size_t>(H) * static_cast<size_t>(W), 0);
+    auto flat = [W](int y, int x) -> int64_t {
+        return static_cast<int64_t>(y) * static_cast<int64_t>(W) + static_cast<int64_t>(x);
+    };
+
+    int64_t hole_pixels = 0;
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            const float z = depth_acc[y][x];
+            const int n_contrib = n_contrib_acc[y][x];
+            const bool is_hole =
+                (n_contrib <= active_hole_max_n_contrib) &&
+                (!std::isfinite(z) || z <= kMonoPriorFillHolesEmptyDepthEps);
+            if (is_hole) {
+                hole_mask[static_cast<size_t>(flat(y, x))] = 1;
+                ++hole_pixels;
+            }
+        }
+    }
+    if (hole_pixels <= 0) {
+        updateRenderedDepthCandidateLifecycle();
+        return;
+    }
+
+    torch::Tensor da_prior_query_mask;
+    if (depthanything_densify_alignment_mode_ == "da_prior") {
+        da_prior_query_mask = torch::from_blob(
+                                  hole_mask.data(),
+                                  {H, W},
+                                  torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                                  .clone()
+                                  .to(torch::kBool);
+    }
+
     torch::Tensor sparse_uv;
     torch::Tensor sparse_depth;
-    if (!buildSparseDepthFromKeyframeOrbAnchors(pkf, W, H, sparse_uv, sparse_depth)) {
-        std::cout << "[depthanything_fill_holes/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " no valid ORB anchors"
-                  << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
     torch::Tensor aligned_depth;
-    int64_t num_valid_anchors = 0;
-    float sparse_depth_q05 = std::numeric_limits<float>::quiet_NaN();
-    float sparse_depth_q95 = std::numeric_limits<float>::quiet_NaN();
-    if (!alignDepthAnythingPriorToSparseAnchors(
-            mono_prior,
-            sparse_uv,
-            sparse_depth,
-            cam.near,
-            depthanything_densify_min_sparse_anchors_,
-            aligned_depth,
-            num_valid_anchors,
-            sparse_depth_q05,
-            sparse_depth_q95)) {
-        std::cout << "[depthanything_fill_holes/start] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " failed alignment num_valid_anchors=" << num_valid_anchors
-                  << " min_required=" << depthanything_densify_min_sparse_anchors_
-                  << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
+    MonoPriorAlignmentStats align_stats;
+    bool used_rendered_alignment = false;
+    bool used_da_prior_alignment = false;
+    bool used_global_alignment = false;
+    bool alignment_ok = false;
+    if (depthanything_densify_alignment_mode_ == "rendered") {
+        alignment_ok = use_metric3d
+            ? alignMetricDepthPriorToRenderedDepth(
+                  mono_prior,
+                  depth_cpu,
+                  alpha_cpu,
+                  n_contrib_cpu,
+                  cam.near,
+                  depthanything_densify_min_sparse_anchors_,
+                  aligned_depth,
+                  align_stats)
+            : alignDepthAnythingPriorToRenderedDepth(
+                  mono_prior,
+                  depth_cpu,
+                  alpha_cpu,
+                  n_contrib_cpu,
+                  cam.near,
+                  depthanything_densify_min_sparse_anchors_,
+                  aligned_depth,
+                  align_stats);
+        used_rendered_alignment = alignment_ok;
     }
-
+    const bool has_sparse_anchors =
+        buildSparseDepthFromKeyframeOrbAnchors(pkf, W, H, sparse_uv, sparse_depth);
+    if (!alignment_ok && has_sparse_anchors) {
+        if (depthanything_densify_alignment_mode_ == "da_prior") {
+            alignment_ok = alignMonoPriorToSparseAnchorsDaPrior(
+                mono_prior,
+                sparse_uv,
+                sparse_depth,
+                da_prior_query_mask,
+                use_metric3d,
+                cam.near,
+                depthanything_densify_min_sparse_anchors_,
+                depthanything_da_prior_knn_k_,
+                depthanything_da_prior_distance_weighting_,
+                depthanything_da_prior_max_pixel_dist_,
+                aligned_depth,
+                align_stats);
+            used_da_prior_alignment = alignment_ok;
+        }
+        if (!alignment_ok) {
+            alignment_ok = use_metric3d
+                ? alignMetricDepthPriorToSparseAnchors(
+                      mono_prior,
+                      sparse_uv,
+                      sparse_depth,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats)
+                : alignDepthAnythingPriorToSparseAnchors(
+                      mono_prior,
+                      sparse_uv,
+                      sparse_depth,
+                      cam.near,
+                      depthanything_densify_min_sparse_anchors_,
+                      aligned_depth,
+                      align_stats);
+        }
+        if (alignment_ok) {
+            accumulateMonoPriorGlobalAlignment(
+                align_stats.scale,
+                align_stats.shift,
+                static_cast<float>(std::max<int64_t>(1, align_stats.num_fit_anchors)));
+        }
+    }
+    if (!alignment_ok) {
+        if (depthanything_global_alignment_valid_ &&
+            ((use_metric3d &&
+              applyMetricDepthAlignment(
+                  mono_prior,
+                  depthanything_global_align_scale_,
+                  depthanything_global_align_shift_,
+                  aligned_depth)) ||
+             (!use_metric3d &&
+              applyDepthAnythingAffineAlignment(
+                  mono_prior,
+                  depthanything_global_align_scale_,
+                  depthanything_global_align_shift_,
+                  aligned_depth)))) {
+            used_global_alignment = true;
+            align_stats.scale = depthanything_global_align_scale_;
+            align_stats.shift = depthanything_global_align_shift_;
+        } else {
+            std::cout << "[mono_prior_alignment] path=fill_holes"
+                      << " iter=" << iter
+                      << " kf=" << pkf->fid_
+                      << " requested=" << depthanything_densify_alignment_mode_
+                      << " used=none"
+                      << " fallback=0"
+                      << " failed=1"
+                      << " has_sparse_anchors=" << (has_sparse_anchors ? 1 : 0)
+                      << " anchors=" << align_stats.num_valid_anchors
+                      << " fit_anchors=" << align_stats.num_fit_anchors
+                      << " min_required=" << depthanything_densify_min_sparse_anchors_
+                      << " global_valid=" << (depthanything_global_alignment_valid_ ? 1 : 0)
+                      << std::endl;
+            updateRenderedDepthCandidateLifecycle();
+            return;
+        }
+    }
+    const char* fill_holes_alignment_source =
+        used_rendered_alignment ? "rendered" :
+        (used_da_prior_alignment ? "da_prior" :
+         (used_global_alignment ? "global" : "orb"));
+    const bool fill_holes_alignment_fallback =
+        depthanything_densify_alignment_mode_ != fill_holes_alignment_source;
+    std::cout << "[mono_prior_alignment] path=fill_holes"
+              << " iter=" << iter
+              << " kf=" << pkf->fid_
+              << " requested=" << depthanything_densify_alignment_mode_
+              << " used=" << fill_holes_alignment_source
+              << " fallback=" << (fill_holes_alignment_fallback ? 1 : 0)
+              << " anchors=" << align_stats.num_valid_anchors
+              << " fit_anchors=" << align_stats.num_fit_anchors
+              << " scale=" << align_stats.scale
+              << " shift=" << align_stats.shift
+              << " med_rel_err=" << align_stats.median_rel_depth_error
+              << " p90_rel_err=" << align_stats.p90_rel_depth_error
+              << " inlier_ratio=" << align_stats.final_inlier_ratio
+              << std::endl;
     int64_t prior_finite_count = 0;
     int64_t aligned_finite_count = 0;
     float prior_min = std::numeric_limits<float>::quiet_NaN();
@@ -10683,126 +12684,7 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
         image_cpu = image_cpu.index({torch::indexing::Slice(0, 3)}).contiguous();
     }
 
-    std::unordered_map<std::string, torch::Tensor> render_pkg;
-    {
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        render_pkg = voxel_model_->render(
-            cam,
-            H,
-            W,
-            torch::Tensor(),
-            "dontcare",
-            false,
-            std::nullopt,
-            true,
-            false,
-            true,
-            false,
-            false,
-            sv::RenderOpts{});
-    }
-
-    auto it_depth = render_pkg.find("raw_depth");
-    if (it_depth == render_pkg.end()) it_depth = render_pkg.find("depth");
-    auto it_T = render_pkg.find("raw_T");
-    if (it_T == render_pkg.end()) it_T = render_pkg.find("T");
-    auto it_n_contrib = render_pkg.find("n_contrib");
-    if (it_n_contrib == render_pkg.end()) it_n_contrib = render_pkg.find("raw_n_contrib");
-    auto it_color = render_pkg.find("color");
-    if (it_color == render_pkg.end()) it_color = render_pkg.find("raw_color");
-    if (it_depth == render_pkg.end() || it_T == render_pkg.end() ||
-        it_n_contrib == render_pkg.end() || it_color == render_pkg.end() ||
-        !it_depth->second.defined() || !it_T->second.defined() ||
-        !it_n_contrib->second.defined() || !it_color->second.defined()) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto raw_depth = it_depth->second;
-    if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) raw_depth = raw_depth.squeeze(0);
-    if (raw_depth.dim() != 3 || raw_depth.size(0) < 1) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-    auto render_depth_raw = raw_depth.index({0}).contiguous();
-    auto render_T = squeezeRenderMap2D(it_T->second);
-    auto render_n_contrib = squeezeRenderMap2D(it_n_contrib->second);
-    auto render_color = it_color->second;
-    if (render_color.dim() == 4 && render_color.size(0) == 1) render_color = render_color.squeeze(0);
-    if (render_color.dim() != 3 || render_color.size(0) < 3) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-    if (render_color.size(0) > 3) {
-        render_color = render_color.index({torch::indexing::Slice(0, 3)});
-    }
-    if (render_depth_raw.dim() != 2 || render_T.dim() != 2 || render_n_contrib.dim() != 2) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto depth_raw_cpu = render_depth_raw.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto T_cpu = render_T.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto n_contrib_cpu = render_n_contrib.to(torch::kCPU).to(torch::kInt32).contiguous();
-    auto render_color_cpu = render_color.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto alpha_cpu = (1.0f - T_cpu).contiguous();
-    auto depth_cpu =
-        (depth_raw_cpu / alpha_cpu.clamp_min(1e-6f)).contiguous();
-
-    if (depth_cpu.size(0) != H || depth_cpu.size(1) != W ||
-        n_contrib_cpu.size(0) != H || n_contrib_cpu.size(1) != W ||
-        render_color_cpu.dim() != 3 || render_color_cpu.size(0) < 3 ||
-        render_color_cpu.size(1) != H || render_color_cpu.size(2) != W) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto depth_acc = depth_cpu.accessor<float, 2>();
-    auto n_contrib_acc = n_contrib_cpu.accessor<int, 2>();
-    auto render_color_acc = render_color_cpu.accessor<float, 3>();
     auto image_acc = image_cpu.accessor<float, 3>();
-
-    const int active_hole_max_n_contrib = 0;
-    std::vector<uint8_t> hole_mask(static_cast<size_t>(H) * static_cast<size_t>(W), 0);
-    auto flat = [W](int y, int x) -> int64_t {
-        return static_cast<int64_t>(y) * static_cast<int64_t>(W) + static_cast<int64_t>(x);
-    };
-
-    int64_t hole_pixels = 0;
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            const float z = depth_acc[y][x];
-            const int n_contrib = n_contrib_acc[y][x];
-            float rgb_error = 0.0f;
-            for (int c = 0; c < 3; ++c) {
-                rgb_error += std::abs(render_color_acc[c][y][x] - image_acc[c][y][x]);
-            }
-            rgb_error /= 3.0f;
-            const bool is_hole =
-                (n_contrib <= active_hole_max_n_contrib) &&
-                (!std::isfinite(z) || z <= rendered_hole_fill_empty_depth_eps_) &&
-                (rgb_error >= rendered_hole_fill_hole_rgb_error_min_);
-            if (is_hole) {
-                hole_mask[static_cast<size_t>(flat(y, x))] = 1;
-                ++hole_pixels;
-            }
-        }
-    }
-
-    std::vector<uint8_t> orb_support_mask;
-    int64_t orb_support_anchors = 0;
-    int64_t orb_support_pixels = 0;
-    if (depthanything_fill_holes_orb_support_mask_) {
-        orb_support_pixels = buildOrbSupportMaskFromKeyframeAnchors(
-            pkf,
-            W,
-            H,
-            depthanything_fill_holes_orb_support_radius_px_,
-            cam.near,
-            RGBD_max_depth_,
-            orb_support_mask,
-            orb_support_anchors);
-    }
 
     torch::Tensor valid_mask =
         torch::isfinite(aligned_depth) &
@@ -10817,21 +12699,6 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
         valid_mask &= hole_mask_tensor.to(torch::kBool);
     }
-    const int64_t valid_hole_pixels_before_orb_support =
-        valid_mask.sum().item<int64_t>();
-    if (depthanything_fill_holes_orb_support_mask_ &&
-        orb_support_pixels > 0 &&
-        static_cast<int64_t>(orb_support_mask.size()) ==
-            static_cast<int64_t>(H) * static_cast<int64_t>(W)) {
-        auto orb_support_mask_tensor = torch::from_blob(
-            orb_support_mask.data(),
-            {H, W},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
-        valid_mask &= torch::logical_not(orb_support_mask_tensor.to(torch::kBool));
-    }
-    const int64_t valid_hole_pixels_after_orb_support =
-        valid_mask.sum().item<int64_t>();
-
     auto mask_it = undistort_mask_.find(pkf->camera_id_);
     if (mask_it != undistort_mask_.end() && mask_it->second.defined()) {
         torch::Tensor eval_mask = mask_it->second.detach().to(torch::kCPU).to(torch::kFloat32);
@@ -10862,8 +12729,9 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
 
     const int stride = std::max(1, depthanything_densify_stride_);
     std::vector<int64_t> selected_idx;
-    selected_idx.reserve(static_cast<size_t>(
-        depthanything_densify_max_points_per_kf_ > 0 ? depthanything_densify_max_points_per_kf_ : 4096));
+    selected_idx.reserve(
+        static_cast<size_t>((H + stride - 1) / stride) *
+        static_cast<size_t>((W + stride - 1) / stride));
     auto valid_acc = valid_mask.accessor<bool, 2>();
     for (int y = 0; y < H; y += stride) {
         for (int x = 0; x < W; x += stride) {
@@ -10872,45 +12740,35 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
             }
         }
     }
-    const int64_t selected_pixels_before_cap = static_cast<int64_t>(selected_idx.size());
 
-    if (depthanything_densify_max_points_per_kf_ > 0 &&
-        static_cast<int>(selected_idx.size()) > depthanything_densify_max_points_per_kf_) {
-        std::vector<int64_t> keep;
-        keep.reserve(static_cast<size_t>(depthanything_densify_max_points_per_kf_));
-        if (depthanything_densify_max_points_per_kf_ == 1) {
-            keep.push_back(selected_idx[selected_idx.size() / 2]);
-        } else {
-            const double step = static_cast<double>(selected_idx.size() - 1) /
-                                static_cast<double>(depthanything_densify_max_points_per_kf_ - 1);
-            for (int i = 0; i < depthanything_densify_max_points_per_kf_; ++i) {
-                const size_t idx = static_cast<size_t>(std::llround(step * static_cast<double>(i)));
-                keep.push_back(selected_idx[std::min(idx, selected_idx.size() - 1)]);
-            }
-        }
-        selected_idx.swap(keep);
-    }
-
-    std::cout << "[depthanything_fill_holes/start] iter=" << iter
-              << " kf=" << pkf->fid_
-              << " anchors=" << num_valid_anchors
-              << " prior_finite=" << prior_finite_count
-              << " prior_range=[" << prior_min << "," << prior_max << "]"
-              << " prior_mean=" << prior_mean
-              << " aligned_finite=" << aligned_finite_count
-              << " aligned_range=[" << aligned_min << "," << aligned_max << "]"
-              << " aligned_mean=" << aligned_mean
-              << " hole_pixels=" << hole_pixels
-              << " orb_support_anchors=" << orb_support_anchors
-              << " orb_support_pixels=" << orb_support_pixels
-              << " valid_hole_pixels_before_orb=" << valid_hole_pixels_before_orb_support
-              << " valid_hole_pixels_after_orb=" << valid_hole_pixels_after_orb_support
-              << " valid_hole_pixels=" << valid_hole_pixels_after_mask
-              << " selected_before_cap=" << selected_pixels_before_cap
-              << " selected_pixels=" << selected_idx.size()
-              << " stride=" << stride
-              << " anchor_depth_stats=[" << sparse_depth_q05 << "," << sparse_depth_q95 << "]"
-              << std::endl;
+    // std::cout << "[mono_prior_fill_holes/start] iter=" << iter
+    //           << " kf=" << pkf->fid_
+    //           << " anchors=" << align_stats.num_valid_anchors
+    //           << " fit_anchors=" << align_stats.num_fit_anchors
+    //           << " prior_finite=" << prior_finite_count
+    //           << " prior_range=[" << prior_min << "," << prior_max << "]"
+    //           << " prior_mean=" << prior_mean
+    //           << " aligned_finite=" << aligned_finite_count
+    //           << " aligned_range=[" << aligned_min << "," << aligned_max << "]"
+    //           << " aligned_mean=" << aligned_mean
+    //           << " hole_pixels=" << hole_pixels
+    //           << " valid_hole_pixels=" << valid_hole_pixels_after_mask
+    //           << " selected_pixels=" << selected_idx.size()
+    //           << " stride=" << stride
+    //           << " alignment_source="
+    //           << (used_rendered_alignment ? "rendered" :
+    //               (used_global_alignment ? "global" : "orb"))
+    //           << " align_scale=" << align_stats.scale
+    //           << " align_shift=" << align_stats.shift
+    //           << " med_rel_err=" << align_stats.median_rel_depth_error
+    //           << " p90_rel_err=" << align_stats.p90_rel_depth_error
+    //           << " inlier_ratio=" << align_stats.final_inlier_ratio
+    //           << " global_scale=" << depthanything_global_align_scale_
+    //           << " global_shift=" << depthanything_global_align_shift_
+    //           << " global_obs=" << depthanything_global_align_observations_
+    //           << " anchor_depth_stats=[" << align_stats.sparse_depth_q05
+    //           << "," << align_stats.sparse_depth_q95 << "]"
+    //           << std::endl;
 
     if (selected_idx.empty()) {
         updateRenderedDepthCandidateLifecycle();
@@ -10976,32 +12834,41 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
     }
 
     const int64_t num_candidates = static_cast<int64_t>(candidate_points_world.size() / 3);
-    std::cout << "[depthanything_fill_holes/candidates] iter=" << iter
-              << " kf=" << pkf->fid_
-              << " valid_candidates=" << num_candidates
-              << " depth_range=["
-              << (num_candidates > 0 ? candidate_depth_min : std::numeric_limits<float>::quiet_NaN())
-              << ","
-              << (num_candidates > 0 ? candidate_depth_max : std::numeric_limits<float>::quiet_NaN())
-              << "]"
-              << " world_bbox_min=["
-              << (num_candidates > 0 ? candidate_world_min.x() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_min.y() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_min.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
-              << " world_bbox_max=["
-              << (num_candidates > 0 ? candidate_world_max.x() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_max.y() : std::numeric_limits<float>::quiet_NaN()) << ","
-              << (num_candidates > 0 ? candidate_world_max.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
-              << std::endl;
-    for (size_t i = 0; i < sample_candidates.size(); ++i) {
-        std::cout << "[depthanything_fill_holes/sample] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " idx=" << i
-                  << " " << sample_candidates[i]
-                  << std::endl;
-    }
+    // std::cout << "[mono_prior_fill_holes/candidates] iter=" << iter
+    //           << " kf=" << pkf->fid_
+    //           << " valid_candidates=" << num_candidates
+    //           << " depth_range=["
+    //           << (num_candidates > 0 ? candidate_depth_min : std::numeric_limits<float>::quiet_NaN())
+    //           << ","
+    //           << (num_candidates > 0 ? candidate_depth_max : std::numeric_limits<float>::quiet_NaN())
+    //           << "]"
+    //           << " world_bbox_min=["
+    //           << (num_candidates > 0 ? candidate_world_min.x() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_min.y() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_min.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
+    //           << " world_bbox_max=["
+    //           << (num_candidates > 0 ? candidate_world_max.x() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_max.y() : std::numeric_limits<float>::quiet_NaN()) << ","
+    //           << (num_candidates > 0 ? candidate_world_max.z() : std::numeric_limits<float>::quiet_NaN()) << "]"
+    //           << std::endl;
+    // for (size_t i = 0; i < sample_candidates.size(); ++i) {
+    //     std::cout << "[mono_prior_fill_holes/sample] iter=" << iter
+    //               << " kf=" << pkf->fid_
+    //               << " idx=" << i
+    //               << " " << sample_candidates[i]
+    //               << std::endl;
+    // }
 
     if (num_candidates > 0) {
+        saveAccumulatedOrbDepthProjectionPng(
+            mpSLAM,
+            pkf,
+            runtimeOrbDepthDebugDir(result_dir_),
+            iter,
+            RGBD_min_depth_,
+            RGBD_max_depth_,
+            aligned_depth);
+
         auto points_tensor = torch::from_blob(
             candidate_points_world.data(),
             {num_candidates, 3},
@@ -11025,33 +12892,36 @@ void VoxelMapper::increasePcdByKeyframeDepthAnythingFillHoles(
             enable_rerun_ && !rerun_final_only_;
         if (log_depthanything_fill_holes_created_voxels) {
             voxel_model_->setNextRealInsertionRerunEntityPath(
-                "world/depthanything_fill_holes/created");
+                "world/mono_prior_fill_holes/created");
         }
         voxel_model_->setRenderedDepthCandidateRealAdjacency(
-            depthanything_densify_require_real_adjacency_,
-            depthanything_densify_adjacency_radius_cells_);
+            false,
+            1);
         voxel_model_->setNextRenderedDepthCandidateInsertion(
             true,
             "",
-            kRenderedCandidateSourceDepthAnything,
+            kRenderedCandidateSourceMonoPrior,
             /*insert_as_real_protected=*/true);
         voxel_model_->increasePcd(points_tensor, colors_tensor, iter, tr_cams);
+        if (pkf->mono_prior_first_apply_iter_ < 0) {
+            pkf->mono_prior_first_apply_iter_ = iter;
+        }
         voxel_model_->setNextRenderedDepthCandidateInsertion(false);
         if (log_depthanything_fill_holes_created_voxels) {
             voxel_model_->setNextRealInsertionRerunEntityPath("");
         }
         const sv::VoxelModel::IncreasePcdStats insert_stats = voxel_model_->lastIncreasePcdStats();
-        std::cout << "[depthanything_fill_holes/insert] iter=" << iter
-                  << " kf=" << pkf->fid_
-                  << " raw_points_in=" << insert_stats.raw_points_in
-                  << " points_after_far_filter=" << insert_stats.points_after_far_filter
-                  << " unique_before_filter=" << insert_stats.unique_voxel_candidates_before_insert_filter
-                  << " unique_after_filter=" << insert_stats.unique_voxel_candidates_after_insert_filter
-                  << " duplicate_existing_voxels=" << insert_stats.duplicate_existing_voxels
-                  << " new_voxels=" << insert_stats.new_voxels
-                  << " pending_promotions=" << insert_stats.pending_promotions
-                  << " pending_support_updates=" << insert_stats.pending_support_updates
-                  << std::endl;
+        // std::cout << "[mono_prior_fill_holes/insert] iter=" << iter
+        //           << " kf=" << pkf->fid_
+        //           << " raw_points_in=" << insert_stats.raw_points_in
+        //           << " points_after_far_filter=" << insert_stats.points_after_far_filter
+        //           << " unique_before_filter=" << insert_stats.unique_voxel_candidates_before_insert_filter
+        //           << " unique_after_filter=" << insert_stats.unique_voxel_candidates_after_insert_filter
+        //           << " duplicate_existing_voxels=" << insert_stats.duplicate_existing_voxels
+        //           << " new_voxels=" << insert_stats.new_voxels
+        //           << " pending_promotions=" << insert_stats.pending_promotions
+        //           << " pending_support_updates=" << insert_stats.pending_support_updates
+        //           << std::endl;
     }
 
     updateRenderedDepthCandidateLifecycle();
@@ -11399,1100 +13269,9 @@ void VoxelMapper::increasePcdByKeyframeRenderedDepthInsertion(
     updateRenderedDepthCandidateLifecycle();
 }
 
-void VoxelMapper::increasePcdByKeyframeRenderedHoleFill(
-    std::shared_ptr<VoxelKeyframe> pkf)
-{
-    torch::NoGradGuard no_grad;
-
-    if (!pkf || !voxel_model_) {
-        return;
-    }
-
-    const int iter = getIteration();
-    if (sensor_type_ != MONOCULAR) {
-        static bool logged_non_mono = false;
-        if (!logged_non_mono) {
-            std::cout << "[rendered_hole_fill] skipping: current implementation is MONOCULAR-only.\n";
-            logged_non_mono = true;
-        }
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    const int active_hole_max_n_contrib = 0;
-    if (rendered_hole_fill_support_min_n_contrib_ <= active_hole_max_n_contrib) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " invalid thresholds support_min_n_contrib=" << rendered_hole_fill_support_min_n_contrib_
-        //           << " hole_max_n_contrib_active=" << active_hole_max_n_contrib
-        //           << " (require support_min_n_contrib > 0)"
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    const int H = pkf->image_height_;
-    const int W = pkf->image_width_;
-    if (H <= 0 || W <= 0) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    sv::MiniCam cam = pkf->toMiniCam(H, W);
-    std::unordered_map<std::string, torch::Tensor> render_pkg;
-    {
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        render_pkg = voxel_model_->render(
-            cam,
-            H,
-            W,
-            torch::Tensor(),
-            "dontcare",
-            false,
-            std::nullopt,
-            true,
-            false,
-            true,
-            false,
-            false,
-            sv::RenderOpts{});
-    }
-
-    auto it_depth = render_pkg.find("raw_depth");
-    if (it_depth == render_pkg.end()) it_depth = render_pkg.find("depth");
-    auto it_T = render_pkg.find("raw_T");
-    if (it_T == render_pkg.end()) it_T = render_pkg.find("T");
-    auto it_n_contrib = render_pkg.find("n_contrib");
-    if (it_n_contrib == render_pkg.end()) it_n_contrib = render_pkg.find("raw_n_contrib");
-    auto it_color = render_pkg.find("color");
-    if (it_color == render_pkg.end()) it_color = render_pkg.find("raw_color");
-    if (it_depth == render_pkg.end() || it_T == render_pkg.end() ||
-        it_n_contrib == render_pkg.end() || it_color == render_pkg.end() ||
-        !it_depth->second.defined() || !it_T->second.defined() ||
-        !it_n_contrib->second.defined() || !it_color->second.defined()) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " render outputs missing depth/T/n_contrib/color; skipping"
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto raw_depth = it_depth->second;
-    if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) raw_depth = raw_depth.squeeze(0);
-    if (raw_depth.dim() != 3 || raw_depth.size(0) < 1) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " invalid raw_depth shape=" << raw_depth.sizes()
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-    auto render_depth_raw = raw_depth.index({0}).contiguous();
-    auto render_T = squeezeRenderMap2D(it_T->second);
-    auto render_n_contrib = squeezeRenderMap2D(it_n_contrib->second);
-    auto render_color = it_color->second;
-    if (render_color.dim() == 4 && render_color.size(0) == 1) render_color = render_color.squeeze(0);
-    if (render_color.dim() != 3 || render_color.size(0) < 3) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " invalid color shape=" << render_color.sizes()
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-    if (render_color.size(0) > 3) render_color = render_color.index({torch::indexing::Slice(0, 3)});
-    if (render_depth_raw.dim() != 2 || render_T.dim() != 2 || render_n_contrib.dim() != 2) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " invalid shapes depth=" << render_depth_raw.sizes()
-        //           << " T=" << render_T.sizes()
-        //           << " n_contrib=" << render_n_contrib.sizes()
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto depth_raw_cpu = render_depth_raw.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto T_cpu = render_T.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto n_contrib_cpu = render_n_contrib.to(torch::kCPU).to(torch::kInt32).contiguous();
-    auto render_color_cpu = render_color.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    auto image_cpu = pkf->original_image_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-    if (image_cpu.dim() == 4 && image_cpu.size(0) == 1) image_cpu = image_cpu.squeeze(0).contiguous();
-    auto alpha_cpu = (1.0f - T_cpu).contiguous();
-    auto depth_cpu =
-        (depth_raw_cpu / alpha_cpu.clamp_min(1e-6f)).contiguous();
-
-    if (depth_cpu.size(0) != H || depth_cpu.size(1) != W ||
-        T_cpu.size(0) != H || T_cpu.size(1) != W ||
-        n_contrib_cpu.size(0) != H || n_contrib_cpu.size(1) != W ||
-        render_color_cpu.dim() != 3 || render_color_cpu.size(0) < 3 ||
-        render_color_cpu.size(1) != H || render_color_cpu.size(2) != W ||
-        image_cpu.dim() != 3 || image_cpu.size(0) < 3 ||
-        image_cpu.size(1) != H || image_cpu.size(2) != W) {
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " shape mismatch depth=" << depth_cpu.sizes()
-        //           << " T=" << T_cpu.sizes()
-        //           << " n_contrib=" << n_contrib_cpu.sizes()
-        //           << " render_color=" << render_color_cpu.sizes()
-        //           << " image=" << image_cpu.sizes()
-        //           << std::endl;
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    auto depth_acc = depth_cpu.accessor<float, 2>();
-    auto alpha_acc = alpha_cpu.accessor<float, 2>();
-    auto n_contrib_acc = n_contrib_cpu.accessor<int, 2>();
-    auto render_color_acc = render_color_cpu.accessor<float, 3>();
-    auto image_acc = image_cpu.accessor<float, 3>();
-
-    const float fx = (cam.fx > 1e-6f)
-        ? cam.fx
-        : (0.5f * static_cast<float>(W) / std::max(cam.tanfovx, 1e-6f));
-    const float fy = (cam.fy > 1e-6f)
-        ? cam.fy
-        : (0.5f * static_cast<float>(H) / std::max(cam.tanfovy, 1e-6f));
-    if (fx <= 1e-6f || fy <= 1e-6f) {
-        updateRenderedDepthCandidateLifecycle();
-        return;
-    }
-
-    const Sophus::SE3f Twc = pkf->getPosef().inverse();
-    const Eigen::Matrix3f Rwc = Twc.rotationMatrix();
-    const Eigen::Vector3f twc = Twc.translation();
-    const int boundary_radius = std::max(1, rendered_hole_fill_boundary_radius_px_);
-    const int neighbor_radius = std::max(1, rendered_hole_fill_neighbor_radius_px_);
-    const int stride = std::max(1, rendered_hole_fill_stride_);
-    const int min_neighbors = std::max(1, rendered_hole_fill_min_neighbors_);
-    const int surface_support_radius = std::max(1, rendered_hole_fill_surface_support_radius_px_);
-    const int surface_min_support_points = std::max(3, rendered_hole_fill_surface_min_support_points_);
-
-    std::vector<uint8_t> support_mask(static_cast<size_t>(H) * static_cast<size_t>(W), 0);
-    std::vector<uint8_t> hole_mask(static_cast<size_t>(H) * static_cast<size_t>(W), 0);
-    auto flat = [W](int y, int x) -> int64_t {
-        return static_cast<int64_t>(y) * static_cast<int64_t>(W) + static_cast<int64_t>(x);
-    };
-
-    int64_t support_pixels = 0;
-    int64_t hole_pixels = 0;
-    int64_t neither_support_nor_hole_pixels = 0;
-    int64_t zero_contrib_empty_low_rgb_pixels = 0;
-    int64_t zero_contrib_nonempty_depth_pixels = 0;
-    int64_t positive_contrib_empty_depth_pixels = 0;
-    float scene_support_depth_min = std::numeric_limits<float>::infinity();
-    float scene_support_depth_max = 0.0f;
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            const float z = depth_acc[y][x];
-            const float alpha = alpha_acc[y][x];
-            const int n_contrib = n_contrib_acc[y][x];
-            float rgb_error = 0.0f;
-            for (int c = 0; c < 3; ++c) {
-                rgb_error += std::abs(render_color_acc[c][y][x] - image_acc[c][y][x]);
-            }
-            rgb_error /= 3.0f;
-            const bool is_support =
-                std::isfinite(z) && z > 0.0f &&
-                (n_contrib >= rendered_hole_fill_support_min_n_contrib_);
-            const bool is_hole =
-                (n_contrib <= active_hole_max_n_contrib) &&
-                (!std::isfinite(z) || z <= rendered_hole_fill_empty_depth_eps_) &&
-                (rgb_error >= rendered_hole_fill_hole_rgb_error_min_);
-            if (is_support) {
-                support_mask[static_cast<size_t>(flat(y, x))] = 1;
-                ++support_pixels;
-                scene_support_depth_min = std::min(scene_support_depth_min, z);
-                scene_support_depth_max = std::max(scene_support_depth_max, z);
-            }
-            if (is_hole) {
-                hole_mask[static_cast<size_t>(flat(y, x))] = 1;
-                ++hole_pixels;
-            } else if (!is_support) {
-                ++neither_support_nor_hole_pixels;
-                const bool empty_depth =
-                    (!std::isfinite(z) || z <= rendered_hole_fill_empty_depth_eps_);
-                if (n_contrib <= active_hole_max_n_contrib) {
-                    if (empty_depth) {
-                        ++zero_contrib_empty_low_rgb_pixels;
-                    } else {
-                        ++zero_contrib_nonempty_depth_pixels;
-                    }
-                } else if (empty_depth) {
-                    ++positive_contrib_empty_depth_pixels;
-                }
-            }
-        }
-    }
-    const bool has_scene_support_depth_bounds =
-        std::isfinite(scene_support_depth_min) &&
-        scene_support_depth_min > 0.0f &&
-        std::isfinite(scene_support_depth_max) &&
-        scene_support_depth_max >= scene_support_depth_min;
-
-    if (save_rendered_hole_fill_debug_images_) {
-        saveRenderedHoleFillDebugImages(
-            result_dir_,
-            iter,
-            pkf->fid_,
-            render_color_cpu,
-            hole_mask,
-            H,
-            W);
-    }
-
-    std::vector<float> candidate_points_world;
-    std::vector<float> candidate_colors;
-    candidate_points_world.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_) * 3);
-    candidate_colors.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_) * 3);
-
-    auto pixelToWorld = [&](int x, int y, float depth, Eigen::Vector3f* p_world) -> bool {
-        if (!std::isfinite(depth) || depth <= 0.0f) {
-            return false;
-        }
-        const float Xc = (static_cast<float>(x) - cam.cx) / fx * depth;
-        const float Yc = (static_cast<float>(y) - cam.cy) / fy * depth;
-        const Eigen::Vector3f p_cam(Xc, Yc, depth);
-        *p_world = Twc * p_cam;
-        return std::isfinite(p_world->x()) &&
-               std::isfinite(p_world->y()) &&
-               std::isfinite(p_world->z());
-    };
-
-    const Sophus::SE3f Tcw = pkf->getPosef();
-    const Eigen::Matrix3f Rcw = Tcw.rotationMatrix();
-    const Eigen::Vector3f tcw = Tcw.translation();
-    const float emitted_voxel_size =
-        (voxel_model_ != nullptr) ? std::max(1e-6f, voxel_model_->fixedVoxSize()) : 1e-6f;
-    std::vector<float> emitted_voxel_cover_z;
-    if (voxel_rendering_checking_) {
-        emitted_voxel_cover_z.assign(
-            static_cast<size_t>(H) * static_cast<size_t>(W),
-            std::numeric_limits<float>::infinity());
-    }
-    auto splatEmittedVoxelCoverage = [&](const Eigen::Vector3f& p_world) {
-        if (!voxel_rendering_checking_) {
-            return;
-        }
-        const Eigen::Vector3f p_cam = Rcw * p_world + tcw;
-        const float z = p_cam.z();
-        if (!std::isfinite(z) || z <= cam.near) {
-            return;
-        }
-
-        const float u_f = fx * (p_cam.x() / z) + cam.cx;
-        const float v_f = fy * (p_cam.y() / z) + cam.cy;
-        if (!std::isfinite(u_f) || !std::isfinite(v_f)) {
-            return;
-        }
-
-        const int ru = std::max(
-            1,
-            static_cast<int>(std::ceil(0.5f * fx * (emitted_voxel_size / std::abs(z)))));
-        const int rv = std::max(
-            1,
-            static_cast<int>(std::ceil(0.5f * fy * (emitted_voxel_size / std::abs(z)))));
-        const int u0 = static_cast<int>(std::floor(u_f + 0.5f));
-        const int v0 = static_cast<int>(std::floor(v_f + 0.5f));
-
-        for (int dv = -rv; dv <= rv; ++dv) {
-            const int vv = v0 + dv;
-            if (vv < 0 || vv >= H) continue;
-            for (int du = -ru; du <= ru; ++du) {
-                const int uu = u0 + du;
-                if (uu < 0 || uu >= W) continue;
-                if ((du * du) / static_cast<float>(ru * ru) +
-                        (dv * dv) / static_cast<float>(rv * rv) >
-                    1.0f) {
-                    continue;
-                }
-                const size_t pix_idx = static_cast<size_t>(flat(vv, uu));
-                if (z < emitted_voxel_cover_z[pix_idx]) {
-                    emitted_voxel_cover_z[pix_idx] = z;
-                }
-            }
-        }
-    };
-
-    bool candidate_cap_applied = false;
-    int64_t hole_components = 0;
-    int64_t usable_hole_components = 0;
-    int64_t boundary_hole_pixels = 0;
-    int64_t selected_hole_pixels = 0;
-    int64_t rejected_sparse_neighbors = 0;
-    int64_t rejected_inconsistent_depth = 0;
-    int64_t rejected_border_components = 0;
-    int64_t rejected_component_size = 0;
-    int64_t rejected_sparse_support_components = 0;
-    int64_t rejected_plane_fit_components = 0;
-    int64_t rejected_depth_range = 0;
-    int64_t rejected_ray_intersections = 0;
-    int64_t frontier_rounds_total = 0;
-    int64_t propagation_filled_pixels_total = 0;
-    int64_t propagation_multi_depth_points = 0;
-
-    if (rendered_hole_fill_surface_patch_) {
-        struct HoleComponent {
-            std::vector<int64_t> pixels;
-            int min_x = std::numeric_limits<int>::max();
-            int max_x = std::numeric_limits<int>::min();
-            int min_y = std::numeric_limits<int>::max();
-            int max_y = std::numeric_limits<int>::min();
-            bool touches_border = false;
-        };
-
-        const size_t total_px = static_cast<size_t>(H) * static_cast<size_t>(W);
-        std::vector<int32_t> component_label(total_px, -1);
-        std::vector<HoleComponent> components;
-
-        for (int y0 = 0; y0 < H; ++y0) {
-            for (int x0 = 0; x0 < W; ++x0) {
-                const int64_t idx0 = flat(y0, x0);
-                if (!hole_mask[static_cast<size_t>(idx0)] || component_label[static_cast<size_t>(idx0)] >= 0) {
-                    continue;
-                }
-
-                components.emplace_back();
-                const int32_t comp_id = static_cast<int32_t>(components.size() - 1);
-                std::vector<int64_t> queue;
-                queue.push_back(idx0);
-                component_label[static_cast<size_t>(idx0)] = comp_id;
-
-                for (size_t qh = 0; qh < queue.size(); ++qh) {
-                    const int64_t cur = queue[qh];
-                    const int cy = static_cast<int>(cur / W);
-                    const int cx = static_cast<int>(cur % W);
-                    auto& comp = components[static_cast<size_t>(comp_id)];
-                    comp.pixels.push_back(cur);
-                    comp.min_x = std::min(comp.min_x, cx);
-                    comp.max_x = std::max(comp.max_x, cx);
-                    comp.min_y = std::min(comp.min_y, cy);
-                    comp.max_y = std::max(comp.max_y, cy);
-                    if (cx == 0 || cx == W - 1 || cy == 0 || cy == H - 1) {
-                        comp.touches_border = true;
-                    }
-
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        const int yy = cy + dy;
-                        if (yy < 0 || yy >= H) continue;
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            const int xx = cx + dx;
-                            if ((dx == 0 && dy == 0) || xx < 0 || xx >= W) continue;
-                            const int64_t nxt = flat(yy, xx);
-                            if (!hole_mask[static_cast<size_t>(nxt)] ||
-                                component_label[static_cast<size_t>(nxt)] >= 0) {
-                                continue;
-                            }
-                            component_label[static_cast<size_t>(nxt)] = comp_id;
-                            queue.push_back(nxt);
-                        }
-                    }
-                }
-            }
-        }
-
-        hole_components = static_cast<int64_t>(components.size());
-        for (const auto& comp : components) {
-            std::unordered_map<int64_t, int32_t> comp_local_idx;
-            comp_local_idx.reserve(comp.pixels.size() * 2);
-            for (int32_t i = 0; i < static_cast<int32_t>(comp.pixels.size()); ++i) {
-                comp_local_idx.emplace(comp.pixels[static_cast<size_t>(i)], i);
-            }
-            std::vector<uint8_t> filled_mask(comp.pixels.size(), 0);
-            std::vector<float> filled_depth(comp.pixels.size(), std::numeric_limits<float>::quiet_NaN());
-            std::vector<int32_t> filled_layer(comp.pixels.size(), -1);
-
-            auto fitLocalPlaneDepth = [&](int x,
-                                          int y,
-                                          const std::vector<Eigen::Vector3f>& support_points_world,
-                                          float depth_min_allow,
-                                          float depth_max_allow,
-                                          float* depth_out) -> bool {
-                if (static_cast<int>(support_points_world.size()) < surface_min_support_points) {
-                    return false;
-                }
-
-                Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-                for (const auto& p : support_points_world) {
-                    centroid += p;
-                }
-                centroid /= static_cast<float>(support_points_world.size());
-
-                Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
-                for (const auto& p : support_points_world) {
-                    const Eigen::Vector3f d = p - centroid;
-                    cov += d * d.transpose();
-                }
-                cov /= static_cast<float>(support_points_world.size());
-
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
-                if (solver.info() != Eigen::Success) {
-                    return false;
-                }
-                Eigen::Vector3f plane_normal = solver.eigenvectors().col(0);
-                if (!std::isfinite(plane_normal.x()) ||
-                    !std::isfinite(plane_normal.y()) ||
-                    !std::isfinite(plane_normal.z()) ||
-                    plane_normal.norm() <= 1e-6f) {
-                    return false;
-                }
-                plane_normal.normalize();
-
-                double sq_err_sum = 0.0;
-                for (const auto& p : support_points_world) {
-                    const float dist = plane_normal.dot(p - centroid);
-                    sq_err_sum += static_cast<double>(dist) * static_cast<double>(dist);
-                }
-                const float rms = std::sqrt(
-                    static_cast<float>(sq_err_sum / std::max<size_t>(1, support_points_world.size())));
-                if (!std::isfinite(rms) || rms > rendered_hole_fill_surface_plane_rms_thresh_m_) {
-                    return false;
-                }
-
-                const Eigen::Vector3f ray_cam(
-                    (static_cast<float>(x) - cam.cx) / fx,
-                    (static_cast<float>(y) - cam.cy) / fy,
-                    1.0f);
-                const Eigen::Vector3f ray_world = Rwc * ray_cam;
-                const float denom = plane_normal.dot(ray_world);
-                if (!std::isfinite(denom) || std::abs(denom) <= 1e-6f) {
-                    return false;
-                }
-                const float depth_along_ray = plane_normal.dot(centroid - twc) / denom;
-                if (!std::isfinite(depth_along_ray) || depth_along_ray <= 0.0f ||
-                    depth_along_ray < depth_min_allow || depth_along_ray > depth_max_allow) {
-                    return false;
-                }
-                *depth_out = depth_along_ray;
-                return true;
-            };
-
-            int64_t component_selected = 0;
-            int64_t component_candidates = 0;
-            bool component_has_progress = false;
-
-            auto has_support_within_radius = [&](int64_t hole_idx, int radius_px) -> bool {
-                const int y = static_cast<int>(hole_idx / W);
-                const int x = static_cast<int>(hole_idx % W);
-                for (int dy = -radius_px; dy <= radius_px; ++dy) {
-                    const int yy = y + dy;
-                    if (yy < 0 || yy >= H) continue;
-                    for (int dx = -radius_px; dx <= radius_px; ++dx) {
-                        if (dx == 0 && dy == 0) continue;
-                        const int xx = x + dx;
-                        if (xx < 0 || xx >= W) continue;
-                        if (support_mask[static_cast<size_t>(flat(yy, xx))]) {
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            };
-
-            std::vector<int32_t> hole_layer(comp.pixels.size(), -1);
-            std::deque<int32_t> bfs_queue;
-            for (int32_t local_i = 0; local_i < static_cast<int32_t>(comp.pixels.size()); ++local_i) {
-                if (has_support_within_radius(
-                        comp.pixels[static_cast<size_t>(local_i)],
-                        boundary_radius)) {
-                    hole_layer[static_cast<size_t>(local_i)] = 0;
-                    bfs_queue.push_back(local_i);
-                }
-            }
-
-            if (bfs_queue.empty()) {
-                // Fall back to the actual support-estimation radius so a component
-                // can still start when support is nearby but not 1-pixel touching.
-                for (int32_t local_i = 0; local_i < static_cast<int32_t>(comp.pixels.size()); ++local_i) {
-                    if (has_support_within_radius(
-                            comp.pixels[static_cast<size_t>(local_i)],
-                            surface_support_radius)) {
-                        hole_layer[static_cast<size_t>(local_i)] = 0;
-                        bfs_queue.push_back(local_i);
-                    }
-                }
-            }
-
-            if (bfs_queue.empty()) {
-                ++rejected_sparse_support_components;
-                continue;
-            }
-
-            while (!bfs_queue.empty()) {
-                const int32_t cur_local = bfs_queue.front();
-                bfs_queue.pop_front();
-                const int64_t cur_idx = comp.pixels[static_cast<size_t>(cur_local)];
-                const int cur_y = static_cast<int>(cur_idx / W);
-                const int cur_x = static_cast<int>(cur_idx % W);
-                const int32_t next_layer = hole_layer[static_cast<size_t>(cur_local)] + 1;
-
-                for (int dy = -1; dy <= 1; ++dy) {
-                    const int yy = cur_y + dy;
-                    if (yy < 0 || yy >= H) continue;
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        const int xx = cur_x + dx;
-                        if ((dx == 0 && dy == 0) || xx < 0 || xx >= W) continue;
-                        const int64_t nb = flat(yy, xx);
-                        const auto it_nb = comp_local_idx.find(nb);
-                        if (it_nb == comp_local_idx.end()) {
-                            continue;
-                        }
-                        const int32_t nb_local = it_nb->second;
-                        if (hole_layer[static_cast<size_t>(nb_local)] >= 0) {
-                            continue;
-                        }
-                        hole_layer[static_cast<size_t>(nb_local)] = next_layer;
-                        bfs_queue.push_back(nb_local);
-                    }
-                }
-            }
-
-            int32_t max_hole_layer = -1;
-            for (int32_t layer : hole_layer) {
-                max_hole_layer = std::max(max_hole_layer, layer);
-            }
-
-            for (int32_t layer_idx = 0; layer_idx <= max_hole_layer; ++layer_idx) {
-                std::vector<std::tuple<int32_t, float, int32_t>> updates;
-                updates.reserve(comp.pixels.size());
-
-                for (int32_t local_i = 0; local_i < static_cast<int32_t>(comp.pixels.size()); ++local_i) {
-                    if (hole_layer[static_cast<size_t>(local_i)] != layer_idx ||
-                        filled_mask[static_cast<size_t>(local_i)]) {
-                        continue;
-                    }
-
-                    const int64_t hole_idx = comp.pixels[static_cast<size_t>(local_i)];
-                    const int y = static_cast<int>(hole_idx / W);
-                    const int x = static_cast<int>(hole_idx % W);
-
-                    std::vector<float> neighbor_depths;
-                    std::vector<Eigen::Vector3f> support_points_world;
-                    const int support_radius = std::max(surface_support_radius, 1);
-                    neighbor_depths.reserve(static_cast<size_t>((2 * support_radius + 1) * (2 * support_radius + 1)));
-                    support_points_world.reserve(neighbor_depths.capacity());
-
-                    for (int dy = -support_radius; dy <= support_radius; ++dy) {
-                        const int yy = y + dy;
-                        if (yy < 0 || yy >= H) continue;
-                        for (int dx = -support_radius; dx <= support_radius; ++dx) {
-                            const int xx = x + dx;
-                            if (xx < 0 || xx >= W || (dx == 0 && dy == 0)) continue;
-                            const int64_t nb = flat(yy, xx);
-
-                            float z_nb = std::numeric_limits<float>::quiet_NaN();
-                            bool has_support = false;
-                            if (support_mask[static_cast<size_t>(nb)]) {
-                                z_nb = depth_acc[yy][xx];
-                                has_support = std::isfinite(z_nb) && z_nb > 0.0f;
-                            } else {
-                                const auto it_nb = comp_local_idx.find(nb);
-                                if (it_nb != comp_local_idx.end() &&
-                                    filled_mask[static_cast<size_t>(it_nb->second)]) {
-                                    z_nb = filled_depth[static_cast<size_t>(it_nb->second)];
-                                    has_support = std::isfinite(z_nb) && z_nb > 0.0f;
-                                }
-                            }
-
-                            if (!has_support) {
-                                continue;
-                            }
-
-                            neighbor_depths.push_back(z_nb);
-                            Eigen::Vector3f p_world;
-                            if (pixelToWorld(xx, yy, z_nb, &p_world)) {
-                                support_points_world.push_back(p_world);
-                            }
-                        }
-                    }
-
-                    if (neighbor_depths.empty()) {
-                        continue;
-                    }
-
-                    std::sort(neighbor_depths.begin(), neighbor_depths.end());
-                    const size_t mid = neighbor_depths.size() / 2;
-                    const float median_depth = (neighbor_depths.size() % 2 == 1)
-                        ? neighbor_depths[mid]
-                        : 0.5f * (neighbor_depths[mid - 1] + neighbor_depths[mid]);
-                    if (!std::isfinite(median_depth) || median_depth <= 0.0f) {
-                        continue;
-                    }
-
-                    const float neighbor_depth_min = neighbor_depths.front();
-                    const float neighbor_depth_max = neighbor_depths.back();
-                    const float local_depth_span =
-                        std::max(0.0f, neighbor_depth_max - neighbor_depth_min);
-                    const float center_depth_safe = std::max(1e-3f, median_depth);
-                    const float rel_depth_span = local_depth_span / center_depth_safe;
-                    const float local_margin =
-                        std::max(0.05f,
-                                 rendered_hole_fill_surface_depth_margin_rel_ *
-                                     center_depth_safe);
-                    float depth_min_allow = std::max(1e-4f, neighbor_depth_min - local_margin);
-                    float depth_max_allow = neighbor_depth_max + local_margin;
-                    if (has_scene_support_depth_bounds) {
-                        depth_min_allow = std::max(depth_min_allow, scene_support_depth_min);
-                        depth_max_allow = std::min(depth_max_allow, scene_support_depth_max);
-                    }
-                    if (depth_max_allow <= depth_min_allow + 1e-4f) {
-                        ++rejected_depth_range;
-                        continue;
-                    }
-                    float center_depth = median_depth;
-
-                    if (fitLocalPlaneDepth(
-                            x,
-                            y,
-                            support_points_world,
-                            depth_min_allow,
-                            depth_max_allow,
-                            &center_depth)) {
-                        // keep plane estimate
-                    } else if (static_cast<int>(support_points_world.size()) >= surface_min_support_points) {
-                        ++rejected_plane_fit_components;
-                    }
-
-                    center_depth = std::clamp(center_depth, depth_min_allow, depth_max_allow);
-                    if (!std::isfinite(center_depth) || center_depth <= 0.0f) {
-                        ++rejected_ray_intersections;
-                        continue;
-                    }
-
-                    const bool emit_candidate = ((x % stride) == 0) && ((y % stride) == 0);
-                    if (emit_candidate) {
-                        int depth_layers = 1;
-                        float depth_lo = center_depth;
-                        float depth_hi = center_depth;
-                        const float depth_safe = std::max(1e-3f, center_depth);
-                        const float max_depth_band =
-                            std::max(0.02f,
-                                     rendered_hole_fill_depth_rel_spread_thresh_ *
-                                         depth_safe);
-                        const float base_emit_half_band =
-                            rendered_hole_fill_surface_propagation_uncertainty_rel_ * depth_safe;
-                        float depth_min_emit = std::max(
-                            depth_min_allow,
-                            neighbor_depth_min - base_emit_half_band);
-                        float depth_max_emit = std::min(
-                            depth_max_allow,
-                            neighbor_depth_max + base_emit_half_band);
-                        if (depth_max_emit <= depth_min_emit + 1e-4f) {
-                            depth_min_emit = center_depth;
-                            depth_max_emit = center_depth;
-                        }
-                        center_depth = std::clamp(center_depth, depth_min_emit, depth_max_emit);
-                        if (rendered_hole_fill_surface_propagate_interior_ &&
-                            rendered_hole_fill_surface_propagation_max_depth_layers_ > 1 &&
-                            layer_idx > 1 &&
-                            rel_depth_span <= rendered_hole_fill_depth_rel_spread_thresh_) {
-                            const float norm_dist = std::min(
-                                1.0f,
-                                static_cast<float>(layer_idx - 1) /
-                                    static_cast<float>(std::max(
-                                        1,
-                                        rendered_hole_fill_surface_propagation_full_band_distance_px_)));
-                            depth_layers =
-                                1 + static_cast<int>(std::floor(
-                                        norm_dist *
-                                        static_cast<float>(
-                                            rendered_hole_fill_surface_propagation_max_depth_layers_ - 1)));
-                            depth_layers = std::clamp(
-                                depth_layers,
-                                1,
-                                rendered_hole_fill_surface_propagation_max_depth_layers_);
-                            const float uncertainty_half_band =
-                                norm_dist *
-                                rendered_hole_fill_surface_propagation_uncertainty_rel_ *
-                                depth_safe;
-                            float band = std::min(
-                                max_depth_band,
-                                2.0f * uncertainty_half_band);
-                            if (std::isfinite(rel_depth_span) &&
-                                rel_depth_span > rendered_hole_fill_depth_rel_spread_thresh_) {
-                                band = std::min(band, 0.5f * max_depth_band);
-                            }
-                            depth_lo = std::max(depth_min_emit, center_depth - 0.5f * band);
-                            depth_hi = std::min(depth_max_emit, center_depth + 0.5f * band);
-                            if (depth_hi <= depth_lo + 1e-4f) {
-                                depth_layers = 1;
-                                depth_lo = center_depth;
-                                depth_hi = center_depth;
-                            }
-                        } else {
-                            depth_lo = center_depth;
-                            depth_hi = center_depth;
-                        }
-
-                        const Eigen::Vector3f ray_cam(
-                            (static_cast<float>(x) - cam.cx) / fx,
-                            (static_cast<float>(y) - cam.cy) / fy,
-                            1.0f);
-                        const Eigen::Vector3f ray_world = Rwc * ray_cam;
-                        const bool skip_render_covered =
-                            voxel_rendering_checking_ &&
-                            std::isfinite(
-                                emitted_voxel_cover_z[static_cast<size_t>(flat(y, x))]);
-
-                        if (!skip_render_covered) {
-                            for (int layer_i = 0; layer_i < depth_layers; ++layer_i) {
-                                const float depth_along_ray =
-                                    (depth_layers <= 1)
-                                        ? center_depth
-                                        : depth_lo +
-                                              (depth_hi - depth_lo) *
-                                                  (static_cast<float>(layer_i) /
-                                                   static_cast<float>(depth_layers - 1));
-                                if (!std::isfinite(depth_along_ray) || depth_along_ray <= 0.0f) {
-                                    ++rejected_depth_range;
-                                    continue;
-                                }
-
-                                const Eigen::Vector3f p_world = twc + depth_along_ray * ray_world;
-                                if (!std::isfinite(p_world.x()) ||
-                                    !std::isfinite(p_world.y()) ||
-                                    !std::isfinite(p_world.z())) {
-                                    ++rejected_ray_intersections;
-                                    continue;
-                                }
-
-                                candidate_points_world.push_back(p_world.x());
-                                candidate_points_world.push_back(p_world.y());
-                                candidate_points_world.push_back(p_world.z());
-                                candidate_colors.push_back(
-                                    std::clamp(image_acc[0][y][x], 0.0f, 1.0f));
-                                candidate_colors.push_back(
-                                    std::clamp(image_acc[1][y][x], 0.0f, 1.0f));
-                                candidate_colors.push_back(
-                                    std::clamp(image_acc[2][y][x], 0.0f, 1.0f));
-                                splatEmittedVoxelCoverage(p_world);
-                                ++component_candidates;
-                                if (depth_layers > 1) {
-                                    ++propagation_multi_depth_points;
-                                }
-                            }
-                        }
-                    }
-
-                    updates.emplace_back(local_i, center_depth, layer_idx);
-                }
-
-                if (updates.empty()) {
-                    if (!component_has_progress && layer_idx == 0) {
-                        ++rejected_sparse_support_components;
-                    }
-                    break;
-                }
-
-                component_has_progress = true;
-                ++frontier_rounds_total;
-                for (const auto& update : updates) {
-                    const int32_t local_i = std::get<0>(update);
-                    filled_mask[static_cast<size_t>(local_i)] = 1;
-                    filled_depth[static_cast<size_t>(local_i)] = std::get<1>(update);
-                    filled_layer[static_cast<size_t>(local_i)] = std::get<2>(update);
-                    ++selected_hole_pixels;
-                    ++component_selected;
-                }
-                propagation_filled_pixels_total += static_cast<int64_t>(updates.size());
-            }
-
-            if (component_has_progress) {
-                ++usable_hole_components;
-            }
-        }
-
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " mode=surface_patch"
-        //           << " support_pixels=" << support_pixels
-        //           << " hole_pixels=" << hole_pixels
-        //           << " hole_components=" << hole_components
-        //           << " usable_hole_components=" << usable_hole_components
-        //           << " selected_hole_pixels=" << selected_hole_pixels
-        //           << " stride=" << stride
-        //           << " support_radius_px=" << surface_support_radius
-        //           << " hole_max_n_contrib_active=" << active_hole_max_n_contrib
-        //           << " support_min_n_contrib=" << rendered_hole_fill_support_min_n_contrib_
-        //           << " hole_rgb_error_min=" << rendered_hole_fill_hole_rgb_error_min_
-        //           << " neither_support_nor_hole_pixels=" << neither_support_nor_hole_pixels
-        //           << " zero_contrib_empty_low_rgb_pixels=" << zero_contrib_empty_low_rgb_pixels
-        //           << " zero_contrib_nonempty_depth_pixels=" << zero_contrib_nonempty_depth_pixels
-        //           << " positive_contrib_empty_depth_pixels=" << positive_contrib_empty_depth_pixels
-        //           << std::endl;
-    } else {
-        std::vector<int64_t> selected_hole_idx;
-        selected_hole_idx.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_));
-        for (int y = 0; y < H; ++y) {
-            for (int x = 0; x < W; ++x) {
-                if (!hole_mask[static_cast<size_t>(flat(y, x))]) {
-                    continue;
-                }
-                bool has_support_neighbor = false;
-                for (int dy = -boundary_radius; dy <= boundary_radius && !has_support_neighbor; ++dy) {
-                    const int yy = y + dy;
-                    if (yy < 0 || yy >= H) continue;
-                    for (int dx = -boundary_radius; dx <= boundary_radius; ++dx) {
-                        if (dx == 0 && dy == 0) continue;
-                        const int xx = x + dx;
-                        if (xx < 0 || xx >= W) continue;
-                        if (support_mask[static_cast<size_t>(flat(yy, xx))]) {
-                            has_support_neighbor = true;
-                            break;
-                        }
-                    }
-                }
-                if (!has_support_neighbor) {
-                    continue;
-                }
-                ++boundary_hole_pixels;
-                if ((x % stride) == 0 && (y % stride) == 0) {
-                    selected_hole_idx.push_back(flat(y, x));
-                }
-            }
-        }
-
-        if (rendered_hole_fill_max_points_per_kf_ > 0 &&
-            static_cast<int>(selected_hole_idx.size()) > rendered_hole_fill_max_points_per_kf_) {
-            std::vector<int64_t> keep;
-            keep.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_));
-            if (rendered_hole_fill_max_points_per_kf_ == 1) {
-                keep.push_back(selected_hole_idx[selected_hole_idx.size() / 2]);
-            } else {
-                const double step = static_cast<double>(selected_hole_idx.size() - 1) /
-                                    static_cast<double>(rendered_hole_fill_max_points_per_kf_ - 1);
-                for (int i = 0; i < rendered_hole_fill_max_points_per_kf_; ++i) {
-                    const size_t idx = static_cast<size_t>(std::llround(step * static_cast<double>(i)));
-                    keep.push_back(selected_hole_idx[std::min(idx, selected_hole_idx.size() - 1)]);
-                }
-            }
-            selected_hole_idx.swap(keep);
-        }
-
-        selected_hole_pixels = static_cast<int64_t>(selected_hole_idx.size());
-        // std::cout << "[rendered_hole_fill/start] iter=" << iter
-        //           << " kf=" << pkf->fid_
-        //           << " mode=local_median"
-        //           << " support_pixels=" << support_pixels
-        //           << " hole_pixels=" << hole_pixels
-        //           << " boundary_hole_pixels=" << boundary_hole_pixels
-        //           << " selected_boundary_hole_pixels=" << selected_hole_idx.size()
-        //           << " stride=" << stride
-        //           << " boundary_radius_px=" << boundary_radius
-        //           << " hole_max_n_contrib_active=" << active_hole_max_n_contrib
-        //           << " support_min_n_contrib=" << rendered_hole_fill_support_min_n_contrib_
-        //           << " hole_rgb_error_min=" << rendered_hole_fill_hole_rgb_error_min_
-        //           << " neither_support_nor_hole_pixels=" << neither_support_nor_hole_pixels
-        //           << " zero_contrib_empty_low_rgb_pixels=" << zero_contrib_empty_low_rgb_pixels
-        //           << " zero_contrib_nonempty_depth_pixels=" << zero_contrib_nonempty_depth_pixels
-        //           << " positive_contrib_empty_depth_pixels=" << positive_contrib_empty_depth_pixels
-        //           << std::endl;
-
-        for (const int64_t flat_idx : selected_hole_idx) {
-            const int y = static_cast<int>(flat_idx / W);
-            const int x = static_cast<int>(flat_idx % W);
-
-            std::vector<float> neighbor_depths;
-            neighbor_depths.reserve(static_cast<size_t>((2 * neighbor_radius + 1) * (2 * neighbor_radius + 1)));
-            for (int dy = -neighbor_radius; dy <= neighbor_radius; ++dy) {
-                const int yy = y + dy;
-                if (yy < 0 || yy >= H) continue;
-                for (int dx = -neighbor_radius; dx <= neighbor_radius; ++dx) {
-                    const int xx = x + dx;
-                    if (xx < 0 || xx >= W) continue;
-                    if (!support_mask[static_cast<size_t>(flat(yy, xx))]) continue;
-                    const float z_nb = depth_acc[yy][xx];
-                    if (std::isfinite(z_nb) && z_nb > 0.0f) {
-                        neighbor_depths.push_back(z_nb);
-                    }
-                }
-            }
-
-            if (static_cast<int>(neighbor_depths.size()) < min_neighbors) {
-                ++rejected_sparse_neighbors;
-                continue;
-            }
-
-            std::sort(neighbor_depths.begin(), neighbor_depths.end());
-            const size_t mid = neighbor_depths.size() / 2;
-            const float median_depth = (neighbor_depths.size() % 2 == 1)
-                ? neighbor_depths[mid]
-                : 0.5f * (neighbor_depths[mid - 1] + neighbor_depths[mid]);
-            const float depth_min = neighbor_depths.front();
-            const float depth_max = neighbor_depths.back();
-            const float rel_spread =
-                (depth_max - depth_min) / std::max(1e-3f, median_depth);
-            if (!std::isfinite(median_depth) || median_depth <= 0.0f ||
-                rel_spread > rendered_hole_fill_depth_rel_spread_thresh_) {
-                ++rejected_inconsistent_depth;
-                continue;
-            }
-
-            Eigen::Vector3f p_world;
-            if (!pixelToWorld(x, y, median_depth, &p_world)) {
-                continue;
-            }
-
-            candidate_points_world.push_back(p_world.x());
-            candidate_points_world.push_back(p_world.y());
-            candidate_points_world.push_back(p_world.z());
-            candidate_colors.push_back(std::clamp(image_acc[0][y][x], 0.0f, 1.0f));
-            candidate_colors.push_back(std::clamp(image_acc[1][y][x], 0.0f, 1.0f));
-            candidate_colors.push_back(std::clamp(image_acc[2][y][x], 0.0f, 1.0f));
-        }
-    }
-
-    int64_t num_candidates = static_cast<int64_t>(candidate_points_world.size() / 3);
-    if (rendered_hole_fill_max_points_per_kf_ > 0 &&
-        num_candidates > rendered_hole_fill_max_points_per_kf_) {
-        candidate_cap_applied = true;
-        std::vector<float> keep_points;
-        std::vector<float> keep_colors;
-        keep_points.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_) * 3);
-        keep_colors.reserve(static_cast<size_t>(rendered_hole_fill_max_points_per_kf_) * 3);
-        if (rendered_hole_fill_max_points_per_kf_ == 1) {
-            const int64_t mid = num_candidates / 2;
-            keep_points.insert(
-                keep_points.end(),
-                candidate_points_world.begin() + 3 * mid,
-                candidate_points_world.begin() + 3 * (mid + 1));
-            keep_colors.insert(
-                keep_colors.end(),
-                candidate_colors.begin() + 3 * mid,
-                candidate_colors.begin() + 3 * (mid + 1));
-        } else {
-            const double step = static_cast<double>(num_candidates - 1) /
-                                static_cast<double>(rendered_hole_fill_max_points_per_kf_ - 1);
-            for (int i = 0; i < rendered_hole_fill_max_points_per_kf_; ++i) {
-                const int64_t idx = static_cast<int64_t>(
-                    std::llround(step * static_cast<double>(i)));
-                const int64_t clamped_idx = std::min<int64_t>(idx, num_candidates - 1);
-                keep_points.insert(
-                    keep_points.end(),
-                    candidate_points_world.begin() + 3 * clamped_idx,
-                    candidate_points_world.begin() + 3 * (clamped_idx + 1));
-                keep_colors.insert(
-                    keep_colors.end(),
-                    candidate_colors.begin() + 3 * clamped_idx,
-                    candidate_colors.begin() + 3 * (clamped_idx + 1));
-            }
-        }
-        candidate_points_world.swap(keep_points);
-        candidate_colors.swap(keep_colors);
-        num_candidates = static_cast<int64_t>(candidate_points_world.size() / 3);
-    }
-
-    // std::cout << "[rendered_hole_fill/candidates] iter=" << iter
-    //           << " kf=" << pkf->fid_
-    //           << " mode=" << (rendered_hole_fill_surface_patch_ ? "surface_patch" : "local_median")
-    //           << " valid_candidates=" << num_candidates
-    //           << " candidate_cap_applied=" << (candidate_cap_applied ? 1 : 0);
-    // if (rendered_hole_fill_surface_patch_) {
-    //     std::cout << " rejected_border_components=" << rejected_border_components
-    //               << " rejected_component_size=" << rejected_component_size
-    //               << " rejected_sparse_support_components=" << rejected_sparse_support_components
-    //               << " rejected_plane_fit_components=" << rejected_plane_fit_components
-    //               << " rejected_depth_range=" << rejected_depth_range
-    //               << " rejected_ray_intersections=" << rejected_ray_intersections
-    //               << " frontier_rounds=" << frontier_rounds_total
-    //               << " propagation_filled_pixels=" << propagation_filled_pixels_total
-    //               << " propagation_multi_depth_points=" << propagation_multi_depth_points
-    //               << " support_radius_px=" << surface_support_radius
-    //               << " plane_min_support_points=" << surface_min_support_points
-    //               << " plane_rms_thresh_m=" << rendered_hole_fill_surface_plane_rms_thresh_m_
-    //               << " depth_margin_rel=" << rendered_hole_fill_surface_depth_margin_rel_
-    //               << " propagate_interior=" << (rendered_hole_fill_surface_propagate_interior_ ? 1 : 0)
-    //               << " propagation_full_band_distance_px="
-    //               << rendered_hole_fill_surface_propagation_full_band_distance_px_
-    //               << " propagation_uncertainty_rel="
-    //               << rendered_hole_fill_surface_propagation_uncertainty_rel_
-    //               << " propagation_max_depth_layers="
-    //               << rendered_hole_fill_surface_propagation_max_depth_layers_;
-    // } else {
-    //     std::cout << " rejected_sparse_neighbors=" << rejected_sparse_neighbors
-    //               << " rejected_inconsistent_depth=" << rejected_inconsistent_depth
-    //               << " neighbor_radius_px=" << neighbor_radius
-    //               << " min_neighbors=" << min_neighbors
-    //               << " hole_max_n_contrib_active=" << active_hole_max_n_contrib
-    //               << " support_min_n_contrib=" << rendered_hole_fill_support_min_n_contrib_
-    //               << " support_alpha_min=" << rendered_hole_fill_support_alpha_min_
-    //               << " hole_rgb_error_min=" << rendered_hole_fill_hole_rgb_error_min_
-    //               << " depth_rel_spread_thresh=" << rendered_hole_fill_depth_rel_spread_thresh_;
-    // }
-    // std::cout << std::endl;
-
-    sv::VoxelModel::IncreasePcdStats hole_fill_insert_stats;
-    if (num_candidates > 0) {
-        auto points_tensor = torch::from_blob(
-            candidate_points_world.data(),
-            {num_candidates, 3},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone().to(device_type_);
-        auto colors_tensor = torch::from_blob(
-            candidate_colors.data(),
-            {num_candidates, 3},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone().to(device_type_);
-
-        std::vector<sv::MiniCam> tr_cams;
-        tr_cams.reserve(scene_->keyframes().size());
-        for (auto& kv : scene_->keyframes()) {
-            if (kv.second) {
-                tr_cams.push_back(
-                    kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
-            }
-        }
-
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        voxel_model_->setRenderedDepthCandidateRealAdjacency(
-            rendered_hole_fill_require_real_adjacency_,
-            rendered_hole_fill_adjacency_radius_cells_);
-        voxel_model_->setNextRenderedDepthCandidateInsertion(
-            true,
-            (enable_rerun_ && !rerun_final_only_ && rerun_rendered_hole_fill_)
-                ? "world/rendered_hole_fill/created"
-                : "",
-            kRenderedCandidateSourceHoleFill,
-            rendered_hole_fill_insert_as_real_protected_);
-        voxel_model_->increasePcd(points_tensor, colors_tensor, iter, tr_cams);
-        hole_fill_insert_stats = voxel_model_->lastIncreasePcdStats();
-        voxel_model_->setNextRenderedDepthCandidateInsertion(false);
-    }
-
-    const double sampled_vs_holes_pct =
-        (hole_pixels > 0) ? (100.0 * static_cast<double>(selected_hole_pixels) /
-                             static_cast<double>(hole_pixels))
-                          : 0.0;
-    const double candidates_vs_holes_pct =
-        (hole_pixels > 0) ? (100.0 * static_cast<double>(num_candidates) /
-                             static_cast<double>(hole_pixels))
-                          : 0.0;
-    const double new_voxels_vs_holes_pct =
-        (hole_pixels > 0) ? (100.0 * static_cast<double>(hole_fill_insert_stats.new_voxels) /
-                             static_cast<double>(hole_pixels))
-                          : 0.0;
-    const double new_voxels_vs_candidates_pct =
-        (num_candidates > 0) ? (100.0 * static_cast<double>(hole_fill_insert_stats.new_voxels) /
-                                static_cast<double>(num_candidates))
-                             : 0.0;
-    // std::cout << "[rendered_hole_fill/coverage] iter=" << iter
-    //           << " kf=" << pkf->fid_
-    //           << " hole_pixels=" << hole_pixels
-    //           << " selected_hole_pixels=" << selected_hole_pixels
-    //           << " valid_candidates=" << num_candidates
-    //           << " quantized_candidates=" << hole_fill_insert_stats.unique_voxel_candidates_after_insert_filter
-    //           << " new_voxels=" << hole_fill_insert_stats.new_voxels
-    //           << " sampled_vs_holes_pct=" << sampled_vs_holes_pct
-    //           << " candidates_vs_holes_pct=" << candidates_vs_holes_pct
-    //           << " new_voxels_vs_holes_pct=" << new_voxels_vs_holes_pct
-    //           << " new_voxels_vs_candidates_pct=" << new_voxels_vs_candidates_pct
-    //           << std::endl;
-
-    updateRenderedDepthCandidateLifecycle();
-}
-
 void VoxelMapper::updateRenderedDepthCandidateLifecycle()
 {
-    if ((!rendered_depth_insert_ && !rendered_hole_fill_ && !depthanything_densify_) || !voxel_model_) {
+    if ((!rendered_depth_insert_ && !depthanything_densify_ && !depthanything_fill_holes_) || !voxel_model_) {
         return;
     }
 
@@ -12574,12 +13353,9 @@ void VoxelMapper::updateRenderedDepthCandidateLifecycle()
     if (n_promote > 0) {
         auto promote_depth_mask =
             (promote_mask & (source_kind == kRenderedCandidateSourceDepthInsert)).to(torch::kBool);
-        auto promote_hole_mask =
-            (promote_mask & (source_kind == kRenderedCandidateSourceHoleFill)).to(torch::kBool);
         auto promote_mono_mask =
-            (promote_mask & (source_kind == kRenderedCandidateSourceDepthAnything)).to(torch::kBool);
+            (promote_mask & (source_kind == kRenderedCandidateSourceMonoPrior)).to(torch::kBool);
         const int64_t n_promote_depth = promote_depth_mask.sum().item<int64_t>();
-        const int64_t n_promote_hole = promote_hole_mask.sum().item<int64_t>();
         const int64_t n_promote_mono = promote_mono_mask.sum().item<int64_t>();
         if (enable_rerun_ && !rerun_final_only_) {
             if (rerun_rendered_depth_insert_) {
@@ -12590,13 +13366,12 @@ void VoxelMapper::updateRenderedDepthCandidateLifecycle()
             }
         }
         voxel_model_->promoteRenderedDepthCandidates(promote_mask);
-        std::cout << "[rendered_candidate/promote] iter=" << iter
-                  << " promoted=" << n_promote
-                  << " rendered_depth_insert=" << n_promote_depth
-                  << " depthanything=" << n_promote_mono
-                  << " rendered_hole_fill=" << n_promote_hole
-                  << " min_support=" << opt_params_.rendered_depth_candidate_promote_min_support_
-                  << std::endl;
+        // std::cout << "[rendered_candidate/promote] iter=" << iter
+        //           << " promoted=" << n_promote
+        //           << " rendered_depth_insert=" << n_promote_depth
+        //           << " mono_prior=" << n_promote_mono
+        //           << " min_support=" << opt_params_.rendered_depth_candidate_promote_min_support_
+        //           << std::endl;
     }
 
     candidate_mask = voxel_model_->renderedDepthCandidateMask();
@@ -12628,31 +13403,6 @@ void VoxelMapper::updateRenderedDepthCandidateLifecycle()
         current_kf_count,
         torch::TensorOptions().dtype(torch::kInt32).device(candidate_mask.device())) -
         last_seen_kf).to(torch::kInt32);
-    auto hole_fill_candidate_mask =
-        (candidate_mask & (source_kind == kRenderedCandidateSourceHoleFill)).to(torch::kBool);
-    const int64_t n_hole_fill_candidates = hole_fill_candidate_mask.sum().item<int64_t>();
-    if (n_hole_fill_candidates > 0) {
-        const int min_support = std::max(1, opt_params_.rendered_depth_candidate_promote_min_support_);
-        auto support_eq_1 =
-            (hole_fill_candidate_mask & (support_count == 1)).to(torch::kBool);
-        auto support_eq_2 =
-            (hole_fill_candidate_mask & (support_count == 2)).to(torch::kBool);
-        auto support_ge_min =
-            (hole_fill_candidate_mask & (support_count >= min_support)).to(torch::kBool);
-        auto stale_hole_fill =
-            (hole_fill_candidate_mask &
-             (last_seen_kf >= 0) &
-             (age_kf >= opt_params_.rendered_depth_candidate_prune_kf_age_)).to(torch::kBool);
-        std::cout << "[rendered_candidate/state] iter=" << iter
-                  << " hole_fill_candidates=" << n_hole_fill_candidates
-                  << " support_eq_1=" << support_eq_1.sum().item<int64_t>()
-                  << " support_eq_2=" << support_eq_2.sum().item<int64_t>()
-                  << " support_ge_min=" << support_ge_min.sum().item<int64_t>()
-                  << " stale=" << stale_hole_fill.sum().item<int64_t>()
-                  << " min_support=" << min_support
-                  << " prune_kf_age=" << opt_params_.rendered_depth_candidate_prune_kf_age_
-                  << std::endl;
-    }
     auto prune_mask =
         (candidate_mask &
          (support_count < opt_params_.rendered_depth_candidate_promote_min_support_) &
@@ -12662,12 +13412,9 @@ void VoxelMapper::updateRenderedDepthCandidateLifecycle()
     if (n_prune > 0) {
         auto prune_depth_mask =
             (prune_mask & (source_kind == kRenderedCandidateSourceDepthInsert)).to(torch::kBool);
-        auto prune_hole_mask =
-            (prune_mask & (source_kind == kRenderedCandidateSourceHoleFill)).to(torch::kBool);
         auto prune_mono_mask =
-            (prune_mask & (source_kind == kRenderedCandidateSourceDepthAnything)).to(torch::kBool);
+            (prune_mask & (source_kind == kRenderedCandidateSourceMonoPrior)).to(torch::kBool);
         const int64_t n_prune_depth = prune_depth_mask.sum().item<int64_t>();
-        const int64_t n_prune_hole = prune_hole_mask.sum().item<int64_t>();
         const int64_t n_prune_mono = prune_mono_mask.sum().item<int64_t>();
         if (enable_rerun_ && !rerun_final_only_) {
             if (rerun_rendered_depth_insert_) {
@@ -12679,14 +13426,13 @@ void VoxelMapper::updateRenderedDepthCandidateLifecycle()
         }
         // Do not prune here. Topology-removing pruning requires the normal adapt
         // path, which rebuilds the trainer/optimizer after the topology change.
-        std::cout << "[rendered_candidate/prune_deferred] iter=" << iter
-                  << " stale_candidates=" << n_prune
-                  << " rendered_depth_insert=" << n_prune_depth
-                  << " depthanything=" << n_prune_mono
-                  << " rendered_hole_fill=" << n_prune_hole
-                  << " prune_kf_age=" << opt_params_.rendered_depth_candidate_prune_kf_age_
-                  << " action=defer_to_adapt_prune"
-                  << std::endl;
+        // std::cout << "[rendered_candidate/prune_deferred] iter=" << iter
+        //           << " stale_candidates=" << n_prune
+        //           << " rendered_depth_insert=" << n_prune_depth
+        //           << " mono_prior=" << n_prune_mono
+        //           << " prune_kf_age=" << opt_params_.rendered_depth_candidate_prune_kf_age_
+        //           << " action=defer_to_adapt_prune"
+        //           << std::endl;
     }
 }
 
@@ -12873,9 +13619,13 @@ void VoxelMapper::renderAndRecordKeyframe(
             main_viz_min,
             main_viz_max);
 
-        const std::filesystem::path depth_path = result_depth_dir / (stem + ".png");
+        std::ostringstream final_depth_tag;
+        final_depth_tag << "_iter_" << std::setw(5) << std::setfill('0') << getIteration();
+        const std::filesystem::path depth_path =
+            result_depth_dir / (stem + final_depth_tag.str() + ".png");
         const std::filesystem::path depth_gt_path = result_depth_dir / (stem + "_gt.png");
-        const std::filesystem::path depth_pair_path = result_depth_dir / (stem + "_pair.png");
+        const std::filesystem::path depth_pair_path =
+            result_depth_dir / (stem + "_pair" + final_depth_tag.str() + ".png");
         saveDepthComparisonDebugPngs(
             pred_depth,
             has_gt_depth_eval ? gt_depth_meters : cv::Mat(),
@@ -13045,174 +13795,171 @@ void VoxelMapper::renderAndRecordKeyframe(
         }
     }
 
-    if (sensor_type_ == MONOCULAR) {
-        if ((opt_params_.lambda_depthanythingv2_ > 0.0f) ||
-            (pkf->depthanythingv2_.defined() && pkf->depthanythingv2_.numel() > 0)) {
-            if (ensureDepthAnythingv2ForKeyframe(pkf)) {
-                const int depthanything_iter = pkf->depthanythingv2_prepare_iter_;
-                std::ostringstream depthanything_tag;
-                if (depthanything_iter >= 0) {
-                    depthanything_tag << "_depthanythingv2_iter_"
-                                      << std::setw(5) << std::setfill('0')
-                                      << depthanything_iter;
-                } else {
-                    depthanything_tag << "_depthanythingv2";
-                }
-                const std::string depthanything_stem = stem + depthanything_tag.str();
-                std::ostringstream rendered_depth_tag;
-                if (depthanything_iter >= 0) {
-                    rendered_depth_tag << "_rendered_depth_iter_"
-                                       << std::setw(5) << std::setfill('0')
-                                       << depthanything_iter;
-                } else {
-                    rendered_depth_tag << "_rendered_depth";
-                }
-                const std::string rendered_depth_stem = stem + rendered_depth_tag.str();
+    constexpr bool save_shutdown_mono_prior_depth_debug = true;
+    if (save_shutdown_mono_prior_depth_debug && sensor_type_ == MONOCULAR) {
+        const int mono_prior_apply_iter = pkf->mono_prior_first_apply_iter_;
+        const bool mono_prior_was_applied = mono_prior_apply_iter >= 0;
+        const int mono_prior_depth_loss_iter = pkf->mono_prior_first_depth_loss_iter_;
+        const bool mono_prior_was_optimized = mono_prior_depth_loss_iter >= 0;
 
-                torch::Tensor mono_prior_viz;
+        if ((mono_prior_was_applied || mono_prior_was_optimized) &&
+            ((opt_params_.lambda_depthanythingv2_ > 0.0f) ||
+             (pkf->mono_prior_.defined() && pkf->mono_prior_.numel() > 0))) {
+            if (ensureMonoPriorForKeyframe(pkf)) {
+                std::ostringstream mono_prior_apply_tag;
+                mono_prior_apply_tag << "_iter_"
+                                     << std::setw(5) << std::setfill('0')
+                                     << mono_prior_apply_iter;
+                std::ostringstream mono_prior_loss_tag;
+                mono_prior_loss_tag << "_iter_"
+                                    << std::setw(5) << std::setfill('0')
+                                    << mono_prior_depth_loss_iter;
+                std::ostringstream shutdown_iter_tag;
+                shutdown_iter_tag << "_iter_"
+                                  << std::setw(5) << std::setfill('0')
+                                  << getIteration();
+                const std::string mono_prior_raw_eval_stem =
+                    stem + "_mono_prior_raw_densification" + mono_prior_apply_tag.str();
+                const std::string mono_prior_aligned_eval_stem =
+                    stem + "_mono_prior_aligned_densification" + mono_prior_apply_tag.str();
+                const std::string mono_prior_target_eval_stem =
+                    stem + "_mono_prior_target" + mono_prior_loss_tag.str();
+
+                torch::Tensor mono_prior_viz =
+                    pkf->mono_prior_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+                if (mono_prior_viz.dim() == 3 && mono_prior_viz.size(0) == 1) {
+                    mono_prior_viz = mono_prior_viz.squeeze(0);
+                }
+
                 torch::Tensor mono_target_viz;
-                torch::Tensor render_depthanything_viz;
-                if (renderPkgToDepthAnythingv2DebugMaps(
-                        render_pkg,
-                        pkf->depthanythingv2_,
-                        cam.near,
-                        mono_prior_viz,
-                        mono_target_viz,
-                        render_depthanything_viz)) {
-                    constexpr float kMonoPriorValidMin = 1e-6f;
-                    constexpr float kMonoPriorValidMax = 1e6f;
+                torch::Tensor aligned_mono_prior_eval_viz;
+                bool have_target_debug_map = false;
+                const bool apply_mono_prior_eval_scale =
+                    sensor_type_ == MONOCULAR &&
+                    global_depth_scale.has_value() &&
+                    std::isfinite(*global_depth_scale) &&
+                    *global_depth_scale > 0.0f;
+                const bool have_aligned_eval_map =
+                    buildAlignedMonoPriorDepthForKeyframe(
+                        pkf,
+                        cam,
+                        pkf->image_width_,
+                        pkf->image_height_,
+                        aligned_mono_prior_eval_viz);
+                if (have_aligned_eval_map) {
+                    aligned_mono_prior_eval_viz =
+                        aligned_mono_prior_eval_viz.to(torch::kCPU).to(torch::kFloat32).contiguous();
+                    if (apply_mono_prior_eval_scale) {
+                        aligned_mono_prior_eval_viz =
+                            aligned_mono_prior_eval_viz * (*global_depth_scale);
+                    }
+                }
+                if (mono_prior_was_optimized) {
+                    if (mono_prior_loss_mode_ == "aligned" ||
+                        isMetric3DModelId(mono_prior_model_id_)) {
+                        if (have_aligned_eval_map) {
+                            mono_target_viz = aligned_mono_prior_eval_viz;
+                            have_target_debug_map = true;
+                        }
+                    } else {
+                        torch::Tensor unused_mono_prior_resized;
+                        torch::Tensor unused_render_mono_prior_viz;
+                        have_target_debug_map = renderPkgToMonoPriorDebugMaps(
+                            render_pkg,
+                            pkf->mono_prior_,
+                            cam.near,
+                            unused_mono_prior_resized,
+                            mono_target_viz,
+                            unused_render_mono_prior_viz);
+                    }
+                }
+                constexpr float kMonoPriorValidMin = 1e-6f;
+                constexpr float kMonoPriorValidMax = 1e6f;
+                if (mono_prior_was_applied) {
+                    torch::Tensor mono_prior_raw_depth_viz = mono_prior_viz;
+                    if (!isMetric3DModelId(mono_prior_model_id_)) {
+                        const torch::Tensor raw_valid =
+                            torch::isfinite(mono_prior_viz) & (mono_prior_viz > 1e-6f);
+                        mono_prior_raw_depth_viz = torch::where(
+                            raw_valid,
+                            1.0f / mono_prior_viz.clamp_min(1e-6f),
+                            torch::full_like(
+                                mono_prior_viz,
+                                std::numeric_limits<float>::quiet_NaN()));
+                    }
 
                     float mono_prior_viz_min = 0.0f;
                     float mono_prior_viz_max = 1.0f;
                     if (computeSharedDepthVizRange(
-                            mono_prior_viz,
+                            mono_prior_raw_depth_viz,
                             cv::Mat(),
                             kMonoPriorValidMin,
                             kMonoPriorValidMax,
                             mono_prior_viz_min,
                             mono_prior_viz_max)) {
                         const cv::Mat mono_prior_bgr = colorizeDepthMatJet(
-                            depthTensorToCvMatFloat(mono_prior_viz),
+                            depthTensorToCvMatFloat(mono_prior_raw_depth_viz),
                             kMonoPriorValidMin,
                             kMonoPriorValidMax,
                             mono_prior_viz_min,
                             mono_prior_viz_max);
-                        const std::filesystem::path mono_prior_path =
-                            result_depth_dir / (depthanything_stem + ".png");
-                        std::filesystem::create_directories(mono_prior_path.parent_path());
-                        cv::imwrite(mono_prior_path.string(), mono_prior_bgr);
+                        const std::filesystem::path mono_prior_raw_eval_path =
+                            result_depth_dir / (mono_prior_raw_eval_stem + ".png");
+                        std::filesystem::create_directories(mono_prior_raw_eval_path.parent_path());
+                        cv::imwrite(mono_prior_raw_eval_path.string(), mono_prior_bgr);
                     }
 
-                    float mono_loss_viz_min = 0.0f;
-                    float mono_loss_viz_max = 1.0f;
+                    if (have_aligned_eval_map) {
+                        float mono_aligned_viz_min = 0.0f;
+                        float mono_aligned_viz_max = 1.0f;
+                        if (computeSharedDepthVizRange(
+                                aligned_mono_prior_eval_viz,
+                                cv::Mat(),
+                                RGBD_min_depth_,
+                                RGBD_max_depth_,
+                                mono_aligned_viz_min,
+                                mono_aligned_viz_max)) {
+                            const cv::Mat mono_aligned_bgr = colorizeDepthMatJet(
+                                depthTensorToCvMatFloat(aligned_mono_prior_eval_viz),
+                                RGBD_min_depth_,
+                                RGBD_max_depth_,
+                                mono_aligned_viz_min,
+                                mono_aligned_viz_max);
+                            const std::filesystem::path mono_aligned_eval_path =
+                                result_depth_dir / (mono_prior_aligned_eval_stem + ".png");
+                            std::filesystem::create_directories(mono_aligned_eval_path.parent_path());
+                            cv::imwrite(mono_aligned_eval_path.string(), mono_aligned_bgr);
+                        }
+                    }
+                }
+
+                if (mono_prior_was_optimized && have_target_debug_map) {
                     const cv::Mat mono_target_mat = depthTensorToCvMatFloat(mono_target_viz);
+                    float mono_target_viz_min = 0.0f;
+                    float mono_target_viz_max = 1.0f;
                     if (computeSharedDepthVizRange(
-                            render_depthanything_viz,
-                            mono_target_mat,
+                            mono_target_viz,
+                            cv::Mat(),
                             kMonoPriorValidMin,
                             kMonoPriorValidMax,
-                            mono_loss_viz_min,
-                            mono_loss_viz_max)) {
+                            mono_target_viz_min,
+                            mono_target_viz_max)) {
                         const cv::Mat mono_target_bgr = colorizeDepthMatJet(
                             mono_target_mat,
                             kMonoPriorValidMin,
                             kMonoPriorValidMax,
-                            mono_loss_viz_min,
-                            mono_loss_viz_max);
-                        const cv::Mat mono_render_bgr = colorizeDepthMatJet(
-                            depthTensorToCvMatFloat(render_depthanything_viz),
-                            kMonoPriorValidMin,
-                            kMonoPriorValidMax,
-                            mono_loss_viz_min,
-                            mono_loss_viz_max);
+                            mono_target_viz_min,
+                            mono_target_viz_max);
 
                         const std::filesystem::path mono_target_path =
-                            result_depth_dir / (depthanything_stem + "_target.png");
-                        const std::filesystem::path mono_render_path =
-                            result_depth_dir / (rendered_depth_stem + ".png");
+                            result_depth_dir / (mono_prior_target_eval_stem + ".png");
                         std::filesystem::create_directories(mono_target_path.parent_path());
                         cv::imwrite(mono_target_path.string(), mono_target_bgr);
-                        cv::imwrite(mono_render_path.string(), mono_render_bgr);
                     }
                 }
             }
         }
 
-        torch::Tensor pred_sparse_depth;
-        if (renderPkgToSparseDepthLossMap(render_pkg, pred_sparse_depth)) {
-            pred_sparse_depth = pred_sparse_depth.to(torch::kCPU).contiguous();
-            const int H_sparse = static_cast<int>(pred_sparse_depth.size(0));
-            const int W_sparse = static_cast<int>(pred_sparse_depth.size(1));
-
-            torch::Tensor sparse_uv;
-            torch::Tensor sparse_depth;
-            if (buildSparseDepthFromMapPoints(
-                    cam,
-                    W_sparse,
-                    H_sparse,
-                    sparse_uv,
-                    sparse_depth)) {
-                cv::Mat sparse_orb_depth_meters;
-                torch::Tensor rend_sparse_depth;
-                if (sampleDenseDepthAtSparseUv(
-                        pred_sparse_depth,
-                        sparse_uv,
-                        rend_sparse_depth) &&
-                    sparseSamplesToDepthMat(
-                        sparse_uv,
-                        sparse_depth,
-                        W_sparse,
-                        H_sparse,
-                        sparse_orb_depth_meters)) {
-                    cv::Mat sparse_render_depth_meters;
-                    if (sparseSamplesToDepthMat(
-                            sparse_uv,
-                            rend_sparse_depth,
-                            W_sparse,
-                            H_sparse,
-                            sparse_render_depth_meters)) {
-                        constexpr float kSparseVizMinDepth = 1e-6f;
-                        constexpr float kSparseVizMaxDepth = 1e6f;
-                        const cv::Mat sparse_orb_depth_for_viz = sparse_orb_depth_meters;
-
-                        float sparse_viz_min = 0.0f;
-                        float sparse_viz_max = 1.0f;
-                        const bool have_sparse_viz_range =
-                            computeSharedDepthVizRange(
-                                torch::from_blob(
-                                    sparse_render_depth_meters.data,
-                                    {H_sparse, W_sparse},
-                                    torch::TensorOptions().dtype(torch::kFloat32)).clone(),
-                                sparse_orb_depth_for_viz,
-                                kSparseVizMinDepth,
-                                kSparseVizMaxDepth,
-                                sparse_viz_min,
-                                sparse_viz_max);
-                        if (have_sparse_viz_range) {
-                            const cv::Mat sparse_pred_bgr = colorizeDepthMatJet(
-                                sparse_render_depth_meters,
-                                kSparseVizMinDepth,
-                                kSparseVizMaxDepth,
-                                sparse_viz_min,
-                                sparse_viz_max);
-                            const cv::Mat sparse_gt_bgr = colorizeDepthMatJet(
-                                sparse_orb_depth_for_viz,
-                                kSparseVizMinDepth,
-                                kSparseVizMaxDepth,
-                                sparse_viz_min,
-                                sparse_viz_max);
-                            const std::filesystem::path sparse_gt_path =
-                                result_depth_dir / (stem + "_sparse_orb.png");
-                            const std::filesystem::path sparse_render_path =
-                                result_depth_dir / (stem + "_sparse_render.png");
-                            std::filesystem::create_directories(sparse_gt_path.parent_path());
-                            cv::imwrite(sparse_gt_path.string(), sparse_gt_bgr);
-                            cv::imwrite(sparse_render_path.string(), sparse_pred_bgr);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // Per-pixel photometric error (L2 or L1)
@@ -13252,6 +13999,7 @@ void VoxelMapper::renderAndRecordAllKeyframes(const std::string& name_suffix)
     // New: depth directory inside the same x_shutdown folder
     std::filesystem::path depth_dir = result_dir / "depth";
     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(depth_dir);
+    copyPngFilesToDirectory(runtimeOrbDepthDebugDir(result_dir_), depth_dir);
 
     std::filesystem::path normal_dir = result_dir / "normal";
     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(normal_dir);

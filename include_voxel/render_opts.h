@@ -15,7 +15,10 @@ struct RenderOpts {
     bool        output_normal = false;
     std::optional<float> lambda_dist = std::nullopt;
     std::optional<float> lambda_ascending = std::nullopt;
+    std::optional<float> lambda_scaling_penalty = std::nullopt;
+    std::optional<float> min_voxel_size = std::nullopt;
     torch::Tensor gt_color = torch::Tensor();
+    torch::Tensor vox_feats = torch::Tensor();
 };
 
 } // namespace sv

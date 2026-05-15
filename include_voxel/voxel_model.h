@@ -92,6 +92,7 @@ public:
     torch::Tensor voxKey() const { return this->vox_key_; }
     
     torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
+    torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
     torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
@@ -103,7 +104,7 @@ public:
     bool hasDenseCoreBB() const { return has_dense_core_bb_; }
     torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
     torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
-    bool refreshDenseCoreBBFromCurrentVoxels(bool exclude_hole_fill_real_voxels = false);
+    bool refreshDenseCoreBBFromCurrentVoxels();
     void logDenseCoreBBoxToRerun(
         int iteration,
         const std::string& entity_path = "world/dense_core/used_for_prune") const;
@@ -162,6 +163,7 @@ public:
         topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
     void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
+    void logLiveOrbVoxels(const int iteration);
     void logFinalartificialVoxels(const int iteration);
     void logFinalPromotedartificialVoxels(const int iteration);
 
@@ -356,6 +358,9 @@ public:
     torch::Tensor inactive_geo_centers_accum_viz_; // [K,3] accumulated real voxels created by inactive geo densify
     torch::Tensor inactive_geo_sizes_accum_viz_;   // [K,1] accumulated sizes for inactive geo densify voxels
     torch::Tensor inactive_geo_rgba_accum_viz_;    // [K,4] accumulated colors for inactive geo densify voxels
+    torch::Tensor orb_created_centers_accum_viz_; // [K,3] accumulated real voxels created from ORB map points
+    torch::Tensor orb_created_sizes_accum_viz_;   // [K,1]
+    torch::Tensor orb_created_rgba_accum_viz_;    // [K,4]
     torch::Tensor depthanything_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything densify
     torch::Tensor depthanything_created_sizes_accum_viz_;   // [K,1]
     torch::Tensor depthanything_created_rgba_accum_viz_;    // [K,4]
@@ -365,11 +370,9 @@ public:
     torch::Tensor rendered_depth_created_centers_accum_viz_; // [K,3] accumulated artificial voxels from rendered depth insertion
     torch::Tensor rendered_depth_created_sizes_accum_viz_;   // [K,1]
     torch::Tensor rendered_depth_created_rgba_accum_viz_;    // [K,4]
-    torch::Tensor rendered_hole_fill_created_centers_accum_viz_; // [K,3] accumulated artificial voxels from rendered hole fill
-    torch::Tensor rendered_hole_fill_created_sizes_accum_viz_;   // [K,1]
-    torch::Tensor rendered_hole_fill_created_rgba_accum_viz_;    // [K,4]
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_artificial_voxel_;          // [N] bool provenance: false=real, true=artificial/support
+    torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
     torch::Tensor is_promoted_artificial_voxel_; // [N] bool provenance: true if voxel was artificial and got promoted to real
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count

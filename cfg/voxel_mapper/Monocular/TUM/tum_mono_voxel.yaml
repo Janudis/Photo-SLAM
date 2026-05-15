@@ -20,40 +20,21 @@ RGBD.max_depth: 40.0
 
 Mapper.inactive_geo_densify: 0  # 0:false, 1 or other integer:true
 Mapper.depth_cache: 10
+
 Mapper.depthanything_densify: 0
 Mapper.depthanything_fill_holes: 1
-Mapper.depthanything_densify_stride: 4
-Mapper.depthanything_densify_max_points_per_kf: 5000
+Mapper.depthanything_densify_stride: 2
 Mapper.depthanything_densify_min_sparse_anchors: 50
-Mapper.depthanything_densify_require_real_adjacency: 0
-Mapper.depthanything_densify_adjacency_radius_cells: 1
+Mapper.depthanything_densify_alignment_mode: "orb" # orb/rendered/da_prior; da_prior uses PriorDA-style local KNN scale-shift alignment
+Mapper.depthanything_da_prior_knn_k: 5
+Mapper.depthanything_da_prior_distance_weighting: 1
+Mapper.depthanything_da_prior_max_pixel_dist: 0.0 # 0 disables a max-distance cutoff for KNN anchors
 Mapper.depthanything_fill_holes_initial_backfill: 1 # after initial ORB map creation, fill holes for the initial keyframes too
-Mapper.depthanything_fill_holes_orb_support_mask: 0 # SPLAT-SLAM like protect pixels near sparse ORB geometry from DepthAnything hole-fill insertion
-Mapper.depthanything_fill_holes_orb_support_radius_px: 6
-
-Mapper.rendered_hole_fill: 0
-Mapper.rendered_hole_fill_stride: 1
-Mapper.rendered_hole_fill_max_points_per_kf: 0 # <=0 disables candidate cap
-Mapper.rendered_hole_fill_support_min_n_contrib: 1
-Mapper.rendered_hole_fill_hole_rgb_error_min: 0.0 # disable RGB-error gating; detect holes from empty depth + zero support only
-Mapper.rendered_hole_fill_empty_depth_eps: 1.0e-6
-Mapper.rendered_hole_fill_depth_rel_spread_thresh: 0.10
-Mapper.rendered_hole_fill_surface_patch: 0
-Mapper.rendered_hole_fill_surface_support_radius_px: 12
-Mapper.rendered_hole_fill_surface_min_support_points: 3
-Mapper.rendered_hole_fill_surface_plane_rms_thresh_m: 0.05
-Mapper.rendered_hole_fill_surface_depth_margin_rel: 0.40
-Mapper.rendered_hole_fill_surface_propagate_interior: 0 #uncertainty logic
-Mapper.rendered_hole_fill_surface_propagation_full_band_distance_px: 24
-Mapper.rendered_hole_fill_surface_propagation_uncertainty_rel: 0.0 #uncertainty logic
-Mapper.rendered_hole_fill_surface_propagation_max_depth_layers: 1
-Mapper.rendered_hole_fill_require_real_adjacency: 0 # disable final adjacency gate so large interior fills are not discarded
-Mapper.rendered_hole_fill_adjacency_radius_cells: 1
-Mapper.rendered_hole_fill_insert_as_real_protected: 1 # if 1, insert hole-fill voxels as real immediately and protect them from the hole-fill prune path
-Mapper.voxel_rendering_checking: 1 # skip emission for a hole pixel if a previously emitted hole-fill voxel already covers that pixel in the current view
+Mapper.depthanything_fill_holes_warmup: 0 # 1 delays gap filling until warmup_iter; 0 uses the previous immediate behavior
+Mapper.depthanything_fill_holes_warmup_iter: 300 # delay gap filling so ORB has accumulated more map points before each KF is densified
 
 Mapper.min_num_initial_map_kfs:        20
-Mapper.new_keyframe_times_of_use:     2 #8 #2
+Mapper.new_keyframe_times_of_use:     8 #8 #2
 Mapper.local_BA_increased_times_of_use: 0       
 Mapper.loop_closure_increased_times_of_use_: 2  
 Mapper.cull_keyframes:                 0
@@ -71,12 +52,10 @@ Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
 Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
-Record.save_rendered_hole_fill_debug_images: 0 # save rendered RGB + hole mask + overlay on every rendered_hole_fill pass
-Record.enable_rerun: 1  # 0:disable all rerun logging/saving, 1:enable
+Record.enable_rerun: 0  # 0:disable all rerun logging/saving, 1:enable
 Record.rerun_final_only: 0 # 0:log rerun during run, 1:log only final voxel sets at shutdown
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [150, 150+N) as rerun cameras
 Record.rerun_rendered_depth_insert: 0
-Record.rerun_rendered_hole_fill: 0
 Record.save_rendered_mesh_eval: 0 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
 Record.rendered_mesh_backend: 1 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.record_depth_metrics: 0 # 0:false, 1:compute Depth L1 / F1 from rendered depth vs GT depth
@@ -106,32 +85,30 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 350
-Optimization.adapt_every: 350
-Optimization.prune_every: 600
-Optimization.subdivide_every: 350
-# Optimization.adapt_from: 650
-# Optimization.adapt_every: 650
-# Optimization.prune_every: 800
-# Optimization.subdivide_every: 650
+# Optimization.adapt_from: 350
+# Optimization.adapt_every: 350
+# Optimization.prune_every: 600
+# Optimization.subdivide_every: 350
+Optimization.adapt_from: 650
+Optimization.adapt_every: 650
+Optimization.prune_every: 800
+Optimization.subdivide_every: 650
 
-Optimization.densify_cooldown_iters: 50  # skip prune/subdivide for voxels younger than this many iters
+Optimization.densify_cooldown_iters: 0  # skip prune/subdivide for voxels younger than this many iters
 Optimization.filter_near_voxels: 1 # 0:false, 1:true, only for fill_empty_cells_ camera filtering
 Optimization.filter_far_voxels_on_insert: 0 # 0:false, 1:true
 Optimization.prune_far_voxels: 1 # 0:false, 1:true
 Optimization.prune_near_voxels_geometric: 1 # 0:false, 1:true, prune-time near-to-camera geometry (also behind camera)
 Optimization.prune_recompute_dense_core: 1 # 0:reuse latest cached dense-core bbox, 1:recompute at each prune
-Optimization.prune_recent_unstable: 1
+Optimization.prune_recent_unstable: 0
 Optimization.prune_recent_keyframes: 3
 Optimization.prune_recent_min_views_real: 3
 Optimization.prune_recent_min_views_artificial: 3
 Optimization.rendered_depth_candidate_promote_min_support: 3 # source keyframe + 2 more observations before promotion
 Optimization.rendered_depth_candidate_prune_kf_age: 3
 Optimization.prune_min_kf_age: 0 #3
-Optimization.prune_surface_keep_enable: 0
-Optimization.prune_surface_keep_use_view: 0
-Optimization.prune_surface_keep_use_size: 0
 Optimization.final_special_prune_enable: 1
+
 # Pruning
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.0001 
@@ -161,11 +138,11 @@ Optimization.tv_until: 1000
 Optimization.ss_aug_max: 0 #1.5 
 
 # Per-point rgb loss
-Optimization.lambda_R_concen: 0.0 #0.01 
+Optimization.lambda_R_concen: 0.00 #0.01 
 
 # Distortion loss (encourage distribution concentration on ray)
-Optimization.lambda_dist: 0.0
-Optimization.dist_from: 2000
+Optimization.lambda_dist: 0.00
+Optimization.dist_from: 2500
 
 # Final transmittance should concentrate to either 0 or 1
 Optimization.lambda_T_concen: 0.0
@@ -173,15 +150,15 @@ Optimization.lambda_T_concen: 0.0
 Optimization.lambda_T_inside: 0.0
 
 # Consistency loss of rendered normal and derived normal from expected depth
-Optimization.lambda_normal_dmean: 0.00
-Optimization.n_dmean_from: 1000
+Optimization.lambda_normal_dmean: 0.000
+Optimization.n_dmean_from: 1500
 Optimization.n_dmean_end: 15000
 Optimization.n_dmean_ks: 3
 Optimization.n_dmean_tol_deg: 90.0
 
 # SSIM loss
 Optimization.lambda_ssim : 0.0
-Optimization.lambda_dssim: 0.2
+Optimization.lambda_dssim: 0.02
 Optimization.use_l1: 0
 Optimization.use_huber: 0
 Optimization.huber_thres: 0.03
@@ -190,17 +167,46 @@ Optimization.huber_thres: 0.03
 Optimization.lambda_sparse_depth : 0.0
 Optimization.sparse_depth_until : 15000
 
-# Depth Anything V2 dense relative depth prior
-Optimization.lambda_depthanythingv2: 0.01 #0.01
-Optimization.depthanythingv2_model_id: "depth-anything/Depth-Anything-V2-Small-hf"
-Optimization.depthanythingv2_from: 300
+# Dense mono prior backend. Depth-Anything-V2-* keeps the old relative-depth path,
+# while metric3d_vit_* uses WildGS-style Metric3D preprocessing/inference and
+# ORB-aligned depth-space calibration.
+Optimization.lambda_depthanythingv2: 0.01 
+Optimization.depthanythingv2_model_id: "depth-anything/Depth-Anything-V2-Small-hf" # metric3d_vit_small depth-anything/Depth-Anything-V2-Small-hf
+# svraster: align DepthAnything to current rendered inverse-depth distribution inside the loss
+# aligned: align the mono prior to sparse ORB/global depth and compare against that fixed target
+# geosvr: GeoSVR-style patch-normalized mono-prior loss with optional uncertainty weighting
+Optimization.depthanythingv2_loss_mode: "aligned"
+Optimization.depthanythingv2_from: 1000
 Optimization.depthanythingv2_end: 15000
 Optimization.depthanythingv2_end_mult: 0.1
+Optimization.depthanythingv2_overall: 0
+Optimization.depthanythingv2_alpha_adjust: 0
+Optimization.enable_da2_uncertainty: 0
+Optimization.level_uncertainty_from: 0
+Optimization.power_level_uncertainty: 1.0
+Optimization.lambda_ascending: 0
+Optimization.ascending_from: 1000
+Optimization.lambda_rectify: 0
+Optimization.rectifiy_from: 2000
+Optimization.lambda_scaling_penalty: 0
+Optimization.scaling_penalty_from: 1000
+Optimization.scaling_penalty_end: 15000
+Optimization.multi_view_weight_from_iter: 1000000000
+Optimization.multi_view_interval: 1
+Optimization.multi_view_anneal_scale: 0.0
+Optimization.multi_view_ncc_weight: 0.05
+Optimization.multi_view_geo_weight: 0.01
+Optimization.multi_view_patch_size: 3
+Optimization.multi_view_sample_num: 10240000
+Optimization.multi_view_pixel_noise_th: 1.0
+Optimization.voxel_dropout_min: 0.5
 
-# Depth Anything V2 normal prior: compare rendered normals against
-# normals derived from the aligned Depth Anything depth prior
-Optimization.lambda_depthanythingv2_normal: 0.001 #0.001
-Optimization.depthanythingv2_normal_from: 300
+# Depth Anything V2 normal prior:
+# - geosvr: derive normals directly from the mono prior as in GeoSVR
+# - aligned: first align depth with ORB/global anchors, then derive normals
+Optimization.lambda_depthanythingv2_normal: 0.00 #0.001
+Optimization.depthanythingv2_normal_mode: "aligned"
+Optimization.depthanythingv2_normal_from: 1000
 Optimization.depthanythingv2_normal_end: 15000
 Optimization.depthanythingv2_normal_end_mult: 0.1
 

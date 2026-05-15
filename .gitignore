@@ -42,6 +42,12 @@
 # results
 /results/
 
+# Generated mono-depth priors and model caches
+/mono_priors/
+
+# Training/run logs written at repository root
+/loss*.csv
+
 # ImGui .ini
 *imgui.iniscripts/data/
 scripts/data/

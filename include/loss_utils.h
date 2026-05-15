@@ -477,4 +477,272 @@ struct DepthAnythingv2Loss
     }
 };
 
+inline torch::Tensor normalize_patch_tensor(
+    const torch::Tensor& input,
+    c10::optional<torch::Tensor> mean = c10::nullopt,
+    c10::optional<torch::Tensor> std = c10::nullopt)
+{
+    torch::Tensor input_mean =
+        mean.has_value() ? *mean : torch::mean(input, /*dim=*/1, /*keepdim=*/true);
+    torch::Tensor input_std =
+        std.has_value() ? *std : torch::std(input, /*dim=*/1, /*unbiased=*/true, /*keepdim=*/true);
+    torch::Tensor global_std =
+        torch::std(input.reshape({-1}) + 1e-5f).clamp_min(1e-6f);
+    return (input - input_mean) / (input_std + 1e-2f * global_std);
+}
+
+inline torch::Tensor patchify_tensor(const torch::Tensor& input, int patch_size)
+{
+    torch::Tensor x = input;
+    if (x.dim() == 2) {
+        x = x.unsqueeze(0).unsqueeze(0);  // [1,1,H,W]
+    } else if (x.dim() == 3) {
+        x = x.unsqueeze(1);               // [N,1,H,W]
+    }
+    TORCH_CHECK(x.dim() == 4,
+                "patchify_tensor expects [N,C,H,W], got ", input.sizes());
+    torch::Tensor unfolded = torch::nn::functional::unfold(
+        x,
+        torch::nn::functional::UnfoldFuncOptions(
+            {patch_size, patch_size}).stride({patch_size, patch_size}));
+    return unfolded.permute({0, 2, 1}).reshape({-1, x.size(1) * patch_size * patch_size});
+}
+
+inline torch::Tensor margin_l2_loss_weighted(
+    const torch::Tensor& network_output,
+    const torch::Tensor& gt,
+    float margin,
+    const torch::Tensor& weight = torch::Tensor())
+{
+    torch::Tensor mask = (network_output - gt).abs() > margin;
+    if (!mask.any().item<bool>()) {
+        return torch::zeros(
+            {},
+            torch::TensorOptions().dtype(network_output.dtype()).device(network_output.device()));
+    }
+    torch::Tensor sq = (network_output - gt).pow(2);
+    if (weight.defined()) {
+        sq = sq * weight;
+    }
+    return sq.masked_select(mask).mean();
+}
+
+inline torch::Tensor patch_norm_mse_loss_geosvr(
+    const torch::Tensor& input,
+    const torch::Tensor& target,
+    c10::optional<int> patch_size = c10::nullopt,
+    float margin = 0.0f,
+    const torch::Tensor& weight = torch::Tensor())
+{
+    torch::Tensor input_patches;
+    torch::Tensor target_patches;
+    torch::Tensor weight_patches;
+
+    if (patch_size.has_value()) {
+        input_patches = normalize_patch_tensor(
+            patchify_tensor(input, *patch_size));
+        target_patches = normalize_patch_tensor(
+            patchify_tensor(target, *patch_size));
+        if (weight.defined()) {
+            weight_patches = patchify_tensor(weight, *patch_size);
+        }
+    } else {
+        input_patches = normalize_patch_tensor(input.view({input.size(0), -1}));
+        target_patches = normalize_patch_tensor(target.view({target.size(0), -1}));
+        if (weight.defined()) {
+            weight_patches = weight.view({weight.size(0), -1});
+        }
+    }
+
+    return margin_l2_loss_weighted(input_patches, target_patches, margin, weight_patches);
+}
+
+inline torch::Tensor patch_norm_mse_loss_global_geosvr(
+    const torch::Tensor& input,
+    const torch::Tensor& target,
+    c10::optional<int> patch_size = c10::nullopt,
+    float margin = 0.0f,
+    const torch::Tensor& weight = torch::Tensor())
+{
+    torch::Tensor input_patches;
+    torch::Tensor target_patches;
+    torch::Tensor weight_patches;
+
+    if (patch_size.has_value()) {
+        torch::Tensor input_std = torch::std(input).detach();
+        torch::Tensor target_std = torch::std(target).detach();
+        input_patches = normalize_patch_tensor(
+            patchify_tensor(input, *patch_size),
+            c10::nullopt,
+            input_std);
+        target_patches = normalize_patch_tensor(
+            patchify_tensor(target, *patch_size),
+            c10::nullopt,
+            target_std);
+        if (weight.defined()) {
+            weight_patches = patchify_tensor(weight, *patch_size);
+        }
+    } else {
+        torch::Tensor input_std = torch::std(input).detach();
+        torch::Tensor target_std = torch::std(target).detach();
+        input_patches = normalize_patch_tensor(
+            input.view({input.size(0), -1}),
+            c10::nullopt,
+            input_std);
+        target_patches = normalize_patch_tensor(
+            target.view({target.size(0), -1}),
+            c10::nullopt,
+            target_std);
+        if (weight.defined()) {
+            weight_patches = weight.view({weight.size(0), -1});
+        }
+    }
+
+    return margin_l2_loss_weighted(input_patches, target_patches, margin, weight_patches);
+}
+
+struct DepthAnythingv2UncertaintyLoss
+{
+    int iter_from_;
+    int iter_end_;
+    float end_mult_;
+    bool overall_;
+    bool alpha_adjust_;
+
+    DepthAnythingv2UncertaintyLoss(
+        int iter_from,
+        int iter_end,
+        float end_mult,
+        bool overall,
+        bool alpha_adjust)
+        : iter_from_(iter_from),
+          iter_end_(iter_end),
+          end_mult_(end_mult),
+          overall_(overall),
+          alpha_adjust_(alpha_adjust)
+    {}
+
+    inline bool isActive(int iteration) const
+    {
+        return iteration >= iter_from_ && iteration <= iter_end_;
+    }
+
+    inline torch::Tensor operator()(const torch::Tensor& raw_T,
+                                    const torch::Tensor& raw_depth,
+                                    const torch::Tensor& mono_depth,
+                                    float cam_near,
+                                    int iteration,
+                                    int patch_size,
+                                    const torch::Tensor& level_weight = torch::Tensor()) const
+    {
+        TORCH_CHECK(raw_T.defined(), "DepthAnythingv2UncertaintyLoss: raw_T is undefined");
+        TORCH_CHECK(raw_depth.defined(), "DepthAnythingv2UncertaintyLoss: raw_depth is undefined");
+        TORCH_CHECK(mono_depth.defined(), "DepthAnythingv2UncertaintyLoss: mono_depth is undefined");
+
+        if (!isActive(iteration)) {
+            return torch::zeros(
+                {},
+                torch::TensorOptions().dtype(torch::kFloat32).device(raw_depth.device()));
+        }
+
+        torch::Tensor depth = raw_depth;
+        if (depth.dim() == 4 && depth.size(0) == 1) depth = depth.squeeze(0);
+        if (depth.dim() == 2) depth = depth.unsqueeze(0);
+        TORCH_CHECK(depth.dim() == 3,
+                    "DepthAnythingv2UncertaintyLoss: raw_depth must be [C,H,W] or [1,C,H,W], got ",
+                    depth.sizes());
+        depth = depth.clamp_min(std::max(1e-6f, cam_near));
+
+        torch::Tensor T = raw_T;
+        if (T.dim() == 4 && T.size(0) == 1) T = T.squeeze(0);
+        if (T.dim() == 2) T = T.unsqueeze(0);
+        TORCH_CHECK(T.dim() == 3,
+                    "DepthAnythingv2UncertaintyLoss: raw_T must be [C,H,W] or [1,C,H,W], got ",
+                    T.sizes());
+
+        torch::Tensor alpha = 1.0f - T.index({0}).unsqueeze(0);
+        torch::Tensor depth_map = depth.index({0}).unsqueeze(0);
+        if (alpha_adjust_) {
+            depth_map = depth_map / alpha.clamp_min(1e-3f).detach();
+        }
+
+        torch::Tensor mono = mono_depth;
+        if (mono.dim() == 4 && mono.size(0) == 1) mono = mono.squeeze(0);
+        if (mono.dim() == 3 && mono.size(0) == 1) mono = mono.squeeze(0);
+        if (mono.dim() == 2) mono = mono.unsqueeze(0);
+        TORCH_CHECK(mono.dim() == 3,
+                    "DepthAnythingv2UncertaintyLoss: mono_depth must be [H,W], [1,H,W], or [1,1,H,W], got ",
+                    mono_depth.sizes());
+
+        if (mono.sizes().slice(1) != depth_map.sizes().slice(1)) {
+            mono = torch::nn::functional::interpolate(
+                mono.unsqueeze(0),
+                torch::nn::functional::InterpolateFuncOptions()
+                    .size(std::vector<int64_t>{depth_map.size(1), depth_map.size(2)})
+                    .mode(torch::kBilinear)
+                    .align_corners(false)).squeeze(0);
+        }
+
+        torch::Tensor weight = level_weight;
+        if (weight.defined()) {
+            if (weight.dim() == 4 && weight.size(0) == 1) weight = weight.squeeze(0);
+            if (weight.dim() == 2) weight = weight.unsqueeze(0);
+            if (weight.dim() == 3 && weight.sizes().slice(1) != depth_map.sizes().slice(1)) {
+                weight = torch::nn::functional::interpolate(
+                    weight.unsqueeze(0),
+                    torch::nn::functional::InterpolateFuncOptions()
+                        .size(std::vector<int64_t>{depth_map.size(1), depth_map.size(2)})
+                        .mode(torch::kNearest)).squeeze(0);
+            }
+        }
+
+        torch::Tensor mask = alpha < 0.5f;
+        torch::Tensor valid = ~mask;
+        if (valid.any().item<bool>()) {
+            torch::Tensor mono_fill = mono.masked_select(valid).mean();
+            torch::Tensor depth_fill = depth_map.masked_select(valid).mean();
+            mono = mono.clone();
+            depth_map = depth_map.clone();
+            mono.masked_fill_(mask, mono_fill.item<float>());
+            depth_map.masked_fill_(mask, depth_fill.item<float>());
+        }
+
+        torch::Tensor loss = patch_norm_mse_loss_global_geosvr(
+            depth_map.unsqueeze(0),
+            mono.unsqueeze(0),
+            patch_size,
+            0.001f,
+            weight);
+        loss = loss + 0.1f * patch_norm_mse_loss_geosvr(
+            depth_map.unsqueeze(0),
+            mono.unsqueeze(0),
+            patch_size,
+            0.001f,
+            weight);
+
+        if (overall_) {
+            torch::Tensor inv_depth = 1.0f / depth_map.clamp_min(std::max(1e-6f, cam_near));
+            torch::Tensor inv_mono = 1.0f / mono.clamp_min(std::max(1e-6f, cam_near));
+            loss = loss + 0.1f * patch_norm_mse_loss_global_geosvr(
+                inv_depth.unsqueeze(0),
+                inv_mono.unsqueeze(0),
+                patch_size,
+                0.001f,
+                weight);
+        }
+
+        if (iter_end_ <= iter_from_ || end_mult_ == 1.0f) {
+            return loss;
+        }
+
+        const float ratio = std::clamp(
+            static_cast<float>(iteration - iter_from_) /
+                static_cast<float>(iter_end_ - iter_from_),
+            0.0f,
+            1.0f);
+        const float mult = std::pow(end_mult_, ratio);
+        return loss * mult;
+    }
+};
+
 }

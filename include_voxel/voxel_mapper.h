@@ -29,6 +29,7 @@
 #include <optional>
 #include <regex>
 #include <iomanip>
+#include <unordered_set>
 
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_keyframe.h"
@@ -174,14 +175,29 @@ public:
         int image_height,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
         int iteration);
-    bool ensureDepthAnythingv2ForKeyframe(
+    bool ensureMonoPriorForKeyframe(
         const std::shared_ptr<VoxelKeyframe>& kf);
-    torch::Tensor computeDepthAnythingv2Loss(
+    bool buildAlignedMonoPriorDepthForKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        torch::Tensor& aligned_depth);
+    bool depthAnythingFillHolesWarmupReady();
+    void queueDepthAnythingFillHolesKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void applyDepthAnythingFillHolesKeyframes(
+        const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes,
+        bool seed_global_alignment);
+    void scheduleDepthAnythingFillHoles(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void processDepthAnythingFillHolesWarmup();
+    torch::Tensor computeMonoPriorDepthLoss(
         const std::shared_ptr<VoxelKeyframe>& kf,
         const sv::MiniCam& cam,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
         int iteration);
-    torch::Tensor computeDepthAnythingv2NormalLoss(
+    torch::Tensor computeMonoPriorNormalLoss(
         const std::shared_ptr<VoxelKeyframe>& kf,
         const sv::MiniCam& cam,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
@@ -256,11 +272,19 @@ protected:
     void cullKeyframes();                  
 
     void increasePcdByKeyframeInactiveGeoDensify(std::shared_ptr<VoxelKeyframe> pkf);
-    void increasePcdByKeyframeDepthAnything(std::shared_ptr<VoxelKeyframe> pkf);
-    void increasePcdByKeyframeDepthAnythingFillHoles(std::shared_ptr<VoxelKeyframe> pkf);
+    void increasePcdByKeyframeMonoPrior(std::shared_ptr<VoxelKeyframe> pkf);
+    void increasePcdByKeyframeMonoPriorFillHoles(std::shared_ptr<VoxelKeyframe> pkf);
+    bool updateMonoPriorGlobalAlignmentFromKeyframe(const std::shared_ptr<VoxelKeyframe>& pkf);
+    void accumulateMonoPriorGlobalAlignment(float scale, float shift, float weight);
     void increasePcdByKeyframeRenderedDepthInsertion(std::shared_ptr<VoxelKeyframe> pkf);
-    void increasePcdByKeyframeRenderedHoleFill(std::shared_ptr<VoxelKeyframe> pkf);
     void updateRenderedDepthCandidateLifecycle();
+    void appendAndLogOrbRawMapPcdToRerun(
+        const std::map<point3D_id_t, Point3D>& pcd,
+        int iteration);
+    void appendAndLogOrbRawPointBatchToRerun(
+        const std::vector<float>& points_flat,
+        const std::vector<float>& colors_flat,
+        int iteration);
 
     void recordKeyframeRendered(
         torch::Tensor &rendered,
@@ -387,7 +411,9 @@ protected:
     cv::Ptr<cv::cuda::StereoSGM> stereo_cv_sgm_;
     float RGBD_min_depth_ = 0.0f;
     float RGBD_max_depth_ = 100.0f;
-    std::string depthanythingv2_model_id_ = "depth-anything/Depth-Anything-V2-Small-hf";
+    std::string mono_prior_model_id_ = "depth-anything/Depth-Anything-V2-Small-hf";
+    std::string mono_prior_loss_mode_ = "svraster";
+    std::string mono_prior_normal_mode_ = "aligned";
 
     bool inactive_geo_densify_ = true;
     int depth_cached_ = 0;
@@ -396,14 +422,25 @@ protected:
     torch::Tensor depth_cache_colors_;
     bool depthanything_densify_ = false;
     int depthanything_densify_stride_ = 8;
-    int depthanything_densify_max_points_per_kf_ = 1500;
     int depthanything_densify_min_sparse_anchors_ = 64;
-    bool depthanything_densify_require_real_adjacency_ = true;
-    int depthanything_densify_adjacency_radius_cells_ = 1;
+    std::string depthanything_densify_alignment_mode_ = "orb";
+    int depthanything_da_prior_knn_k_ = 5;
+    bool depthanything_da_prior_distance_weighting_ = true;
+    float depthanything_da_prior_max_pixel_dist_ = 0.0f;
     bool depthanything_fill_holes_ = false;
     bool depthanything_fill_holes_initial_backfill_ = true;
-    bool depthanything_fill_holes_orb_support_mask_ = true;
-    int depthanything_fill_holes_orb_support_radius_px_ = 6;
+    bool depthanything_fill_holes_warmup_ = false;
+    int depthanything_fill_holes_warmup_iter_ = 0;
+    bool depthanything_fill_holes_warmup_flushed_ = false;
+    std::vector<std::weak_ptr<VoxelKeyframe>> depthanything_fill_holes_pending_kfs_;
+    std::unordered_set<std::size_t> depthanything_fill_holes_pending_kfids_;
+    torch::Tensor orb_raw_pcd_points_accum_cpu_;
+    torch::Tensor orb_raw_pcd_colors_accum_cpu_;
+    bool depthanything_global_alignment_valid_ = false;
+    float depthanything_global_align_scale_ = std::numeric_limits<float>::quiet_NaN();
+    float depthanything_global_align_shift_ = std::numeric_limits<float>::quiet_NaN();
+    float depthanything_global_align_weight_ = 0.0f;
+    int depthanything_global_align_observations_ = 0;
     bool rendered_depth_insert_ = false;
     int rendered_depth_insert_stride_ = 4;
     int rendered_depth_insert_frontier_radius_px_ = 1;
@@ -412,36 +449,6 @@ protected:
     bool rendered_depth_insert_require_real_adjacency_ = true;
     int rendered_depth_insert_adjacency_radius_cells_ = 1;
     bool rerun_rendered_depth_insert_ = true;
-    bool rendered_hole_fill_ = false;
-    int rendered_hole_fill_stride_ = 4;
-    int rendered_hole_fill_boundary_radius_px_ = 1;
-    int rendered_hole_fill_neighbor_radius_px_ = 2;
-    int rendered_hole_fill_min_neighbors_ = 3;
-    int rendered_hole_fill_max_points_per_kf_ = 3000;
-    int rendered_hole_fill_hole_max_n_contrib_ = 0;
-    int rendered_hole_fill_support_min_n_contrib_ = 1;
-    float rendered_hole_fill_support_alpha_min_ = 0.05f;
-    float rendered_hole_fill_hole_rgb_error_min_ = 0.12f;
-    float rendered_hole_fill_empty_depth_eps_ = 1e-6f;
-    float rendered_hole_fill_depth_rel_spread_thresh_ = 0.15f;
-    bool rendered_hole_fill_surface_patch_ = false;
-    int rendered_hole_fill_surface_support_radius_px_ = 8;
-    int rendered_hole_fill_surface_min_support_points_ = 12;
-    float rendered_hole_fill_surface_plane_rms_thresh_m_ = 0.05f;
-    float rendered_hole_fill_surface_depth_margin_rel_ = 0.25f;
-    bool rendered_hole_fill_surface_propagate_interior_ = true;
-    int rendered_hole_fill_surface_propagation_full_band_distance_px_ = 24;
-    float rendered_hole_fill_surface_propagation_uncertainty_rel_ = 0.20f;
-    int rendered_hole_fill_surface_propagation_max_depth_layers_ = 3;
-    int rendered_hole_fill_surface_component_min_pixels_ = 4;
-    int rendered_hole_fill_surface_component_max_pixels_ = 25000;
-    bool rendered_hole_fill_surface_skip_border_components_ = true;
-    bool rendered_hole_fill_require_real_adjacency_ = true;
-    int rendered_hole_fill_adjacency_radius_cells_ = 1;
-    bool rendered_hole_fill_insert_as_real_protected_ = false;
-    bool voxel_rendering_checking_ = false;
-    bool rerun_rendered_hole_fill_ = true;
-    bool rendered_hole_fill_bootstrap_done_ = false;
 
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;
@@ -464,7 +471,6 @@ protected:
     bool record_rendered_image_;
     bool record_ground_truth_image_;
     bool record_loss_image_;
-    bool save_rendered_hole_fill_debug_images_ = false;
     bool enable_rerun_ = true;
     bool rerun_final_only_ = false;
     int rerun_max_keyframes_ = -1; // <=0: all keyframes, >0: only keyframes in [150, 150+N) in rerun camera stream

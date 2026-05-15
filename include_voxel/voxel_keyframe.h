@@ -82,8 +82,13 @@ public:
     std::string img_filename_;
     cv::Mat img_undist_, img_auxiliary_undist_;
     torch::Tensor original_image_; ///< image
-    torch::Tensor depthanythingv2_; ///< cached dense relative depth prior on CPU
-    int depthanythingv2_prepare_iter_ = -1; ///< mapper iteration when the prior was first attached in this run
+    torch::Tensor mono_prior_; ///< cached dense mono prior on CPU
+    torch::Tensor mono_prior_aligned_depth_cache_; ///< cached aligned mono-prior target on CPU
+    std::string mono_prior_aligned_depth_cache_mode_;
+    int mono_prior_aligned_depth_cache_iter_ = -1;
+    int mono_prior_prepare_iter_ = -1; ///< mapper iteration when the prior was first attached in this run
+    int mono_prior_first_apply_iter_ = -1; ///< mapper iteration when the prior first contributed geometry
+    int mono_prior_first_depth_loss_iter_ = -1; ///< mapper iteration when the prior first contributed depth loss
     int image_width_;              ///< image
     int image_height_;             ///< image
 

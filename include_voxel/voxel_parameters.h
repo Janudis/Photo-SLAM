@@ -72,9 +72,6 @@ public:
         int   rendered_depth_candidate_promote_min_support_ = 3,
         int   rendered_depth_candidate_prune_kf_age_ = 3,
         int   prune_min_kf_age_ = 0,            // prune only if current_kf - exist_since_kf >= this
-        bool  prune_surface_keep_enable_ = true,
-        bool  prune_surface_keep_use_view_ = true,
-        bool  prune_surface_keep_use_size_ = true,
         bool  final_special_prune_enable_ = true,
         // Pruning
         int   prune_until_           = 18000,
@@ -118,6 +115,27 @@ public:
         int   depthanythingv2_from = 3000,
         int   depthanythingv2_end = 20000,
         float depthanythingv2_end_mult = 0.1f,
+        bool  depthanythingv2_overall = false,
+        bool  depthanythingv2_alpha_adjust = false,
+        bool  enable_da2_uncertainty = true,
+        int   level_uncertainty_from = 0,
+        float power_level_uncertainty = 1.0f,
+        float lambda_ascending = 0.0f,
+        int   ascending_from = 0,
+        float lambda_rectify = 1e-6f,
+        int   rectifiy_from = 0,
+        float lambda_scaling_penalty = 1e-6f,
+        int   scaling_penalty_from = 0,
+        int   scaling_penalty_end = 20000,
+        int   multi_view_weight_from_iter = 1000000000,
+        int   multi_view_interval = 1,
+        float multi_view_anneal_scale = 0.0f,
+        float multi_view_ncc_weight = 0.05f,
+        float multi_view_geo_weight = 0.01f,
+        int   multi_view_patch_size = 3,
+        int   multi_view_sample_num = 10240000,
+        float multi_view_pixel_noise_th = 1.0f,
+        float voxel_dropout_min = 0.5f,
         float lambda_depthanythingv2_normal = 0.0f,
         int   depthanythingv2_normal_from = 3000,
         int   depthanythingv2_normal_end = 20000,
@@ -151,9 +169,6 @@ public:
     int rendered_depth_candidate_promote_min_support_;
     int rendered_depth_candidate_prune_kf_age_;
     int prune_min_kf_age_;
-    bool prune_surface_keep_enable_;
-    bool prune_surface_keep_use_view_;
-    bool prune_surface_keep_use_size_;
     bool final_special_prune_enable_;
     int prune_until_;
     float prune_thres_init_;
@@ -196,6 +211,27 @@ public:
     int   depthanythingv2_from_;
     int   depthanythingv2_end_;
     float depthanythingv2_end_mult_;
+    bool  depthanythingv2_overall_;
+    bool  depthanythingv2_alpha_adjust_;
+    bool  enable_da2_uncertainty_;
+    int   level_uncertainty_from_;
+    float power_level_uncertainty_;
+    float lambda_ascending_;
+    int   ascending_from_;
+    float lambda_rectify_;
+    int   rectifiy_from_;
+    float lambda_scaling_penalty_;
+    int   scaling_penalty_from_;
+    int   scaling_penalty_end_;
+    int   multi_view_weight_from_iter_;
+    int   multi_view_interval_;
+    float multi_view_anneal_scale_;
+    float multi_view_ncc_weight_;
+    float multi_view_geo_weight_;
+    int   multi_view_patch_size_;
+    int   multi_view_sample_num_;
+    float multi_view_pixel_noise_th_;
+    float voxel_dropout_min_;
     float lambda_depthanythingv2_normal_;
     int   depthanythingv2_normal_from_;
     int   depthanythingv2_normal_end_;

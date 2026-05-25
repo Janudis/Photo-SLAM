@@ -125,7 +125,19 @@ public:
     
     std::shared_ptr<nvblox::Mapper> sdf_mapper_;
     bool use_tsdf_mapping_ = false; 
+    bool use_tsdf_pruning_ = false;
+    bool use_tsdf_planning_ = false;
     float sdf_voxel_size_m_ = 0.05f;   // example, configurable via YAML
+    float tsdf_prune_min_weight_ = 1.0f;
+    float tsdf_prune_surface_band_vox_ = 2.0f;
+    int tsdf_prune_min_valid_corners_ = 8;
+    bool tsdf_density_init_ = false;
+    float tsdf_density_init_min_weight_ = 1.0f;
+    float tsdf_density_init_trunc_vox_ = 4.0f;
+    float tsdf_density_init_bell_a_ = 0.1f;
+    float tsdf_density_init_bell_b_ = 0.5f;
+    float tsdf_density_init_alpha_min_ = 0.0002f;
+    float tsdf_density_init_alpha_max_ = 0.5f;
     void initializeNvbloxMapper();
     void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
                                     const cv::Mat& depth_meters);
@@ -135,16 +147,24 @@ public:
         torch::Tensor success; // [N]
     };
     TsdfSample sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
+    torch::Tensor computeTsdfDensityInitForGridPoints(
+        const torch::Tensor& grid_points_world,
+        float ray_interval_m);
     struct TsdfCornerSample {
         torch::Tensor tsdf;    // [N,8] float32
         torch::Tensor weight;  // [N,8] float32
         torch::Tensor success; // [N,8] bool
+        torch::Tensor points_world; // [N,8,3] float32, sampled SVRaster corners
     };
     TsdfCornerSample sampleTsdfAtVoxelCornersWorld(
         const torch::Tensor& centers_world,  // [N,3]
         const torch::Tensor& sizes_world     // [N,1] or [N]
     );
     TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld();
+    void recordTsdfPruneAblation(
+        const torch::Tensor& tsdf_prune_mask,
+        const std::string& tag);
+    void printTsdfPruneAblationSummary(const std::string& tag) const;
     
     // ~VoxelMapper();
     void readConfigFromFile(const std::filesystem::path& cfg_path);
@@ -197,7 +217,17 @@ public:
         const sv::MiniCam& cam,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
         int iteration);
+    torch::Tensor computeRgbdDepthLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
     torch::Tensor computeMonoPriorNormalLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    torch::Tensor computeRgbdNormalLoss(
         const std::shared_ptr<VoxelKeyframe>& kf,
         const sv::MiniCam& cam,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
@@ -420,6 +450,24 @@ protected:
     int max_depth_cached_ = 1;
     torch::Tensor depth_cache_points_;
     torch::Tensor depth_cache_colors_;
+    torch::Tensor rgbd_fill_render_holes_cache_points_;
+    torch::Tensor rgbd_fill_render_holes_cache_colors_;
+    int64_t tsdf_ablation_rgbd_points_created_ = 0;
+    int64_t tsdf_ablation_inactive_geo_created_ = 0;
+    int64_t tsdf_ablation_rgbd_fill_created_ = 0;
+    int64_t tsdf_ablation_rgbd_points_lineage_created_ = 0;
+    int64_t tsdf_ablation_inactive_geo_lineage_created_ = 0;
+    int64_t tsdf_ablation_rgbd_fill_lineage_created_ = 0;
+    int64_t tsdf_ablation_rgbd_points_live_last_ = 0;
+    int64_t tsdf_ablation_inactive_geo_live_last_ = 0;
+    int64_t tsdf_ablation_rgbd_fill_live_last_ = 0;
+    int64_t tsdf_ablation_rgbd_points_pruned_by_sdf_ = 0;
+    int64_t tsdf_ablation_inactive_geo_pruned_by_sdf_ = 0;
+    int64_t tsdf_ablation_rgbd_fill_pruned_by_sdf_ = 0;
+    int64_t tsdf_ablation_sdf_prune_passes_ = 0;
+    bool rgbd_fill_render_holes_ = false;
+    int rgbd_fill_render_holes_stride_ = 2;
+    int rgbd_fill_render_holes_max_points_per_kf_ = 20000;
     bool depthanything_densify_ = false;
     int depthanything_densify_stride_ = 8;
     int depthanything_densify_min_sparse_anchors_ = 64;
@@ -474,7 +522,12 @@ protected:
     bool enable_rerun_ = true;
     bool rerun_final_only_ = false;
     int rerun_max_keyframes_ = -1; // <=0: all keyframes, >0: only keyframes in [150, 150+N) in rerun camera stream
+    bool save_nvblox_mesh_eval_ = false;
+    bool load_saved_nvblox_mesh_ = false;
+    bool rerun_nvblox_mesh_ = false;
+    std::string saved_nvblox_mesh_path_;
     bool save_rendered_mesh_eval_ = true; // save voxel_surface_mesh.ply used for reconstruction evaluation
+    bool rerun_rendered_mesh_eval_ = false;
     int rendered_mesh_backend_ = 0; // 0: current SVRaster Python exporter, 1: shared C++ sparse TSDF exporter
     bool record_depth_metrics_ = false;
     float depth_f1_threshold_m_ = 0.01f;

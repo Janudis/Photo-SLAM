@@ -97,6 +97,7 @@ void RerunVisualizerBridge::visualizeCamera(
     const std::vector<Eigen::Vector2f>& kps_uv,
     const std::vector<int>& track_ids,
     int iteration,
+    int keyframe_id,
     float fx, float fy,
     float cx, float cy
 ) {
@@ -216,6 +217,7 @@ void RerunVisualizerBridge::visualizeCamera(
             py::none(),  // points_uv
             py::none(),   // track_ids
             iteration,
+            keyframe_id,
             fx,
             fy,
             cx,
@@ -443,7 +445,8 @@ void RerunVisualizerBridge::visualizeNvbloxMesh(
 
 void RerunVisualizerBridge::visualizeNvbloxPlyMesh(
     const std::string& ply_path,
-    int iteration
+    int iteration,
+    const std::string& entity_path
 ) {
     ensureInitialized();
     if (!impl_) return;
@@ -452,7 +455,8 @@ void RerunVisualizerBridge::visualizeNvbloxPlyMesh(
     try {
         impl_->visualizer.attr("visualize_nvblox_ply")(
             py::str(ply_path),
-            iteration
+            iteration,
+            py::str(entity_path)
         );
     } catch (const py::error_already_set& e) {
         std::cerr << "[RERUN] Python error in visualizeNvbloxPlyMesh: "

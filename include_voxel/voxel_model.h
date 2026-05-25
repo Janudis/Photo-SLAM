@@ -7,6 +7,7 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
+#include <functional>
 #include <torch/torch.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <Python.h>  
@@ -74,6 +75,9 @@ public:
         int64_t pending_promotions = 0;
         int64_t pending_support_updates = 0;
     };
+    using GeoGridInitCallback =
+        std::function<torch::Tensor(const torch::Tensor& grid_points_world,
+                                    float ray_interval_m)>;
 
     VoxelModel(const int sh_degree);
     VoxelModel(const VoxelModelParams& model_params);
@@ -93,6 +97,9 @@ public:
     
     torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
     torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
+    torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
+    torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
+    torch::Tensor depthAnythingFillHolesVoxelMask() const { return this->is_depthanything_fill_holes_voxel_; } // [N] bool
     torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
@@ -127,6 +134,9 @@ public:
     }
     int renderedDepthCandidateAdjacencyRadiusCells() const {
         return rendered_depth_candidate_adjacency_radius_cells_;
+    }
+    void setGeoGridInitCallback(GeoGridInitCallback callback) {
+        geo_grid_init_callback_ = std::move(callback);
     }
     void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
         pending_real_insert_rr_entity_path_ = entity_path;
@@ -163,7 +173,10 @@ public:
         topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
     void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
-    void logLiveOrbVoxels(const int iteration);
+    void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveDepthAnythingFillHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logFinalartificialVoxels(const int iteration);
     void logFinalPromotedartificialVoxels(const int iteration);
 
@@ -340,7 +353,7 @@ public:
 
     float global_scene_extent_ = 200.0f;  // example: 100 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
-    float fixed_vox_size_ = 0.1f;     
+    float fixed_vox_size_ = 0.05f;     
 
     bool   fill_empty_cells_ = false;
     int    fill_empty_cells_warmup_iters_ = 300; // delay one-shot bbox fill until this iteration
@@ -373,6 +386,9 @@ public:
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_artificial_voxel_;          // [N] bool provenance: false=real, true=artificial/support
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
+    torch::Tensor is_inactive_geo_voxel_;        // [N] bool provenance: true=created by inactive-geo densification
+    torch::Tensor is_rgbd_fill_render_holes_voxel_; // [N] bool provenance: true=created by RGB-D render-hole fill
+    torch::Tensor is_depthanything_fill_holes_voxel_; // [N] bool provenance: true=created by DepthAnything fill-hole insertion
     torch::Tensor is_promoted_artificial_voxel_; // [N] bool provenance: true if voxel was artificial and got promoted to real
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
@@ -408,6 +424,7 @@ public:
     bool pending_insert_rendered_depth_candidate_ = false;
     int pending_insert_rendered_depth_candidate_source_kind_ = 0;
     bool pending_insert_rendered_depth_candidate_as_real_protected_ = false;
+    GeoGridInitCallback geo_grid_init_callback_;
     int64_t total_promoted_artificial_voxels_ = 0;
     int32_t topology_birth_iter_ = -1;
     int32_t topology_birth_kf_ = -1;
@@ -426,6 +443,11 @@ protected:
     std::unique_ptr<PyState> py_;  // holds all pybind objects
     // Pull all core tensors from the Python SVM after any topology change.
     void syncFromPython_();
+    torch::Tensor makeGeoGridInitRows_(
+        const torch::Tensor& grid_pts_key_new,
+        int64_t begin,
+        int64_t end,
+        float default_value);
     // Helper math
     static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
     static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);

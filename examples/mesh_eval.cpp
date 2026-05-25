@@ -2892,9 +2892,9 @@ int main(int argc, char** argv)
 
 // voxel photoslam
 // ./bin/mesh_eval \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
 //   --gt=scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/mesh_eval \
 //   --tau_cm=5.0 \
 //   --recon_samples=500000 \
 //   --gt_samples=500000 \
@@ -2907,34 +2907,33 @@ int main(int argc, char** argv)
 //   --near=0.05 \
 //   --far=20.0 \
 //   --align_recon_to_gt=1 \
-//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/CameraTrajectory_TUM.txt \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4681_shutdown/ply/voxel_model/iteration_4681/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4681_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
 //   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
-//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/CameraTrajectory_TUM.txt \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
 
-
 // ./bin/mesh_eval \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/3771_shutdown/mesh_eval_aligned \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/mesh_eval_aligned \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
 //   --cam_json=/home/dimitris/Photo-SLAM/scripts/data/Replica/cam_params.json \
 //   --align_recon_to_gt=1 \
-//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_voxel/office0/CameraTrajectory_TUM.txt \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1 \
 //   --save_depth_heatmaps=1 \
 //   --frame_stride=1 --max_frames=1000 --depth_heatmap_max_frames=50

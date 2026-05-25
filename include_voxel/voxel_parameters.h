@@ -211,6 +211,10 @@ public:
     int   depthanythingv2_from_;
     int   depthanythingv2_end_;
     float depthanythingv2_end_mult_;
+    float lambda_rgbd_depth_ = 0.0f;
+    int   rgbd_depth_from_ = 3000;
+    int   rgbd_depth_end_ = 20000;
+    float rgbd_depth_end_mult_ = 0.1f;
     bool  depthanythingv2_overall_;
     bool  depthanythingv2_alpha_adjust_;
     bool  enable_da2_uncertainty_;
@@ -236,4 +240,12 @@ public:
     int   depthanythingv2_normal_from_;
     int   depthanythingv2_normal_end_;
     float depthanythingv2_normal_end_mult_;
+    int   depthanythingv2_normal_ks_ = 3;
+    float depthanythingv2_normal_tol_deg_ = 90.0f;
+    float lambda_rgbd_normal_ = 0.0f;
+    int   rgbd_normal_from_ = 3000;
+    int   rgbd_normal_end_ = 20000;
+    float rgbd_normal_end_mult_ = 0.1f;
+    int   rgbd_normal_ks_ = 3;
+    float rgbd_normal_tol_deg_ = 90.0f;
 };

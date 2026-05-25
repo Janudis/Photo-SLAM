@@ -362,6 +362,22 @@ target_link_libraries(replica_mono_voxel
 )
 target_link_directories(replica_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
+add_executable(replica_rgbd_voxel examples/replica_rgbd_voxel.cpp)
+target_include_directories(replica_rgbd_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        pybind11::embed
+)
+target_link_libraries(replica_rgbd_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(replica_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # # TUM Monocular

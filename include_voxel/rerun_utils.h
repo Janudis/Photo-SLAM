@@ -38,12 +38,15 @@ public:
     // image_bgr     : tracking image (cv::Mat, BGR or RGB).
     // keypoints_uv  : vector of (u,v) pixel coords.
     // track_ids     : optional vector of track IDs (same length as keypoints_uv).
+    // iteration     : mapper iteration used as the Rerun timeline.
+    // keyframe_id   : stable SLAM keyframe id used as the Rerun entity name.
     void visualizeCamera(
         const Eigen::Matrix4f& T_W_C,
         const cv::Mat& image_bgr,
         const std::vector<Eigen::Vector2f>& keypoints_uv,
         const std::vector<int>& track_ids,
         int iteration,
+        int keyframe_id,
         float fx,
         float fy,
         float cx,
@@ -76,7 +79,10 @@ public:
         int iteration
     );
 
-    void visualizeNvbloxPlyMesh(const std::string& ply_path, int iteration);
+    void visualizeNvbloxPlyMesh(
+        const std::string& ply_path,
+        int iteration,
+        const std::string& entity_path = "world/tsdf_mesh/live");
     void visualizeSVRasterMesh(
         const torch::Tensor& centers,   // [N,3] float
         const torch::Tensor& sizes,     // [N] or [N,1] or [N,3] float

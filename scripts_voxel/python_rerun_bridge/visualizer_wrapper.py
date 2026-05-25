@@ -225,6 +225,7 @@ class RerunVisualizer:
         points_uv: Optional[npt.NDArray] = None,
         track_ids: Optional[npt.NDArray] = None,
         iteration: Optional[int] = None,
+        keyframe_id: Optional[int] = None,
         fx: Optional[float] = None,
         fy: Optional[float] = None,
         cx: Optional[float] = None,
@@ -238,6 +239,11 @@ class RerunVisualizer:
         """
         if iteration is not None:
             rr.set_time_sequence("iter", int(iteration))
+        if keyframe_id is not None:
+            kf_name = f"kf_{int(keyframe_id):06d}"
+            cam_entity = f"world/keyframes/{kf_name}"
+            img2d_entity = f"world/keyframes_2d/{kf_name}"
+        elif iteration is not None:
             kf_name = f"kf_{int(iteration):06d}"
             cam_entity = f"world/keyframes/{kf_name}"
             img2d_entity = f"world/keyframes_2d/{kf_name}"
@@ -265,10 +271,15 @@ class RerunVisualizer:
         self.t_W_C_history.append(t_W_C)
         self._log_trajectory()
 
-    def visualize_nvblox_ply(self, ply_path: str, iteration: int):
+    def visualize_nvblox_ply(
+        self,
+        ply_path: str,
+        iteration: int,
+        entity_path: str = "world/tsdf_mesh/live",
+    ):
         """
         Called from C++:
-            impl_->visualizer.attr("visualize_nvblox_ply")(py::str(ply_path), iteration)
+            impl_->visualizer.attr("visualize_nvblox_ply")(py::str(ply_path), iteration, entity_path)
         Loads the NVBlox color mesh PLY and logs it to Rerun.
         """
         # print("[RERUN] visualize_nvblox_ply called")
@@ -304,9 +315,6 @@ class RerunVisualizer:
 
         # 2) Time
         rr.set_time_sequence("iter", int(iteration))
-
-        # 3) Make it a child of "world" so it is visible in the Spatial3DView(origin="world")
-        entity_path = f"world/tsdf_mesh/iter_{iteration:05d}"
 
         # print("[RERUN] loaded mesh:")
         # print("         vertices shape:", vertices.shape)

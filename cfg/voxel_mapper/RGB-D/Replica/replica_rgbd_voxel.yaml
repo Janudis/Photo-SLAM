@@ -18,16 +18,17 @@ Monocular.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.use_tsdf_mapping: 1 # 1: integrate RGB-D frames into an accumulated nvblox TSDF
-Mapper.use_tsdf_pruning: 1 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
+Mapper.use_tsdf_mapping: 0 # 1: integrate RGB-D frames into the configured TSDF backend
+Mapper.use_tsdf_pruning: 0 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
 Mapper.use_tsdf_planning: 0 # 0: do not run ESDF path planning at shutdown
+Mapper.tsdf_backend: svraster # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
 Mapper.tsdf_voxel_size_m: 0.05
 Mapper.tsdf_prune_min_weight: 1.0
 Mapper.tsdf_prune_surface_band_vox: 2.0
 Mapper.tsdf_prune_min_valid_corners: 8
-Mapper.tsdf_density_init: 1 # 1: initialize new SVRaster grid densities from nvblox TSDF with NeuS-style bell mapping
+Mapper.tsdf_density_init: 0 # 1: initialize new SVRaster grid densities from TSDF with NeuS-style bell mapping
 Mapper.tsdf_density_init_min_weight: 1.0
-Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many nvblox voxels
+Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many configured TSDF voxels
 Mapper.tsdf_density_init_bell_a: 0.1 # normalized TSDF offset used for bell calibration
 Mapper.tsdf_density_init_bell_b: 0.5 # bell opacity at |F| = bell_a before alpha rescale
 Mapper.tsdf_density_init_alpha_min: 0.0002
@@ -98,10 +99,10 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 600
-Optimization.adapt_every: 600
-Optimization.prune_every: 700
-Optimization.subdivide_every: 600
+Optimization.adapt_from: 700
+Optimization.adapt_every: 700
+Optimization.prune_every: 800
+Optimization.subdivide_every: 700
 
 # Pruning heuristics
 Optimization.densify_cooldown_iters: 0  # skip prune/subdivide for voxels younger than this many iters
@@ -122,18 +123,18 @@ Optimization.final_special_prune_enable: 0
 # Pruning
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.001 
-Optimization.prune_thres_final: 0.01 #0.15
-Optimization.prune_thres_final_at_target: 0.01
-Optimization.prune_thres_init_artificial: 0.01
-Optimization.prune_thres_final_artificial: 0.01 # used for artificial rendered-hole-fill candidates until promotion
+Optimization.prune_thres_final: 0.05 #0.15
+Optimization.prune_thres_final_at_target: 0.05
+Optimization.prune_thres_init_artificial: 0.05
+Optimization.prune_thres_final_artificial: 0.05 # used for artificial rendered-hole-fill candidates until promotion
 
 # Subdivision
 Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
-Optimization.subdivide_samp_thres: 0.7 #0.7 #1.0
-Optimization.subdivide_prop: 0.1 #0.1 #0.05
-Optimization.subdivide_samp_thres_at_target: 0.7
-Optimization.subdivide_prop_at_target: 0.1
+Optimization.subdivide_samp_thres: 0.9 #0.7 #1.0
+Optimization.subdivide_prop: 0.07 #0.1 #0.05
+Optimization.subdivide_samp_thres_at_target: 0.9
+Optimization.subdivide_prop_at_target: 0.07
 Optimization.subdivide_max_num: 10000000
 Optimization.subdivide_artificial_requires_promotion: 0 # if 1, current artificial voxels cannot subdivide until they are promoted/real
 Optimization.subdivide_force_to_target_size: 0  # 0:false(default behavior), 1:force refine to target size

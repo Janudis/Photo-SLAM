@@ -89,11 +89,23 @@ public:
     torch::Tensor voxCenter() { return this->center_; }
     int64_t numGridPts() const;
     const torch::Tensor& geoGridPts() const;
+    const torch::Tensor& svrasterSdfGridPts() const;
+    const torch::Tensor& svrasterSdfWeights() const;
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
     torch::Tensor voxelDensityMean() const;
     torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
     torch::Tensor voxKey() const { return this->vox_key_; }
+    torch::Tensor gridPointsWorld() const;
+    bool hasSvrasterSdfField() const;
+    void ensureSvrasterSdfField();
+    void fuseSvrasterSdfGridSamples(
+        const torch::Tensor& tsdf_values,
+        const torch::Tensor& weights,
+        const torch::Tensor& valid_mask);
+    void applyGeoGridRawInit(
+        const torch::Tensor& raw_values,
+        const torch::Tensor& valid_mask);
     
     torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
     torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
@@ -328,6 +340,9 @@ public:
     torch::Tensor max_w_;              // [N]
     torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
     torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
+    torch::Tensor svraster_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each SVRaster grid-point
+    torch::Tensor svraster_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
+    torch::Tensor svraster_sdf_grid_pts_key_; // [M,3] int64 keys aligned with SDF buffers
     torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
     torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
     torch::Tensor frozen_vox_geo_;

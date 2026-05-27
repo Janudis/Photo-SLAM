@@ -11,6 +11,30 @@ namespace py = pybind11;
 using namespace py::literals;  // enables "name"_a syntax
 namespace sv {
 
+namespace {
+struct GridPointKey3 {
+    int64_t x = 0;
+    int64_t y = 0;
+    int64_t z = 0;
+
+    bool operator==(const GridPointKey3& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct GridPointKey3Hash {
+    std::size_t operator()(const GridPointKey3& k) const {
+        std::size_t h = std::hash<int64_t>{}(k.x);
+        auto combine = [&](std::size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        combine(std::hash<int64_t>{}(k.y));
+        combine(std::hash<int64_t>{}(k.z));
+        return h;
+    }
+};
+} // namespace
+
 struct __attribute__((visibility("hidden"))) VoxelModel::PyState {
     py::object svm;        // Python SparseVoxelModel
     py::object optimizer_py;  // Python SparseAdam
@@ -78,8 +102,190 @@ int64_t sv::VoxelModel::numGridPts() const {
 }
 
 const torch::Tensor& sv::VoxelModel::geoGridPts() const { return _geo_grid_pts_; }
+const torch::Tensor& sv::VoxelModel::svrasterSdfGridPts() const { return svraster_sdf_grid_pts_; }
+const torch::Tensor& sv::VoxelModel::svrasterSdfWeights() const { return svraster_sdf_weights_; }
 const torch::Tensor& sv::VoxelModel::sh0()        const { return sh0_; }
 const torch::Tensor& sv::VoxelModel::shs()        const { return shs_; }
+
+torch::Tensor VoxelModel::gridPointsWorld() const
+{
+    TORCH_CHECK(grid_pts_key_.defined() &&
+                    grid_pts_key_.dim() == 2 &&
+                    grid_pts_key_.size(1) == 3,
+                "gridPointsWorld: grid_pts_key_ must be [M,3]");
+    TORCH_CHECK(scene_center_.defined() && scene_center_.numel() == 3,
+                "gridPointsWorld: scene_center_ must be [3]");
+    TORCH_CHECK(scene_extent_.defined() && scene_extent_.numel() == 1,
+                "gridPointsWorld: scene_extent_ must be [1]");
+
+    auto dev = grid_pts_key_.device();
+    torch::Tensor scene_center =
+        scene_center_.to(dev).to(torch::kFloat32).contiguous().view({3});
+    torch::Tensor scene_extent =
+        scene_extent_.to(dev).to(torch::kFloat32).contiguous().view({1});
+    torch::Tensor scene_min = scene_center - 0.5f * scene_extent;
+
+    const float finest_scale = std::ldexp(1.0f, -max_num_levels_);
+    torch::Tensor finest_vox = scene_extent * finest_scale;
+    return (scene_min.view({1, 3}) +
+            grid_pts_key_.to(torch::kFloat32) * finest_vox.view({1, 1}))
+        .contiguous();
+}
+
+bool VoxelModel::hasSvrasterSdfField() const
+{
+    return svraster_sdf_grid_pts_.defined() &&
+           svraster_sdf_weights_.defined() &&
+           svraster_sdf_grid_pts_.dim() == 2 &&
+           svraster_sdf_weights_.dim() == 2 &&
+           svraster_sdf_grid_pts_.size(1) == 1 &&
+           svraster_sdf_weights_.size(1) == 1 &&
+           grid_pts_key_.defined() &&
+           svraster_sdf_grid_pts_.size(0) == grid_pts_key_.size(0) &&
+           svraster_sdf_weights_.size(0) == grid_pts_key_.size(0);
+}
+
+void VoxelModel::ensureSvrasterSdfField()
+{
+    if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
+        svraster_sdf_grid_pts_ = torch::empty(
+            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+        svraster_sdf_weights_ = torch::empty(
+            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+        svraster_sdf_grid_pts_key_ = torch::empty(
+            {0, 3}, torch::TensorOptions().dtype(torch::kInt64).device(device_type_));
+        return;
+    }
+
+    const int64_t M = grid_pts_key_.size(0);
+    auto tensor_dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : grid_pts_key_.device();
+    auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(tensor_dev);
+
+    auto make_empty_values = [&]() {
+        svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+        svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+        svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
+    };
+
+    if (M == 0) {
+        make_empty_values();
+        return;
+    }
+
+    if (svraster_sdf_grid_pts_.defined() &&
+        svraster_sdf_weights_.defined() &&
+        svraster_sdf_grid_pts_key_.defined() &&
+        svraster_sdf_grid_pts_.size(0) == M &&
+        svraster_sdf_weights_.size(0) == M &&
+        svraster_sdf_grid_pts_key_.sizes() == grid_pts_key_.sizes() &&
+        torch::equal(svraster_sdf_grid_pts_key_.to(torch::kCPU), grid_pts_key_.to(torch::kCPU))) {
+        if (svraster_sdf_grid_pts_.device() != tensor_dev) {
+            svraster_sdf_grid_pts_ = svraster_sdf_grid_pts_.to(tensor_dev).contiguous();
+            svraster_sdf_weights_ = svraster_sdf_weights_.to(tensor_dev).contiguous();
+        }
+        return;
+    }
+
+    if (!svraster_sdf_grid_pts_.defined() ||
+        !svraster_sdf_weights_.defined() ||
+        !svraster_sdf_grid_pts_key_.defined() ||
+        svraster_sdf_grid_pts_key_.dim() != 2 ||
+        svraster_sdf_grid_pts_key_.size(1) != 3 ||
+        svraster_sdf_grid_pts_.size(0) != svraster_sdf_grid_pts_key_.size(0) ||
+        svraster_sdf_weights_.size(0) != svraster_sdf_grid_pts_key_.size(0)) {
+        make_empty_values();
+        return;
+    }
+
+    torch::Tensor old_keys_cpu =
+        svraster_sdf_grid_pts_key_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    torch::Tensor new_keys_cpu =
+        grid_pts_key_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    torch::Tensor old_sdf_cpu =
+        svraster_sdf_grid_pts_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor old_w_cpu =
+        svraster_sdf_weights_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+
+    torch::Tensor new_sdf_cpu = torch::zeros({M, 1}, torch::TensorOptions().dtype(torch::kFloat32));
+    torch::Tensor new_w_cpu = torch::zeros({M, 1}, torch::TensorOptions().dtype(torch::kFloat32));
+
+    std::unordered_map<GridPointKey3, int64_t, GridPointKey3Hash> old_index;
+    old_index.reserve(static_cast<size_t>(old_keys_cpu.size(0) * 2 + 1));
+    auto old_acc = old_keys_cpu.accessor<int64_t, 2>();
+    for (int64_t i = 0; i < old_keys_cpu.size(0); ++i) {
+        old_index.emplace(GridPointKey3{old_acc[i][0], old_acc[i][1], old_acc[i][2]}, i);
+    }
+
+    auto new_acc = new_keys_cpu.accessor<int64_t, 2>();
+    auto old_sdf_acc = old_sdf_cpu.accessor<float, 2>();
+    auto old_w_acc = old_w_cpu.accessor<float, 2>();
+    auto new_sdf_acc = new_sdf_cpu.accessor<float, 2>();
+    auto new_w_acc = new_w_cpu.accessor<float, 2>();
+    for (int64_t i = 0; i < M; ++i) {
+        auto it = old_index.find(GridPointKey3{new_acc[i][0], new_acc[i][1], new_acc[i][2]});
+        if (it == old_index.end()) {
+            continue;
+        }
+        const int64_t old_i = it->second;
+        new_sdf_acc[i][0] = old_sdf_acc[old_i][0];
+        new_w_acc[i][0] = old_w_acc[old_i][0];
+    }
+
+    svraster_sdf_grid_pts_ = new_sdf_cpu.to(tensor_dev).contiguous();
+    svraster_sdf_weights_ = new_w_cpu.to(tensor_dev).contiguous();
+    svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
+}
+
+void VoxelModel::fuseSvrasterSdfGridSamples(
+    const torch::Tensor& tsdf_values,
+    const torch::Tensor& weights,
+    const torch::Tensor& valid_mask)
+{
+    ensureSvrasterSdfField();
+    if (!hasSvrasterSdfField() || grid_pts_key_.size(0) == 0) {
+        return;
+    }
+
+    const int64_t M = grid_pts_key_.size(0);
+    torch::NoGradGuard no_grad;
+    auto dev = svraster_sdf_grid_pts_.device();
+    torch::Tensor sample_tsdf = tsdf_values.to(dev).to(torch::kFloat32).reshape({M, 1});
+    torch::Tensor sample_w = weights.to(dev).to(torch::kFloat32).reshape({M, 1});
+    torch::Tensor valid = valid_mask.to(dev).to(torch::kBool).reshape({M, 1}) &
+                          torch::isfinite(sample_tsdf) &
+                          (sample_w > 0.0f);
+
+    torch::Tensor old_w = svraster_sdf_weights_;
+    torch::Tensor old_sdf = svraster_sdf_grid_pts_;
+    torch::Tensor fused_w = old_w + sample_w;
+    torch::Tensor fused_sdf =
+        (old_sdf * old_w + sample_tsdf * sample_w) / fused_w.clamp_min(1.0e-6f);
+
+    svraster_sdf_grid_pts_ = torch::where(valid, fused_sdf, old_sdf).contiguous();
+    svraster_sdf_weights_ = torch::where(valid, fused_w, old_w).contiguous();
+}
+
+void VoxelModel::applyGeoGridRawInit(
+    const torch::Tensor& raw_values,
+    const torch::Tensor& valid_mask)
+{
+    if (!_geo_grid_pts_.defined() || _geo_grid_pts_.dim() != 2 || _geo_grid_pts_.size(1) != 1) {
+        return;
+    }
+    const int64_t M = _geo_grid_pts_.size(0);
+    if (M == 0) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    auto dev = _geo_grid_pts_.device();
+    torch::Tensor raw = raw_values.to(dev).to(torch::kFloat32).reshape({M, 1});
+    torch::Tensor valid = valid_mask.to(dev).to(torch::kBool).reshape({M, 1}) &
+                          torch::isfinite(raw);
+
+    torch::Tensor updated = torch::where(valid, raw, _geo_grid_pts_).contiguous();
+    _geo_grid_pts_.copy_(updated);
+}
 
 torch::Tensor VoxelModel::voxelDensityMean() const
 {
@@ -1513,6 +1719,7 @@ void VoxelModel::createFromPcd(
 
     // learnables
     this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
+    ensureSvrasterSdfField();
     this->sh0_           = fetch("_sh0").requires_grad_(true);
     this->shs_           = fetch("_shs").requires_grad_(true);
     this->subdiv_p_      = fetch("_subdiv_p").requires_grad_(true);
@@ -3713,6 +3920,7 @@ void VoxelModel::increasePcd(
     this->vox_size_inv_  = 1.0f / size_;
     this->grid_pts_key_  = fetch("grid_pts_key");
     this->vox_key_       = fetch("vox_key");
+    ensureSvrasterSdfField();
     // (optimizer params already set by appendGroup_; just ensure requires_grad)
     this->subdiv_p_      = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
     // stats buffer resize
@@ -4916,6 +5124,7 @@ void VoxelModel::syncFromPython_() {
     this->grid_pts_key_  = fetch("grid_pts_key");
     // Learnables
     this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
+    ensureSvrasterSdfField();
     this->sh0_ = fetch("_sh0").requires_grad_(true);
     // this->sh0_ = this->sh0_.view({-1,1,3});
     this->shs_ = fetch("_shs").requires_grad_(true);

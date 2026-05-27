@@ -2411,7 +2411,7 @@ int main(int argc, char** argv)
 
     if ((eval_mode == EvalMode::GaussianSlam || eval_mode == EvalMode::GaussianSlamSim3) && recon_has_faces)
     {
-        cleanMeshLikeGaussianSlam(recon_mesh, 200);
+        cleanMeshLikeGaussianSlam(recon_mesh, 100);
     }
 
     bool traj_is_c2w = true;
@@ -2912,9 +2912,9 @@ int main(int argc, char** argv)
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4681_shutdown/ply/voxel_model/iteration_4681/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5530_shutdown/ply/voxel_model/iteration_5530/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4681_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5530_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \

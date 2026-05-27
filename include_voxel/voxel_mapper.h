@@ -127,6 +127,7 @@ public:
     bool use_tsdf_mapping_ = false; 
     bool use_tsdf_pruning_ = false;
     bool use_tsdf_planning_ = false;
+    std::string tsdf_backend_ = "svraster";
     float sdf_voxel_size_m_ = 0.05f;   // example, configurable via YAML
     float tsdf_prune_min_weight_ = 1.0f;
     float tsdf_prune_surface_band_vox_ = 2.0f;
@@ -141,6 +142,27 @@ public:
     void initializeNvbloxMapper();
     void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
                                     const cv::Mat& depth_meters);
+    bool useSvrasterTsdfBackend() const;
+    bool useNvbloxTsdfBackend() const;
+    bool hasTsdfForSampling() const;
+    float tsdfMetricVoxelSize() const;
+    void integrateKeyframeIntoSvrasterSdf(VoxelKeyframe& kf,
+                                          const cv::Mat& depth_meters);
+    bool prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf);
+    void clearSvrasterTsdfInitContext();
+    torch::Tensor computeSvrasterProjectiveDensityInitForGridPoints(
+        const torch::Tensor& grid_points_world,
+        float ray_interval_m);
+    bool svraster_tsdf_init_context_valid_ = false;
+    cv::Mat svraster_tsdf_init_depth_meters_;
+    Sophus::SE3f svraster_tsdf_init_Tcw_;
+    float svraster_tsdf_init_fx_ = 0.0f;
+    float svraster_tsdf_init_fy_ = 0.0f;
+    float svraster_tsdf_init_cx_ = 0.0f;
+    float svraster_tsdf_init_cy_ = 0.0f;
+    int svraster_tsdf_init_width_ = 0;
+    int svraster_tsdf_init_height_ = 0;
+    std::size_t svraster_tsdf_init_kfid_ = 0;
     struct TsdfSample {
         torch::Tensor tsdf;    // [N]
         torch::Tensor weight;  // [N]

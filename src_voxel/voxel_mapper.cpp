@@ -23,6 +23,8 @@ std::ofstream loss_l1_log_;
 std::ofstream loss_ssim_log_;
 std::ofstream loss_l2_log_;
 
+static bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters);
+
 namespace {
 constexpr int kRenderedCandidateSourceDepthInsert = 1;
 constexpr int kRenderedCandidateSourceMonoPrior = 3;
@@ -360,7 +362,10 @@ static cv::Mat filterDepthOutliersLikeGaussianSlam(const cv::Mat& depth_map)
     return filtered;
 }
 
-static bool saveTriangleMeshPly(const std::filesystem::path& ply_path, const TriangleMeshRgb& mesh)
+static bool saveTriangleMeshPly(
+    const std::filesystem::path& ply_path,
+    const TriangleMeshRgb& mesh,
+    bool write_vertex_colors = true)
 {
     if (mesh.vertices.empty() || mesh.faces.empty()) return false;
 
@@ -383,7 +388,8 @@ static bool saveTriangleMeshPly(const std::filesystem::path& ply_path, const Tri
     }
 
     std::vector<uint8_t> vertex_rgb;
-    const bool has_colors = mesh.colors.size() == mesh.vertices.size();
+    const bool has_colors =
+        write_vertex_colors && mesh.colors.size() == mesh.vertices.size();
     if (has_colors)
     {
         vertex_rgb.reserve(mesh.colors.size() * 3);
@@ -425,6 +431,136 @@ static bool saveTriangleMeshPly(const std::filesystem::path& ply_path, const Tri
     ply.write(out, true);
     fb.close();
     return true;
+}
+
+static void capTriangleMeshForExport(
+    TriangleMeshRgb& mesh,
+    std::size_t max_vertices,
+    std::size_t max_faces,
+    float quantization_eps)
+{
+    if (mesh.vertices.empty() || mesh.faces.empty()) return;
+    if ((max_vertices == 0 || mesh.vertices.size() <= max_vertices) &&
+        (max_faces == 0 || mesh.faces.size() <= max_faces)) {
+        return;
+    }
+
+    struct QuantizedVertexKey
+    {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        std::int64_t z = 0;
+
+        bool operator==(const QuantizedVertexKey& other) const noexcept
+        {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+
+    struct QuantizedVertexKeyHash
+    {
+        std::size_t operator()(const QuantizedVertexKey& key) const noexcept
+        {
+            const std::uint64_t x = static_cast<std::uint64_t>(key.x) * 73856093ull;
+            const std::uint64_t y = static_cast<std::uint64_t>(key.y) * 19349663ull;
+            const std::uint64_t z = static_cast<std::uint64_t>(key.z) * 83492791ull;
+            return static_cast<std::size_t>(x ^ y ^ z);
+        }
+    };
+
+    const float eps = std::max(quantization_eps, 1.0e-8f);
+    auto make_key = [eps](const Eigen::Vector3f& p) -> QuantizedVertexKey
+    {
+        return QuantizedVertexKey{
+            static_cast<std::int64_t>(std::llround(static_cast<double>(p.x()) / eps)),
+            static_cast<std::int64_t>(std::llround(static_cast<double>(p.y()) / eps)),
+            static_cast<std::int64_t>(std::llround(static_cast<double>(p.z()) / eps))};
+    };
+
+    const bool has_colors = mesh.colors.size() == mesh.vertices.size();
+    TriangleMeshRgb capped;
+    capped.vertices.reserve(max_vertices > 0 ? std::min(max_vertices, mesh.vertices.size()) : mesh.vertices.size());
+    capped.faces.reserve(max_faces > 0 ? std::min(max_faces, mesh.faces.size()) : mesh.faces.size());
+    if (has_colors) {
+        capped.colors.reserve(capped.vertices.capacity());
+    }
+
+    std::unordered_map<QuantizedVertexKey, uint32_t, QuantizedVertexKeyHash> vertex_map;
+    vertex_map.reserve(capped.vertices.capacity());
+
+    const std::size_t face_limit = max_faces > 0 ? max_faces : mesh.faces.size();
+    for (const auto& face : mesh.faces)
+    {
+        if (capped.faces.size() >= face_limit) break;
+
+        std::array<QuantizedVertexKey, 3> keys;
+        std::array<uint32_t, 3> remapped{};
+        bool valid_face = true;
+        std::size_t new_vertices = 0;
+
+        for (int i = 0; i < 3; ++i)
+        {
+            if (face[i] >= mesh.vertices.size()) {
+                valid_face = false;
+                break;
+            }
+            keys[i] = make_key(mesh.vertices[face[i]]);
+            const auto it = vertex_map.find(keys[i]);
+            if (it != vertex_map.end()) {
+                remapped[i] = it->second;
+                continue;
+            }
+
+            bool duplicate_new_key = false;
+            for (int j = 0; j < i; ++j)
+            {
+                if (keys[i] == keys[j] && vertex_map.find(keys[i]) == vertex_map.end()) {
+                    duplicate_new_key = true;
+                    break;
+                }
+            }
+            if (!duplicate_new_key) ++new_vertices;
+        }
+        if (!valid_face) continue;
+        if (max_vertices > 0 && capped.vertices.size() + new_vertices > max_vertices) {
+            continue;
+        }
+
+        for (int i = 0; i < 3; ++i)
+        {
+            const auto it = vertex_map.find(keys[i]);
+            if (it != vertex_map.end()) {
+                remapped[i] = it->second;
+                continue;
+            }
+
+            const uint32_t new_index = static_cast<uint32_t>(capped.vertices.size());
+            vertex_map.emplace(keys[i], new_index);
+            remapped[i] = new_index;
+            capped.vertices.push_back(mesh.vertices[face[i]]);
+            if (has_colors) {
+                capped.colors.push_back(mesh.colors[face[i]]);
+            }
+        }
+
+        if (remapped[0] == remapped[1] ||
+            remapped[1] == remapped[2] ||
+            remapped[0] == remapped[2]) {
+            continue;
+        }
+        capped.faces.push_back({remapped[0], remapped[1], remapped[2]});
+    }
+
+    if (!capped.vertices.empty() && !capped.faces.empty()) {
+        std::cout << "[saveRenderedTsdfMeshPly] capped mesh "
+                  << " verts " << mesh.vertices.size() << " -> " << capped.vertices.size()
+                  << " faces " << mesh.faces.size() << " -> " << capped.faces.size()
+                  << " limits=(" << max_vertices << " verts, " << max_faces << " faces)"
+                  << "\n";
+        mesh = std::move(capped);
+    } else {
+        std::cout << "[saveRenderedTsdfMeshPly] mesh cap produced empty mesh; keeping full mesh.\n";
+    }
 }
 
 struct SparseTsdfVolume
@@ -1412,6 +1548,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
               << " rendered_mesh_backend=" << rendered_mesh_backend_
               << " prune_recompute_dense_core=" << static_cast<int>(opt_params_.prune_recompute_dense_core_)
               << " promote_artificial=" << static_cast<int>(voxel_model_->enableArtificialPromotion())
+              << " tsdf_backend=" << tsdf_backend_
               << " tsdf_density_init=" << static_cast<int>(tsdf_density_init_)
               << "\n";
 
@@ -1683,6 +1820,15 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     {
         cv::FileNode n = settings_file["Mapper.use_tsdf_planning"];
         use_tsdf_planning_ = n.empty() ? false : ((n.operator int()) != 0);
+    }
+    {
+        cv::FileNode n = settings_file["Mapper.tsdf_backend"];
+        tsdf_backend_ = n.empty() ? std::string("svraster") : toLowerCopy(static_cast<std::string>(n));
+        if (tsdf_backend_ != "svraster" && tsdf_backend_ != "nvblox") {
+            std::cerr << "[TSDF] Unknown Mapper.tsdf_backend='" << tsdf_backend_
+                      << "', falling back to 'svraster'.\n";
+            tsdf_backend_ = "svraster";
+        }
     }
     {
         cv::FileNode n = settings_file["Mapper.tsdf_voxel_size_m"];
@@ -2699,6 +2845,228 @@ bool VoxelMapper::queryEsdfAtWorld(const Eigen::Vector3d& p_W, float& dist_out) 
     return true;
 }
 
+bool VoxelMapper::useSvrasterTsdfBackend() const
+{
+    return tsdf_backend_ == "svraster";
+}
+
+bool VoxelMapper::useNvbloxTsdfBackend() const
+{
+    return tsdf_backend_ == "nvblox";
+}
+
+float VoxelMapper::tsdfMetricVoxelSize() const
+{
+    if (useNvbloxTsdfBackend() && sdf_mapper_ && sdf_mapper_->tsdf_layer().size() > 0) {
+        return static_cast<float>(sdf_mapper_->tsdf_layer().voxel_size());
+    }
+    return std::max(1.0e-6f, sdf_voxel_size_m_);
+}
+
+bool VoxelMapper::hasTsdfForSampling() const
+{
+    if (useSvrasterTsdfBackend()) {
+        return voxel_model_ &&
+               voxel_model_->hasSvrasterSdfField() &&
+               voxel_model_->svrasterSdfWeights().defined() &&
+               voxel_model_->svrasterSdfWeights().numel() > 0 &&
+               voxel_model_->svrasterSdfWeights().max().item<float>() > 0.0f;
+    }
+    return sdf_mapper_ && sdf_mapper_->tsdf_layer().size() > 0;
+}
+
+bool VoxelMapper::prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf)
+{
+    clearSvrasterTsdfInitContext();
+    if (!kf || sensor_type_ != RGBD || !useSvrasterTsdfBackend() || !tsdf_density_init_) {
+        return false;
+    }
+
+    cv::Mat depth_meters;
+    if (!depthMatToMeters(kf->img_auxiliary_undist_, depth_meters) || depth_meters.empty()) {
+        return false;
+    }
+    if (depth_meters.channels() > 1) {
+        cv::extractChannel(depth_meters, depth_meters, 0);
+    }
+    if (depth_meters.type() != CV_32FC1) {
+        depth_meters.convertTo(depth_meters, CV_32FC1);
+    }
+
+    const float fx = kf->cam_.fx();
+    const float fy = kf->cam_.fy();
+    if (fx <= 1.0e-6f || fy <= 1.0e-6f) {
+        return false;
+    }
+
+    svraster_tsdf_init_depth_meters_ = depth_meters;
+    svraster_tsdf_init_Tcw_ = kf->getPosef();
+    svraster_tsdf_init_fx_ = fx;
+    svraster_tsdf_init_fy_ = fy;
+    svraster_tsdf_init_cx_ = kf->cam_.cx();
+    svraster_tsdf_init_cy_ = kf->cam_.cy();
+    svraster_tsdf_init_width_ = depth_meters.cols;
+    svraster_tsdf_init_height_ = depth_meters.rows;
+    svraster_tsdf_init_kfid_ = kf->fid_;
+    svraster_tsdf_init_context_valid_ = true;
+    return true;
+}
+
+void VoxelMapper::clearSvrasterTsdfInitContext()
+{
+    svraster_tsdf_init_context_valid_ = false;
+    svraster_tsdf_init_depth_meters_.release();
+    svraster_tsdf_init_Tcw_ = Sophus::SE3f();
+    svraster_tsdf_init_fx_ = 0.0f;
+    svraster_tsdf_init_fy_ = 0.0f;
+    svraster_tsdf_init_cx_ = 0.0f;
+    svraster_tsdf_init_cy_ = 0.0f;
+    svraster_tsdf_init_width_ = 0;
+    svraster_tsdf_init_height_ = 0;
+    svraster_tsdf_init_kfid_ = 0;
+}
+
+torch::Tensor VoxelMapper::computeSvrasterProjectiveDensityInitForGridPoints(
+    const torch::Tensor& grid_points_world,
+    float ray_interval_m)
+{
+    TORCH_CHECK(
+        grid_points_world.defined() &&
+        grid_points_world.dim() == 2 &&
+        grid_points_world.size(1) == 3,
+        "computeSvrasterProjectiveDensityInitForGridPoints expects grid_points_world [N,3]");
+
+    const int64_t N = grid_points_world.size(0);
+    auto out_opts = torch::TensorOptions()
+                        .dtype(torch::kFloat32)
+                        .device(grid_points_world.device());
+    torch::Tensor raw_init = torch::full({N, 1}, -10.0f, out_opts);
+    if (N == 0 ||
+        !svraster_tsdf_init_context_valid_ ||
+        svraster_tsdf_init_depth_meters_.empty() ||
+        svraster_tsdf_init_width_ <= 0 ||
+        svraster_tsdf_init_height_ <= 0) {
+        return raw_init;
+    }
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor pts_world =
+        grid_points_world.to(mDevice).to(torch::kFloat32).contiguous();
+
+    Eigen::Matrix3f Rcw = svraster_tsdf_init_Tcw_.rotationMatrix();
+    Eigen::Vector3f tcw = svraster_tsdf_init_Tcw_.translation();
+    std::vector<float> R_data = {
+        Rcw(0, 0), Rcw(0, 1), Rcw(0, 2),
+        Rcw(1, 0), Rcw(1, 1), Rcw(1, 2),
+        Rcw(2, 0), Rcw(2, 1), Rcw(2, 2)};
+    std::vector<float> t_data = {tcw.x(), tcw.y(), tcw.z()};
+    torch::Tensor R = torch::from_blob(
+                          R_data.data(),
+                          {3, 3},
+                          torch::TensorOptions().dtype(torch::kFloat32))
+                          .clone()
+                          .to(mDevice);
+    torch::Tensor t = torch::from_blob(
+                          t_data.data(),
+                          {1, 3},
+                          torch::TensorOptions().dtype(torch::kFloat32))
+                          .clone()
+                          .to(mDevice);
+
+    torch::Tensor pts_cam = torch::matmul(pts_world, R.t()) + t;
+    torch::Tensor x = pts_cam.index({torch::indexing::Slice(), 0});
+    torch::Tensor y = pts_cam.index({torch::indexing::Slice(), 1});
+    torch::Tensor z = pts_cam.index({torch::indexing::Slice(), 2});
+
+    torch::Tensor z_safe = z.clamp_min(1.0e-6f);
+    torch::Tensor u = svraster_tsdf_init_fx_ * x / z_safe + svraster_tsdf_init_cx_;
+    torch::Tensor v = svraster_tsdf_init_fy_ * y / z_safe + svraster_tsdf_init_cy_;
+    const int W = svraster_tsdf_init_width_;
+    const int H = svraster_tsdf_init_height_;
+    torch::Tensor in_image =
+        (z > RGBD_min_depth_) &
+        (u >= 0.0f) & (u <= static_cast<float>(W - 1)) &
+        (v >= 0.0f) & (v <= static_cast<float>(H - 1));
+
+    cv::Mat depth_for_tensor = svraster_tsdf_init_depth_meters_;
+    torch::Tensor depth =
+        tensor_utils::cvMat2TorchTensor_Float32(depth_for_tensor, device_type_)
+            .to(mDevice)
+            .to(torch::kFloat32)
+            .contiguous();
+    if (depth.dim() != 2) {
+        return raw_init;
+    }
+
+    torch::Tensor x_norm = ((u + 0.5f) * (2.0f / static_cast<float>(W))) - 1.0f;
+    torch::Tensor y_norm = ((v + 0.5f) * (2.0f / static_cast<float>(H))) - 1.0f;
+    torch::Tensor sample_grid =
+        torch::stack({x_norm, y_norm}, 1).view({1, N, 1, 2}).contiguous();
+    auto gs_opts = torch::nn::functional::GridSampleFuncOptions()
+                       .mode(torch::kNearest)
+                       .padding_mode(torch::kZeros)
+                       .align_corners(false);
+    torch::Tensor sampled_depth =
+        torch::nn::functional::grid_sample(depth.view({1, 1, H, W}), sample_grid, gs_opts)
+            .view({N});
+
+    const float trunc_m =
+        std::max(1.0e-6f, tsdf_density_init_trunc_vox_ * tsdfMetricVoxelSize());
+    torch::Tensor sdf = sampled_depth - z;
+    torch::Tensor valid =
+        in_image &
+        torch::isfinite(sampled_depth) &
+        (sampled_depth > RGBD_min_depth_) &
+        (sampled_depth < RGBD_max_depth_) &
+        (z < sampled_depth + trunc_m);
+    if (!valid.any().item<bool>()) {
+        return raw_init;
+    }
+
+    const float a = std::max(1.0e-4f, tsdf_density_init_bell_a_);
+    const float b = std::clamp(tsdf_density_init_bell_b_, 1.0e-4f, 0.9999f);
+    const float u_bell =
+        (2.0f - b + 2.0f * std::sqrt(std::max(0.0f, 1.0f - b))) / b;
+    const float sharpness = std::log(u_bell) / a;
+    torch::Tensor F = torch::clamp(sdf / trunc_m, -1.0f, 1.0f);
+    torch::Tensor sigmoid = torch::sigmoid(-sharpness * F);
+    torch::Tensor alpha_unit = 4.0f * sigmoid * (1.0f - sigmoid);
+    const float alpha_min = std::clamp(tsdf_density_init_alpha_min_, 1.0e-6f, 0.999f);
+    const float alpha_max = std::clamp(tsdf_density_init_alpha_max_, alpha_min, 0.999f);
+    torch::Tensor alpha =
+        torch::clamp(alpha_min + (alpha_max - alpha_min) * alpha_unit,
+                     1.0e-6f,
+                     0.999f);
+
+    constexpr float kSvrasterStepSzScale = 100.0f;
+    const float interval = std::max(1.0e-6f, ray_interval_m);
+    torch::Tensor density =
+        -torch::log(torch::clamp(1.0f - alpha, 1.0e-6f, 1.0f)) /
+        (kSvrasterStepSzScale * interval);
+    torch::Tensor density_safe = torch::clamp(density, 1.0e-12f);
+    torch::Tensor raw_low =
+        (torch::log(density_safe) + 0.904689820196f) / 0.909090909091f;
+    torch::Tensor raw =
+        torch::where(density > 1.1f, density, raw_low)
+            .clamp(-20.0f, 20.0f)
+            .view({N, 1});
+
+    raw_init = torch::where(valid.view({N, 1}), raw, raw_init).contiguous();
+
+    static int printed = 0;
+    if (printed < 5) {
+        ++printed;
+        std::cout << "[SVRASTER TSDF DENSITY INIT] kf=" << svraster_tsdf_init_kfid_
+                  << " N=" << N
+                  << " valid=" << valid.sum().item<int64_t>()
+                  << " trunc_m=" << trunc_m
+                  << " interval=" << interval
+                  << "\n";
+    }
+
+    return raw_init.to(grid_points_world.device()).contiguous();
+}
+
 VoxelMapper::TsdfSample VoxelMapper::sampleTsdfAtPointsWorld(const torch::Tensor& pts_world)
 {
     TORCH_CHECK(
@@ -2720,8 +3088,9 @@ VoxelMapper::TsdfSample VoxelMapper::sampleTsdfAtPointsWorld(const torch::Tensor
     out.weight  = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(out_device));
     out.success = torch::zeros({N}, torch::TensorOptions().dtype(torch::kBool).device(out_device));
 
-    // If TSDF is unavailable, return unknowns.
-    if (!sdf_mapper_) {
+    // Arbitrary-point sampling is provided by nvblox. The SVRaster backend is
+    // sampled directly through grid point keys in sampleTsdfAtSvrasterGridCornersWorld().
+    if (!useNvbloxTsdfBackend() || !sdf_mapper_) {
         return out;
     }
     nvblox::TsdfLayer& tsdf_layer = sdf_mapper_->tsdf_layer();
@@ -2844,10 +3213,15 @@ torch::Tensor VoxelMapper::computeTsdfDensityInitForGridPoints(
                     .device(grid_points_world.device());
     torch::Tensor raw_init = torch::full({N, 1}, -10.0f, opts);
 
-    if (!tsdf_density_init_ ||
-        sensor_type_ != RGBD ||
-        !sdf_mapper_ ||
-        sdf_mapper_->tsdf_layer().size() == 0) {
+    if (!tsdf_density_init_ || sensor_type_ != RGBD) {
+        return raw_init;
+    }
+    if (useSvrasterTsdfBackend()) {
+        return computeSvrasterProjectiveDensityInitForGridPoints(
+            grid_points_world,
+            ray_interval_m);
+    }
+    if (!hasTsdfForSampling()) {
         return raw_init;
     }
 
@@ -2864,9 +3238,7 @@ torch::Tensor VoxelMapper::computeTsdfDensityInitForGridPoints(
         return raw_init;
     }
 
-    const float tsdf_vox_size = std::max(
-        1.0e-6f,
-        static_cast<float>(sdf_mapper_->tsdf_layer().voxel_size()));
+    const float tsdf_vox_size = tsdfMetricVoxelSize();
     const float trunc_m =
         std::max(1.0e-6f, tsdf_density_init_trunc_vox_ * tsdf_vox_size);
 
@@ -2925,37 +3297,6 @@ torch::Tensor VoxelMapper::computeTsdfDensityInitForGridPoints(
     return raw_init;
 }
 
-static torch::Tensor computeSvrasterGridPointsWorld(
-    const torch::Tensor& grid_pts_key,   // [M,3] int64
-    const torch::Tensor& scene_center,   // [3] float
-    const torch::Tensor& scene_extent,   // [1] float
-    int max_num_levels)                  // e.g. 16
-{
-    TORCH_CHECK(grid_pts_key.defined() && grid_pts_key.dim() == 2 && grid_pts_key.size(1) == 3,
-                "grid_pts_key must be [M,3] int64");
-    TORCH_CHECK(scene_center.defined() && scene_center.numel() == 3,
-                "scene_center must be [3]");
-    TORCH_CHECK(scene_extent.defined() && scene_extent.numel() == 1,
-                "scene_extent must be [1]");
-
-    auto dev = scene_center.device();
-    auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
-
-    // scene_min = scene_center - 0.5 * scene_extent
-    torch::Tensor scene_min = scene_center.to(opts_f).view({3}) - 0.5f * scene_extent.to(opts_f).view({1});
-
-    // finest_vox_size = scene_extent * 2^{-MAX_NUM_LEVELS}
-    // (grid_pts_key are integer coords on the finest grid; corners, not centers)
-    const float scale = std::ldexp(1.0f, -max_num_levels);  // 2^{-L}
-    torch::Tensor finest_vox = scene_extent.to(opts_f) * scale; // [1]
-
-    // grid_xyz = scene_min + grid_pts_key * finest_vox_size
-    torch::Tensor grid_xyz =
-        scene_min.view({1,3}) + grid_pts_key.to(dev).to(torch::kFloat32) * finest_vox.view({1,1});
-
-    return grid_xyz.contiguous(); // [M,3]
-}
-
 // Grid-point-based: gather 8 corner TSDFs for each SVRaster voxel using vox_key_
 VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld()
 {
@@ -2982,20 +3323,30 @@ VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld(
     out.success = torch::zeros({N, 8}, torch::TensorOptions().dtype(torch::kBool).device(dev));
     out.points_world = torch::Tensor();
 
-    if (!sdf_mapper_ || sdf_mapper_->tsdf_layer().size() == 0 || N == 0 || M == 0) {
+    if (N == 0 || M == 0 || !hasTsdfForSampling()) {
         return out;
     }
 
     // 1) grid_key -> world xyz
-    torch::Tensor scene_center = voxel_model_->SceneCenter(); // [3]
-    torch::Tensor scene_extent = voxel_model_->SceneExtent(); // [1]
-    const int Lmax = voxel_model_->maxNumLevels();
-
-    torch::Tensor grid_xyz = computeSvrasterGridPointsWorld(grid_key, scene_center, scene_extent, Lmax);
+    torch::Tensor grid_xyz = voxel_model_->gridPointsWorld();
     if (grid_xyz.device() != dev) grid_xyz = grid_xyz.to(dev);
 
-    // 2) Sample TSDF at all grid points
-    TsdfSample g = sampleTsdfAtPointsWorld(grid_xyz); // g.tsdf,g.weight,g.success are [M]
+    TsdfSample g;
+    if (useSvrasterTsdfBackend()) {
+        voxel_model_->ensureSvrasterSdfField();
+        torch::Tensor tsdf_grid = voxel_model_->svrasterSdfGridPts();
+        torch::Tensor weight_grid = voxel_model_->svrasterSdfWeights();
+        if (!tsdf_grid.defined() || !weight_grid.defined() ||
+            tsdf_grid.size(0) != M || weight_grid.size(0) != M) {
+            return out;
+        }
+        g.tsdf = tsdf_grid.to(dev).to(torch::kFloat32).view({M});
+        g.weight = weight_grid.to(dev).to(torch::kFloat32).view({M});
+        g.success = (g.weight > 0.0f).to(torch::kBool);
+    } else {
+        // 2) Sample nvblox TSDF at all SVRaster grid points
+        g = sampleTsdfAtPointsWorld(grid_xyz); // g.tsdf,g.weight,g.success are [M]
+    }
 
     // 3) Gather per-voxel corners using vox_key
     // Flatten indices: [N,8] -> [N*8]
@@ -3017,6 +3368,175 @@ VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld(
     out.success = ok8;
     out.points_world = points8;
     return out;
+}
+
+void VoxelMapper::integrateKeyframeIntoSvrasterSdf(
+    VoxelKeyframe& kf,
+    const cv::Mat& depth_meters)
+{
+    if (!voxel_model_ || !use_tsdf_mapping_ || sensor_type_ != RGBD ||
+        !useSvrasterTsdfBackend() || depth_meters.empty()) {
+        return;
+    }
+    if (!voxel_model_->gridPtsKey().defined() || voxel_model_->gridPtsKey().numel() == 0) {
+        return;
+    }
+
+    cv::Mat depth32 = depth_meters;
+    if (depth32.channels() > 1) {
+        cv::extractChannel(depth32, depth32, 0);
+    }
+    if (depth32.type() != CV_32FC1) {
+        depth32.convertTo(depth32, CV_32FC1);
+    }
+
+    const int H = depth32.rows;
+    const int W = depth32.cols;
+    if (H <= 0 || W <= 0) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    voxel_model_->ensureSvrasterSdfField();
+
+    torch::Tensor grid_world = voxel_model_->gridPointsWorld().to(mDevice).to(torch::kFloat32).contiguous();
+    const int64_t M = grid_world.size(0);
+    if (M == 0) {
+        return;
+    }
+
+    Sophus::SE3f Tcw = kf.getPosef();
+    Eigen::Matrix3f Rcw = Tcw.rotationMatrix();
+    Eigen::Vector3f tcw = Tcw.translation();
+    std::vector<float> R_data = {
+        Rcw(0, 0), Rcw(0, 1), Rcw(0, 2),
+        Rcw(1, 0), Rcw(1, 1), Rcw(1, 2),
+        Rcw(2, 0), Rcw(2, 1), Rcw(2, 2)};
+    std::vector<float> t_data = {tcw.x(), tcw.y(), tcw.z()};
+    torch::Tensor R = torch::from_blob(
+                          R_data.data(),
+                          {3, 3},
+                          torch::TensorOptions().dtype(torch::kFloat32))
+                          .clone()
+                          .to(mDevice);
+    torch::Tensor t = torch::from_blob(
+                          t_data.data(),
+                          {1, 3},
+                          torch::TensorOptions().dtype(torch::kFloat32))
+                          .clone()
+                          .to(mDevice);
+
+    torch::Tensor grid_cam = torch::matmul(grid_world, R.t()) + t; // [M,3]
+    torch::Tensor x = grid_cam.index({torch::indexing::Slice(), 0});
+    torch::Tensor y = grid_cam.index({torch::indexing::Slice(), 1});
+    torch::Tensor z = grid_cam.index({torch::indexing::Slice(), 2});
+
+    const float fx = kf.cam_.fx();
+    const float fy = kf.cam_.fy();
+    const float cx = kf.cam_.cx();
+    const float cy = kf.cam_.cy();
+    torch::Tensor z_safe = z.clamp_min(1.0e-6f);
+    torch::Tensor u = fx * x / z_safe + cx;
+    torch::Tensor v = fy * y / z_safe + cy;
+
+    torch::Tensor in_image =
+        (z > RGBD_min_depth_) &
+        (u >= 0.0f) & (u <= static_cast<float>(W - 1)) &
+        (v >= 0.0f) & (v <= static_cast<float>(H - 1));
+
+    cv::Mat depth_for_tensor = depth32;
+    torch::Tensor depth = tensor_utils::cvMat2TorchTensor_Float32(depth_for_tensor, device_type_)
+                              .to(mDevice)
+                              .to(torch::kFloat32)
+                              .contiguous();
+    if (depth.dim() != 2) {
+        return;
+    }
+
+    torch::Tensor x_norm = ((u + 0.5f) * (2.0f / static_cast<float>(W))) - 1.0f;
+    torch::Tensor y_norm = ((v + 0.5f) * (2.0f / static_cast<float>(H))) - 1.0f;
+    torch::Tensor sample_grid =
+        torch::stack({x_norm, y_norm}, 1).view({1, M, 1, 2}).contiguous();
+    torch::Tensor depth_img = depth.view({1, 1, H, W});
+    auto gs_opts = torch::nn::functional::GridSampleFuncOptions()
+                       .mode(torch::kNearest)
+                       .padding_mode(torch::kZeros)
+                       .align_corners(false);
+    torch::Tensor sampled_depth =
+        torch::nn::functional::grid_sample(depth_img, sample_grid, gs_opts)
+            .view({M});
+
+    const float trunc_m =
+        std::max(1.0e-6f, tsdf_density_init_trunc_vox_ * tsdfMetricVoxelSize());
+    torch::Tensor sdf = sampled_depth - z;
+    torch::Tensor valid =
+        in_image &
+        torch::isfinite(sampled_depth) &
+        (sampled_depth > RGBD_min_depth_) &
+        (sampled_depth < RGBD_max_depth_) &
+        (z < sampled_depth + trunc_m);
+
+    torch::Tensor tsdf_metric = torch::clamp(sdf, -trunc_m, trunc_m);
+    torch::Tensor weights = valid.to(torch::kFloat32);
+    voxel_model_->fuseSvrasterSdfGridSamples(tsdf_metric, weights, valid);
+
+    if (tsdf_density_init_) {
+        torch::Tensor tsdf_all =
+            voxel_model_->svrasterSdfGridPts().to(mDevice).to(torch::kFloat32).view({M});
+        torch::Tensor weight_all =
+            voxel_model_->svrasterSdfWeights().to(mDevice).to(torch::kFloat32).view({M});
+        torch::Tensor geo_all =
+            voxel_model_->geoGridPts().to(mDevice).to(torch::kFloat32).view({M});
+
+        torch::Tensor init_valid =
+            torch::isfinite(tsdf_all) &
+            (weight_all >= std::max(0.0f, tsdf_density_init_min_weight_)) &
+            (geo_all <= -9.5f);
+
+        if (init_valid.any().item<bool>()) {
+            const float a = std::max(1.0e-4f, tsdf_density_init_bell_a_);
+            const float b = std::clamp(tsdf_density_init_bell_b_, 1.0e-4f, 0.9999f);
+            const float u_bell =
+                (2.0f - b + 2.0f * std::sqrt(std::max(0.0f, 1.0f - b))) / b;
+            const float sharpness = std::log(u_bell) / a;
+            torch::Tensor F = torch::clamp(tsdf_all / trunc_m, -1.0f, 1.0f);
+            torch::Tensor sigmoid = torch::sigmoid(-sharpness * F);
+            torch::Tensor alpha_unit = 4.0f * sigmoid * (1.0f - sigmoid);
+            const float alpha_min =
+                std::clamp(tsdf_density_init_alpha_min_, 1.0e-6f, 0.999f);
+            const float alpha_max =
+                std::clamp(tsdf_density_init_alpha_max_, alpha_min, 0.999f);
+            torch::Tensor alpha =
+                torch::clamp(alpha_min + (alpha_max - alpha_min) * alpha_unit,
+                             1.0e-6f,
+                             0.999f);
+
+            constexpr float kSvrasterStepSzScale = 100.0f;
+            const float interval = std::max(1.0e-6f, voxel_model_->fixed_vox_size_);
+            torch::Tensor density =
+                -torch::log(torch::clamp(1.0f - alpha, 1.0e-6f, 1.0f)) /
+                (kSvrasterStepSzScale * interval);
+            torch::Tensor density_safe = torch::clamp(density, 1.0e-12f);
+            torch::Tensor raw_low =
+                (torch::log(density_safe) + 0.904689820196f) / 0.909090909091f;
+            torch::Tensor raw = torch::where(density > 1.1f, density, raw_low)
+                                    .clamp(-20.0f, 20.0f)
+                                    .view({M, 1});
+            voxel_model_->applyGeoGridRawInit(raw, init_valid);
+        }
+    }
+
+    static int printed = 0;
+    if (printed < 5) {
+        ++printed;
+        const int64_t valid_count = valid.sum().item<int64_t>();
+        std::cout << "[SVRASTER TSDF] kf=" << kf.fid_
+                  << " grid_pts=" << M
+                  << " fused=" << valid_count
+                  << " trunc_m=" << trunc_m
+                  << " backend=" << tsdf_backend_
+                  << "\n";
+    }
 }
 
 VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtVoxelCornersWorld(
@@ -3437,9 +3957,8 @@ void VoxelMapper::run()
     }
 
     const bool need_nvblox =
-        use_tsdf_mapping_ ||
-        use_tsdf_pruning_ ||
-        tsdf_density_init_ ||
+        (useNvbloxTsdfBackend() &&
+         (use_tsdf_mapping_ || use_tsdf_pruning_ || tsdf_density_init_)) ||
         use_tsdf_planning_ ||
         save_nvblox_mesh_eval_ ||
         (enable_rerun_ && rerun_nvblox_mesh_ && !load_saved_nvblox_mesh_);
@@ -3598,21 +4117,12 @@ void VoxelMapper::run()
                         //         << e.what() << std::endl;
                     }
 
-                    // ─── nvblox: integrate this keyframe’s depth into TSDF ───
+                    // ─── TSDF: before SVRaster topology exists, only nvblox can integrate here. ───
                     if (sensor_type_ == RGBD && need_nvblox) {
-                        // Assume imgAux_undistorted is a depth map aligned to imgRGB_undistorted
                         cv::Mat depth_meters;
-                        if (imgAux_undistorted.type() == CV_32FC1) {
-                            // already in meters
-                            depth_meters = imgAux_undistorted;
-                        } else if (imgAux_undistorted.type() == CV_16UC1) {
-                            // common RealSense-style millimeters → meters conversion
-                            imgAux_undistorted.convertTo(depth_meters, CV_32FC1, 1.0 / 1000.0);
-                        } else {
-                            // fallback: convert to float, assume already in meters scale
-                            imgAux_undistorted.convertTo(depth_meters, CV_32FC1);
+                        if (depthMatToMeters(imgAux_undistorted, depth_meters)) {
+                            integrateKeyframeIntoNvblox(*new_kf, depth_meters);
                         }
-                        integrateKeyframeIntoNvblox(*new_kf, depth_meters);
                     }
 
                 }
@@ -3687,6 +4197,19 @@ void VoxelMapper::run()
                 voxel_model_->createFromPcd(
                     scene_->cached_point_cloud_,
                     tr_cams);
+                if (sensor_type_ == RGBD &&
+                    use_tsdf_mapping_ &&
+                    useSvrasterTsdfBackend()) {
+                    for (const auto& kv : scene_->keyframes()) {
+                        if (!kv.second) {
+                            continue;
+                        }
+                        cv::Mat depth_meters;
+                        if (depthMatToMeters(kv.second->img_auxiliary_undist_, depth_meters)) {
+                            integrateKeyframeIntoSvrasterSdf(*kv.second, depth_meters);
+                        }
+                    }
+                }
                 if (sensor_type_ == RGBD) {
                     const int64_t roots_created = voxel_model_->numVoxels();
                     tsdf_ablation_rgbd_points_created_ += roots_created;
@@ -3975,7 +4498,7 @@ void VoxelMapper::run()
             }
 
             if (sensor_type_ == RGBD && use_tsdf_pruning_) {
-                if (sdf_mapper_ && sdf_mapper_->tsdf_layer().size() > 0 &&
+                if (hasTsdfForSampling() &&
                     sizes.defined() && sizes.numel() == before_final_special) {
                     try {
                         TsdfCornerSample c = sampleTsdfAtSvrasterGridCornersWorld();
@@ -3997,7 +4520,7 @@ void VoxelMapper::run()
                             const float min_weight = tsdf_prune_min_weight_;
                             const float tau_surface =
                                 std::max(0.0f, tsdf_prune_surface_band_vox_) *
-                                sdf_mapper_->tsdf_layer().voxel_size();
+                                tsdfMetricVoxelSize();
                             const float sign_eps = 1.0e-6f;
 
                             torch::Tensor corner_valid =
@@ -4091,9 +4614,8 @@ void VoxelMapper::run()
                     }
                 } else {
                     std::cout << "[FINAL/special_prune/tsdf] skipped"
-                              << " mapper=" << (sdf_mapper_ ? 1 : 0)
-                              << " tsdf_blocks="
-                              << (sdf_mapper_ ? sdf_mapper_->tsdf_layer().size() : 0)
+                              << " backend=" << tsdf_backend_
+                              << " has_tsdf=" << (hasTsdfForSampling() ? 1 : 0)
                               << " sizes_ok="
                               << (sizes.defined() && sizes.numel() == before_final_special)
                               << "\n";
@@ -10096,7 +10618,7 @@ void VoxelMapper::trainForOneIteration()
                 // NEW: declare tsdf_prune_mask here, default undefined
                 torch::Tensor tsdf_prune_mask;
                 if (sensor_type_ == RGBD && use_tsdf_pruning_) {
-                    if (N > 0 && sdf_mapper_ && sdf_mapper_->tsdf_layer().size() > 0) {
+                    if (N > 0 && hasTsdfForSampling()) {
                         try {
                             torch::Tensor centers_world = voxel_model_->voxCenter(); // [N,3]
                             torch::Tensor sizes_world   = voxel_model_->voxSize();   // [N,1] (your implementation)
@@ -10130,7 +10652,7 @@ void VoxelMapper::trainForOneIteration()
                                 const float min_weight = tsdf_prune_min_weight_;
                                 const float tau_surface =
                                     std::max(0.0f, tsdf_prune_surface_band_vox_) *
-                                    sdf_mapper_->tsdf_layer().voxel_size();
+                                    tsdfMetricVoxelSize();
                                 const float sign_eps = 1.0e-6f;
 
                                 torch::Tensor corner_valid = (ok8 & (w8 >= min_weight)).to(torch::kBool); // [N,8]
@@ -12754,25 +13276,25 @@ void VoxelMapper::handleNewKeyframe(
         //           << e.what() << std::endl;
     }
 
-    // // ─── nvblox: integrate this new keyframe into TSDF ───
+    // // ─── TSDF: integrate this new keyframe into the selected TSDF backend. ───
     const bool need_nvblox =
-        use_tsdf_mapping_ ||
-        use_tsdf_pruning_ ||
-        tsdf_density_init_ ||
+        (useNvbloxTsdfBackend() &&
+         (use_tsdf_mapping_ || use_tsdf_pruning_ || tsdf_density_init_)) ||
         use_tsdf_planning_ ||
         save_nvblox_mesh_eval_ ||
         (enable_rerun_ && rerun_nvblox_mesh_ && !load_saved_nvblox_mesh_);
-    if (sensor_type_ == RGBD && need_nvblox) {
+    if (sensor_type_ == RGBD && (need_nvblox ||
+                                 (use_tsdf_mapping_ && useSvrasterTsdfBackend()))) {
         cv::Mat depth_meters;
-        if (pkf->img_auxiliary_undist_.type() == CV_32FC1) {
-            depth_meters = pkf->img_auxiliary_undist_;
-        } else if (pkf->img_auxiliary_undist_.type() == CV_16UC1) {
-            pkf->img_auxiliary_undist_.convertTo(depth_meters, CV_32FC1, 1.0 / 1000.0);
-        } else {
-            pkf->img_auxiliary_undist_.convertTo(depth_meters, CV_32FC1);
+        if (depthMatToMeters(pkf->img_auxiliary_undist_, depth_meters)) {
+            debugDepthStats(depth_meters, static_cast<int>(std::get<0>(kf)));
+            if (need_nvblox) {
+                integrateKeyframeIntoNvblox(*pkf, depth_meters);
+            }
+            if (use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
+                integrateKeyframeIntoSvrasterSdf(*pkf, depth_meters);
+            }
         }
-        debugDepthStats(depth_meters, static_cast<int>(std::get<0>(kf)));
-        integrateKeyframeIntoNvblox(*pkf, depth_meters);
     }
 }
 
@@ -13395,11 +13917,16 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
             if (log_created_voxels) {
                 voxel_model_->setNextRealInsertionRerunEntityPath(entity_path);
             }
+            const bool tsdf_init_context_set =
+                prepareSvrasterTsdfInitContext(pkf);
             voxel_model_->increasePcd(
                 cache_points,
                 cache_colors,
                 getIteration(),
                 tr_cams);
+            if (tsdf_init_context_set) {
+                clearSvrasterTsdfInitContext();
+            }
             const sv::VoxelModel::IncreasePcdStats insert_stats =
                 voxel_model_->lastIncreasePcdStats();
             if (entity_path == "world/voxels_inactive_geo_densify/created") {
@@ -14960,7 +15487,12 @@ void VoxelMapper::increasePcdByKeyframeRenderedDepthInsertion(
                 ? "world/rendered_depth_insert/created"
                 : "",
             kRenderedCandidateSourceDepthInsert);
+        const bool tsdf_init_context_set =
+            prepareSvrasterTsdfInitContext(pkf);
         voxel_model_->increasePcd(points_tensor, colors_tensor, iter, tr_cams);
+        if (tsdf_init_context_set) {
+            clearSvrasterTsdfInitContext();
+        }
         voxel_model_->setNextRenderedDepthCandidateInsertion(false);
     }
 
@@ -16530,7 +17062,7 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
                     1.0f,
                     true,
                     false,
-                    true,
+                    false,
                     false,
                     false,
                     sv::RenderOpts{});
@@ -16583,11 +17115,8 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
 
             auto it_color = render_pkg.find("color");
             auto it_depth = render_pkg.find("depth");
-            auto it_T = render_pkg.find("T");
             if (it_color == render_pkg.end() || it_depth == render_pkg.end() ||
-                it_T == render_pkg.end() ||
-                !it_color->second.defined() || !it_depth->second.defined() ||
-                !it_T->second.defined()) {
+                !it_color->second.defined() || !it_depth->second.defined()) {
                 std::cout << "[saveRenderedTsdfMeshPly] incomplete render package for kf="
                           << kfid << ", skipping frame.\n";
                 continue;
@@ -16604,9 +17133,6 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
             {
                 rendered_depth = normalize_hw(depth_pkg, "depth");
             }
-            torch::Tensor T_pkg = it_T->second.detach().contiguous();
-            torch::Tensor rendered_alpha =
-                normalize_hw(1.0f - T_pkg, "T");
 
             const auto mask_it = undistort_mask_.find(pkf->camera_id_);
             if (mask_it != undistort_mask_.end())
@@ -16616,13 +17142,7 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
                 mask = normalize_hw(mask.to(rendered_depth.device()), "undistort_mask");
                 rendered_color = rendered_color * mask.unsqueeze(0);
                 rendered_depth = rendered_depth * mask;
-                rendered_alpha = rendered_alpha * mask;
             }
-
-            rendered_depth = torch::where(
-                rendered_alpha > 1e-4f,
-                rendered_depth,
-                torch::zeros_like(rendered_depth));
 
             auto color_cpu = rendered_color.clamp(0, 1)
                 .mul(255.0f)
@@ -16640,7 +17160,26 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
             cv::Mat depth_mat(
                 image_height, image_width, CV_32FC1, depth_cpu.data_ptr<float>());
 
-            cv::Mat filtered_depth = filterDepthOutliersLikeGaussianSlam(depth_mat.clone());
+            cv::Mat depth_for_fusion = depth_mat.clone();
+            cv::Mat gt_depth_meters;
+            if (getKeyframeDepthMetersForEval(pkf, image_height, image_width, gt_depth_meters))
+            {
+                for (int y = 0; y < image_height; ++y)
+                {
+                    const float* gt_ptr = gt_depth_meters.ptr<float>(y);
+                    float* depth_ptr = depth_for_fusion.ptr<float>(y);
+                    for (int x = 0; x < image_width; ++x)
+                    {
+                        const float gt_depth = gt_ptr[x];
+                        if (!std::isfinite(gt_depth) || gt_depth <= 0.0f)
+                        {
+                            depth_ptr[x] = 0.0f;
+                        }
+                    }
+                }
+            }
+
+            cv::Mat filtered_depth = filterDepthOutliersLikeGaussianSlam(depth_for_fusion);
             volume.integrate(
                 color_mat.clone(),
                 filtered_depth,
@@ -16675,6 +17214,14 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
         if (!saveTriangleMeshPly(result_path, mesh))
         {
             throw std::runtime_error("saveRenderedTsdfMeshPly: failed to write mesh PLY");
+        }
+
+        const std::filesystem::path nocolor_path =
+            result_path.parent_path() /
+            (result_path.stem().string() + "_nocolor" + result_path.extension().string());
+        if (!saveTriangleMeshPly(nocolor_path, mesh, false))
+        {
+            throw std::runtime_error("saveRenderedTsdfMeshPly: failed to write no-color mesh PLY");
         }
 
         inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
@@ -16715,7 +17262,10 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
     }
 
     std::cout << "[saveRenderedTsdfMeshPly] Wrote C++ sparse-TSDF fused mesh to "
-              << result_path << "\n";
+              << result_path << " and "
+              << (result_path.parent_path() /
+                  (result_path.stem().string() + "_nocolor" + result_path.extension().string()))
+              << "\n";
 }
 
 void VoxelMapper::savePly(std::filesystem::path result_dir)

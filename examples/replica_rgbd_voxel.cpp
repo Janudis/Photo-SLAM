@@ -9,7 +9,7 @@
 #include <memory>
 #include <sstream>
 #include <thread>
-#include <unistd.h>
+#include <unistd.h> 
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -56,21 +56,76 @@ static void saveTrackingTime(const std::vector<float>& times, const std::string&
         out << std::fixed << std::setprecision(4) << t << "\n";
 }
 
-static void saveGpuPeakMemoryUsage(const std::filesystem::path& path)
+struct GpuMemoryStats
 {
+    float reserved_mb = 0.0f;
+    float allocated_mb = 0.0f;
+};
+
+static GpuMemoryStats getGpuPeakMemoryStats()
+{
+    GpuMemoryStats stats;
+    if (!torch::cuda::is_available())
+        return stats;
+
     namespace c10Alloc = c10::cuda::CUDACachingAllocator;
     c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
 
-    const float max_reserved_mb =
+    stats.reserved_mb =
         mem_stats.reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
         (1024.0f * 1024.0f);
-    const float max_alloc_mb =
+    stats.allocated_mb =
         mem_stats.allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
         (1024.0f * 1024.0f);
+    return stats;
+}
+
+static void saveGpuPeakMemoryUsage(const std::filesystem::path& path)
+{
+    const GpuMemoryStats stats = getGpuPeakMemoryStats();
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out << "Peak reserved (MB): " << stats.reserved_mb << "\n";
+    out << "Peak allocated (MB): " << stats.allocated_mb << "\n";
+}
+
+static double fileSizeMb(const std::filesystem::path& path)
+{
+    if (!std::filesystem::exists(path))
+        return 0.0;
+    return static_cast<double>(std::filesystem::file_size(path)) /
+           (1024.0 * 1024.0);
+}
+
+static void saveRuntimeMetrics(
+    const std::filesystem::path& path,
+    int frames,
+    int keyframes,
+    int voxels,
+    int iterations,
+    double total_seconds,
+    const std::filesystem::path& map_path,
+    const GpuMemoryStats& gpu_stats)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
 
     std::ofstream out(path);
-    out << "Peak reserved (MB): " << max_reserved_mb << "\n";
-    out << "Peak allocated (MB): " << max_alloc_mb << "\n";
+    out << std::fixed << std::setprecision(6);
+    out << "{\n";
+    out << "  \"frames\": " << frames << ",\n";
+    out << "  \"keyframes\": " << keyframes << ",\n";
+    out << "  \"voxels\": " << voxels << ",\n";
+    out << "  \"iterations\": " << iterations << ",\n";
+    out << "  \"total_seconds\": " << total_seconds << ",\n";
+    out << "  \"fps_hz\": "
+        << (total_seconds > 0.0 ? frames / total_seconds : 0.0) << ",\n";
+    out << "  \"map_path\": \"" << map_path.string() << "\",\n";
+    out << "  \"map_size_mb\": " << fileSizeMb(map_path) << ",\n";
+    out << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb << ",\n";
+    out << "  \"gpu_memory_reserved_mb\": " << gpu_stats.reserved_mb << "\n";
+    out << "}\n";
 }
 
 int main(int argc, char** argv)
@@ -104,6 +159,7 @@ int main(int argc, char** argv)
     if (output_directory.back() != '/')
         output_directory += "/";
     std::filesystem::path output_dir(output_directory);
+    const auto total_start = std::chrono::steady_clock::now();
 
     const std::filesystem::path seq_path(argv[4]);
     const std::filesystem::path image_dir = seq_path / "results";
@@ -161,7 +217,7 @@ int main(int argc, char** argv)
 
     const int num_images = static_cast<int>(rgb_files.size());
     std::vector<float> tracking_times(num_images);
-    constexpr double replica_fps = 30.0;
+    int processed_frames = 0;
 
     std::cout << "\n-------\n";
     std::cout << "Start processing Replica RGB-D sequence ..." << std::endl;
@@ -197,7 +253,7 @@ int main(int argc, char** argv)
             cv::resize(depth, depth, cv::Size(width, height));
         }
 
-        const double timestamp = static_cast<double>(i) / replica_fps;
+        const double timestamp = static_cast<double>(i);
         const auto start = std::chrono::steady_clock::now();
         slam->TrackRGBD(
             rgb,
@@ -210,16 +266,31 @@ int main(int argc, char** argv)
         const float track_time =
             std::chrono::duration_cast<std::chrono::duration<float>>(end - start).count();
         tracking_times[i] = track_time;
+        ++processed_frames;
 
-        constexpr double frame_dt = 1.0 / replica_fps;
-        if (track_time < frame_dt)
-            usleep(static_cast<useconds_t>((frame_dt - track_time) * 1e6));
+        // // Photo-SLAM's Replica RGB-D runner feeds frames as fast as TrackRGBD returns. Uncomment this block, the replica_fps constant, the unistd include, and the
+        // // timestamp=i/replica_fps line above to reproduce the earlier fixed-30Hz pacing.
+        // constexpr double replica_fps = 30.0;  // Uncomment when enabling fixed-FPS pacing.
+        // constexpr double frame_dt = 1.0 / replica_fps;
+        // if (track_time < frame_dt) {
+        //     usleep(static_cast<useconds_t>((frame_dt - track_time) * 1e6));
+        // }
     }
 
     slam->Shutdown();
     training_thread.join();
 
-    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    const int final_iteration = voxel_mapper->getIteration();
+    const std::filesystem::path shutdown_dir =
+        output_dir / (std::to_string(final_iteration) + "_shutdown");
+    const std::filesystem::path final_map_path =
+        shutdown_dir / "ply" / "voxel_model" /
+        ("iteration_" + std::to_string(final_iteration)) / "voxel_model.ply";
+    const int keyframes =
+        voxel_mapper->scene_ ? static_cast<int>(voxel_mapper->scene_->keyframes().size()) : 0;
+    const int voxels =
+        voxel_mapper->voxel_model_ ? voxel_mapper->voxel_model_->numVoxels() : 0;
+
     saveTrackingTime(tracking_times, (output_dir / "TrackingTime.txt").string());
 
     slam->SaveTrajectoryTUM((output_dir / "CameraTrajectory_TUM.txt").string());
@@ -227,6 +298,25 @@ int main(int argc, char** argv)
     slam->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
     slam->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
     slam->SaveTrajectoryKITTI((output_dir / "CameraTrajectory_KITTI.txt").string());
+
+    const auto total_end = std::chrono::steady_clock::now();
+    const double total_wall_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            total_end - total_start).count();
+    const double total_seconds = std::max(0.0, total_wall_seconds);
+    const GpuMemoryStats gpu_stats = getGpuPeakMemoryStats();
+
+    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
+    saveRuntimeMetrics(
+        shutdown_dir / "runtime_metrics.json",
+        processed_frames,
+        keyframes,
+        voxels,
+        final_iteration,
+        total_seconds,
+        final_map_path,
+        gpu_stats);
 
     if (use_viewer)
         viewer_thread.join();

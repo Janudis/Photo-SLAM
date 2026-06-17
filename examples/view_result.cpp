@@ -23,7 +23,7 @@
 #include <torch/torch.h>
 
 #include "include/gaussian_mapper.h"
-#include "viewer/imgui_viewer.h"
+#include "viewer/gaussian_imgui_viewer.h"
 
 int main(int argc, char** argv)
 {

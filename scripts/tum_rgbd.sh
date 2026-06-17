@@ -6,9 +6,9 @@ do
     ../ORB-SLAM3/Vocabulary/ORBvoc.txt \
     ../cfg/ORB_SLAM3/RGB-D/TUM/tum_freiburg1_desk.yaml \
     ../cfg/gaussian_mapper/RGB-D/TUM/tum_rgbd.yaml \
-    /home/rapidlab/dataset/VSLAM/TUM/rgbd_dataset_freiburg1_desk \
+    /home/dimitris/Photo-SLAM/scripts/data/rgbd_dataset_freiburg1_desk \
     ../cfg/ORB_SLAM3/RGB-D/TUM/associations/tum_freiburg1_desk.txt \
-    ../results/tum_rgbd_$i/rgbd_dataset_freiburg1_desk \
+    ../results/tum_rgbd_/rgbd_dataset_freiburg1_desk \
     no_viewer
 
 ../bin/tum_rgbd \

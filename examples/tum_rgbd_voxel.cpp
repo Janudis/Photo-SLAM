@@ -85,22 +85,77 @@ static void saveTrackingTime(const std::vector<float> &times, const std::string 
     out.close();
 }
 
-static void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
+struct GpuMemoryStats
 {
+    float reserved_mb = 0.0f;
+    float allocated_mb = 0.0f;
+};
+
+static GpuMemoryStats getGpuPeakMemoryStats()
+{
+    GpuMemoryStats stats;
+    if (!torch::cuda::is_available())
+        return stats;
+
     namespace c10Alloc = c10::cuda::CUDACachingAllocator;
     c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
 
-    float max_reserved_MB =
+    stats.reserved_mb =
         mem_stats.reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
-        (1024.0 * 1024.0);
-    float max_alloc_MB =
+        (1024.0f * 1024.0f);
+    stats.allocated_mb =
         mem_stats.allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
-        (1024.0 * 1024.0);
+        (1024.0f * 1024.0f);
+    return stats;
+}
 
+static void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
+{
+    const GpuMemoryStats stats = getGpuPeakMemoryStats();
+    if (!pathSave.parent_path().empty())
+        std::filesystem::create_directories(pathSave.parent_path());
     std::ofstream out(pathSave);
-    out << "Peak reserved (MB): " << max_reserved_MB << "\n";
-    out << "Peak allocated (MB): " << max_alloc_MB << "\n";
+    out << "Peak reserved (MB): " << stats.reserved_mb << "\n";
+    out << "Peak allocated (MB): " << stats.allocated_mb << "\n";
     out.close();
+}
+
+static double fileSizeMb(const std::filesystem::path& path)
+{
+    if (!std::filesystem::exists(path))
+        return 0.0;
+    return static_cast<double>(std::filesystem::file_size(path)) /
+           (1024.0 * 1024.0);
+}
+
+static void saveRuntimeMetrics(
+    const std::filesystem::path& path,
+    int frames,
+    int keyframes,
+    int voxels,
+    int iterations,
+    double total_seconds,
+    const std::filesystem::path& map_path,
+    const GpuMemoryStats& gpu_stats)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+
+    std::ofstream out(path);
+    out << std::fixed << std::setprecision(6);
+    out << "{\n";
+    out << "  \"frames\": " << frames << ",\n";
+    out << "  \"keyframes\": " << keyframes << ",\n";
+    out << "  \"voxels\": " << voxels << ",\n";
+    out << "  \"iterations\": " << iterations << ",\n";
+    out << "  \"total_seconds\": " << total_seconds << ",\n";
+    out << "  \"fps_hz\": "
+        << (total_seconds > 0.0 ? frames / total_seconds : 0.0) << ",\n";
+    out << "  \"map_path\": \"" << map_path.string() << "\",\n";
+    out << "  \"map_size_mb\": " << fileSizeMb(map_path) << ",\n";
+    out << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb << ",\n";
+    out << "  \"gpu_memory_reserved_mb\": " << gpu_stats.reserved_mb << "\n";
+    out << "}\n";
 }
 
 // ----------------- main -----------------
@@ -153,6 +208,7 @@ int main(int argc, char **argv)
     if (output_directory.back() != '/')
         output_directory += "/";
     std::filesystem::path output_dir(output_directory);
+    const auto total_start = std::chrono::steady_clock::now();
 
     // load image/depth filelists
     std::vector<std::string> vstrImageFilenamesRGB;
@@ -217,6 +273,7 @@ int main(int argc, char **argv)
     }
 
     std::vector<float> vTimesTrack(nImages);
+    int processed_frames = 0;
 
     std::cout << "\n-------\n";
     std::cout << "Start processing sequence ..." << std::endl;
@@ -276,6 +333,7 @@ int main(int argc, char **argv)
         float ttrack =
             std::chrono::duration_cast<std::chrono::duration<float>>(t2 - t1).count();
         vTimesTrack[ni] = ttrack;
+        ++processed_frames;
 
         // sleep to simulate real-time pacing, same pattern as mono voxel runner
         double T;
@@ -286,16 +344,25 @@ int main(int argc, char **argv)
         else
             T = 0.0;
 
-        if (ttrack < T)
-            usleep((T - ttrack) * 1e6);
+        if (ttrack < T) {
+            usleep(static_cast<useconds_t>((T - ttrack) * 1e6));
+        }
     }
 
     // Shutdown SLAM + mapper thread
     pSLAM->Shutdown();
     training_thd.join();
 
-    // Save GPU peak usage stats
-    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    const int final_iteration = pVoxelMapper->getIteration();
+    const std::filesystem::path shutdown_dir =
+        output_dir / (std::to_string(final_iteration) + "_shutdown");
+    const std::filesystem::path final_map_path =
+        shutdown_dir / "ply" / "voxel_model" /
+        ("iteration_" + std::to_string(final_iteration)) / "voxel_model.ply";
+    const int keyframes =
+        pVoxelMapper->scene_ ? static_cast<int>(pVoxelMapper->scene_->keyframes().size()) : 0;
+    const int voxels =
+        pVoxelMapper->voxel_model_ ? pVoxelMapper->voxel_model_->numVoxels() : 0;
 
     // Save tracking time stats
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
@@ -306,6 +373,26 @@ int main(int argc, char **argv)
     pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
     pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
     pSLAM->SaveTrajectoryKITTI((output_dir / "CameraTrajectory_KITTI.txt").string());
+
+    const auto total_end = std::chrono::steady_clock::now();
+    const double total_wall_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            total_end - total_start).count();
+    const double total_seconds = std::max(0.0, total_wall_seconds);
+    const GpuMemoryStats gpu_stats = getGpuPeakMemoryStats();
+
+    // Save GPU peak usage stats
+    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
+    saveRuntimeMetrics(
+        shutdown_dir / "runtime_metrics.json",
+        processed_frames,
+        keyframes,
+        voxels,
+        final_iteration,
+        total_seconds,
+        final_map_path,
+        gpu_stats);
 
     if (use_viewer)
         viewer_thd.join();

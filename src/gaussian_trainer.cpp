@@ -73,9 +73,9 @@
              override_color
          );
          auto image = std::get<0>(render_pkg);
-         auto viewspace_point_tensor = std::get<1>(render_pkg);
-         auto visibility_filter = std::get<2>(render_pkg);
-         auto radii = std::get<3>(render_pkg);
+         auto viewspace_point_tensor = std::get<2>(render_pkg);
+         auto visibility_filter = std::get<3>(render_pkg);
+         auto radii = std::get<4>(render_pkg);
  
          // Loss
          auto gt_image = viewpoint_cam->original_image_.cuda();

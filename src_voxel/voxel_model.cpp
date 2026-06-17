@@ -236,10 +236,31 @@ void VoxelModel::ensureSvrasterSdfField()
     svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
 }
 
+void VoxelModel::resetSvrasterSdfField()
+{
+    if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
+        svraster_sdf_grid_pts_ = torch::empty(
+            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+        svraster_sdf_weights_ = torch::empty(
+            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+        svraster_sdf_grid_pts_key_ = torch::empty(
+            {0, 3}, torch::TensorOptions().dtype(torch::kInt64).device(device_type_));
+        return;
+    }
+
+    const int64_t M = grid_pts_key_.size(0);
+    auto tensor_dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : grid_pts_key_.device();
+    auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(tensor_dev);
+    svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+    svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+    svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
+}
+
 void VoxelModel::fuseSvrasterSdfGridSamples(
     const torch::Tensor& tsdf_values,
     const torch::Tensor& weights,
-    const torch::Tensor& valid_mask)
+    const torch::Tensor& valid_mask,
+    float max_weight)
 {
     ensureSvrasterSdfField();
     if (!hasSvrasterSdfField() || grid_pts_key_.size(0) == 0) {
@@ -251,6 +272,10 @@ void VoxelModel::fuseSvrasterSdfGridSamples(
     auto dev = svraster_sdf_grid_pts_.device();
     torch::Tensor sample_tsdf = tsdf_values.to(dev).to(torch::kFloat32).reshape({M, 1});
     torch::Tensor sample_w = weights.to(dev).to(torch::kFloat32).reshape({M, 1});
+    sample_w = torch::where(
+        torch::isfinite(sample_w),
+        sample_w,
+        torch::zeros_like(sample_w));
     torch::Tensor valid = valid_mask.to(dev).to(torch::kBool).reshape({M, 1}) &
                           torch::isfinite(sample_tsdf) &
                           (sample_w > 0.0f);
@@ -260,6 +285,9 @@ void VoxelModel::fuseSvrasterSdfGridSamples(
     torch::Tensor fused_w = old_w + sample_w;
     torch::Tensor fused_sdf =
         (old_sdf * old_w + sample_tsdf * sample_w) / fused_w.clamp_min(1.0e-6f);
+    if (max_weight > 0.0f) {
+        fused_w = fused_w.clamp_max(max_weight);
+    }
 
     svraster_sdf_grid_pts_ = torch::where(valid, fused_sdf, old_sdf).contiguous();
     svraster_sdf_weights_ = torch::where(valid, fused_w, old_w).contiguous();
@@ -1634,6 +1662,8 @@ void VoxelModel::createFromPcd(
             kept = kept & (~is_near);
             n_near_hit = is_near.sum().item<int64_t>();
         }
+        // std::cout << "[mark_near/createFromPcd] cams=" << cams.size()
+        //           << " near_voxels=" << n_near_hit << "\n";
 
         kept = kept.view({-1}).to(torch::kBool);
         auto idx = torch::nonzero(kept).view({-1});
@@ -2167,15 +2197,12 @@ void VoxelModel::increasePcd(
             kept = kept & (~is_near);
             n_near_hit = is_near.sum().item<int64_t>();
         }
+        // std::cout << "[mark_near/increasePcd] cams=" << cams.size()
+        //           << " near_voxels=" << n_near_hit << "\n";
 
         kept = kept.view({-1}).to(torch::kBool);
         auto idx = torch::nonzero(kept).view({-1});
         int64_t K = idx.size(0);
-
-        if (K == 0) {
-            std::cout << "[increasePcd/filter] all candidates filtered out, nothing to add.\n";
-            return;
-        }
 
         if (K < octpath_new.size(0)) {
             // Apply mask to ALL aligned tensors

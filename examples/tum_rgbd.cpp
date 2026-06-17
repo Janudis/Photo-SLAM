@@ -32,7 +32,7 @@
 
 #include "ORB-SLAM3/include/System.h"
 #include "include/gaussian_mapper.h"
-#include "viewer/imgui_viewer.h"
+#include "viewer/gaussian_imgui_viewer.h"
 
 void LoadImages(const std::string &strAssociationFilename, std::vector<std::string> &vstrImageFilenamesRGB,
                 std::vector<std::string> &vstrImageFilenamesD, std::vector<double> &vTimestamps);
@@ -108,6 +108,7 @@ int main(int argc, char **argv)
     std::shared_ptr<GaussianMapper> pGausMapper =
         std::make_shared<GaussianMapper>(
             pSLAM, gaussian_cfg_path, output_dir, 0, device_type);
+    pGausMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&GaussianMapper::run, pGausMapper.get());
 
     // Create Gaussian Viewer

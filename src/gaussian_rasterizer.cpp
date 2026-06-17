@@ -73,10 +73,11 @@ GaussianRasterizerFunction::forward(
 
     auto num_rendered = std::get<0>(rasterization_result);
     auto color = std::get<1>(rasterization_result);
-    auto radii = std::get<2>(rasterization_result);
-    auto geomBuffer = std::get<3>(rasterization_result);
-    auto binningBuffer = std::get<4>(rasterization_result);
-    auto imgBuffer = std::get<5>(rasterization_result);
+    auto depth = std::get<2>(rasterization_result);
+    auto radii = std::get<3>(rasterization_result);
+    auto geomBuffer = std::get<4>(rasterization_result);
+    auto binningBuffer = std::get<5>(rasterization_result);
+    auto imgBuffer = std::get<6>(rasterization_result);
 
     // Keep relevant tensors for backward
     ctx->saved_data["num_rendered"] = num_rendered;
@@ -99,7 +100,7 @@ GaussianRasterizerFunction::forward(
                             binningBuffer,
                             imgBuffer});
 
-    return {color, radii};
+    return {color, depth, radii};
 }
 
 torch::autograd::tensor_list
@@ -179,7 +180,7 @@ GaussianRasterizerFunction::backward(
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 GaussianRasterizer::forward(
     torch::Tensor means3D,
     torch::Tensor means2D,
@@ -230,5 +231,5 @@ GaussianRasterizer::forward(
         raster_settings
     );
 
-    return std::make_tuple(result[0]/*color*/, result[1]/*radii*/);
+    return std::make_tuple(result[0]/*color*/, result[1]/*depth*/, result[2]/*radii*/);
 }

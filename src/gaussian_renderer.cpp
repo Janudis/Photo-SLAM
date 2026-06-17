@@ -18,9 +18,9 @@
 /**
  * @brief 
  * 
- * @return std::tuple<render, viewspace_points, visibility_filter, radii>, which are all `torch::Tensor`
+ * @return std::tuple<render, depth, viewspace_points, visibility_filter, radii>, which are all `torch::Tensor`
  */
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 GaussianRenderer::render(
     std::shared_ptr<GaussianKeyframe> viewpoint_camera,
     int image_height,
@@ -135,13 +135,15 @@ GaussianRenderer::render(
         cov3D_precomp
     );
     auto rendered_image = std::get<0>(rasterizer_result);
-    auto radii = std::get<1>(rasterizer_result);
+    auto rendered_depth = std::get<1>(rasterizer_result);
+    auto radii = std::get<2>(rasterizer_result);
 
     /* Those Gaussians that were frustum culled or had a radius of 0 were not visible.
        They will be excluded from value updates used in the splitting criteria.
      */
     return std::make_tuple(
         rendered_image,     /*render*/
+        rendered_depth,     /*depth*/
         screenspace_points, /*viewspace_points*/
         radii > 0,          /*visibility_filter*/
         radii               /*radii*/

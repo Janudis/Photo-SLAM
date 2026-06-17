@@ -59,15 +59,24 @@ Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.enable_rerun: 0  # 0:disable all rerun logging/saving, 1:enable
 Record.rerun_final_only: 0 # 0:log rerun during run, 1:log only final voxel sets at shutdown
-Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [150, 150+N) as rerun cameras
+Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
+Record.rerun_keyframe_start: 0
+Record.rerun_voxels_stride: 1 # log live voxel boxes every N iterations
+Record.rerun_voxels_max_instances: 60000 # 0:log every live voxel; >0:downsample to this many boxes before logging
+Record.rerun_density_debug_only: 0 # 1:reduced Rerun logging; skip heavy auxiliary topics
+Record.rerun_log_aux_topics: 1 # log densification/pruning source topics
 Record.rerun_rendered_depth_insert: 0
 Record.save_nvblox_mesh_eval: 0 # RGB-D only: run nvblox and save one final reference mesh at shutdown
 Record.load_saved_nvblox_mesh: 9 # RGB-D only: load an existing reference mesh instead of running nvblox
 Record.saved_nvblox_mesh_path: "/home/dimitris/Photo-SLAM/results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply"
 Record.rerun_nvblox_mesh: 0 # log the saved/generated nvblox mesh in Rerun
+Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
+Record.rerun_gt_mesh_path: "/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply"
 Record.save_rendered_mesh_eval: 1 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
 Record.rerun_rendered_mesh_eval: 0 # log final voxel_surface_mesh.ply to world/voxel_model_mesh/final
 Record.rendered_mesh_backend: 1 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
+Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
+Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
 Record.record_depth_metrics: 0 # 0:false, 1:compute Depth L1 / F1 from rendered depth vs GT depth
 Record.depth_f1_threshold_m: 0.01 # 1 cm
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically

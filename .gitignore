@@ -42,6 +42,9 @@
 # results
 /results/
 
+# Local third-party checkouts / submodules
+/third_party/
+
 # Generated mono-depth priors and model caches
 /mono_priors/
 

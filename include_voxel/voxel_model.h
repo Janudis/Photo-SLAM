@@ -99,10 +99,12 @@ public:
     torch::Tensor gridPointsWorld() const;
     bool hasSvrasterSdfField() const;
     void ensureSvrasterSdfField();
+    void resetSvrasterSdfField();
     void fuseSvrasterSdfGridSamples(
         const torch::Tensor& tsdf_values,
         const torch::Tensor& weights,
-        const torch::Tensor& valid_mask);
+        const torch::Tensor& valid_mask,
+        float max_weight = -1.0f);
     void applyGeoGridRawInit(
         const torch::Tensor& raw_values,
         const torch::Tensor& valid_mask);

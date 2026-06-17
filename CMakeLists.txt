@@ -114,32 +114,31 @@ include_directories(
 # # target_compile_features(simple_knn PUBLIC cxx_std_17)
 # target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
 
-# add_library(cuda_rasterizer SHARED
-#     include/operate_points.h
-#     src/operate_points.cu
-#     include/rasterize_points.h
-#     src/rasterize_points.cu
-#     include/stereo_vision.h
-#     src/stereo_vision.cu
-#     cuda_rasterizer/auxiliary.h
-#     cuda_rasterizer/backward.cu
-#     cuda_rasterizer/backward.h
-#     cuda_rasterizer/config.h
-#     cuda_rasterizer/forward.cu
-#     cuda_rasterizer/forward.h
-#     cuda_rasterizer/operate_points.h
-#     cuda_rasterizer/rasterizer.h
-#     cuda_rasterizer/rasterizer_impl.cu
-#     cuda_rasterizer/rasterizer_impl.h
-#     cuda_rasterizer/stereo_vision.h)
-# set_target_properties(cuda_rasterizer PROPERTIES CUDA_ARCHITECTURES "75;86")
-# # target_compile_features(cuda_rasterizer PUBLIC cxx_std_17)
-# target_include_directories(cuda_rasterizer PRIVATE
-#     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-# target_link_libraries(cuda_rasterizer
-#     glm::glm
-#     "${TORCH_LIBRARIES}"
-#     Eigen3::Eigen)
+add_library(cuda_rasterizer SHARED
+    include/operate_points.h
+    src/operate_points.cu
+    include/rasterize_points.h
+    src/rasterize_points.cu
+    include/stereo_vision.h
+    src/stereo_vision.cu
+    cuda_rasterizer/auxiliary.h
+    cuda_rasterizer/backward.cu
+    cuda_rasterizer/backward.h
+    cuda_rasterizer/config.h
+    cuda_rasterizer/forward.cu
+    cuda_rasterizer/forward.h
+    cuda_rasterizer/operate_points.h
+    cuda_rasterizer/rasterizer.h
+    cuda_rasterizer/rasterizer_impl.cu
+    cuda_rasterizer/rasterizer_impl.h
+    cuda_rasterizer/stereo_vision.h)
+set_target_properties(cuda_rasterizer PROPERTIES CUDA_ARCHITECTURES "75;86")
+target_include_directories(cuda_rasterizer PRIVATE
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+target_link_libraries(cuda_rasterizer
+    glm::glm
+    "${TORCH_LIBRARIES}"
+    Eigen3::Eigen)
 
 ##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
@@ -168,49 +167,49 @@ target_link_libraries(imgui glfw OpenGL::GL)
 ##  Build the gaussian mapper library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-# add_library(gaussian_mapper SHARED
-#     third_party/tinyply/tinyply.h
-#     third_party/tinyply/tinyply.cpp
-#     include/gaussian_keyframe.h
-#     include/gaussian_model.h
-#     include/gaussian_parameters.h
-#     include/gaussian_rasterizer.h
-#     include/gaussian_renderer.h
-#     include/gaussian_scene.h
-#     include/gaussian_trainer.h
-#     include/gaussian_mapper.h
-#     include/general_utils.h
-#     include/graphics_utils.h
-#     include/loss_utils.h
-#     include/sh_utils.h
-#     include/tensor_utils.h
-#     include/camera.h
-#     include/point_cloud.h
-#     include/point2d.h
-#     include/point3d.h
-#     include/types.h
-#     src/gaussian_keyframe.cpp
-#     src/gaussian_model.cpp
-#     src/gaussian_parameters.cpp
-#     src/gaussian_rasterizer.cpp
-#     src/gaussian_renderer.cpp
-#     src/gaussian_scene.cpp
-#     src/gaussian_trainer.cpp
-#     src/gaussian_mapper.cpp)
-# target_link_libraries(gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-#     ${OpenCV_LIBRARIES}
-#     jsoncpp_lib
-#     "${TORCH_LIBRARIES}"
-#     Eigen3::Eigen
-#     simple_knn
-#     cuda_rasterizer
-#     ${Python3_LIBRARIES})
+add_library(gaussian_mapper SHARED
+    third_party/tinyply/tinyply.h
+    third_party/tinyply/tinyply.cpp
+    include/gaussian_keyframe.h
+    include/gaussian_model.h
+    include/gaussian_parameters.h
+    include/gaussian_rasterizer.h
+    include/gaussian_renderer.h
+    include/gaussian_scene.h
+    include/gaussian_trainer.h
+    include/gaussian_mapper.h
+    include/general_utils.h
+    include/graphics_utils.h
+    include/loss_utils.h
+    include/sh_utils.h
+    include/tensor_utils.h
+    include/camera.h
+    include/point_cloud.h
+    include/point2d.h
+    include/point3d.h
+    include/types.h
+    src/gaussian_keyframe.cpp
+    src/gaussian_model.cpp
+    src/gaussian_parameters.cpp
+    src/gaussian_rasterizer.cpp
+    src/gaussian_renderer.cpp
+    src/gaussian_scene.cpp
+    src/gaussian_trainer.cpp
+    src/gaussian_mapper.cpp)
+target_link_libraries(gaussian_mapper
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+    ${OpenCV_LIBRARIES}
+    jsoncpp_lib
+    "${TORCH_LIBRARIES}"
+    Eigen3::Eigen
+    ${PROJECT_SOURCE_DIR}/lib/libsimple_knn.so
+    cuda_rasterizer
+    ${Python3_LIBRARIES})
 
-# target_include_directories(gaussian_mapper
-#     PRIVATE
-#         ${Python3_INCLUDE_DIRS}
-# )
+target_include_directories(gaussian_mapper
+    PRIVATE
+        ${Python3_INCLUDE_DIRS}
+)
 
 ##################################################################################
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
@@ -273,6 +272,7 @@ add_library(voxel_core
         src/stereo_vision.cu
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
+        evaluation/mesh_extraction.cpp
         src_voxel/voxel_parameters.cpp
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
@@ -386,6 +386,23 @@ set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 #     gaussian_mapper
 #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
+# TUM RGBD
+add_executable(tum_rgbd examples/tum_rgbd.cpp)
+target_include_directories(tum_rgbd PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(tum_rgbd
+    gaussian_viewer    
+    gaussian_mapper
+    ${OpenCV_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(tum_rgbd PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+
 add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
 target_include_directories(tum_mono_voxel PRIVATE
         ${CMAKE_SOURCE_DIR}/include_voxel      # <‑‑ header path
@@ -442,7 +459,7 @@ target_link_directories(statues_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_
 
 # Mesh evaluation utility (reconstruction mesh vs GT mesh)
 add_executable(mesh_eval
-        examples/mesh_eval.cpp
+        evaluation/mesh_eval.cpp
         third_party/tinyply/tinyply.h
         third_party/tinyply/tinyply.cpp)
 target_include_directories(mesh_eval PRIVATE
@@ -451,6 +468,15 @@ target_include_directories(mesh_eval PRIVATE
 target_link_libraries(mesh_eval
         ${OpenCV_LIBRARIES}
         jsoncpp_lib)
+
+add_executable(maps_compare_rerun
+        evaluation/maps_compare_rerun.cpp)
+target_include_directories(maps_compare_rerun PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(maps_compare_rerun
+        ${OpenCV_LIBRARIES}
+        rerun_sdk)
 
 # # EuRoC Stereo
 # add_executable(euroc_stereo examples/euroc_stereo.cpp)

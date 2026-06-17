@@ -80,6 +80,7 @@ public:
     sv::Camera cam_;  
 
     std::string img_filename_;
+    int source_frame_id_ = -1;
     cv::Mat img_undist_, img_auxiliary_undist_;
     torch::Tensor original_image_; ///< image
     torch::Tensor mono_prior_; ///< cached dense mono prior on CPU

@@ -27,7 +27,7 @@
 
 #include "third_party/colmap/utils/endian.h"
 #include "include/gaussian_mapper.h"
-#include "viewer/imgui_viewer.h"
+#include "viewer/gaussian_imgui_viewer.h"
 
 void readColmapCamerasBinary(
     std::shared_ptr<GaussianMapper> pMapper,

@@ -18,6 +18,250 @@
 
  #include "include/gaussian_mapper.h"
 
+#include <cmath>
+#include <iomanip>
+#include <limits>
+
+namespace
+{
+struct GaussianGpuMemoryStats
+{
+    float reserved_mb = 0.0f;
+    float allocated_mb = 0.0f;
+};
+
+GaussianGpuMemoryStats getGaussianGpuPeakMemoryStats()
+{
+    GaussianGpuMemoryStats stats;
+    if (!torch::cuda::is_available())
+        return stats;
+
+    namespace c10Alloc = c10::cuda::CUDACachingAllocator;
+    c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
+    stats.reserved_mb =
+        mem_stats.reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        (1024.0f * 1024.0f);
+    stats.allocated_mb =
+        mem_stats.allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        (1024.0f * 1024.0f);
+    return stats;
+}
+
+void saveGaussianGpuPeakMemoryUsage(const std::filesystem::path& path)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    const GaussianGpuMemoryStats stats = getGaussianGpuPeakMemoryStats();
+    std::ofstream out(path);
+    out << "Peak reserved (MB): " << stats.reserved_mb << "\n";
+    out << "Peak allocated (MB): " << stats.allocated_mb << "\n";
+}
+
+double fileSizeMbGaussian(const std::filesystem::path& path)
+{
+    if (!std::filesystem::exists(path))
+        return 0.0;
+    return static_cast<double>(std::filesystem::file_size(path)) / (1024.0 * 1024.0);
+}
+
+void saveGaussianRuntimeMetrics(
+    const std::filesystem::path& path,
+    int frames,
+    int keyframes,
+    int gaussians,
+    int iterations,
+    double total_seconds,
+    const std::filesystem::path& map_path)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    const GaussianGpuMemoryStats gpu_stats = getGaussianGpuPeakMemoryStats();
+
+    std::ofstream out(path);
+    out << std::fixed << std::setprecision(6);
+    out << "{\n";
+    out << "  \"frames\": " << frames << ",\n";
+    out << "  \"keyframes\": " << keyframes << ",\n";
+    out << "  \"gaussians\": " << gaussians << ",\n";
+    out << "  \"iterations\": " << iterations << ",\n";
+    out << "  \"total_seconds\": " << total_seconds << ",\n";
+    out << "  \"fps_hz\": "
+        << (total_seconds > 0.0 ? static_cast<double>(frames) / total_seconds : 0.0) << ",\n";
+    out << "  \"map_path\": \"" << map_path.string() << "\",\n";
+    out << "  \"map_size_mb\": " << fileSizeMbGaussian(map_path) << ",\n";
+    out << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb << ",\n";
+    out << "  \"gpu_memory_reserved_mb\": " << gpu_stats.reserved_mb << "\n";
+    out << "}\n";
+}
+
+bool depthMatToMetersGaussian(const cv::Mat& depth_in, cv::Mat& depth_m)
+{
+    if (depth_in.empty())
+        return false;
+    if (depth_in.type() == CV_32FC1) {
+        depth_m = depth_in.clone();
+        return true;
+    }
+    if (depth_in.type() == CV_16UC1) {
+        depth_in.convertTo(depth_m, CV_32FC1, 1.0 / 5000.0);
+        return true;
+    }
+    if (depth_in.type() == CV_64FC1) {
+        depth_in.convertTo(depth_m, CV_32FC1);
+        return true;
+    }
+    return false;
+}
+
+cv::Mat colorizeDepthJetGaussian(
+    const cv::Mat& depth_m,
+    float min_depth,
+    float max_depth)
+{
+    cv::Mat normalized(depth_m.size(), CV_8UC1, cv::Scalar(0));
+    const float denom = std::max(1e-6f, max_depth - min_depth);
+    for (int y = 0; y < depth_m.rows; ++y) {
+        const float* dptr = depth_m.ptr<float>(y);
+        uint8_t* nptr = normalized.ptr<uint8_t>(y);
+        for (int x = 0; x < depth_m.cols; ++x) {
+            const float z = dptr[x];
+            if (!std::isfinite(z) || z <= min_depth || z >= max_depth)
+                continue;
+            const float t = std::clamp((z - min_depth) / denom, 0.0f, 1.0f);
+            nptr[x] = static_cast<uint8_t>(std::round(255.0f * t));
+        }
+    }
+    cv::Mat bgr;
+    cv::applyColorMap(normalized, bgr, cv::COLORMAP_JET);
+    bgr.setTo(cv::Scalar(0, 0, 0), normalized == 0);
+    return bgr;
+}
+
+cv::Mat normalBgrFromDepthGaussian(
+    const cv::Mat& depth_m,
+    const std::vector<float>& intr,
+    float min_depth,
+    float max_depth)
+{
+    cv::Mat normal_bgr(depth_m.size(), CV_8UC3, cv::Scalar(0, 0, 0));
+    if (depth_m.empty() || depth_m.type() != CV_32FC1 || intr.size() < 4)
+        return normal_bgr;
+
+    const float fx = intr[0];
+    const float fy = intr[1];
+    const float cx = intr[2];
+    const float cy = intr[3];
+    if (fx <= 1e-6f || fy <= 1e-6f)
+        return normal_bgr;
+
+    auto point_at = [&](int x, int y, Eigen::Vector3f& p) -> bool {
+        const float z = depth_m.at<float>(y, x);
+        if (!std::isfinite(z) || z <= min_depth || z >= max_depth)
+            return false;
+        p.x() = (static_cast<float>(x) - cx) * z / fx;
+        p.y() = (static_cast<float>(y) - cy) * z / fy;
+        p.z() = z;
+        return true;
+    };
+
+    for (int y = 1; y + 1 < depth_m.rows; ++y) {
+        cv::Vec3b* out = normal_bgr.ptr<cv::Vec3b>(y);
+        for (int x = 1; x + 1 < depth_m.cols; ++x) {
+            Eigen::Vector3f left, right, up, down;
+            if (!point_at(x - 1, y, left) ||
+                !point_at(x + 1, y, right) ||
+                !point_at(x, y - 1, up) ||
+                !point_at(x, y + 1, down)) {
+                continue;
+            }
+            Eigen::Vector3f n = (right - left).cross(down - up);
+            const float norm = n.norm();
+            if (!(norm > 1e-6f) ||
+                !std::isfinite(n.x()) || !std::isfinite(n.y()) || !std::isfinite(n.z())) {
+                continue;
+            }
+            n /= norm;
+            out[x][0] = static_cast<uint8_t>(std::clamp((n.z() + 1.0f) * 127.5f, 0.0f, 255.0f));
+            out[x][1] = static_cast<uint8_t>(std::clamp((n.y() + 1.0f) * 127.5f, 0.0f, 255.0f));
+            out[x][2] = static_cast<uint8_t>(std::clamp((n.x() + 1.0f) * 127.5f, 0.0f, 255.0f));
+        }
+    }
+    return normal_bgr;
+}
+
+cv::Mat depthTensorToCvMatGaussian(const torch::Tensor& depth_tensor)
+{
+    if (!depth_tensor.defined() || depth_tensor.numel() == 0) {
+        return cv::Mat();
+    }
+
+    torch::Tensor depth = depth_tensor.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (depth.dim() == 3 && depth.size(0) == 1) {
+        depth = depth.squeeze(0).contiguous();
+    } else if (depth.dim() == 4 && depth.size(0) == 1 && depth.size(1) == 1) {
+        depth = depth.squeeze(0).squeeze(0).contiguous();
+    }
+    if (depth.dim() != 2) {
+        return cv::Mat();
+    }
+
+    cv::Mat depth_view(
+        static_cast<int>(depth.size(0)),
+        static_cast<int>(depth.size(1)),
+        CV_32FC1,
+        depth.data_ptr<float>());
+    return depth_view.clone();
+}
+
+void saveGaussianDepthAndNormalMaps(
+    const std::shared_ptr<GaussianKeyframe>& pkf,
+    const torch::Tensor& rendered_depth,
+    const std::filesystem::path& depth_dir,
+    const std::filesystem::path& normal_dir,
+    float min_depth,
+    float max_depth)
+{
+    std::filesystem::create_directories(depth_dir);
+    std::filesystem::create_directories(normal_dir);
+    std::ostringstream ss;
+    ss << "kf_" << std::setw(5) << std::setfill('0') << pkf->fid_;
+    const std::string stem = ss.str();
+
+    const cv::Mat depth = depthTensorToCvMatGaussian(rendered_depth);
+    if (depth.empty())
+        return;
+    const cv::Mat depth_bgr = colorizeDepthJetGaussian(depth, min_depth, std::min(max_depth, 6.0f));
+    cv::imwrite((depth_dir / (stem + ".png")).string(), depth_bgr);
+
+    cv::Mat gt_depth_m;
+    if (depthMatToMetersGaussian(pkf->img_auxiliary_undist_, gt_depth_m)) {
+        if (gt_depth_m.size() != depth.size()) {
+            cv::resize(gt_depth_m, gt_depth_m, depth.size(), 0.0, 0.0, cv::INTER_NEAREST);
+        }
+        const cv::Mat gt_depth_bgr =
+            colorizeDepthJetGaussian(gt_depth_m, min_depth, std::min(max_depth, 6.0f));
+        cv::imwrite((depth_dir / (stem + "_gt.png")).string(), gt_depth_bgr);
+        cv::Mat depth_pair;
+        cv::hconcat(std::vector<cv::Mat>{gt_depth_bgr, depth_bgr}, depth_pair);
+        cv::imwrite((depth_dir / (stem + "_pair.png")).string(), depth_pair);
+
+        const cv::Mat gt_normal_bgr =
+            normalBgrFromDepthGaussian(gt_depth_m, pkf->intr_, min_depth, max_depth);
+        cv::imwrite((normal_dir / (stem + "_gt_from_depth.png")).string(), gt_normal_bgr);
+        const cv::Mat pred_normal_bgr =
+            normalBgrFromDepthGaussian(depth, pkf->intr_, min_depth, max_depth);
+        cv::imwrite((normal_dir / (stem + ".png")).string(), pred_normal_bgr);
+        cv::Mat normal_pair;
+        cv::hconcat(std::vector<cv::Mat>{gt_normal_bgr, pred_normal_bgr}, normal_pair);
+        cv::imwrite((normal_dir / (stem + "_pair.png")).string(), normal_pair);
+    } else {
+        const cv::Mat pred_normal_bgr =
+            normalBgrFromDepthGaussian(depth, pkf->intr_, min_depth, max_depth);
+        cv::imwrite((normal_dir / (stem + ".png")).string(), pred_normal_bgr);
+    }
+}
+}
+
  GaussianMapper::GaussianMapper(
      std::shared_ptr<ORB_SLAM3::System> pSLAM,
      std::filesystem::path gaussian_config_file_path,
@@ -229,6 +473,11 @@
      }
  }
  
+ void GaussianMapper::setRuntimeFrameCount(int frame_count)
+ {
+     runtime_frame_count_ = std::max(0, frame_count);
+ }
+
  void GaussianMapper::readConfigFromFile(std::filesystem::path cfg_path)
  {
      cv::FileStorage settings_file(cfg_path.string().c_str(), cv::FileStorage::READ);
@@ -368,8 +617,10 @@
          settings_file["GaussianViewer.image_scale_main"].operator float();
  }
  
- void GaussianMapper::run()
- {
+void GaussianMapper::run()
+{
+    const auto run_start_time = std::chrono::steady_clock::now();
+
      // First loop: Initial gaussian mapping
      while (!isStopped()) {
          // Check conditions for initial mapping
@@ -533,16 +784,36 @@
          n_delay_iters = densify_interval * 0.8;
      }
  
-     // Save and clear
-     renderAndRecordAllKeyframes("_shutdown");
-     savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
-     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
+    // Save and clear
+    const int final_iteration = getIteration();
+    const std::filesystem::path shutdown_dir =
+        result_dir_ / (std::to_string(final_iteration) + "_shutdown");
+    renderAndRecordAllKeyframes("_shutdown");
+    savePly(shutdown_dir / "ply");
+    const std::filesystem::path final_map_path =
+        shutdown_dir / "ply" / "point_cloud" /
+        ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";
+    const double total_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - run_start_time).count();
+    saveGaussianGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
+    saveGaussianRuntimeMetrics(
+        shutdown_dir / "runtime_metrics.json",
+        runtime_frame_count_,
+        scene_ ? static_cast<int>(scene_->keyframes().size()) : 0,
+        gaussians_ ? static_cast<int>(gaussians_->getXYZ().size(0)) : 0,
+        final_iteration,
+        total_seconds,
+        final_map_path);
+    writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
  
      signalStop();
  }
  
- void GaussianMapper::trainColmap()
- {
+void GaussianMapper::trainColmap()
+{
+    const auto run_start_time = std::chrono::steady_clock::now();
+
      // Prepare multi resolution images for training
      for (auto& kfit : scene_->keyframes()) {
          auto pkf = kfit.second;
@@ -599,10 +870,30 @@
          n_delay_iters = densify_interval * 0.8;
      }
  
-     // Save and clear
-     renderAndRecordAllKeyframes("_shutdown");
-     savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
-     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
+    // Save and clear
+    const int final_iteration = getIteration();
+    const std::filesystem::path shutdown_dir =
+        result_dir_ / (std::to_string(final_iteration) + "_shutdown");
+    renderAndRecordAllKeyframes("_shutdown");
+    savePly(shutdown_dir / "ply");
+    const std::filesystem::path final_map_path =
+        shutdown_dir / "ply" / "point_cloud" /
+        ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";
+    const double total_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - run_start_time).count();
+    saveGaussianGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
+    saveGaussianRuntimeMetrics(
+        shutdown_dir / "runtime_metrics.json",
+        runtime_frame_count_ > 0
+            ? runtime_frame_count_
+            : (scene_ ? static_cast<int>(scene_->keyframes().size()) : 0),
+        scene_ ? static_cast<int>(scene_->keyframes().size()) : 0,
+        gaussians_ ? static_cast<int>(gaussians_->getXYZ().size(0)) : 0,
+        final_iteration,
+        total_seconds,
+        final_map_path);
+    writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
  
      signalStop();
  }
@@ -684,9 +975,9 @@
          override_color_
      );
      auto rendered_image = std::get<0>(render_pkg);
-     auto viewspace_point_tensor = std::get<1>(render_pkg);
-     auto visibility_filter = std::get<2>(render_pkg);
-     auto radii = std::get<3>(render_pkg);
+     auto viewspace_point_tensor = std::get<2>(render_pkg);
+     auto visibility_filter = std::get<3>(render_pkg);
+     auto radii = std::get<4>(render_pkg);
  
      // Get rid of black edges caused by undistortion
      torch::Tensor masked_image = rendered_image * mask;
@@ -1544,7 +1835,7 @@
          throw std::runtime_error("[GaussianMapper::renderFromPose]KeyFrame Camera not found!");
      }
  
-     std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> render_pkg;
+     std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> render_pkg;
      {
          std::unique_lock<std::mutex> lock_render(mutex_render_);
          // Render
@@ -1568,7 +1859,7 @@
      return tensor_utils::torchTensor2CvMat_Float32(masked_image);
  }
  
- void GaussianMapper::renderAndRecordKeyframe(
+void GaussianMapper::renderAndRecordKeyframe(
      std::shared_ptr<GaussianKeyframe> pkf,
      float &dssim,
      float &psnr,
@@ -1577,6 +1868,8 @@
      std::filesystem::path result_img_dir,
      std::filesystem::path result_gt_dir,
      std::filesystem::path result_loss_dir,
+     std::filesystem::path result_depth_dir,
+     std::filesystem::path result_normal_dir,
      std::string name_suffix)
  {
      auto start_timing = std::chrono::steady_clock::now();
@@ -1601,7 +1894,14 @@
      psnr = loss_utils::psnr(masked_image, gt_image).item().toFloat();
      psnr_gs = loss_utils::psnr_gaussian_splatting(masked_image, gt_image).item().toFloat();
  
-     recordKeyframeRendered(masked_image, gt_image, pkf->fid_, result_img_dir, result_gt_dir, result_loss_dir, name_suffix);    
+     recordKeyframeRendered(masked_image, gt_image, pkf->fid_, result_img_dir, result_gt_dir, result_loss_dir, name_suffix);
+     saveGaussianDepthAndNormalMaps(
+         pkf,
+         std::get<1>(render_pkg),
+         result_depth_dir,
+         result_normal_dir,
+         RGBD_min_depth_,
+         RGBD_max_depth_);
  }
  
  void GaussianMapper::renderAndRecordAllKeyframes(
@@ -1622,6 +1922,12 @@
      if (record_loss_image_) {
          CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(image_loss_dir);
      }
+
+     std::filesystem::path depth_dir = result_dir / "depth";
+     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(depth_dir);
+
+     std::filesystem::path normal_dir = result_dir / "normal";
+     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(normal_dir);
  
      std::filesystem::path render_time_path = result_dir / "render_time.txt";
      std::ofstream out_time(render_time_path);
@@ -1644,7 +1950,17 @@
      float dssim, psnr, psnr_gs;
      double render_time;
      for (std::size_t i = 0; i < nkfs; ++i) {
-         renderAndRecordKeyframe((*kfit).second, dssim, psnr, psnr_gs, render_time, image_dir, image_gt_dir, image_loss_dir);
+         renderAndRecordKeyframe(
+             (*kfit).second,
+             dssim,
+             psnr,
+             psnr_gs,
+             render_time,
+             image_dir,
+             image_gt_dir,
+             image_loss_dir,
+             depth_dir,
+             normal_dir);
          out_time << (*kfit).first << " " << std::fixed << std::setprecision(8) << render_time << std::endl;
  
          out_dssim   << (*kfit).first << " " << std::fixed << std::setprecision(10) << dssim   << std::endl;

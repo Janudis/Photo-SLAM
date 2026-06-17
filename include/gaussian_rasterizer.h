@@ -107,7 +107,7 @@ public:
 
     torch::Tensor markVisibleGaussians(torch::Tensor& positions);
 
-    std::tuple<torch::Tensor, torch::Tensor> forward(
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> forward(
         torch::Tensor means3D,
         torch::Tensor means2D,
         torch::Tensor opacities,

@@ -2582,6 +2582,7 @@ int main(int argc, char** argv)
     const double chamfer = accuracy + completeness;
     const double precision = ratioBelow(d_r2g, tau_m);
     const double recall = ratioBelow(d_g2r, tau_m);
+    const double completion = recall;
     const double fscore = (precision + recall > 0.0)
                               ? (2.0 * precision * recall / (precision + recall))
                               : 0.0;
@@ -2715,6 +2716,8 @@ int main(int argc, char** argv)
     root["chamfer_l1_mean"] = 0.5 * chamfer;
     root["precision"] = precision;
     root["recall"] = recall;
+    root["completion"] = completion;
+    root["completion_percent"] = 100.0 * completion;
     root["fscore"] = fscore;
     root["threshold_m"] = tau_m;
     root["threshold_cm"] = tau_cm;
@@ -2775,6 +2778,8 @@ int main(int argc, char** argv)
         f << "chamfer_l1_mean " << 0.5 * chamfer << "\n";
         f << "precision " << precision << "\n";
         f << "recall " << recall << "\n";
+        f << "completion " << completion << "\n";
+        f << "completion_percent " << 100.0 * completion << "\n";
         f << "fscore " << fscore << "\n";
         f << "recon_geometry_type " << recon_geom_type << "\n";
         f << "gt_geometry_type " << gt_geom_type << "\n";
@@ -2834,6 +2839,8 @@ int main(int argc, char** argv)
     std::cout << "Chamfer L1: " << chamfer << " m\n";
     std::cout << "Precision@" << tau_cm << "cm: " << precision << "\n";
     std::cout << "Recall@" << tau_cm << "cm: " << recall << "\n";
+    std::cout << "Completion@" << tau_cm << "cm: " << completion
+              << " (" << 100.0 * completion << "%)\n";
     std::cout << "F-score@" << tau_cm << "cm: " << fscore << "\n";
     if (alignment_ok)
     {
@@ -2912,9 +2919,9 @@ int main(int argc, char** argv)
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5530_shutdown/ply/voxel_model/iteration_5530/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4890_shutdown/ply/voxel_model/iteration_4890/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5530_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4890_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \

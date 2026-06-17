@@ -162,6 +162,7 @@
      GaussianModelParams& getGaussianModelParams() { return this->model_params_; }
      void setColmapDataPath(std::filesystem::path colmap_path) { this->model_params_.source_path_ = colmap_path; }
      void setSensorType(SystemSensorType sensor_type) { this->sensor_type_ = sensor_type; }
+     void setRuntimeFrameCount(int frame_count);
  
      void loadPly(std::filesystem::path ply_path, std::filesystem::path camera_path = "");
  
@@ -209,6 +210,8 @@
          std::filesystem::path result_img_dir,
          std::filesystem::path result_gt_dir,
          std::filesystem::path result_loss_dir,
+         std::filesystem::path result_depth_dir,
+         std::filesystem::path result_normal_dir,
          std::string name_suffix = "");
      void renderAndRecordAllKeyframes(
          std::string name_suffix = "");
@@ -221,7 +224,7 @@
  public:
      // Parameters
      std::filesystem::path config_file_path_;
- 
+
      // Model
      std::shared_ptr<GaussianModel> gaussians_;
      std::shared_ptr<GaussianScene> scene_;
@@ -306,6 +309,7 @@
      bool do_gaus_pyramid_training_;
  
      std::filesystem::path result_dir_;
+     int runtime_frame_count_ = 0;
      int keyframe_record_interval_;
      int all_keyframes_record_interval_;
      bool record_rendered_image_;

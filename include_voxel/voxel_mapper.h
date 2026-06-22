@@ -44,6 +44,10 @@
 #include "include_voxel/voxel_model.h"
 #include "include_voxel/py_utils.h"
 #include "include_voxel/render_opts.h"  
+#include "include_voxel/voxel_mono_prior_parameters.h"
+#include "include_voxel/voxel_planner_parameters.h"
+#include "include_voxel/voxel_rerun_parameters.h"
+#include "include_voxel/voxel_sdf_parameters.h"
 // #include "include/stereo_vision.h"
 // #include "include/operate_points.h"
 
@@ -64,10 +68,6 @@
 #include <nvblox/io/mesh_io.h>   // for io::outputColorMeshLayerToPly
 #include "nvblox/integrators/tsdf_decay_integrator.h"
 #include "nvblox/integrators/freespace_integrator.h"
-
-#include "voxel_planner.h"
-
-pybind11::array_t<uint8_t> cvMatToNumpyRGB(const cv::Mat& img);
 
 #define CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(dir)                                       \
     if (!dir.empty() && !std::filesystem::exists(dir))                                      \
@@ -118,179 +118,21 @@ public:
         int seed = 0,
         torch::DeviceType device_type = torch::kCUDA);
     
-    std::unique_ptr<VoxelPlanner> planner_;
-    bool planned_once_ = false;
-    Eigen::Vector3f offline_goal_W_ = Eigen::Vector3f(10,5,0); // from YAML later
-    float planner_clearance_m_ = 0.3f;
-    bool queryEsdfAtWorld(const Eigen::Vector3d& p_W, float& dist_out) const;
-    
-    std::shared_ptr<nvblox::Mapper> sdf_mapper_;
-    bool use_tsdf_mapping_ = false; 
-    bool use_tsdf_pruning_ = false;
-    bool use_tsdf_planning_ = false;
-    std::string tsdf_backend_ = "svraster";
-    float sdf_voxel_size_m_ = 0.05f;   // example, configurable via YAML
-    float tsdf_prune_min_weight_ = 1.0f;
-    float tsdf_prune_surface_band_vox_ = 2.0f;
-    int tsdf_prune_min_valid_corners_ = 8;
-    bool tsdf_protect_surface_band_from_pruning_ = true;
-    bool tsdf_density_init_ = false;
-    float tsdf_density_init_min_weight_ = 1.0f;
-    float tsdf_density_init_trunc_vox_ = 4.0f;
-    float svraster_tsdf_max_integration_distance_m_ = 4.0f;
-    bool svraster_tsdf_inverse_square_weighting_ = true;
-    float svraster_tsdf_max_weight_ = 5.0f;
-    bool svraster_tsdf_refit_on_topology_change_ = true;
-    float tsdf_density_init_bell_a_ = 0.1f;
-    float tsdf_density_init_bell_b_ = 0.5f;
-    float tsdf_density_init_alpha_min_ = 0.0002f;
-    float tsdf_density_init_alpha_max_ = 0.5f;
-    void initializeNvbloxMapper();
-    void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
-                                    const cv::Mat& depth_meters);
-    bool useSvrasterTsdfBackend() const;
-    bool useNvbloxTsdfBackend() const;
-    bool hasTsdfForSampling() const;
-    float tsdfMetricVoxelSize() const;
-    void integrateKeyframeIntoSvrasterSdf(VoxelKeyframe& kf,
-                                          const cv::Mat& depth_meters);
-    void refitSvrasterTsdfFromRegisteredKeyframes(const std::string& reason);
-    bool prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf);
-    void clearSvrasterTsdfInitContext();
-    torch::Tensor computeSvrasterProjectiveDensityInitForGridPoints(
-        const torch::Tensor& grid_points_world,
-        float ray_interval_m);
-    bool svraster_tsdf_init_context_valid_ = false;
-    cv::Mat svraster_tsdf_init_depth_meters_;
-    Sophus::SE3f svraster_tsdf_init_Tcw_;
-    float svraster_tsdf_init_fx_ = 0.0f;
-    float svraster_tsdf_init_fy_ = 0.0f;
-    float svraster_tsdf_init_cx_ = 0.0f;
-    float svraster_tsdf_init_cy_ = 0.0f;
-    int svraster_tsdf_init_width_ = 0;
-    int svraster_tsdf_init_height_ = 0;
-    std::size_t svraster_tsdf_init_kfid_ = 0;
-    bool svraster_tsdf_last_context_valid_ = false;
-    cv::Mat svraster_tsdf_last_depth_meters_;
-    Sophus::SE3f svraster_tsdf_last_Tcw_;
-    float svraster_tsdf_last_fx_ = 0.0f;
-    float svraster_tsdf_last_fy_ = 0.0f;
-    float svraster_tsdf_last_cx_ = 0.0f;
-    float svraster_tsdf_last_cy_ = 0.0f;
-    int svraster_tsdf_last_width_ = 0;
-    int svraster_tsdf_last_height_ = 0;
-    std::size_t svraster_tsdf_last_kfid_ = 0;
-    struct TsdfSample {
-        torch::Tensor tsdf;    // [N]
-        torch::Tensor weight;  // [N]
-        torch::Tensor success; // [N]
-    };
-    TsdfSample sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
-    TsdfSample sampleNvbloxTsdfAtPointsWorld(const torch::Tensor& pts_world);
-    torch::Tensor computeTsdfDensityInitForGridPoints(
-        const torch::Tensor& grid_points_world,
-        float ray_interval_m);
-    struct TsdfCornerSample {
-        torch::Tensor tsdf;    // [N,8] float32
-        torch::Tensor weight;  // [N,8] float32
-        torch::Tensor success; // [N,8] bool
-        torch::Tensor points_world; // [N,8,3] float32, sampled SVRaster corners
-    };
-    TsdfCornerSample sampleTsdfAtVoxelCornersWorld(
-        const torch::Tensor& centers_world,  // [N,3]
-        const torch::Tensor& sizes_world     // [N,1] or [N]
-    );
-    TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld();
-    void recordTsdfPruneAblation(
-        const torch::Tensor& tsdf_prune_mask,
-        const std::string& tag);
-    void printTsdfPruneAblationSummary(const std::string& tag) const;
-    
     // ~VoxelMapper();
     void readConfigFromFile(const std::filesystem::path& cfg_path);
 
     void run();
-
-    void saveDepthTensorAsPng(
-        const torch::Tensor& depth_in,
-        const std::filesystem::path& out_path);
-    bool buildSparseDepthFromRGBD(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        torch::Tensor& sparse_uv,
-        torch::Tensor& sparse_depth);
-    torch::Tensor computeSparseDepthLoss(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    bool buildSparseDepthFromMapPoints(
-        const sv::MiniCam& cam,
-        int image_width,
-        int image_height,
-        torch::Tensor& sparse_uv,     // [N,2]
-        torch::Tensor& sparse_depth); // [N]
-    torch::Tensor computeSparseDepthLoss_Points(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        int image_width,
-        int image_height,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    bool ensureMonoPriorForKeyframe(
-        const std::shared_ptr<VoxelKeyframe>& kf);
-    bool buildAlignedMonoPriorDepthForKeyframe(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        int image_width,
-        int image_height,
-        torch::Tensor& aligned_depth);
-    bool depthAnythingFillHolesWarmupReady();
-    void queueDepthAnythingFillHolesKeyframe(
-        const std::shared_ptr<VoxelKeyframe>& pkf);
-    void applyDepthAnythingFillHolesKeyframes(
-        const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes,
-        bool seed_global_alignment);
-    void scheduleDepthAnythingFillHoles(
-        const std::shared_ptr<VoxelKeyframe>& pkf);
-    void processDepthAnythingFillHolesWarmup();
-    torch::Tensor computeMonoPriorDepthLoss(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    torch::Tensor computeRgbdDepthLoss(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    torch::Tensor computeMonoPriorNormalLoss(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    torch::Tensor computeRgbdNormalLoss(
-        const std::shared_ptr<VoxelKeyframe>& kf,
-        const sv::MiniCam& cam,
-        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-        int iteration);
-    void debugDepthStats(const cv::Mat& depth_meters, int kf_id);
-
     void trainForOneIteration();
 
-    // graceful stop
     bool isStopped() const;
-    // void signalStop(bool stop = true);
     void signalStop(const bool going_to_stop = true);
 
-    void applyFinalTsdfTransparency();
-
-    // rendering / dumping -----------------------------------------------------
     cv::Mat renderFromPose(
         const Sophus::SE3f& Tcw, 
         const int width, 
         const int height, 
         const bool main_vision = false);
 
-    // misc helpers
     int  getIteration();
     void increaseIteration(const int inc=1);
     
@@ -318,13 +160,10 @@ public:
     VariableParameters getVaribleParameters();
     void setVaribleParameters(const VariableParameters& params);
 
-protected:    
-    // SLAM‑pipeline logic -----------------------------------------------------
+protected:
     bool hasMetInitialMappingConditions();
     bool hasMetIncrementalMappingConditions();
-
     void combineMappingOperations();       
-
     void handleNewKeyframe(std::tuple<unsigned long,
                             unsigned long,
                             Sophus::SE3f,
@@ -334,7 +173,7 @@ protected:
                             std::vector<float>,
                             std::vector<float>,
                             std::string> &kf);
-    // keyframe scheduling -----------------------------------------------------
+
     void generateKfidRandomShuffle();
     std::shared_ptr<VoxelKeyframe> useOneRandomSlidingWindowKeyframe();  
     std::shared_ptr<VoxelKeyframe> useOneRandomKeyframe();   
@@ -342,20 +181,6 @@ protected:
     void cullKeyframes();                  
 
     void increasePcdByKeyframeInactiveGeoDensify(std::shared_ptr<VoxelKeyframe> pkf);
-    
-    void increasePcdByKeyframeMonoPrior(std::shared_ptr<VoxelKeyframe> pkf);
-    void increasePcdByKeyframeMonoPriorFillHoles(std::shared_ptr<VoxelKeyframe> pkf);
-    bool updateMonoPriorGlobalAlignmentFromKeyframe(const std::shared_ptr<VoxelKeyframe>& pkf);
-    void accumulateMonoPriorGlobalAlignment(float scale, float shift, float weight);
-    void increasePcdByKeyframeRenderedDepthInsertion(std::shared_ptr<VoxelKeyframe> pkf);
-    void updateRenderedDepthCandidateLifecycle();
-    void appendAndLogOrbRawMapPcdToRerun(
-        const std::map<point3D_id_t, Point3D>& pcd,
-        int iteration);
-    void appendAndLogOrbRawPointBatchToRerun(
-        const std::vector<float>& points_flat,
-        const std::vector<float>& colors_flat,
-        int iteration);
 
     void recordKeyframeRendered(
         torch::Tensor &rendered,
@@ -369,8 +194,6 @@ protected:
         std::shared_ptr<VoxelKeyframe> pkf,
         float&  dssim,
         float&  psnr,
-        float&  depth_l1,
-        float&  depth_f1,
         double& render_ms,
         const std::filesystem::path& img_dir,
         const std::filesystem::path& gt_dir,
@@ -384,14 +207,107 @@ protected:
     void renderAndRecordAllKeyframes(
         const std::string& name_suffix = "");
 
-    void saveRenderedTsdfMeshPly(const std::filesystem::path& result_path);
-    void saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::path& result_path);
-    void saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path);
-    
     void savePly(std::filesystem::path result_dir);         
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
+    void saveRenderedTsdfMeshPly(const std::filesystem::path& result_path);
+    void saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::path& result_path);
+    void saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path);
+
+    // sdf-based mapping -------------------------------------------------------
+    void initializeNvbloxMapper();
+    void integrateKeyframeIntoNvblox(VoxelKeyframe& kf,
+                                    const cv::Mat& depth_meters);
+    bool useSvrasterTsdfBackend() const;
+    bool useNvbloxTsdfBackend() const;
+    bool hasTsdfForSampling() const;
+    float tsdfMetricVoxelSize() const;
+    void integrateKeyframeIntoSvrasterSdf(VoxelKeyframe& kf,
+                                          const cv::Mat& depth_meters);
+    void refitSvrasterTsdfFromRegisteredKeyframes(const std::string& reason);
+    bool prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf);
+    void clearSvrasterTsdfInitContext();
+    torch::Tensor computeSvrasterProjectiveDensityInitForGridPoints(
+        const torch::Tensor& grid_points_world,
+        float ray_interval_m);
+    struct TsdfSample {
+        torch::Tensor tsdf;    // [N]
+        torch::Tensor weight;  // [N]
+        torch::Tensor success; // [N]
+    };
+    TsdfSample sampleTsdfAtPointsWorld(const torch::Tensor& pts_world);
+    TsdfSample sampleNvbloxTsdfAtPointsWorld(const torch::Tensor& pts_world);
+    torch::Tensor computeTsdfDensityInitForGridPoints(
+        const torch::Tensor& grid_points_world,
+        float ray_interval_m);
+    struct TsdfCornerSample {
+        torch::Tensor tsdf;    // [N,8] float32
+        torch::Tensor weight;  // [N,8] float32
+        torch::Tensor success; // [N,8] bool
+        torch::Tensor points_world; // [N,8,3] float32, sampled SVRaster corners
+    };
+    TsdfCornerSample sampleTsdfAtVoxelCornersWorld(
+        const torch::Tensor& centers_world,  // [N,3]
+        const torch::Tensor& sizes_world     // [N,1] or [N]
+    );
+    TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld();
+    void recordTsdfPruneAblation(
+        const torch::Tensor& tsdf_prune_mask,
+        const std::string& tag);
+    void printTsdfPruneAblationSummary(const std::string& tag) const;
+    void runFinalSpecialPrune();
+
+    // mono-prior integration --------------------------------------------------
+    void readMonoPriorConfigFromSettings(const cv::FileStorage& settings_file);
+    bool monoPriorUsesMetricDepth() const;
+    bool ensureMonoPriorForKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& kf);
+    bool buildAlignedMonoPriorDepthForKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        torch::Tensor& aligned_depth);
+    bool depthAnythingFillHolesWarmupReady();
+    void queueDepthAnythingFillHolesKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void applyDepthAnythingFillHolesKeyframes(
+        const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes,
+        bool seed_global_alignment);
+    void scheduleDepthAnythingFillHoles(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void processDepthAnythingFillHolesWarmup();
+    torch::Tensor computeMonoPriorDepthLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    torch::Tensor computeMonoPriorNormalLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    void increasePcdByKeyframeMonoPriorFillHoles(std::shared_ptr<VoxelKeyframe> pkf);
+    bool updateMonoPriorGlobalAlignmentFromKeyframe(const std::shared_ptr<VoxelKeyframe>& pkf);
+    void accumulateMonoPriorGlobalAlignment(float scale, float shift, float weight);
     
+    // monocular flood-full fill holes integration --------------------------------------------------
+    void increasePcdByKeyframeRenderedDepthInsertion(std::shared_ptr<VoxelKeyframe> pkf);
+    void updateRenderedDepthCandidateLifecycle();
+
+    // rerun debugging ---------------------------------------------------------
+    void logKeyframeCameraToRerunRecordings(
+        const std::shared_ptr<VoxelKeyframe>& pkf,
+        unsigned long kf_id,
+        bool log_reconstruction_mesh);
+    void saveRerunRecordingsAtShutdown();
+    void appendAndLogOrbRawMapPcdToRerun(
+        const std::map<point3D_id_t, Point3D>& pcd,
+        int iteration);
+    void appendAndLogOrbRawPointBatchToRerun(
+        const std::vector<float>& points_flat,
+        const std::vector<float>& colors_flat,
+        int iteration);
     bool ensureRerunGtSdfGridCache(const std::string& mesh_path);
     void logTsdfUnknownVoxelsToRerun(
         int iteration,
@@ -416,23 +332,37 @@ protected:
     void logWholeRunNvbloxMeshToRerun(int iteration);
     void logReconstructionMeshToRerun(int iteration);
     void logNvbloxReconstructionMeshToRerun(int iteration);
-    
-    void saveVoxelErrorHeatmap(const sv::MiniCam& cam,
-                            const at::Tensor& rendered_img,
-                            const at::Tensor& gt_img,
-                            int fid,
-                            const std::string& base_dir);
-    void savePhotometricErrorHeatmapAsPng(
-        const torch::Tensor& error_tensor,
-        const std::filesystem::path& out_path);
 
-    void savePlannerNPZ(std::filesystem::path result_dir);
+    // evaluation/debugging ----------------------------------------------------
+    bool buildSparseDepthFromMapPoints(
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        torch::Tensor& sparse_uv,     // [N,2]
+        torch::Tensor& sparse_depth); // [N]
+    torch::Tensor computeSparseDepthLoss_Points(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        int image_width,
+        int image_height,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    torch::Tensor computeRgbdDepthLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+    torch::Tensor computeRgbdNormalLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+        int iteration);
+
+    // sdf-based planner -------------------------------------------------------
+    bool queryEsdfAtWorld(const Eigen::Vector3d& p_W, float& dist_out) const;
+    void runTsdfPlannerAtShutdown();
 
 public:
-    std::vector<float> best_loss_per_kf_;          // size == #key-frames
-    std::vector<float> worst_loss_per_kf_;
-    std::filesystem::path extrema_dir_;            // …/result/extrema
-    
     // Parameters
     std::filesystem::path config_file_path_;
 
@@ -463,26 +393,26 @@ public:
     std::map<camera_id_t, torch::Tensor> undistort_mask_;
     std::map<camera_id_t, torch::Tensor> viewer_main_undistort_mask_;
     std::map<camera_id_t, torch::Tensor> viewer_sub_undistort_mask_; 
-
-    std::ofstream pose_dump_stream_;
-    bool poses_header_written_ = false;
-
-    Eigen::Vector3f aabb_min_{ std::numeric_limits<float>::infinity(),
-                            std::numeric_limits<float>::infinity(),
-                            std::numeric_limits<float>::infinity() };
-    Eigen::Vector3f aabb_max_{ -std::numeric_limits<float>::infinity(),
-                            -std::numeric_limits<float>::infinity(),
-                            -std::numeric_limits<float>::infinity() };
-    bool have_bounds_ = false;
-    int next_batch_index_ = 0;
-
-    std::vector<sv::MiniCam> tr_cams;
-
+    
 protected:
+    // Parameters
     VoxelModelParams model_params_;
     VoxelOptimizationParams opt_params_;
     VoxelPipelineParams pipe_params_;    
-        
+
+    VoxelSdfParameters sdf_params_;
+    VoxelPlannerParameters planner_params_;
+    // Feature state
+    VoxelSdfState sdf_state_;
+    VoxelPlannerState planner_state_;
+    std::shared_ptr<nvblox::Mapper> sdf_mapper_;
+    // Mono-prior state
+    VoxelMonoPriorParameters mono_prior_params_;
+    VoxelMonoPriorState mono_prior_state_;
+    // Rerun debugging
+    VoxelRerunParameters rerun_params_;
+    VoxelRerunState rerun_state_;
+
     // Data
     std::vector<std::size_t> kfid_shuffle_;
     std::size_t kfid_shuffle_idx_ = 0;
@@ -512,55 +442,24 @@ protected:
     float RGBD_min_depth_ = 0.0f;
     float RGBD_max_depth_ = 100.0f;
 
-    std::string mono_prior_model_id_ = "depth-anything/Depth-Anything-V2-Small-hf";
-    std::string mono_prior_loss_mode_ = "svraster";
-    std::string mono_prior_normal_mode_ = "aligned";
-
     bool inactive_geo_densify_ = true;
+    bool rgbd_inactive_geo_initial_backfill_ = true;
     int depth_cached_ = 0;
     int max_depth_cached_ = 1;
     torch::Tensor depth_cache_points_;
     torch::Tensor depth_cache_colors_;
-    
+
+    // Artificial dense-core fill
+    bool fill_empty_cells_ = false;
+
+    // RGBD fill holes
     torch::Tensor rgbd_fill_render_holes_cache_points_;
     torch::Tensor rgbd_fill_render_holes_cache_colors_;
-    int64_t tsdf_ablation_rgbd_points_created_ = 0;
-    int64_t tsdf_ablation_inactive_geo_created_ = 0;
-    int64_t tsdf_ablation_rgbd_fill_created_ = 0;
-    int64_t tsdf_ablation_rgbd_points_lineage_created_ = 0;
-    int64_t tsdf_ablation_inactive_geo_lineage_created_ = 0;
-    int64_t tsdf_ablation_rgbd_fill_lineage_created_ = 0;
-    int64_t tsdf_ablation_rgbd_points_live_last_ = 0;
-    int64_t tsdf_ablation_inactive_geo_live_last_ = 0;
-    int64_t tsdf_ablation_rgbd_fill_live_last_ = 0;
-    int64_t tsdf_ablation_rgbd_points_pruned_by_sdf_ = 0;
-    int64_t tsdf_ablation_inactive_geo_pruned_by_sdf_ = 0;
-    int64_t tsdf_ablation_rgbd_fill_pruned_by_sdf_ = 0;
-    int64_t tsdf_ablation_sdf_prune_passes_ = 0;
     bool rgbd_fill_render_holes_ = false;
     int rgbd_fill_render_holes_stride_ = 2;
     int rgbd_fill_render_holes_max_points_per_kf_ = 20000;
-    bool depthanything_densify_ = false;
-    int depthanything_densify_stride_ = 8;
-    int depthanything_densify_min_sparse_anchors_ = 64;
-    std::string depthanything_densify_alignment_mode_ = "orb";
-    int depthanything_da_prior_knn_k_ = 5;
-    bool depthanything_da_prior_distance_weighting_ = true;
-    float depthanything_da_prior_max_pixel_dist_ = 0.0f;
-    bool depthanything_fill_holes_ = false;
-    bool depthanything_fill_holes_initial_backfill_ = true;
-    bool depthanything_fill_holes_warmup_ = false;
-    int depthanything_fill_holes_warmup_iter_ = 0;
-    bool depthanything_fill_holes_warmup_flushed_ = false;
-    std::vector<std::weak_ptr<VoxelKeyframe>> depthanything_fill_holes_pending_kfs_;
-    std::unordered_set<std::size_t> depthanything_fill_holes_pending_kfids_;
-    torch::Tensor orb_raw_pcd_points_accum_cpu_;
-    torch::Tensor orb_raw_pcd_colors_accum_cpu_;
-    bool depthanything_global_alignment_valid_ = false;
-    float depthanything_global_align_scale_ = std::numeric_limits<float>::quiet_NaN();
-    float depthanything_global_align_shift_ = std::numeric_limits<float>::quiet_NaN();
-    float depthanything_global_align_weight_ = 0.0f;
-    int depthanything_global_align_observations_ = 0;
+
+    // Monocular flood-full fill holes
     bool rendered_depth_insert_ = false;
     int rendered_depth_insert_stride_ = 4;
     int rendered_depth_insert_frontier_radius_px_ = 1;
@@ -568,7 +467,6 @@ protected:
     float rendered_depth_insert_normal_offset_vox_ = 0.5f;
     bool rendered_depth_insert_require_real_adjacency_ = true;
     int rendered_depth_insert_adjacency_radius_cells_ = 1;
-    bool rerun_rendered_depth_insert_ = true;
 
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;
@@ -579,7 +477,6 @@ protected:
     int new_keyframe_times_of_use_;
     int local_BA_increased_times_of_use_;
     int loop_closure_increased_times_of_use_;
-
     bool cull_keyframes_;
     int stable_num_iter_existence_;
 
@@ -592,82 +489,9 @@ protected:
     bool record_ground_truth_image_;
     bool record_loss_image_;
 
-    bool enable_rerun_ = true;
-    bool rerun_final_only_ = false;
-    int rerun_max_keyframes_ = -1; // <=0: all keyframes, >0: only keyframes in [rerun_keyframe_start, start+N)
-    int rerun_keyframe_start_ = 0;
-    int rerun_voxels_stride_ = 1;
-    int rerun_voxels_max_instances_ = 60000;
-    bool rerun_density_debug_only_ = false;
-    bool rerun_log_aux_topics_ = true;
-    bool run_tsdf_pruned_ = false;
-    bool rerun_tsdf_unknown_voxels_ = false;
-    bool rerun_tsdf_unknown_dirty_ = false;
-    bool run_floaters_ = false;
-    bool run_whole_run_ = false;
-    bool run_sdf_pruned_nvblox_ = false;
-    int run_floaters_stride_ = 1;
-    bool run_floaters_dirty_ = false;
-    torch::Tensor whole_run_pruned_centers_accum_;
-    torch::Tensor whole_run_pruned_sizes_accum_;
-    torch::Tensor whole_run_pruned_colors_accum_;
-    torch::Tensor whole_run_pruned_tsdf_centers_accum_;
-    torch::Tensor whole_run_pruned_tsdf_sizes_accum_;
-    torch::Tensor whole_run_pruned_tsdf_colors_accum_;
-    torch::Tensor whole_run_pruned_svraster_centers_accum_;
-    torch::Tensor whole_run_pruned_svraster_sizes_accum_;
-    torch::Tensor whole_run_pruned_svraster_colors_accum_;
-    torch::Tensor whole_run_pruned_near_centers_accum_;
-    torch::Tensor whole_run_pruned_near_sizes_accum_;
-    torch::Tensor whole_run_pruned_near_colors_accum_;
-    torch::Tensor whole_run_pruned_recent_unstable_centers_accum_;
-    torch::Tensor whole_run_pruned_recent_unstable_sizes_accum_;
-    torch::Tensor whole_run_pruned_recent_unstable_colors_accum_;
-    torch::Tensor whole_run_pruned_final_special_centers_accum_;
-    torch::Tensor whole_run_pruned_final_special_sizes_accum_;
-    torch::Tensor whole_run_pruned_final_special_colors_accum_;
-    bool rerun_tsdf_pruned_log_gt_mesh_ = false;
-    bool rerun_tsdf_pruned_align_gt_to_slam_ = false;
-    std::string rerun_tsdf_pruned_gt_mesh_path_;
-    std::string rerun_tsdf_pruned_gt_traj_path_;
-    int rerun_tsdf_pruned_align_min_pairs_ = 10;
-    torch::Tensor rerun_gt_sdf_grid_keys_cpu_;
-    torch::Tensor rerun_gt_sdf_grid_pts_cpu_;
-    std::string rerun_gt_sdf_grid_mesh_path_;
-    std::size_t rerun_gt_sdf_grid_kfid_ = std::numeric_limits<std::size_t>::max();
-    bool rerun_gt_sdf_log_pending_ = false;
-    std::size_t rerun_gt_sdf_pending_kfid_ = 0;
-    torch::Tensor rerun_gt_sdf_pending_Tcw_cpu_;
-    float rerun_gt_sdf_pending_fx_ = 0.0f;
-    float rerun_gt_sdf_pending_fy_ = 0.0f;
-    float rerun_gt_sdf_pending_cx_ = 0.0f;
-    float rerun_gt_sdf_pending_cy_ = 0.0f;
-    int rerun_gt_sdf_pending_width_ = 0;
-    int rerun_gt_sdf_pending_height_ = 0;
-    bool save_nvblox_mesh_eval_ = false;
-    bool load_saved_nvblox_mesh_ = false;
-    bool rerun_nvblox_mesh_ = false;
-    std::string saved_nvblox_mesh_path_;
-    bool rerun_gt_mesh_ = false;
-    std::string rerun_gt_mesh_path_;
-    bool save_rendered_mesh_eval_ = true; // save voxel_surface_mesh.ply used for reconstruction evaluation
-    bool rerun_rendered_mesh_eval_ = false;
-    int rendered_mesh_backend_ = 0; // 0: current SVRaster Python exporter, 1: shared C++ sparse TSDF exporter
-    float rendered_mesh_eval_voxel_size_m_ = 5.0f / 512.0f;
-    float rendered_mesh_eval_min_weight_ = 1.0e-4f;
-    bool rerun_reconstruction_mesh_ = false;
-    int rerun_reconstruction_mesh_interval_ = 200;
-    float rerun_reconstruction_mesh_min_weight_ = 1.0e-4f;
-    bool rerun_reconstruction_mesh_weld_vertices_ = true;
-    std::size_t rerun_reconstruction_mesh_max_vertices_ = 250000;
-    std::size_t rerun_reconstruction_mesh_max_faces_ = 500000;
-    bool rerun_maps_ = false;
-    int rerun_maps_stride_ = 1;
-    bool record_depth_metrics_ = false;
-    float depth_f1_threshold_m_ = 0.01f;
+    int training_report_interval_;   
+    bool record_loop_ply_;
 
-    int   training_report_interval_;   
-    
     // Tools
     std::random_device rd_;
     
@@ -676,6 +500,7 @@ protected:
     mutable std::mutex mutex_render_;
     mutable std::mutex mutex_settings_;
 
+    // Topology update schedule
     int next_subdiv_iter_   = 0;
     int next_prune_iter_    = 0;
     int next_opacity_reset_ = 0;
@@ -684,5 +509,5 @@ protected:
     PyThreadState* m_savedState = nullptr;
 
     int64_t last_artificial_fill_iter_ = -1;
-    int64_t last_densify_iter_       = -1;  // NEW: last prune/subdivide iteration
+    int64_t last_densify_iter_ = -1;
 };

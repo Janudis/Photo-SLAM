@@ -40,7 +40,9 @@ Mapper.tsdf_density_init_alpha_min: 0.0002
 Mapper.tsdf_density_init_alpha_max: 0.5
 
 Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
+Mapper.rgbd_inactive_geo_initial_backfill: 1 # run inactive-geo densify once for initial RGB-D keyframes after createFromPcd
 Mapper.depth_cache: 10
+Mapper.fill_empty_cells: 0 # one-shot artificial dense-core fill; separate from rendered_depth_insert
 Mapper.rgbd_fill_render_holes: 1 # RGB-D only: use real depth to fill pixels where current voxel render has holes
 Mapper.rgbd_fill_render_holes_stride: 2
 Mapper.rgbd_fill_render_holes_max_points_per_kf: 0 # 0 disables cap
@@ -65,18 +67,11 @@ Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
-Record.enable_rerun: 1  # 0:disable all rerun logging/saving, 1:enable
-Record.rerun_final_only: 0 # 0:log rerun during run, 1:log only final voxel sets at shutdown
+Record.enable_rerun: 0  # 0:disable all rerun logging/saving, 1:enable
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
-Record.rerun_voxels_stride: 1 # log live voxel boxes every N iterations
-Record.rerun_voxels_max_instances: 0 # 0:log every live voxel; >0:downsample to this many boxes before logging
-Record.rerun_density_debug_only: 0 # 1:reduced Rerun logging; skip heavy auxiliary topics
-Record.rerun_log_aux_topics: 1 # log densification/pruning source topics
-Record.rerun_rendered_depth_insert: 0
-
-Record.run_whole_run: 0 # write whole_run.rrd with keyframes, trajectory, live voxels/source, accumulated pruned voxels, and nvblox mesh
-Record.run_sdf_pruned_nvblox: 1 # write run_sdf_pruned_nvblox.rrd using saved nvblox mesh as pseudo-GT for SDF-pruned voxels
+Record.run_whole_run: 1 # write whole_run.rrd with keyframes, trajectory, live voxels/source, accumulated pruned voxels, and nvblox mesh
+Record.run_sdf_pruned_nvblox: 0 # write run_sdf_pruned_nvblox.rrd using saved nvblox mesh as pseudo-GT for SDF-pruned voxels
 Record.run_reconstruction_mesh: 0 # write run_reconstruction_mesh.rrd with GT mesh, SVRaster mesh, and nvblox mesh
 Record.run_reconstruction_mesh_interval: 200 # mapper-iteration interval for SVRaster and nvblox mesh updates
 Record.run_reconstruction_mesh_min_weight: 1e-4 # nvblox mesh_integrator_min_weight default
@@ -98,8 +93,6 @@ Record.save_rendered_mesh_eval: 0 # 0:skip voxel_surface_mesh.ply shutdown expor
 Record.rendered_mesh_backend: 0 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
 Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
-Record.record_depth_metrics: 0 # 0:false, 1:compute Depth L1 / F1 from rendered depth vs GT depth
-Record.depth_f1_threshold_m: 0.01 # 1 cm
 
 ##############################################################################
 # SVRaster-style optimisation parameters
@@ -125,24 +118,18 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 Optimization.adapt_from: 800
 Optimization.adapt_every: 800
-Optimization.prune_every: 1000
+Optimization.prune_every: 800
 Optimization.subdivide_every: 800
 
 # Pruning heuristics
-Optimization.filter_near_voxels: 0 # 0:false, 1:true, only for fill_empty_cells_ camera filtering
-Optimization.filter_far_voxels_on_insert: 0 # 0:false, 1:true
+Optimization.filter_near_voxels: 0 # 0:false, 1:true, insertion-time mark_near filtering
 Optimization.prune_far_voxels: 1 # 0:false, 1:true
 Optimization.prune_near_voxels_geometric: 1 # 0:false, 1:true, prune-time near-to-camera geometry (also behind camera)
-Optimization.prune_recompute_dense_core: 1 # 0:reuse latest cached dense-core bbox, 1:recompute at each prune
 Optimization.prune_recent_unstable: 1
 Optimization.prune_recent_keyframes: 3
 Optimization.prune_recent_min_views_real: 3
 Optimization.prune_recent_min_views_artificial: 3
-Optimization.rendered_depth_candidate_promote_min_support: 3 # source keyframe + 2 more observations before promotion
-Optimization.rendered_depth_candidate_prune_kf_age: 3
-Optimization.densify_cooldown_iters: 0  # skip prune/subdivide for voxels younger than this many iters
-Optimization.prune_min_kf_age: 0 #3 # skip prune for voxels that have been observed less than this many keyframes
-Optimization.final_special_prune_enable: 1
+Optimization.final_special_prune_enable: 0
 
 # Pruning
 Optimization.prune_until: 15000
@@ -157,12 +144,7 @@ Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
 Optimization.subdivide_samp_thres: 0.6 #0.7 #1.0
 Optimization.subdivide_prop: 0.2 #0.1 #0.05
-Optimization.subdivide_samp_thres_at_target: 0.6
-Optimization.subdivide_prop_at_target: 0.2
 Optimization.subdivide_max_num: 10000000
-Optimization.subdivide_artificial_requires_promotion: 0 # if 1, current artificial voxels cannot subdivide until they are promoted/real
-Optimization.subdivide_force_to_target_size: 0  # 0:false(default behavior), 1:force refine to target size
-Optimization.subdivide_target_vox_size: 0.05
 
 # Total variation loss of density grid
 Optimization.lambda_tv_density: 0 #1e-10

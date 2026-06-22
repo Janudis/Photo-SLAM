@@ -59,19 +59,15 @@ public:
         int   adapt_every_           = 1000,
         int   prune_every_           = 0,         // 0: fallback to adapt_every_
         int   subdivide_every_       = 0,         // 0: fallback to adapt_every_
-        int   densify_cooldown_iters_ = 0,      // skip prune/subdivide for very recent voxels
         bool  filter_near_voxels_ = true,
-        bool  filter_far_voxels_on_insert_ = true,
         bool  prune_far_voxels_ = true,
         bool  prune_near_voxels_geometric_ = false,
-        bool  prune_recompute_dense_core_ = true, // 1: recompute at prune time, 0: reuse latest cached bbox
         bool  prune_recent_unstable_ = false,
         int   prune_recent_keyframes_ = 3,      // GS-SLAM style: "inserted within last K keyframes"
         int   prune_recent_min_views_real_ = 0,
         int   prune_recent_min_views_artificial_ = 0,
         int   rendered_depth_candidate_promote_min_support_ = 3,
         int   rendered_depth_candidate_prune_kf_age_ = 3,
-        int   prune_min_kf_age_ = 0,            // prune only if current_kf - exist_since_kf >= this
         bool  final_special_prune_enable_ = true,
         // Pruning
         int   prune_until_           = 18000,
@@ -85,11 +81,7 @@ public:
         int   subdivide_all_until_   = 0,
         float subdivide_samp_thres_  = 1.0f,
         float subdivide_prop_        = 0.05f,        // top 5% by priority
-        float subdivide_samp_thres_at_target_ = 1.0f,
-        float subdivide_prop_at_target_ = 0.05f,
         int   subdivide_max_num_     = 10000000,   // hard cap
-        bool  subdivide_force_to_target_size_ = false,
-        float subdivide_target_vox_size_ = 0.05f,
         float lambda_dssim = 0.2f,
         bool  use_l1 = false,
         bool  use_huber = false,
@@ -156,19 +148,15 @@ public:
     int adapt_every_;
     int prune_every_;
     int subdivide_every_;
-    int densify_cooldown_iters_;
     bool filter_near_voxels_;
-    bool filter_far_voxels_on_insert_;
     bool prune_far_voxels_;
     bool prune_near_voxels_geometric_;
-    bool prune_recompute_dense_core_;
     bool prune_recent_unstable_;
     int prune_recent_keyframes_;
     int prune_recent_min_views_real_;
     int prune_recent_min_views_artificial_;
     int rendered_depth_candidate_promote_min_support_;
     int rendered_depth_candidate_prune_kf_age_;
-    int prune_min_kf_age_;
     bool final_special_prune_enable_;
     int prune_until_;
     float prune_thres_init_;
@@ -180,12 +168,7 @@ public:
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
-    float subdivide_samp_thres_at_target_;
-    float subdivide_prop_at_target_;
     int subdivide_max_num_;
-    bool subdivide_artificial_requires_promotion_ = false;
-    bool subdivide_force_to_target_size_;
-    float subdivide_target_vox_size_;
     float lambda_dssim_;
     bool use_l1_;
     bool use_huber_;

@@ -686,7 +686,7 @@ struct SparseTsdfVolume
 
 void VoxelMapper::saveRenderedTsdfMeshPly(const std::filesystem::path& result_path)
 {
-    switch (rendered_mesh_backend_)
+    switch (rerun_params_.rendered_mesh_backend_)
     {
     case 1:
         saveRenderedTsdfMeshPlySparseCpp(result_path);
@@ -759,10 +759,7 @@ void VoxelMapper::saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::p
         return;
     }
 
-    const float target_vox_size =
-        (opt_params_.subdivide_target_vox_size_ > 0.0f)
-            ? opt_params_.subdivide_target_vox_size_
-            : std::max(0.01f, voxel_model_->fixedVoxSize());
+    const float target_vox_size = std::max(0.01f, voxel_model_->fixedVoxSize());
     const int outside_level = py::hasattr(py_svm, "outside_level")
         ? py::cast<int>(py_svm.attr("outside_level"))
         : 0;
@@ -1150,12 +1147,12 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
     }
 
     const float voxel_length =
-        std::max(1.0e-6f, std::isfinite(rendered_mesh_eval_voxel_size_m_)
-                              ? rendered_mesh_eval_voxel_size_m_
+        std::max(1.0e-6f, std::isfinite(rerun_params_.rendered_mesh_eval_voxel_size_m_)
+                              ? rerun_params_.rendered_mesh_eval_voxel_size_m_
                               : kDefaultEvalVoxelLength);
     const float min_weight =
-        std::max(0.0f, std::isfinite(rendered_mesh_eval_min_weight_)
-                          ? rendered_mesh_eval_min_weight_
+        std::max(0.0f, std::isfinite(rerun_params_.rendered_mesh_eval_min_weight_)
+                          ? rerun_params_.rendered_mesh_eval_min_weight_
                           : 1.0e-4f);
     const Eigen::Vector3f margin = Eigen::Vector3f::Constant(3.0f * kDefaultEvalSdfTrunc);
     bb_min -= margin;

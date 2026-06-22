@@ -40,7 +40,6 @@
 #include "include_voxel/py_utils.h"
 #include "include_voxel/voxel_constants.h"
 #include "include_voxel/render_opts.h" 
-#include <rerun.hpp>
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
     this->Tensor_vec_geo_       = { this->_geo_grid_pts_ };       \
@@ -48,11 +47,11 @@
     this->Tensor_vec_shs_       = { this->shs_ };       \
 
 #define VOXEL_MODEL_INIT_TENSORS(device_type)                                              \
-    this->center_       = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
-    this->size_         = torch::empty({0},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->_geo_grid_pts_= torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->sh0_          = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->shs_          = torch::empty({0, 0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+    this->center_       = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
+    this->size_         = torch::empty({0},    torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     this->oct_path_     = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kLong   ).device(device_type)); \
     this->oct_level_    = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kInt8   ).device(device_type)); \
     this->subdiv_p_     = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
@@ -65,108 +64,16 @@ namespace sv {
 class VoxelModel 
 {
 public:
-    struct IncreasePcdStats {
-        int64_t raw_points_in = 0;
-        int64_t points_after_far_filter = 0;
-        int64_t unique_voxel_candidates_before_insert_filter = 0;
-        int64_t unique_voxel_candidates_after_insert_filter = 0;
-        int64_t duplicate_existing_voxels = 0;
-        int64_t new_voxels = 0;
-        int64_t pending_promotions = 0;
-        int64_t pending_support_updates = 0;
-    };
-    using GeoGridInitCallback =
-        std::function<torch::Tensor(const torch::Tensor& grid_points_world,
-                                    float ray_interval_m)>;
-
     VoxelModel(const int sh_degree);
     VoxelModel(const VoxelModelParams& model_params);
     ~VoxelModel();  
 
-    void oneUpShDegree();
-    void setShDegree(int sh);
-
-    torch::Tensor voxCenter() { return this->center_; }
-    int64_t numGridPts() const;
     const torch::Tensor& geoGridPts() const;
-    const torch::Tensor& svrasterSdfGridPts() const;
-    const torch::Tensor& svrasterSdfWeights() const;
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
-    torch::Tensor voxelDensityMean() const;
-    torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
-    torch::Tensor voxKey() const { return this->vox_key_; }
-    torch::Tensor gridPointsWorld() const;
-    bool hasSvrasterSdfField() const;
-    void ensureSvrasterSdfField();
-    void resetSvrasterSdfField();
-    void fuseSvrasterSdfGridSamples(
-        const torch::Tensor& tsdf_values,
-        const torch::Tensor& weights,
-        const torch::Tensor& valid_mask,
-        float max_weight = -1.0f);
-    void applyGeoGridRawInit(
-        const torch::Tensor& raw_values,
-        const torch::Tensor& valid_mask);
-    
-    torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
-    torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
-    torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
-    torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
-    torch::Tensor depthAnythingFillHolesVoxelMask() const { return this->is_depthanything_fill_holes_voxel_; } // [N] bool
-    torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
-    torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
-    torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
-    torch::Tensor geometricallyUnstableMask() const { return this->geometrically_unstable_voxel_; } // [N] bool
-    torch::Tensor renderedDepthCandidateMask() const { return this->rendered_depth_candidate_voxel_; } // [N] bool
-    torch::Tensor renderedDepthCandidateSupportCount() const { return this->rendered_depth_candidate_support_count_; } // [N] int32
-    torch::Tensor renderedDepthCandidateLastSeenKf() const { return this->rendered_depth_candidate_last_seen_kf_; } // [N] int32
-    torch::Tensor renderedDepthCandidateSourceKind() const { return this->rendered_depth_candidate_source_kind_; } // [N] int32
-    bool hasDenseCoreBB() const { return has_dense_core_bb_; }
-    torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
-    torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
-    bool refreshDenseCoreBBFromCurrentVoxels();
-    void logDenseCoreBBoxToRerun(
-        int iteration,
-        const std::string& entity_path = "world/dense_core/used_for_prune") const;
-    void setGeometricallyUnstableMask(const torch::Tensor& mask);
-    void setEnableArtificialPromotion(const bool enable) { enable_artificial_promotion_ = enable; }
-    bool enableArtificialPromotion() const { return enable_artificial_promotion_; }
-    void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
-    bool filterNearVoxels() const { return filter_near_voxels_; }
-    void setFilterFarVoxelsOnInsert(const bool enable) { filter_far_voxels_on_insert_ = enable; }
-    bool filterFarVoxelsOnInsert() const { return filter_far_voxels_on_insert_; }
-    void setRenderedDepthCandidateRealAdjacency(
-        const bool enable,
-        const int radius_cells = 1)
-    {
-        rendered_depth_candidate_require_real_adjacency_ = enable;
-        rendered_depth_candidate_adjacency_radius_cells_ = std::max(1, radius_cells);
-    }
-    bool renderedDepthCandidateRealAdjacency() const {
-        return rendered_depth_candidate_require_real_adjacency_;
-    }
-    int renderedDepthCandidateAdjacencyRadiusCells() const {
-        return rendered_depth_candidate_adjacency_radius_cells_;
-    }
-    void setGeoGridInitCallback(GeoGridInitCallback callback) {
-        geo_grid_init_callback_ = std::move(callback);
-    }
-    void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
-        pending_real_insert_rr_entity_path_ = entity_path;
-    }
-    void setNextRenderedDepthCandidateInsertion(const bool enable,
-                                                const std::string& entity_path = "",
-                                                const int source_kind = 1,
-                                                const bool insert_as_real_protected = false) {
-        pending_insert_rendered_depth_candidate_ = enable;
-        pending_artificial_insert_rr_entity_path_ = enable ? entity_path : "";
-        pending_insert_rendered_depth_candidate_source_kind_ =
-            enable ? std::max(1, source_kind) : 0;
-        pending_insert_rendered_depth_candidate_as_real_protected_ =
-            enable && insert_as_real_protected;
-    }
-    int64_t totalPromotedartificialCount() const { return total_promoted_artificial_voxels_; }
+
+    void oneUpShDegree();
+    void setShDegree(int sh);
 
     void createFromPcd(
         const std::map<point3D_id_t, Point3D>& pcd,
@@ -181,18 +88,27 @@ public:
         torch::Tensor& new_colors,
         const int iteration,
         const std::vector<sv::MiniCam>& cams);
-    IncreasePcdStats lastIncreasePcdStats() const { return last_increase_pcd_stats_; }
-    void setTopologyBirthContext(const int iteration, const int kf_count) {
-        topology_birth_iter_ = static_cast<int32_t>(iteration);
-        topology_birth_kf_ = static_cast<int32_t>(kf_count);
-    }
-    void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
-    void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveDepthAnythingFillHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logFinalartificialVoxels(const int iteration);
-    void logFinalPromotedartificialVoxels(const int iteration);
+
+    torch::Tensor voxCenter() { return this->center_; }
+    int64_t numGridPts() const;
+    torch::Tensor voxelDensityMean() const;
+    torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
+    torch::Tensor voxKey() const { return this->vox_key_; }
+    torch::Tensor gridPointsWorld() const;
+    // Read helpers (mirrors SVM tensors)
+    torch::Tensor subdivisionPriority() const; // [N,1]
+    torch::Tensor voxSize() const;             // [N,1]
+    torch::Tensor octLevel() const;            // [N,1] int8
+    torch::Tensor octPath() const;             // [N,1] int64
+    int           numVoxels() const;           // N
+    int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
+    torch::Tensor SceneCenter() const;  
+    torch::Tensor SceneExtent() const;
+    float         fixedVoxSize() const { return fixed_vox_size_; }
+    
+    // svraster SDF helpers
+    const torch::Tensor& svrasterSdfGridPts() const;
+    const torch::Tensor& svrasterSdfWeights() const;
 
     // ───────── Optimizer setup ─────────
     void setGeoLearningRate(float geo_lr);
@@ -216,7 +132,6 @@ public:
     void schedulerStep();
     void schedulerLoadStateDict(const py::object& state_dict);
     std::tuple<double,double,double> currentLearningRates() const;
-    void appendGroup_(int group_idx, const torch::Tensor& add_rows, const char* svm_field_name, torch::Tensor* out_member_param);
 
     // === Adaptive API (SVRaster style) ===
     struct StatPkg {
@@ -229,17 +144,6 @@ public:
     // Topology changes (mirrors python SparseVoxelModel)
     void pruning(const torch::Tensor& prune_mask);         // mask: [N] or [N,1] bool/byte
     void subdividing(const torch::Tensor& subdivide_mask); // mask: [N] or [N,1] bool/byte
-    // Read helpers (mirrors SVM tensors)
-    torch::Tensor subdivisionPriority() const; // [N,1]
-    torch::Tensor voxSize() const;             // [N,1]
-    torch::Tensor octLevel() const;            // [N,1] int8
-    torch::Tensor octPath() const;             // [N,1] int64
-    int           numVoxels() const;           // N
-    int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
-    torch::Tensor SceneCenter() const;  
-    torch::Tensor SceneExtent() const;
-    float         fixedVoxSize() const { return fixed_vox_size_; }
-    int           baseOctLevel() const { return static_cast<int>(octlevel_); }
     // Maintenance
     void resetSubdivisionPriority();
     void freezeVoxGeo();
@@ -249,12 +153,6 @@ public:
     void loadPly(const std::filesystem::path& ply_file);
     /// Save all voxel data to a PLY file with full attributes.
     void savePly(const std::filesystem::path& result_path);
-    /// Save a triangle surface mesh extracted from voxel occupancy (PLY with faces).
-    void saveSurfaceMeshPly(const std::filesystem::path& result_path);
-    /// Save only sparse voxels to PLY (not implemented here).
-    void saveSparsePointsPly(const std::filesystem::path& result_path);
-
-    void savePlannerNPZ(const std::filesystem::path& npz_path, int target_max_voxels = 1000000);
 
     std::unordered_map<std::string, torch::Tensor>
     // render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss = 1.0f, bool track_max_w = false) const;
@@ -271,57 +169,114 @@ public:
         bool rand_bg=false,
         bool use_auto_exposure=false,
         const sv::RenderOpts& other_opt = sv::RenderOpts()) const;
-
     void applyTvOnDensityField(float lambda_tv_density);
 
-    float paramL2(const char* name);
-    float gradL2(const char* name);
-    void    debugParamChain();
-    void    debugOptimizer();
-    torch::Tensor snapParam(const char* name);                       // <- return Tensor
-    double        deltaFrom(const char* name, const torch::Tensor& prev);
-    void debugAssertTopologyConsistent(const char* where) const;
-    void logParamSignature(const char* tag);
+    struct IncreasePcdStats {
+        int64_t raw_points_in = 0;
+        int64_t points_after_far_filter = 0;
+        int64_t unique_voxel_candidates_before_insert_filter = 0;
+        int64_t unique_voxel_candidates_after_insert_filter = 0;
+        int64_t duplicate_existing_voxels = 0;
+        int64_t new_voxels = 0;
+        int64_t pending_promotions = 0;
+        int64_t pending_support_updates = 0;
+    };
+    using GeoGridInitCallback =
+        std::function<torch::Tensor(const torch::Tensor& grid_points_world,
+                                    float ray_interval_m)>;
 
-    // Initialize once & spawn viewer
-    void rrInitOnce();
-    void rrLogPointsAndAABB(int iteration,                   // keep if you want for labels
-                            const at::Tensor& xyz,
-                            const at::Tensor& rgb,
-                            const at::Tensor& bounding_2x3,
-                            const std::string& tag,
-                            int64_t max_points_for_viz = 200000,
-                            bool log_points = true,
-                            bool log_box   = true,
-                            int64_t inc = -1); 
-    void rrLogVoxelBoxes(const at::Tensor& centers,
-                         const at::Tensor& sizes,
-                         int64_t max_boxes_for_viz = 100000000,
-                         const std::string& tag = "boxes",
-                         int64_t inc = -1);
-    void rrLogGlobalSceneAABB(int64_t inc);
-    void rrLogTrainingCamera(const sv::MiniCam& cam, int64_t inc);
-    void rrLogVoxelBoxesWithShColor(const at::Tensor& centers,
-                                    const at::Tensor& sizes,
-                                    const at::Tensor& sh0,
-                                    int64_t max_boxes_for_viz = 100000,
-                                    const std::string& tag = "boxes_sh_color",
-                                    int64_t inc = -1);
+    bool hasSvrasterSdfField() const;
+    void ensureSvrasterSdfField();
+    void resetSvrasterSdfField();
+    void fuseSvrasterSdfGridSamples(
+        const torch::Tensor& tsdf_values,
+        const torch::Tensor& weights,
+        const torch::Tensor& valid_mask,
+        float max_weight = -1.0f);
+    void applyGeoGridRawInit(
+        const torch::Tensor& raw_values,
+        const torch::Tensor& valid_mask);
+    torch::Tensor makeGeoGridInitRows_(
+        const torch::Tensor& grid_pts_key_new,
+        int64_t begin,
+        int64_t end,
+        float default_value);
+    
+    torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
+    torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
+    torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
+    torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
+    torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
+    torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
+    torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
+    torch::Tensor renderedDepthCandidateMask() const { return this->rendered_depth_candidate_voxel_; } // [N] bool
+    torch::Tensor renderedDepthCandidateSupportCount() const { return this->rendered_depth_candidate_support_count_; } // [N] int32
+    torch::Tensor renderedDepthCandidateLastSeenKf() const { return this->rendered_depth_candidate_last_seen_kf_; } // [N] int32
+    torch::Tensor renderedDepthCandidateSourceKind() const { return this->rendered_depth_candidate_source_kind_; } // [N] int32
+    
+    bool hasDenseCoreBB() const { return has_dense_core_bb_; }
+    torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
+    torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
+    bool refreshDenseCoreBBFromCurrentVoxels();
+    void logDenseCoreBBoxToRerun(
+        int iteration,
+        const std::string& entity_path = "world/dense_core/used_for_prune") const;
+    void setGeometricallyUnstableMask(const torch::Tensor& mask);
+    void setEnableArtificialPromotion(const bool enable) { enable_artificial_promotion_ = enable; }
+    void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
+    void setRenderedDepthCandidateRealAdjacency(
+        const bool enable,
+        const int radius_cells = 1)
+    {
+        rendered_depth_candidate_require_real_adjacency_ = enable;
+        rendered_depth_candidate_adjacency_radius_cells_ = std::max(1, radius_cells);
+    }
+    void setGeoGridInitCallback(GeoGridInitCallback callback) {
+        geo_grid_init_callback_ = std::move(callback);
+    }
+    void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
+        pending_real_insert_rr_entity_path_ = entity_path;
+    }
+    void setNextRenderedDepthCandidateInsertion(const bool enable,
+                                                const std::string& entity_path = "",
+                                                const int source_kind = 1,
+                                                const bool insert_as_real_protected = false) {
+        pending_insert_rendered_depth_candidate_ = enable;
+        pending_artificial_insert_rr_entity_path_ = enable ? entity_path : "";
+        pending_insert_rendered_depth_candidate_source_kind_ =
+            enable ? std::max(1, source_kind) : 0;
+        pending_insert_rendered_depth_candidate_as_real_protected_ =
+            enable && insert_as_real_protected;
+    }
+    int64_t totalPromotedartificialCount() const { return total_promoted_artificial_voxels_; }
 
-    void applyTsdfTransparency(const torch::Tensor& tsdf_mask, float geo_value);
-    void applySingleVoxelTsdfTransparency(int64_t voxel_idx, float geo_value);
+    IncreasePcdStats lastIncreasePcdStats() const { return last_increase_pcd_stats_; }
+    void setTopologyBirthContext(const int iteration, const int kf_count) {
+        topology_birth_iter_ = static_cast<int32_t>(iteration);
+        topology_birth_kf_ = static_cast<int32_t>(kf_count);
+    }
+    void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
+    void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logLiveDepthAnythingFillHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
+    void logFinalartificialVoxels(const int iteration);
+    void logFinalPromotedartificialVoxels(const int iteration);
+    
+    void savePlannerNPZ(const std::filesystem::path& npz_path, int target_max_voxels = 1000000);
 
 private:
-    std::unique_ptr<rerun::RecordingStream> rr_;
-    std::vector<rerun::Vec3D> rr_acc_mins_;
-    std::vector<rerun::Vec3D> rr_acc_sizes_;
-    std::vector<rerun::Rgba32> rr_acc_colors_;
-    std::vector<std::string>   rr_acc_labels_;
-    bool rr_initialized_ = false;
-    int64_t rr_inc_step_ = 0;  // unique per increasePcd() call
     IncreasePcdStats last_increase_pcd_stats_;
     int last_artificial_iter_ = -1;
+    
     torch::Tensor art_key_before_iter_; // [K] int64 artificial keys at start of current iter
+    void appendGroup_(int group_idx, const torch::Tensor& add_rows, const char* svm_field_name, torch::Tensor* out_member_param);
+    // Pull all core tensors from the Python SVM after any topology change.
+    void syncFromPython_();
+    // Helper math
+    static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
+    static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
+    static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy) 
 
 public:
     torch::DeviceType device_type_;
@@ -331,28 +286,24 @@ public:
     int max_sh_degree_;
 
     /// Main voxel tensors
-    torch::Tensor center_;             // [N, 3]
-    torch::Tensor size_;               // [N]
     torch::Tensor geo_;                // [N, 8] (covariance and pad)
     torch::Tensor sh0_;                // [N, 3]
     torch::Tensor shs_;                // [N, 45, 3]
+    torch::Tensor center_;             // [N, 3]
+    torch::Tensor size_;               // [N]
     torch::Tensor oct_path_;           // [N]
     torch::Tensor oct_level_;          // [N]
     torch::Tensor subdiv_p_;           // [N]
     torch::Tensor max_w_;              // [N]
     torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
     torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
-    torch::Tensor svraster_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each SVRaster grid-point
-    torch::Tensor svraster_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
-    torch::Tensor svraster_sdf_grid_pts_key_; // [M,3] int64 keys aligned with SDF buffers
     torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
     torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
     torch::Tensor frozen_vox_geo_;
     
-    float ss_ = 1.5f;
-    bool  white_background_ = false;
-    bool  black_background_ = false;
-    int   n_samp_per_vox_ = 3;
+    torch::Tensor svraster_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each SVRaster grid-point
+    torch::Tensor svraster_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
+    torch::Tensor svraster_sdf_grid_pts_key_; // [M,3] int64 keys aligned with SDF buffers
 
     std::vector<torch::Tensor>  Tensor_vec_geo_,
                                 Tensor_vec_sh0_,
@@ -388,12 +339,6 @@ public:
     torch::Tensor inactive_geo_centers_accum_viz_; // [K,3] accumulated real voxels created by inactive geo densify
     torch::Tensor inactive_geo_sizes_accum_viz_;   // [K,1] accumulated sizes for inactive geo densify voxels
     torch::Tensor inactive_geo_rgba_accum_viz_;    // [K,4] accumulated colors for inactive geo densify voxels
-    torch::Tensor orb_created_centers_accum_viz_; // [K,3] accumulated real voxels created from ORB map points
-    torch::Tensor orb_created_sizes_accum_viz_;   // [K,1]
-    torch::Tensor orb_created_rgba_accum_viz_;    // [K,4]
-    torch::Tensor depthanything_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything densify
-    torch::Tensor depthanything_created_sizes_accum_viz_;   // [K,1]
-    torch::Tensor depthanything_created_rgba_accum_viz_;    // [K,4]
     torch::Tensor depthanything_fill_holes_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything hole fill
     torch::Tensor depthanything_fill_holes_created_sizes_accum_viz_;   // [K,1]
     torch::Tensor depthanything_fill_holes_created_rgba_accum_viz_;    // [K,4]
@@ -417,9 +362,6 @@ public:
     // This is kept after promotion so live debug views can trace current voxels
     // back to their insertion path (depth-insert vs hole-fill).
     torch::Tensor rendered_depth_candidate_source_kind_;
-    int64_t max_artificial_viz_accum_ = 300000;  // cap to keep rerun responsive
-    int64_t max_inactive_geo_viz_accum_ = 300000;  // cap to keep rerun responsive
-    int64_t max_rendered_depth_viz_accum_ = 300000;  // cap to keep rerun responsive
     py::object svm() const;
 
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
@@ -433,7 +375,6 @@ public:
     bool fill_empty_cells_warmup_notified_ = false;
     bool enable_artificial_promotion_ = true;
     bool filter_near_voxels_ = true;
-    bool filter_far_voxels_on_insert_ = true;
     bool rendered_depth_candidate_require_real_adjacency_ = true;
     int rendered_depth_candidate_adjacency_radius_cells_ = 1;
     std::string pending_real_insert_rr_entity_path_;
@@ -453,26 +394,18 @@ public:
     bool artificial_fill_happened_ = false;  // default false
 
 protected:
+    float ss_ = 1.5f;
+    bool  white_background_ = false;
+    bool  black_background_ = false;
+    int   n_samp_per_vox_ = 3;
     /// The Adam optimizer
     // std::shared_ptr<torch::optim::Adam> optimizer_;
     // py::object optimizer_py_;
     struct PyState;                // forward declaration only
     std::unique_ptr<PyState> py_;  // holds all pybind objects
-    // Pull all core tensors from the Python SVM after any topology change.
-    void syncFromPython_();
-    torch::Tensor makeGeoGridInitRows_(
-        const torch::Tensor& grid_pts_key_new,
-        int64_t begin,
-        int64_t end,
-        float default_value);
-    // Helper math
-    static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
-    static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
-    static float         camPixSize_(const MiniCam& cam); // max(1/fx, 1/fy)
-    // Cache MAX_NUM_LEVELS
-    const int max_num_levels_ = 16; // safe default; overwritten at init
-
     std::mutex mutex_settings_;
+    // Cache MAX_NUM_LEVELS
+    const int max_num_levels_ = 16; // safe default; overwritten at init  
 };
 
 } // namespace sv

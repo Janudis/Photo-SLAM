@@ -272,11 +272,18 @@ add_library(voxel_core
         src/stereo_vision.cu
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
+        src_voxel/voxel_mapper_tsdf.cpp
+        src_voxel/voxel_mapper_rerun.cpp
+        src_voxel/voxel_mapper_mono_prior.cpp
+        src_voxel/voxel_mapper_planner.cpp
+        src_voxel/voxel_mapper_utils.cpp
+        src_voxel/voxel_mapper_evaluation.cpp
         evaluation/mesh_extraction.cpp
         src_voxel/voxel_parameters.cpp
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
+        src_voxel/voxel_model_rerun.cpp
         src_voxel/rerun_utils.cpp
         ${NVBLOX_SRC_DIR}/src/io/mesh_io.cpp
         third_party/tinyply/tinyply.h

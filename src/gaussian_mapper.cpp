@@ -15,8 +15,8 @@
  * You should have received a copy of the GNU General Public License along with Photo-SLAM.
  * If not, see <http://www.gnu.org/licenses/>.
  */
-
- #include "include/gaussian_mapper.h"
+ 
+#include "include/gaussian_mapper.h"
 
 #include <cmath>
 #include <iomanip>

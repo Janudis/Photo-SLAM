@@ -28,18 +28,27 @@ Mapper.rgbd_fill_render_holes: 1 # RGB-D only: use real depth to fill pixels whe
 Mapper.rgbd_fill_render_holes_stride: 2
 Mapper.rgbd_fill_render_holes_max_points_per_kf: 20000 # 0 disables cap
 
-Mapper.depthanything_densify: 0
+#da_prior
 Mapper.depthanything_fill_holes: 0
 Mapper.depthanything_densify_stride: 2
 Mapper.depthanything_densify_min_sparse_anchors: 50
 Mapper.depthanything_densify_alignment_mode: "orb" # orb/rendered/da_prior; da_prior uses PriorDA-style local KNN scale-shift alignment
-#da_prior
 Mapper.depthanything_da_prior_knn_k: 5
 Mapper.depthanything_da_prior_distance_weighting: 1
 Mapper.depthanything_da_prior_max_pixel_dist: 0.0 # 0 disables a max-distance cutoff for KNN anchors
 Mapper.depthanything_fill_holes_initial_backfill: 1 # after initial ORB map creation, fill holes for the initial keyframes too
 Mapper.depthanything_fill_holes_warmup: 0 # 1 delays gap filling until warmup_iter; 0 uses the previous immediate behavior
+
+#flood fill hole filling parameters
 Mapper.depthanything_fill_holes_warmup_iter: 200 # delay gap filling so ORB has accumulated more map points before each KF is densified
+Mapper.fill_empty_cells: 0 # one-shot artificial dense-core fill;
+Mapper.rendered_depth_insert: 0
+Mapper.rendered_depth_insert_stride: 4
+Mapper.rendered_depth_insert_frontier_radius_px: 1
+Mapper.rendered_depth_insert_max_points_per_kf: 3000
+Mapper.rendered_depth_insert_normal_offset_vox: 0.5
+Mapper.rendered_depth_insert_require_real_adjacency: 1
+Mapper.rendered_depth_insert_adjacency_radius_cells: 1
 
 Mapper.min_num_initial_map_kfs:        20
 Mapper.new_keyframe_times_of_use:    8 #8 for replica #2 for tum
@@ -61,14 +70,8 @@ Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.enable_rerun: 1  # 0:disable all rerun logging/saving, 1:enable
-Record.rerun_final_only: 0 # 0:log rerun during run, 1:log only final voxel sets at shutdown
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
-Record.rerun_voxels_stride: 1 # log live voxel boxes every N iterations
-Record.rerun_voxels_max_instances: 60000 # 0:log every live voxel; >0:downsample to this many boxes before logging
-Record.rerun_density_debug_only: 0 # 1:reduced Rerun logging; skip heavy auxiliary topics
-Record.rerun_log_aux_topics: 1 # log densification/pruning source topics
-Record.rerun_rendered_depth_insert: 0
 Record.save_nvblox_mesh_eval: 0 # RGB-D only: run nvblox and save one final reference mesh at shutdown
 Record.load_saved_nvblox_mesh: 1 # RGB-D only: load an existing reference mesh instead of running nvblox
 Record.saved_nvblox_mesh_path: "/home/dimitris/Photo-SLAM/results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply"
@@ -80,8 +83,6 @@ Record.rerun_rendered_mesh_eval: 1 # log final voxel_surface_mesh.ply to world/v
 Record.rendered_mesh_backend: 1 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
 Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
-Record.record_depth_metrics: 0 # 0:false, 1:compute Depth L1 / F1 from rendered depth vs GT depth
-Record.depth_f1_threshold_m: 0.01 # 1 cm
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
@@ -117,19 +118,15 @@ Optimization.subdivide_every: 400
 # Optimization.subdivide_every: 650
 
 # Pruning heuristics
-Optimization.densify_cooldown_iters: 0  # skip prune/subdivide for voxels younger than this many iters
-Optimization.filter_near_voxels: 1 # 0:false, 1:true, only for fill_empty_cells_ camera filtering
-Optimization.filter_far_voxels_on_insert: 0 # 0:false, 1:true
+Optimization.filter_near_voxels: 1 # 0:false, 1:true, insertion-time mark_near filtering
 Optimization.prune_far_voxels: 1 # 0:false, 1:true
 Optimization.prune_near_voxels_geometric: 1 # 0:false, 1:true, prune-time near-to-camera geometry (also behind camera)
-Optimization.prune_recompute_dense_core: 1 # 0:reuse latest cached dense-core bbox, 1:recompute at each prune
 Optimization.prune_recent_unstable: 0
 Optimization.prune_recent_keyframes: 3
 Optimization.prune_recent_min_views_real: 3
 Optimization.prune_recent_min_views_artificial: 3
 Optimization.rendered_depth_candidate_promote_min_support: 3 # source keyframe + 2 more observations before promotion
 Optimization.rendered_depth_candidate_prune_kf_age: 3
-Optimization.prune_min_kf_age: 0 #3
 Optimization.final_special_prune_enable: 1
 
 # Pruning
@@ -145,12 +142,7 @@ Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
 Optimization.subdivide_samp_thres: 0.5 #0.7 #1.0
 Optimization.subdivide_prop: 0.2 #0.1 #0.05
-Optimization.subdivide_samp_thres_at_target: 0.5
-Optimization.subdivide_prop_at_target: 0.2
 Optimization.subdivide_max_num: 10000000
-Optimization.subdivide_artificial_requires_promotion: 0 # if 1, current artificial voxels cannot subdivide until they are promoted/real
-Optimization.subdivide_force_to_target_size: 0  # 0:false(default behavior), 1:force refine to target size
-Optimization.subdivide_target_vox_size: 0.05
 
 # Total variation loss of density grid
 Optimization.lambda_tv_density: 0 #1e-10

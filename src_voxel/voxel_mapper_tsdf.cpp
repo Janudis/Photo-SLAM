@@ -1125,10 +1125,6 @@ VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld(
     torch::Tensor idx = vox_key.to(dev).to(torch::kLong).reshape({-1}); // [N*8]
     TORCH_CHECK(idx.numel() == N * 8, "vox_key reshape mismatch");
 
-    // // Defensive bounds check (optional; can be expensive, use only while debugging)
-    // TORCH_CHECK((idx >= 0).all().item<bool>() && (idx < M).all().item<bool>(),
-    //             "vox_key contains out-of-range indices (must be in [0, M))");
-
     torch::Tensor tsdf8 = g.tsdf.index_select(0, idx).view({N, 8}).contiguous();
     torch::Tensor w8    = g.weight.index_select(0, idx).view({N, 8}).contiguous();
     torch::Tensor ok8   = g.success.index_select(0, idx).view({N, 8}).contiguous();

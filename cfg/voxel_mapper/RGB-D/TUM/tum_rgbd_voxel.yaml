@@ -18,7 +18,7 @@ Monocular.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.use_tsdf_mapping: 1 # 1: integrate RGB-D frames into the configured TSDF backend
+Mapper.use_tsdf_mapping: 0 # 1: integrate RGB-D frames into the configured TSDF backend
 Mapper.use_tsdf_pruning: 1 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
 Mapper.use_tsdf_planning: 0 # 0: do not run ESDF path planning at shutdown
 Mapper.tsdf_backend: svraster # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
@@ -39,10 +39,10 @@ Mapper.tsdf_density_init_bell_b: 0.5 # bell opacity at |F| = bell_a before alpha
 Mapper.tsdf_density_init_alpha_min: 0.0002
 Mapper.tsdf_density_init_alpha_max: 0.5
 
+Mapper.fill_empty_cells: 0 # one-shot artificial dense-core fill; separate from rendered_depth_insert
 Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
 Mapper.rgbd_inactive_geo_initial_backfill: 1 # run inactive-geo densify once for initial RGB-D keyframes after createFromPcd
 Mapper.depth_cache: 10
-Mapper.fill_empty_cells: 0 # one-shot artificial dense-core fill; separate from rendered_depth_insert
 Mapper.rgbd_fill_render_holes: 1 # RGB-D only: use real depth to fill pixels where current voxel render has holes
 Mapper.rgbd_fill_render_holes_stride: 2
 Mapper.rgbd_fill_render_holes_max_points_per_kf: 0 # 0 disables cap
@@ -100,8 +100,8 @@ Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight th
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups (match train.py)
 Optimization.geo_lr: 0.1 #0.1 #0.025 # very important, 4x better than 8x
-Optimization.sh0_lr: 0.1 #0.04 #0.01 # very important
-Optimization.shs_lr: 0.001 #0.001 #0.00025 #important
+Optimization.sh0_lr: 0.04 #0.04 #0.01 # very important
+Optimization.shs_lr: 0.00025 #0.001 #0.00025 #important
 
 # Optimizer hyper-params (match svraster cfg.optimizer)
 Optimization.optim_beta1: 0.1
@@ -116,13 +116,13 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 800
-Optimization.adapt_every: 800
-Optimization.prune_every: 800
-Optimization.subdivide_every: 800
+Optimization.adapt_from: 900
+Optimization.adapt_every: 900
+Optimization.prune_every: 900
+Optimization.subdivide_every: 900
 
 # Pruning heuristics
-Optimization.filter_near_voxels: 0 # 0:false, 1:true, insertion-time mark_near filtering
+Optimization.filter_near_voxels: 1 # 0:false, 1:true, insertion-time mark_near filtering
 Optimization.prune_far_voxels: 1 # 0:false, 1:true
 Optimization.prune_near_voxels_geometric: 1 # 0:false, 1:true, prune-time near-to-camera geometry (also behind camera)
 Optimization.prune_recent_unstable: 1

@@ -2919,9 +2919,9 @@ int main(int argc, char** argv)
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4890_shutdown/ply/voxel_model/iteration_4890/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/6801_shutdown/ply/voxel_model/iteration_6801/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/4890_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/6801_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \

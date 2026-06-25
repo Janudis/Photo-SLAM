@@ -1027,9 +1027,7 @@ void VoxelMapper::run()
             {
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
                 voxel_model_->createFromPcd(scene_->cached_point_cloud_, tr_cams);
-                if (sensor_type_ == RGBD &&
-                    sdf_params_.use_tsdf_mapping_ &&
-                    useSvrasterTsdfBackend()) {
+                if (sensor_type_ == RGBD && sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
                     for (const auto& kv : scene_->keyframes()) {
                         if (!kv.second) {
                             continue;
@@ -1381,10 +1379,6 @@ void VoxelMapper::run()
             std::cout << "[NVBLOX] final mesh skipped: nvblox mapper was not initialized.\n";
         }
     }
-    if (sdf_params_.use_tsdf_planning_) {
-        voxel_model_->savePlannerNPZ(
-            result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "planner.npz");
-    }
     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
 
     saveRerunRecordingsAtShutdown();
@@ -1706,9 +1700,6 @@ void VoxelMapper::trainForOneIteration()
     bool debug_has_tsdf_occupied_corners = false;
     bool debug_has_tsdf_surface_corners = false;
     bool debug_has_tsdf_unknown_corners = false;
-    torch::Tensor debug_pruned_centers; // [K_prune,3]
-    torch::Tensor debug_pruned_sizes;   // [K_prune,1] or [K_prune]
-    bool debug_has_pruned = false;
     torch::Tensor debug_far_pruned_centers; // [K_far,3]
     torch::Tensor debug_far_pruned_sizes;   // [K_far,1] or [K_far]
     bool debug_has_far_pruned = false;
@@ -1950,13 +1941,12 @@ void VoxelMapper::trainForOneIteration()
                         ? (int)prune_mask_base.sum().item<int64_t>()
                         : -1;
 
-                // NEW: declare tsdf_prune_mask here, default undefined
                 torch::Tensor tsdf_prune_mask;
                 torch::Tensor tsdf_debug_corner_points_all;
                 torch::Tensor tsdf_debug_values_all;
                 torch::Tensor tsdf_debug_weights_all;
                 torch::Tensor tsdf_surface_protect_mask;
-                // 2) Optional TSDF/SDF pruning: prune voxels classified as strong free-space.
+                // 2) Optional TSDF/SDF pruning.
                 if (sensor_type_ == RGBD && sdf_params_.use_tsdf_pruning_) {
                     if (N > 0 && hasTsdfForSampling()) {
                         try {
@@ -1970,8 +1960,7 @@ void VoxelMapper::trainForOneIteration()
                                 sizes_world.defined() &&
                                 sizes_world.size(0) == N)
                             {
-                                // Sample TSDF at 8 corners per voxel
-                                // TsdfCornerSample c = sampleTsdfAtVoxelCornersWorld(centers_world, sizes_world);
+                                // Gather TSDF at the 8 SVRaster grid corners per voxel.
                                 TsdfCornerSample c = sampleTsdfAtSvrasterGridCornersWorld();
                                 torch::Tensor tsdf8   = c.tsdf;    // [N,8]
                                 torch::Tensor w8      = c.weight;  // [N,8]
@@ -2021,23 +2010,6 @@ void VoxelMapper::trainForOneIteration()
                                 torch::Tensor far_from_surface =
                                     (min_abs_tsdf > tau_surface).to(torch::kBool); // [N]
 
-                                torch::Tensor sizes_for_tsdf = sizes_world;
-                                if (sizes_for_tsdf.dim() == 2 && sizes_for_tsdf.size(1) == 1) {
-                                    sizes_for_tsdf = sizes_for_tsdf.squeeze(1);
-                                } else if (sizes_for_tsdf.dim() != 1) {
-                                    sizes_for_tsdf = sizes_for_tsdf.reshape({N});
-                                }
-                                sizes_for_tsdf = sizes_for_tsdf
-                                    .to(prune_mask.device())
-                                    .to(torch::kFloat32)
-                                    .contiguous();
-                                torch::Tensor half_voxel_diag =
-                                    (0.5f * std::sqrt(3.0f)) * sizes_for_tsdf; // [N]
-                                torch::Tensor conservative_free_thresh =
-                                    torch::full_like(half_voxel_diag, tau_surface) + half_voxel_diag;
-                                torch::Tensor strong_far_from_surface =
-                                    (min_abs_tsdf > conservative_free_thresh).to(torch::kBool); // [N]
-
                                 torch::Tensor all_positive =
                                     (voxel_valid & has_pos & (~has_neg)).to(torch::kBool);
                                 torch::Tensor all_negative =
@@ -2045,19 +2017,17 @@ void VoxelMapper::trainForOneIteration()
                                 torch::Tensor tsdf_unknown_mask =
                                     (~voxel_valid).to(torch::kBool);
                                 torch::Tensor tsdf_free_mask =
-                                    (all_positive & strong_far_from_surface).to(torch::kBool);
+                                    (all_positive & far_from_surface).to(torch::kBool);
                                 torch::Tensor tsdf_occupied_mask =
-                                    (all_negative & strong_far_from_surface).to(torch::kBool);
+                                    (all_negative & far_from_surface).to(torch::kBool);
                                 torch::Tensor tsdf_surface_mask =
-                                    (voxel_valid & (has_surface | (~strong_far_from_surface)))
+                                    (voxel_valid & (has_surface | (~far_from_surface)))
                                         .to(torch::kBool);
                                 tsdf_surface_protect_mask =
                                     tsdf_surface_mask.to(prune_mask.device()).to(torch::kBool).contiguous();
 
-                                // Conservative external-TSDF pruning:
-                                // prune only strong positive/free-space voxels. Negative-side voxels
-                                // are kept for now because nvblox sign alone is not enough to prove
-                                // they are useless scene geometry.
+                                // Prune only positive/free-space voxels. Negative-side voxels
+                                // are kept because the sign alone does not prove they are useless.
                                 tsdf_prune_mask =
                                     tsdf_free_mask.to(torch::kBool); // [N]
 
@@ -2069,9 +2039,7 @@ void VoxelMapper::trainForOneIteration()
                                     tsdf_prune_mask,
                                     "regular_prune");
 
-                                // Union + overlap statistics
                                 auto prune_mask_union = prune_mask | tsdf_prune_mask;      // [N]
-                                // Verbose TSDF union statistics disabled.
 
                                 // 2) Cache TSDF class samples only when the Rerun debug recording needs them.
                                 if (rerun_params_.enable_rerun_ &&
@@ -2239,12 +2207,8 @@ void VoxelMapper::trainForOneIteration()
 
                                 // Use union as final prune mask
                                 prune_mask = prune_mask_union;
-                            } else {
-                                // Verbose TSDF corner prune diagnostics disabled.
                             }
-                        } catch (const std::exception&) {
-                            // Verbose TSDF corner prune diagnostics disabled.
-                        }
+                        } catch (const std::exception&) {}
                     }
                 }
 
@@ -3172,7 +3136,6 @@ void VoxelMapper::trainForOneIteration()
                     }
                 }
 
-                // Save final pruned voxels (all criteria merged) for rerun visualization.
                 if (prune_mask.defined() && prune_mask.numel() == N) {
                     auto prune_idx = prune_mask.to(torch::kBool).nonzero().squeeze(1); // [K]
                     if (prune_idx.numel() > 0) {
@@ -3182,13 +3145,12 @@ void VoxelMapper::trainForOneIteration()
                             centers_world.dim() == 2 &&
                             centers_world.size(0) == N &&
                             centers_world.size(1) == 3 &&
-                            sizes_world.defined() &&
-                            sizes_world.size(0) == N)
-                        {
-                            debug_pruned_centers = centers_world.index({prune_idx}).clone();
-                            debug_pruned_sizes   = sizes_world.index({prune_idx}).clone();
-                            debug_has_pruned     = true;
-                            torch::Tensor whole_run_pruned_by_tsdf;
+	                            sizes_world.defined() &&
+	                            sizes_world.size(0) == N)
+	                        {
+	                            torch::Tensor pruned_centers = centers_world.index({prune_idx}).clone();
+	                            torch::Tensor pruned_sizes = sizes_world.index({prune_idx}).clone();
+	                            torch::Tensor whole_run_pruned_by_tsdf;
                             if (tsdf_prune_mask.defined() &&
                                 tsdf_prune_mask.numel() == N) {
                                 whole_run_pruned_by_tsdf =
@@ -3221,13 +3183,13 @@ void VoxelMapper::trainForOneIteration()
                                         .index_select(0, prune_idx.to(torch::kLong))
                                         .contiguous();
                             }
-                            appendWholeRunPrunedVoxels(
-                                iter,
-                                debug_pruned_centers,
-                                debug_pruned_sizes,
-                                whole_run_pruned_by_tsdf,
-                                whole_run_pruned_by_near,
-                                whole_run_pruned_by_recent_unstable);
+	                            appendWholeRunPrunedVoxels(
+	                                iter,
+	                                pruned_centers,
+	                                pruned_sizes,
+	                                whole_run_pruned_by_tsdf,
+	                                whole_run_pruned_by_near,
+	                                whole_run_pruned_by_recent_unstable);
 
                             // Save far-only pruned voxels for a dedicated rerun topic.
                             debug_has_far_pruned = false;
@@ -3243,18 +3205,15 @@ void VoxelMapper::trainForOneIteration()
                                     debug_has_far_pruned     = true;
                                 }
                             }
-                        } else {
-                            debug_has_pruned = false;
-                            debug_has_far_pruned = false;
-                        }
-                    } else {
-                        debug_has_pruned = false;
-                        debug_has_far_pruned = false;
-                    }
-                } else {
-                    debug_has_pruned = false;
-                    debug_has_far_pruned = false;
-                }
+	                        } else {
+	                            debug_has_far_pruned = false;
+	                        }
+	                    } else {
+	                        debug_has_far_pruned = false;
+	                    }
+	                } else {
+	                    debug_has_far_pruned = false;
+	                }
 
                 voxel_model_->pruning(prune_mask);
                 if (rerun_params_.rerun_tsdf_unknown_voxels_) {
@@ -3277,6 +3236,10 @@ void VoxelMapper::trainForOneIteration()
                     stat = voxel_model_->computeTrainingStat(tr_cams);
                 }
             };
+
+            if (need_pruning) {
+                run_pruning();
+            }
 
             // ---------------- SUBDIVIDE ----------------
             if (need_subdividing) {
@@ -3548,9 +3511,6 @@ void VoxelMapper::trainForOneIteration()
                               << "\n";
                 }
             }
-            if (need_pruning) {
-                run_pruning();
-            }
             // Keep SVRaster behavior: clear accumulated subdivision priority
             // after each adapt round that enters the subdivision branch.
             if (need_subdividing) {
@@ -3679,12 +3639,6 @@ void VoxelMapper::trainForOneIteration()
                 }
             }
         }
-        // Log full voxel field sparsely to keep Rerun memory bounded on long runs.
-        // if ((iter % 20) == 0) {
-        //     sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-        //         centers_all, sizes_all, colors_all, iter
-        //     );
-        // }
         sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
             centers_all, sizes_all, colors_all, iter
         );
@@ -3729,9 +3683,6 @@ void VoxelMapper::trainForOneIteration()
                     colors_all.dim() == 2 && colors_all.size(0) == centers_all.size(0)) {
                     colors_real = colors_all.index_select(0, real_idx).contiguous();
                 }
-                // sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                //     centers_real, sizes_real, colors_real, iter, "world/voxels_real"
-                // );
             }
         }
         // Keep artificials/all synchronized with final topology state of this iteration.
@@ -3939,37 +3890,6 @@ void VoxelMapper::trainForOneIteration()
             "world/tsdf_samples/unknown_corners",
             "TSDF unknown");
 
-        // ----- 4) FINAL-PRUNED VOXELS (debug overlay) -----
-        if (debug_has_pruned &&
-            debug_pruned_centers.defined() &&
-            debug_pruned_centers.numel() > 0)
-        {
-            auto centers_pruned = debug_pruned_centers; // [K_prune,3]
-            auto sizes_pruned   = debug_pruned_sizes;   // [K_prune,1] or [K_prune]
-
-        if (sizes_pruned.dim() == 1) {
-            sizes_pruned = sizes_pruned.view({sizes_pruned.size(0), 1});
-        } else if (sizes_pruned.dim() == 2 && sizes_pruned.size(1) == 1) {
-            // ok
-        } else {
-            sizes_pruned = sizes_pruned.reshape({sizes_pruned.size(0), 1});
-        }
-
-        auto Kp = centers_pruned.size(0);
-        torch::Tensor colors_pruned = torch::zeros({Kp, 4}, centers_pruned.options());
-        colors_pruned.index_put_({torch::indexing::Slice(), 0}, 1.0f);  // R
-        colors_pruned.index_put_({torch::indexing::Slice(), 1}, 1.0f);  // G (yellow)
-        colors_pruned.index_put_({torch::indexing::Slice(), 3}, 0.8f);  // alpha
-
-        // sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-        //     centers_pruned,
-        //     sizes_pruned,
-        //     colors_pruned,
-        //     iter,
-        //     "world/voxels_pruned"   // separate entity path
-        // );
-        }
-
         // ----- 6) FAR-ONLY PRUNED VOXELS (debug overlay) -----
         if (debug_has_far_pruned &&
             debug_far_pruned_centers.defined() &&
@@ -4089,20 +4009,14 @@ void VoxelMapper::combineMappingOperations()
             auto& points = std::get<0>(associated_points);
             auto& colors = std::get<1>(associated_points);
 
-            // Add new points to the model
             const int iter = getIteration();
             if (initial_mapped_ && points.size() >= 30) {
                 torch::NoGradGuard no_grad;
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
-            //  voxel_model_->increasePcd(points, colors, getIteration(), kfs_for_bounding);
-                // py::object sched_state = voxel_model_->schedulerStateDict();
 
-                // Build training camera list from the keyframes we keep in the scene
                 std::vector<sv::MiniCam> tr_cams;
                 tr_cams.reserve(scene_->keyframes().size());
                 for (auto& kv : scene_->keyframes()) {
-                    // OLD:
-                    // if (kv.second) tr_cams.push_back(kv.second->toMiniCam());
                     if (kv.second) {
                         tr_cams.push_back(
                             kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
@@ -4140,16 +4054,6 @@ void VoxelMapper::combineMappingOperations()
                                 << iter << "\n";
                     }
                 }
-                // voxel_model_->createTrainer(
-                //                             opt_params_.geo_lr_,
-                //                             opt_params_.sh0_lr_,
-                //                             opt_params_.shs_lr_,
-                //                             opt_params_.optim_beta1_,
-                //                             opt_params_.optim_beta2_,
-                //                             opt_params_.optim_eps_,
-                //                             opt_params_.lr_decay_ckpt_,
-                //                             opt_params_.lr_decay_mult_);
-                // voxel_model_->schedulerLoadStateDict(sched_state);
             }
 
         }
@@ -4214,29 +4118,15 @@ void VoxelMapper::combineMappingOperations()
                              torch::Tensor diff_pose_tensor =
                                  tensor_utils::EigenMatrix2TorchTensor(
                                      diff_pose.matrix(), device_type_).transpose(0, 1);
-                            //  {
-                            //      std::unique_lock<std::mutex> lock_render(mutex_render_);
-                            //      voxel_model_->scaledTransformVisiblePointsOfKeyframe(
-                            //          point_not_transformed_flags,
-                            //          diff_pose_tensor,
-                            //          pkf->world_view_transform_,
-                            //          pkf->full_proj_transform_,
-                            //          pkf->creation_iter_,
-                            //          stableNumIterExistence(),
-                            //          num_transformed,
-                            //          loop_kf_scale); // selected xyz *= s
-                            //  }
-                             // Give loop keyframes times of use
-                             increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
-                         }
+	                             // Give loop keyframes times of use
+	                             increaseKeyframeTimesOfUse(pkf, loop_closure_increased_times_of_use_);
+	                         }
                      pkf->setPose(
                          pose.unit_quaternion().cast<double>(),
                          pose.translation().cast<double>());
-                    //  pkf->computeTransformTensors();
- // if (std::get<4>(kf)) renderAndRecordKeyframe(pkf, result_dir_, "_2_after_pose_correction");
 
-                    kf_changed = true;
-                 }
+	                    kf_changed = true;
+	                 }
                  else {
                      handleNewKeyframe(kf);
                      pkf = scene_->getKeyframe(kfid);
@@ -4244,9 +4134,7 @@ void VoxelMapper::combineMappingOperations()
              }
              if (record_loop_ply_)
                  savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
- // keyframesToJson(result_dir_ / (std::to_string(getIteration()) + "_0_before_loop_correction"));
- 
-             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
+	             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
              auto& associated_points = opr.associatedMapPoints();
              auto& points = std::get<0>(associated_points);
              auto& colors = std::get<1>(associated_points);
@@ -4317,11 +4205,8 @@ void VoxelMapper::combineMappingOperations()
                  // Apply the scaled transformation on gaussian model points
                  {
                      std::unique_lock<std::mutex> lock_render(mutex_render_);
-                    //  voxel_model_->applyScaledTransformation(s, T);
-                 }
-                 // Apply the scaled transformation to the scene
-                //  scene_->applyScaledTransformation(s, T);
-             }
+	                 }
+	             }
              else { // TODO: the workflow should not come here, delete this branch
                  // Apply the scaled transformation to the cached points
                  for (auto& pt : scene_->cached_point_cloud_) {
@@ -5465,7 +5350,7 @@ void VoxelMapper::writeKeyframeUsedTimes(std::filesystem::path result_dir, std::
     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir)
     std::filesystem::path result_path = result_dir / ("keyframe_used_times" + name_suffix + ".txt");
     std::ofstream out_stream;
-    out_stream.open(result_path, std::ios::app);
+    out_stream.open(result_path, std::ios::out | std::ios::trunc);
     if (!out_stream.is_open())
         throw std::runtime_error("Cannot open json at " + result_path.string());
 

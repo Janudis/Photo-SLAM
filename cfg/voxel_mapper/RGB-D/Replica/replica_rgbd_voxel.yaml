@@ -12,13 +12,12 @@ Model.eval: 0  # 0:false, 1 or other integer:true
 ##############################################################################
 # Replica RGB-D voxel mapper parameters
 ##############################################################################
-
 Camera.z_near: 0.01
 Monocular.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.use_tsdf_mapping: 0 # 1: integrate RGB-D frames into the configured TSDF backend
+Mapper.use_tsdf_mapping: 1 # 1: integrate RGB-D frames into the configured TSDF backend
 Mapper.use_tsdf_pruning: 1 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
 Mapper.use_tsdf_planning: 0 # 0: do not run ESDF path planning at shutdown
 Mapper.tsdf_backend: svraster # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
@@ -27,7 +26,7 @@ Mapper.svraster_tsdf_refit_on_topology_change: 0 # 1: replay registered RGB-D KF
 Mapper.tsdf_protect_surface_band_from_pruning: 0 # 1: prevent non-SDF pruning from deleting estimated TSDF surface-band voxels
 Mapper.tsdf_prune_min_weight: 1.0
 Mapper.tsdf_prune_surface_band_vox: 1.0
-Mapper.tsdf_prune_min_valid_corners: 2
+Mapper.tsdf_prune_min_valid_corners: 8
 Mapper.tsdf_density_init: 0 # 1: initialize new SVRaster grid densities from TSDF with NeuS-style bell mapping
 Mapper.tsdf_density_init_min_weight: 1.0
 Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many configured TSDF voxels
@@ -98,7 +97,7 @@ Record.rerun_rendered_mesh_eval: 0 # log final voxel_surface_mesh.ply to world/v
 Record.rerun_gt_mesh: 0 # raw Replica mesh is not aligned to the current SLAM frame in Rerun
 Record.rerun_gt_mesh_path: "/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply"
 
-Record.save_rendered_mesh_eval: 0 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
+Record.save_rendered_mesh_eval: 1 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
 Record.rendered_mesh_backend: 1 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
 Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
@@ -108,9 +107,9 @@ Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight th
 ##############################################################################
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups (match train.py)
-Optimization.geo_lr: 0.1 #0.025 # very important 4x better than 8x
-Optimization.sh0_lr: 0.04 #0.010 # very important
-Optimization.shs_lr: 0.001 #0.00025 #important
+Optimization.geo_lr: 0.1 
+Optimization.sh0_lr: 0.01 
+Optimization.shs_lr: 0.00025 
 
 # Optimizer hyper-params (match svraster cfg.optimizer)
 Optimization.optim_beta1: 0.1
@@ -125,10 +124,10 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 700
-Optimization.adapt_every: 700
-Optimization.prune_every: 800
-Optimization.subdivide_every: 700
+Optimization.adapt_from: 1000
+Optimization.adapt_every: 1000
+Optimization.prune_every: 1000
+Optimization.subdivide_every: 1000
 
 # Pruning heuristics
 Optimization.filter_near_voxels: 1 # 0:false, 1:true, insertion-time mark_near filtering

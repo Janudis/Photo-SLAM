@@ -262,9 +262,6 @@ public:
     void logLiveDepthAnythingFillHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logFinalartificialVoxels(const int iteration);
     void logFinalPromotedartificialVoxels(const int iteration);
-    
-    void savePlannerNPZ(const std::filesystem::path& npz_path, int target_max_voxels = 1000000);
-
 private:
     IncreasePcdStats last_increase_pcd_stats_;
     int last_artificial_iter_ = -1;

@@ -18,16 +18,17 @@ Monocular.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.use_tsdf_mapping: 0 # 1: integrate RGB-D frames into the configured TSDF backend
+Mapper.use_tsdf_mapping: 1 # 1: integrate RGB-D frames into the configured TSDF backend
 Mapper.use_tsdf_pruning: 1 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
 Mapper.use_tsdf_planning: 0 # 0: do not run ESDF path planning at shutdown
-Mapper.tsdf_backend: svraster # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
+Mapper.tsdf_backend: "svraster" # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
 Mapper.tsdf_voxel_size_m: 0.05
 Mapper.svraster_tsdf_refit_on_topology_change: 0 # 1: replay registered RGB-D KFs after insertion/subdivision so new corners receive TSDF
 Mapper.tsdf_protect_surface_band_from_pruning: 0 # 1: prevent non-SDF pruning from deleting estimated TSDF surface-band voxels
 Mapper.tsdf_prune_min_weight: 1.0
 Mapper.tsdf_prune_surface_band_vox: 1.0
-Mapper.tsdf_prune_min_valid_corners: 8
+Mapper.tsdf_prune_min_valid_corners: 2
+Mapper.tsdf_prune_unknown: 0
 Mapper.tsdf_density_init: 0 # 1: initialize new SVRaster grid densities from TSDF with NeuS-style bell mapping
 Mapper.tsdf_density_init_min_weight: 1.0
 Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many configured TSDF voxels
@@ -70,8 +71,8 @@ Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 Record.enable_rerun: 0  # 0:disable all rerun logging/saving, 1:enable
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
-Record.run_whole_run: 1 # write whole_run.rrd with keyframes, trajectory, live voxels/source, accumulated pruned voxels, and nvblox mesh
-Record.run_sdf_pruned_nvblox: 0 # write run_sdf_pruned_nvblox.rrd using saved nvblox mesh as pseudo-GT for SDF-pruned voxels
+Record.run_whole_run: 0 # write whole_run.rrd with keyframes, trajectory, live voxels/source, accumulated pruned voxels, and nvblox mesh
+Record.run_sdf_pruned_nvblox: 1 # write run_sdf_pruned_nvblox.rrd using saved nvblox mesh as pseudo-GT for SDF-pruned voxels
 Record.run_reconstruction_mesh: 0 # write run_reconstruction_mesh.rrd with GT mesh, SVRaster mesh, and nvblox mesh
 Record.run_reconstruction_mesh_interval: 200 # mapper-iteration interval for SVRaster and nvblox mesh updates
 Record.run_reconstruction_mesh_min_weight: 1e-4 # nvblox mesh_integrator_min_weight default
@@ -90,7 +91,6 @@ Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
 Record.rerun_gt_mesh_path: ""
 
 Record.save_rendered_mesh_eval: 0 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
-Record.rendered_mesh_backend: 0 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
 Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
 
@@ -100,8 +100,8 @@ Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight th
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups (match train.py)
 Optimization.geo_lr: 0.1 #0.1 #0.025 # very important, 4x better than 8x
-Optimization.sh0_lr: 0.04 #0.04 #0.01 # very important
-Optimization.shs_lr: 0.00025 #0.001 #0.00025 #important
+Optimization.sh0_lr: 0.01 #0.04 #0.01 # very important
+Optimization.shs_lr: 0.00025 #0.00025 #important
 
 # Optimizer hyper-params (match svraster cfg.optimizer)
 Optimization.optim_beta1: 0.1
@@ -133,17 +133,17 @@ Optimization.final_special_prune_enable: 0
 
 # Pruning
 Optimization.prune_until: 15000
-Optimization.prune_thres_init: 0.001 
-Optimization.prune_thres_final: 0.005 #0.15
-Optimization.prune_thres_final_at_target: 0.005
-Optimization.prune_thres_init_artificial: 0.005
-Optimization.prune_thres_final_artificial: 0.005 # used for artificial rendered-hole-fill candidates until promotion
+# Optimization.prune_thres_init: 0.001 
+Optimization.prune_thres_final: 0.05 #0.05
+# Optimization.prune_thres_final_at_target: 0.005
+# Optimization.prune_thres_init_artificial: 0.005
+# Optimization.prune_thres_final_artificial: 0.005 # used for artificial rendered-hole-fill candidates until promotion
 
 # Subdivision
 Optimization.subdivide_until: 15000
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
-Optimization.subdivide_samp_thres: 0.6 #0.7 #1.0
-Optimization.subdivide_prop: 0.2 #0.1 #0.05
+Optimization.subdivide_samp_thres: 0.8 #1.0
+Optimization.subdivide_prop: 0.1 #0.05
 Optimization.subdivide_max_num: 10000000
 
 # Total variation loss of density grid

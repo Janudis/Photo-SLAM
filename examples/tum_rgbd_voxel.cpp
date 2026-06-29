@@ -16,8 +16,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <pybind11/embed.h>
-
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include "viewer/imgui_viewer.h"
@@ -161,21 +159,6 @@ static void saveRuntimeMetrics(
 // ----------------- main -----------------
 int main(int argc, char **argv)
 {
-    namespace py = pybind11;
-
-    // We mirror tum_mono_voxel: initialize Python first so torch.cuda is live
-    py::initialize_interpreter();
-    {
-        py::gil_scoped_acquire gil;
-        // add your voxel python scripts location
-        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
-        // warm up renderer wrapper (spawns watchdog thread, imports torch.cuda, etc.)
-        py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-        // explicitly touch torch.cuda so CUDA context is ready
-        py::module_::import("torch.cuda");
-    }
-    py::gil_scoped_release release;
-
     // arg parsing
     // rgbd version originally:
     //   1 vocab

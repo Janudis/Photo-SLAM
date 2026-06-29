@@ -2,6 +2,10 @@
 #include "include_voxel/voxel_mapper_evaluation.h"
 #include "include/stereo_vision.h"
 
+#include <pybind11/embed.h>
+#include <pybind11/gil.h>
+#include <pybind11/pybind11.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -2514,6 +2518,8 @@ bool VoxelMapper::ensureMonoPriorForKeyframe(
         return true;
     }
 
+    ensureEmbeddedPythonRuntime(/*import_torch_cuda=*/true);
+
     try {
         py::gil_scoped_acquire gil;
         static py::object py_load_or_infer;
@@ -3826,7 +3832,7 @@ void VoxelMapper::increasePcdByKeyframeMonoPriorFillHoles(
 
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         const bool log_depthanything_fill_holes_created_voxels =
-            rerun_params_.enable_rerun_;
+            true;
         if (log_depthanything_fill_holes_created_voxels) {
             voxel_model_->setNextRealInsertionRerunEntityPath(
                 "world/mono_prior_fill_holes/created");

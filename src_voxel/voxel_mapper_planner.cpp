@@ -19,8 +19,6 @@
 #include "ORB-SLAM3/include/Atlas.h"
 #include "ORB-SLAM3/include/MapPoint.h"
 
-namespace py = pybind11;
-
 namespace {
 static inline torch::Tensor make_points_tensor_cpu_f32(
     const std::vector<Eigen::Vector3f>& pts

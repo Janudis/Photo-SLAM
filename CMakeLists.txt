@@ -140,6 +140,28 @@ target_link_libraries(cuda_rasterizer
     "${TORCH_LIBRARIES}"
     Eigen3::Eigen)
 
+add_library(svraster_cuda_core STATIC
+    third_party/svraster/cuda/src/raster_state.cu
+    third_party/svraster/cuda/src/preprocess.cu
+    third_party/svraster/cuda/src/forward.cu
+    third_party/svraster/cuda/src/backward.cu
+    third_party/svraster/cuda/src/geo_params_gather.cu
+    third_party/svraster/cuda/src/sh_compute.cu
+    third_party/svraster/cuda/src/tv_compute.cu
+    third_party/svraster/cuda/src/utils.cu
+    third_party/svraster/cuda/src/adam_step.cu)
+set_target_properties(svraster_cuda_core PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "75;86")
+target_include_directories(svraster_cuda_core
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/third_party/svraster/cuda
+        ${TORCH_INCLUDE_DIRS}
+        ${Python3_INCLUDE_DIRS})
+target_link_libraries(svraster_cuda_core
+    PUBLIC
+        "${TORCH_LIBRARIES}")
+
 ##################################################################################
 ##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
@@ -284,6 +306,7 @@ add_library(voxel_core
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
         src_voxel/voxel_model_rerun.cpp
+        src_voxel/voxel_svraster_rasterizer.cpp
         src_voxel/rerun_utils.cpp
         ${NVBLOX_SRC_DIR}/src/io/mesh_io.cpp
         third_party/tinyply/tinyply.h
@@ -300,6 +323,7 @@ target_include_directories(voxel_core
 target_link_libraries(voxel_core
         PUBLIC
             # voxel_rasterizer           # call kernels directly if needed
+            svraster_cuda_core
             "${TORCH_LIBRARIES}"
             Python3::Python
             pybind11::embed

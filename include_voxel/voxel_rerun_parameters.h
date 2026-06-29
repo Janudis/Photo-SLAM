@@ -32,7 +32,6 @@ struct VoxelRerunParameters
     std::string rerun_gt_mesh_path_;
     bool save_rendered_mesh_eval_ = true;
     bool rerun_rendered_mesh_eval_ = false;
-    int rendered_mesh_backend_ = 0;
     float rendered_mesh_eval_voxel_size_m_ = 5.0f / 512.0f;
     float rendered_mesh_eval_min_weight_ = 1.0e-4f;
     bool rerun_reconstruction_mesh_ = false;

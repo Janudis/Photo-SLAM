@@ -16,14 +16,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <pybind11/embed.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include "viewer/imgui_viewer.h"
-
-namespace py = pybind11;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -133,29 +130,6 @@ int main(int argc, char **argv)
     bool use_viewer = true;
     if (argc == 7)
         use_viewer = (std::string(argv[6]) == "no_viewer" ? false : true);
-
-    // -------------------------------------------------------------------------
-    // Initialize embedded Python first (like tum_mono_voxel.cpp).
-    // We make sure torch.cuda is initialized in Python space before we spawn
-    // the voxel training thread, so CUDA contexts line up.
-    // -------------------------------------------------------------------------
-    pybind11::initialize_interpreter();
-    {
-        // acquire GIL, do python-side setup
-        py::gil_scoped_acquire gil;
-
-        // add our voxel scripts to PYTHONPATH
-        py::module_ sys = py::module_::import("sys");
-        sys.attr("path").attr("insert")(0, "../scripts_voxel");
-
-        // import the wrapper – warms up svraster bridge & torch.cuda
-        py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-
-        // explicitly touch torch.cuda
-        py::module_::import("torch.cuda");
-    }
-    // drop the GIL explicitly just to mirror tum_mono_voxel.cpp style
-    pybind11::gil_scoped_release release;
 
     // -------------------------------------------------------------------------
     // Normalize output directory (ensure trailing slash like tum runner)

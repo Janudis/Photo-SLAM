@@ -1,6 +1,7 @@
 #include "include_voxel/voxel_mapper.h"
 #include "include/stereo_vision.h"
 #include "include_voxel/voxel_mapper_utils.h"
+#include "include/sh_utils.h"
 
 #include <algorithm>
 #include <array>
@@ -19,11 +20,10 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include "ORB-SLAM3/include/Atlas.h"
 #include "ORB-SLAM3/include/MapPoint.h"
-
-namespace py = pybind11;
 
 void VoxelMapper::logKeyframeCameraToRerunRecordings(
     const std::shared_ptr<VoxelKeyframe>& pkf,
@@ -31,6 +31,16 @@ void VoxelMapper::logKeyframeCameraToRerunRecordings(
     bool log_reconstruction_mesh)
 {
     if (!pkf || !rerun_params_.enable_rerun_) {
+        return;
+    }
+    const bool needs_camera_recording =
+        rerun_params_.run_tsdf_pruned_ ||
+        rerun_params_.run_sdf_pruned_nvblox_ ||
+        (log_reconstruction_mesh && rerun_params_.rerun_reconstruction_mesh_) ||
+        rerun_params_.rerun_tsdf_unknown_voxels_ ||
+        rerun_params_.run_floaters_ ||
+        rerun_params_.run_whole_run_;
+    if (!needs_camera_recording) {
         return;
     }
 
@@ -65,16 +75,6 @@ void VoxelMapper::logKeyframeCameraToRerunRecordings(
             voxel_utils::parseFrameIdFromPath(pkf->img_filename_);
         const std::vector<Eigen::Vector2f> kps_uv;
         const std::vector<int> track_ids;
-
-        sv::RerunVisualizerBridge::instance().visualizeCamera(
-            T_W_C,
-            pkf->img_undist_,
-            kps_uv,
-            track_ids,
-            getIteration(),
-            static_cast<int>(kf_id),
-            fx, fy, cx, cy,
-            source_frame_id);
 
         auto log_debug_camera =
             [&](bool enabled, const std::string& recording_name)
@@ -1331,12 +1331,7 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
          (live_colors.size(1) != 3 && live_colors.size(1) != 4))) {
         torch::Tensor sh0 = voxel_model_->sh0();
         if (sh0.defined() && sh0.dim() == 2 && sh0.size(0) == N) {
-            {
-                py::gil_scoped_acquire gil;
-                static py::module act_mod = py::module::import("src.utils.activation_utils");
-                py::object rgb_py = act_mod.attr("shzero2rgb")(py::cast(sh0));
-                live_colors = rgb_py.cast<torch::Tensor>().contiguous();
-            }
+            live_colors = (sh0 * sh_utils::C0 + 0.5f).clamp(0.0f, 1.0f).contiguous();
 
             torch::Tensor density = voxel_model_->voxelDensityMean();
             if (density.defined() && density.numel() == N) {
@@ -2671,7 +2666,6 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
         return;
     }
 
-    namespace py = pybind11;
     torch::NoGradGuard no_grad;
 
     const auto& keyframes = scene_->keyframes();
@@ -2692,26 +2686,18 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
 
     SparseTsdfVolume volume(voxel_length, sdf_trunc);
 
-    py::gil_scoped_acquire gil;
-    py::object py_svm = voxel_model_->svm();
-    if (py_svm.is_none()) {
-        std::cout << "[RERUN/reconstruction_mesh] skipped: Python voxel model unavailable.\n";
-        return;
-    }
-
-    static py::module_ torch_mod = py::module_::import("torch");
     bool froze_geo = false;
-    py::object inference_ctx = torch_mod.attr("inference_mode")();
+    auto unfreeze_geo = [&]() {
+        if (froze_geo) {
+            voxel_model_->unfreezeVoxGeo();
+            froze_geo = false;
+        }
+    };
     try
     {
-        torch_mod.attr("cuda").attr("empty_cache")();
-        inference_ctx.attr("__enter__")();
-
-        if (py::hasattr(py_svm, "freeze_vox_geo"))
-        {
-            py_svm.attr("freeze_vox_geo")();
-            froze_geo = true;
-        }
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        voxel_model_->freezeVoxGeo();
+        froze_geo = true;
 
         std::size_t frame_idx = 0;
         for (const auto& [kfid, pkf] : keyframes)
@@ -2854,10 +2840,7 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
         TriangleMeshRgb mesh = volume.extractMesh(rerun_params_.rerun_reconstruction_mesh_min_weight_);
         if (mesh.vertices.empty() || mesh.faces.empty())
         {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-                py_svm.attr("unfreeze_vox_geo")();
-            }
+            unfreeze_geo();
             std::cout << "[RERUN/reconstruction_mesh] iter=" << iteration
                       << " empty mesh after fusing " << frame_idx << " keyframes.\n";
             return;
@@ -2874,10 +2857,7 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
             rerun_params_.rerun_reconstruction_mesh_max_faces_ > 0 &&
             mesh.faces.size() > rerun_params_.rerun_reconstruction_mesh_max_faces_;
         if (over_vertex_budget || over_face_budget) {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-                py_svm.attr("unfreeze_vox_geo")();
-            }
+            unfreeze_geo();
             std::cout << "[RERUN/reconstruction_mesh] iter=" << iteration
                       << " skipped over-budget full-scene mesh"
                       << " verts=" << mesh.vertices.size()
@@ -2897,11 +2877,7 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
         torch::Tensor triangles;
         triangleMeshToTensors(mesh, vertices, colors, triangles);
 
-        inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-            py_svm.attr("unfreeze_vox_geo")();
-            froze_geo = false;
-        }
+        unfreeze_geo();
 
         sv::RerunVisualizerBridge::instance().visualizeDebugNvbloxMesh(
             "reconstruction_mesh",
@@ -2926,30 +2902,10 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
                   << " max_faces=" << rerun_params_.rerun_reconstruction_mesh_max_faces_
                   << "\n";
     }
-    catch (const py::error_already_set& e)
-    {
-        try
-        {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
-        }
-        catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-            py_svm.attr("unfreeze_vox_geo")();
-        }
-        std::cerr << "[RERUN/reconstruction_mesh] Python error: " << e.what() << "\n";
-    }
     catch (const std::exception& e)
     {
-        try
-        {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
-        }
-        catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-            py_svm.attr("unfreeze_vox_geo")();
-        }
+        unfreeze_geo();
+        c10::cuda::CUDACachingAllocator::emptyCache();
         std::cerr << "[RERUN/reconstruction_mesh] failed: " << e.what() << "\n";
     }
 }

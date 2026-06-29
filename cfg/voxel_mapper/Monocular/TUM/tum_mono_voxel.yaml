@@ -80,7 +80,6 @@ Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
 Record.rerun_gt_mesh_path: ""
 Record.save_rendered_mesh_eval: 1 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
 Record.rerun_rendered_mesh_eval: 1 # log final voxel_surface_mesh.ply to world/voxel_model_mesh/final
-Record.rendered_mesh_backend: 1 # 0:current SVRaster Python fuser/marching cubes, 1:shared C++ sparse TSDF backend
 Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
 Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically

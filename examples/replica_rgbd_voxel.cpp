@@ -15,14 +15,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <pybind11/embed.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include "viewer/imgui_viewer.h"
-
-namespace py = pybind11;
 
 static void loadReplicaImages(
     const std::filesystem::path& image_dir,
@@ -144,16 +141,6 @@ int main(int argc, char** argv)
     }
 
     const bool use_viewer = argc == 7 ? (std::string(argv[6]) != "no_viewer") : true;
-
-    py::initialize_interpreter();
-    {
-        py::gil_scoped_acquire gil;
-        py::module_ sys = py::module_::import("sys");
-        sys.attr("path").attr("insert")(0, "../scripts_voxel");
-        py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-        py::module_::import("torch.cuda");
-    }
-    py::gil_scoped_release release;
 
     std::string output_directory = std::string(argv[5]);
     if (output_directory.back() != '/')

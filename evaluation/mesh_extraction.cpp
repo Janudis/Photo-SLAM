@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -13,8 +14,6 @@
 #include <unordered_set>
 
 #include "third_party/tinyply/tinyply.h"
-
-namespace py = pybind11;
 
 namespace {
 
@@ -686,420 +685,7 @@ struct SparseTsdfVolume
 
 void VoxelMapper::saveRenderedTsdfMeshPly(const std::filesystem::path& result_path)
 {
-    switch (rerun_params_.rendered_mesh_backend_)
-    {
-    case 1:
-        saveRenderedTsdfMeshPlySparseCpp(result_path);
-        return;
-    case 0:
-    default:
-        saveRenderedTsdfMeshPlySvrasterPython(result_path);
-        return;
-    }
-}
-
-void VoxelMapper::saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::path& result_path)
-{
-    namespace fs = std::filesystem;
-    namespace py = pybind11;
-    torch::NoGradGuard no_grad;
-
-    if (!scene_ || scene_->keyframes().empty()) {
-        std::cout << "[saveRenderedTsdfMeshPly] No keyframes, skipping.\n";
-        return;
-    }
-    if (!result_path.parent_path().empty()) {
-        fs::create_directories(result_path.parent_path());
-    }
-
-    py::gil_scoped_acquire gil;
-    static py::module_ torch_mod = py::module_::import("torch");
-    static py::module_ oct_utils = py::module_::import("src.utils.octree_utils");
-    static py::module_ fuser_utils = py::module_::import("src.utils.fuser_utils");
-    static py::module_ mc_utils = py::module_::import("src.utils.marching_cubes_utils");
-    static py::module_ svm_mod = py::module_::import("src.sparse_voxel_model");
-    static py::object nnf_grid_sample =
-        torch_mod.attr("nn").attr("functional").attr("grid_sample");
-
-    py::object py_svm = voxel_model_->svm();
-    if (py_svm.is_none()) {
-        std::cout << "[saveRenderedTsdfMeshPly] Python voxel model unavailable, skipping.\n";
-        return;
-    }
-
-    py::list py_cams;
-    py::object py_cuda = torch_mod.attr("device")("cuda");
-    auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name) {
-        if (py::hasattr(obj, name)) {
-            py::object t = obj.attr(name);
-            if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                obj.attr(name) = t.attr("to")(py_cuda);
-            }
-        }
-    };
-    for (const auto& kv : scene_->keyframes()) {
-        const std::shared_ptr<VoxelKeyframe>& pkf = kv.second;
-        if (!pkf) {
-            continue;
-        }
-        const int image_width = pkf->image_width_;
-        const int image_height = pkf->image_height_;
-        if (image_width <= 0 || image_height <= 0) {
-            continue;
-        }
-        py::object py_cam = MiniCam_to_py(pkf->toMiniCam(image_height, image_width));
-        move_attr_to_cuda_if_tensor(py_cam, "w2c");
-        move_attr_to_cuda_if_tensor(py_cam, "c2w");
-        move_attr_to_cuda_if_tensor(py_cam, "position");
-        move_attr_to_cuda_if_tensor(py_cam, "lookat");
-        py_cams.append(py_cam);
-    }
-    if (py::len(py_cams) == 0) {
-        std::cout << "[saveRenderedTsdfMeshPly] No valid train cameras, skipping.\n";
-        return;
-    }
-
-    const float target_vox_size = std::max(0.01f, voxel_model_->fixedVoxSize());
-    const int outside_level = py::hasattr(py_svm, "outside_level")
-        ? py::cast<int>(py_svm.attr("outside_level"))
-        : 0;
-    torch::Tensor scene_extent = py_svm.attr("scene_extent").cast<torch::Tensor>().contiguous();
-    torch::Tensor scene_center = py_svm.attr("scene_center").cast<torch::Tensor>().contiguous();
-    torch::Tensor inside_extent = py_svm.attr("inside_extent").cast<torch::Tensor>().contiguous();
-    torch::Tensor vox_size_t = torch::full(
-        {1},
-        target_vox_size,
-        scene_extent.options().dtype(torch::kFloat32));
-    torch::Tensor final_lv_t = oct_utils.attr("vox_size_2_level")(
-        scene_extent,
-        py::cast(vox_size_t)).cast<torch::Tensor>().round().to(torch::kInt32);
-    int final_lv = final_lv_t.clamp_min(1).clamp_max(voxel_model_->maxNumLevels()).item<int>() - outside_level;
-    final_lv = std::max(1, final_lv);
-    const float bbox_scale = 1.0f;
-    const float bandwidth_vox = 5.0f;
-    const float crop_border = 0.01f;
-    const float alpha_thres = 0.5f;
-
-    std::cout << "[saveRenderedTsdfMeshPly] begin kfs=" << py::len(py_cams)
-              << " target_vox_size=" << target_vox_size
-              << " final_lv=" << final_lv
-              << " alpha_thres=" << alpha_thres
-              << " crop_border=" << crop_border
-              << " bandwidth_vox=" << bandwidth_vox
-              << " use_mean=0\n";
-
-    bool froze_geo = false;
-    py::object inference_ctx = torch_mod.attr("inference_mode")();
-    try {
-        torch_mod.attr("cuda").attr("empty_cache")();
-        inference_ctx.attr("__enter__")();
-
-        if (py::hasattr(py_svm, "freeze_vox_geo")) {
-            py_svm.attr("freeze_vox_geo")();
-            froze_geo = true;
-        }
-
-        const int target_lv = outside_level + final_lv;
-        py::tuple clamped = oct_utils.attr("clamp_level")(
-            py_svm.attr("octpath"),
-            py_svm.attr("octlevel"),
-            py::int_(target_lv));
-        py::object SparseVoxelModel = svm_mod.attr("SparseVoxelModel");
-        py::object vol = SparseVoxelModel(py::arg("sh_degree") = 0);
-        vol.attr("octpath_init")(
-            scene_center,
-            scene_extent,
-            clamped[0],
-            clamped[1]);
-
-        torch::Tensor inside_min = (scene_center - 0.5f * inside_extent * bbox_scale).contiguous();
-        torch::Tensor inside_max = (scene_center + 0.5f * inside_extent * bbox_scale).contiguous();
-        torch::Tensor grid_pts_xyz = vol.attr("grid_pts_xyz").cast<torch::Tensor>().contiguous();
-        torch::Tensor vox_key = vol.attr("vox_key").cast<torch::Tensor>().contiguous();
-
-        torch::Tensor gridpts_outside =
-            ((grid_pts_xyz < inside_min) | (grid_pts_xyz > inside_max)).any(-1);
-        torch::Tensor corners_outside = gridpts_outside.index({vox_key});
-        torch::Tensor prune_mask = corners_outside.all(-1);
-        vol.attr("pruning")(prune_mask);
-
-        grid_pts_xyz = vol.attr("grid_pts_xyz").cast<torch::Tensor>().contiguous();
-        vox_key = vol.attr("vox_key").cast<torch::Tensor>().contiguous();
-        torch::Tensor vox_size = vol.attr("vox_size").cast<torch::Tensor>().contiguous();
-        const float bandwidth = bandwidth_vox * vox_size.min().item<float>();
-
-        py::object Fuser = fuser_utils.attr("Fuser");
-        py::object fuser = Fuser(
-            py::arg("xyz") = grid_pts_xyz,
-            py::arg("bandwidth") = bandwidth,
-            py::arg("use_trunc") = true,
-            py::arg("fuse_tsdf") = true,
-            py::arg("feat_dim") = 0,
-            py::arg("alpha_thres") = alpha_thres,
-            py::arg("crop_border") = crop_border,
-            py::arg("normal_weight") = false,
-            py::arg("depth_weight") = false,
-            py::arg("border_weight") = false,
-            py::arg("use_half") = false);
-
-        const ssize_t num_cams = py::len(py_cams);
-        for (ssize_t i = 0; i < num_cams; ++i) {
-            py::object cam = py_cams[i];
-            py::dict render_pkg = py_svm.attr("render")(
-                cam,
-                py::arg("output_depth") = true,
-                py::arg("output_T") = true).cast<py::dict>();
-            torch::Tensor raw_depth = render_pkg["raw_depth"].cast<torch::Tensor>().contiguous();
-            torch::Tensor frame_depth = raw_depth.index({2}).unsqueeze(0).contiguous();
-            torch::Tensor raw_T = render_pkg["raw_T"].cast<torch::Tensor>().contiguous();
-            torch::Tensor frame_alpha = (1.0f - raw_T).contiguous();
-            fuser.attr("integrate")(cam, frame_depth, py::arg("alpha") = frame_alpha);
-
-            render_pkg = py::dict();
-            raw_depth = torch::Tensor();
-            frame_depth = torch::Tensor();
-            raw_T = torch::Tensor();
-            frame_alpha = torch::Tensor();
-            if ((i % 8) == 7) {
-                torch_mod.attr("cuda").attr("empty_cache")();
-            }
-        }
-
-        torch_mod.attr("cuda").attr("empty_cache")();
-
-        torch::Tensor grid_tsdf = fuser.attr("tsdf").cast<torch::Tensor>().squeeze(1).contiguous();
-        py::tuple mc = mc_utils.attr("torch_marching_cubes_grid")(
-            py::arg("grid_pts_val") = grid_tsdf,
-            py::arg("grid_pts_xyz") = grid_pts_xyz,
-            py::arg("vox_key") = vox_key,
-            py::arg("iso") = 0.0f).cast<py::tuple>();
-        torch::Tensor verts = mc[0].cast<torch::Tensor>().to(torch::kFloat32).contiguous();
-        torch::Tensor faces = mc[1].cast<torch::Tensor>().to(torch::kInt64).to(torch::kCPU).contiguous();
-
-        const int64_t num_vertices = verts.size(0);
-        const int64_t num_faces = faces.size(0);
-        if (num_vertices == 0 || num_faces == 0) {
-            throw std::runtime_error("SVRaster-style fusion produced an empty mesh");
-        }
-
-        torch::Tensor closest_color = torch::full(
-            {num_vertices, 3},
-            0.5f,
-            verts.options().dtype(torch::kFloat32));
-        torch::Tensor closest_dist = torch::full(
-            {num_vertices},
-            std::numeric_limits<float>::infinity(),
-            verts.options().dtype(torch::kFloat32));
-
-        for (ssize_t i = 0; i < num_cams; ++i) {
-            py::object cam = py_cams[i];
-            py::dict render_pkg = py_svm.attr("render")(
-                cam,
-                py::arg("color_mode") = "sh0",
-                py::arg("output_depth") = true,
-                py::arg("output_T") = true).cast<py::dict>();
-
-            torch::Tensor frame_color = render_pkg["color"].cast<torch::Tensor>().contiguous();
-            torch::Tensor raw_depth = render_pkg["raw_depth"].cast<torch::Tensor>().contiguous();
-            torch::Tensor frame_depth = raw_depth.index({2}).unsqueeze(0).contiguous();
-            torch::Tensor raw_T = render_pkg["raw_T"].cast<torch::Tensor>().contiguous();
-            torch::Tensor frame_alpha = (1.0f - raw_T).contiguous();
-
-            torch::Tensor pts_uv =
-                cam.attr("project")(py::cast(verts)).cast<torch::Tensor>().contiguous();
-            torch::Tensor inside_mask = (pts_uv.abs() <= 1.0f).all(-1);
-            torch::Tensor valid_pts_idx = torch::nonzero(inside_mask).view({-1});
-            if (valid_pts_idx.numel() == 0) {
-                render_pkg = py::dict();
-                frame_color = torch::Tensor();
-                raw_depth = torch::Tensor();
-                frame_depth = torch::Tensor();
-                raw_T = torch::Tensor();
-                frame_alpha = torch::Tensor();
-                pts_uv = torch::Tensor();
-                inside_mask = torch::Tensor();
-                valid_pts_idx = torch::Tensor();
-                if ((i % 8) == 7) {
-                    torch_mod.attr("cuda").attr("empty_cache")();
-                }
-                continue;
-            }
-
-            torch::Tensor valid_pts = verts.index_select(0, valid_pts_idx);
-            pts_uv = pts_uv.index_select(0, valid_pts_idx).contiguous();
-
-            torch::Tensor pts_frame_alpha = nnf_grid_sample(
-                frame_alpha.view({1, 1, frame_alpha.size(-2), frame_alpha.size(-1)}),
-                pts_uv.view({1, 1, -1, 2}),
-                py::arg("mode") = "bilinear",
-                py::arg("align_corners") = false).cast<torch::Tensor>().flatten();
-            torch::Tensor alpha_mask = pts_frame_alpha > alpha_thres;
-            torch::Tensor alpha_keep_idx = torch::nonzero(alpha_mask).view({-1});
-            if (alpha_keep_idx.numel() == 0) {
-                render_pkg = py::dict();
-                frame_color = torch::Tensor();
-                raw_depth = torch::Tensor();
-                frame_depth = torch::Tensor();
-                raw_T = torch::Tensor();
-                frame_alpha = torch::Tensor();
-                pts_uv = torch::Tensor();
-                inside_mask = torch::Tensor();
-                valid_pts_idx = torch::Tensor();
-                valid_pts = torch::Tensor();
-                pts_frame_alpha = torch::Tensor();
-                alpha_mask = torch::Tensor();
-                alpha_keep_idx = torch::Tensor();
-                if ((i % 8) == 7) {
-                    torch_mod.attr("cuda").attr("empty_cache")();
-                }
-                continue;
-            }
-
-            valid_pts_idx = valid_pts_idx.index_select(0, alpha_keep_idx);
-            valid_pts = valid_pts.index_select(0, alpha_keep_idx);
-            pts_uv = pts_uv.index_select(0, alpha_keep_idx).contiguous();
-
-            torch::Tensor pts_frame_depth = nnf_grid_sample(
-                frame_depth.view({1, 1, frame_depth.size(-2), frame_depth.size(-1)}),
-                pts_uv.view({1, 1, -1, 2}),
-                py::arg("mode") = "bilinear",
-                py::arg("align_corners") = false).cast<torch::Tensor>().flatten();
-            torch::Tensor cam_position = cam.attr("position").cast<torch::Tensor>().contiguous();
-            torch::Tensor cam_lookat = cam.attr("lookat").cast<torch::Tensor>().contiguous();
-            torch::Tensor pts_depth =
-                ((valid_pts - cam_position) * cam_lookat).sum(-1);
-            torch::Tensor pts_dist = (pts_frame_depth - pts_depth).abs();
-
-            torch::Tensor prev_dist = closest_dist.index_select(0, valid_pts_idx);
-            torch::Tensor better_mask = pts_dist < prev_dist;
-            torch::Tensor better_idx = torch::nonzero(better_mask).view({-1});
-            if (better_idx.numel() > 0) {
-                torch::Tensor better_pts_idx = valid_pts_idx.index_select(0, better_idx);
-                torch::Tensor better_uv = pts_uv.index_select(0, better_idx).contiguous();
-                torch::Tensor pts_color = nnf_grid_sample(
-                    frame_color.unsqueeze(0),
-                    better_uv.view({1, 1, -1, 2}),
-                    py::arg("mode") = "bilinear",
-                    py::arg("align_corners") = false).cast<torch::Tensor>();
-                pts_color = pts_color.squeeze(0).squeeze(1).transpose(0, 1).contiguous();
-
-                closest_dist.index_put_(
-                    {better_pts_idx},
-                    pts_dist.index_select(0, better_idx));
-                closest_color.index_put_(
-                    {better_pts_idx},
-                    pts_color);
-            }
-
-            render_pkg = py::dict();
-            frame_color = torch::Tensor();
-            raw_depth = torch::Tensor();
-            frame_depth = torch::Tensor();
-            raw_T = torch::Tensor();
-            frame_alpha = torch::Tensor();
-            pts_uv = torch::Tensor();
-            inside_mask = torch::Tensor();
-            valid_pts_idx = torch::Tensor();
-            valid_pts = torch::Tensor();
-            pts_frame_alpha = torch::Tensor();
-            alpha_mask = torch::Tensor();
-            alpha_keep_idx = torch::Tensor();
-            pts_frame_depth = torch::Tensor();
-            cam_position = torch::Tensor();
-            cam_lookat = torch::Tensor();
-            pts_depth = torch::Tensor();
-            pts_dist = torch::Tensor();
-            prev_dist = torch::Tensor();
-            better_mask = torch::Tensor();
-            better_idx = torch::Tensor();
-            if ((i % 8) == 7) {
-                torch_mod.attr("cuda").attr("empty_cache")();
-            }
-        }
-
-        torch::Tensor verts_cpu = verts.to(torch::kCPU).contiguous();
-        std::vector<float> vertices_xyz(static_cast<size_t>(verts.numel()));
-        std::copy(
-            verts_cpu.data_ptr<float>(),
-            verts_cpu.data_ptr<float>() + verts_cpu.numel(),
-            vertices_xyz.begin());
-
-        torch::Tensor vertices_rgb_cpu =
-            (closest_color.clamp(0.0f, 1.0f) * 255.0f)
-                .round()
-                .to(torch::kUInt8)
-                .to(torch::kCPU)
-                .contiguous();
-        std::vector<uint8_t> vertices_rgb(static_cast<size_t>(vertices_rgb_cpu.numel()));
-        std::copy(
-            vertices_rgb_cpu.data_ptr<uint8_t>(),
-            vertices_rgb_cpu.data_ptr<uint8_t>() + vertices_rgb_cpu.numel(),
-            vertices_rgb.begin());
-
-        const int64_t* face_ptr = faces.data_ptr<int64_t>();
-        std::vector<uint32_t> tri_idx(static_cast<size_t>(faces.numel()));
-        for (int64_t i = 0; i < faces.numel(); ++i) {
-            tri_idx[static_cast<size_t>(i)] = static_cast<uint32_t>(face_ptr[i]);
-        }
-
-        std::filebuf fb;
-        fb.open(result_path, std::ios::out | std::ios::binary);
-        std::ostream out(&fb);
-        if (out.fail()) {
-            throw std::runtime_error("saveRenderedTsdfMeshPly: open failed: " + result_path.string());
-        }
-
-        tinyply::PlyFile ply;
-        ply.add_properties_to_element(
-            "vertex", {"x", "y", "z"},
-            tinyply::Type::FLOAT32, static_cast<uint64_t>(num_vertices),
-            reinterpret_cast<uint8_t*>(vertices_xyz.data()),
-            tinyply::Type::INVALID, 0);
-        ply.add_properties_to_element(
-            "vertex", {"red", "green", "blue"},
-            tinyply::Type::UINT8, static_cast<uint64_t>(num_vertices),
-            reinterpret_cast<uint8_t*>(vertices_rgb.data()),
-            tinyply::Type::INVALID, 0);
-        ply.add_properties_to_element(
-            "face", {"vertex_indices"},
-            tinyply::Type::UINT32, static_cast<uint64_t>(num_faces),
-            reinterpret_cast<uint8_t*>(tri_idx.data()),
-            tinyply::Type::UINT8, 3);
-        ply.get_comments().push_back("generated_from_svraster_style_tsdf_fusion");
-        ply.get_comments().push_back("vertex_colors projected_sh0");
-        ply.get_comments().push_back("alpha_thres " + std::to_string(alpha_thres));
-        ply.get_comments().push_back("crop_border " + std::to_string(crop_border));
-        ply.get_comments().push_back("bandwidth_vox " + std::to_string(bandwidth_vox));
-        ply.write(out, /*binary=*/true);
-        fb.close();
-        inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-    } catch (const py::error_already_set& e) {
-        try {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
-        } catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-            py_svm.attr("unfreeze_vox_geo")();
-        }
-        throw std::runtime_error(
-            std::string("saveRenderedTsdfMeshPly SVRaster-style extraction failed: ") + e.what());
-    } catch (...) {
-        try {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
-        } catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-            py_svm.attr("unfreeze_vox_geo")();
-        }
-        throw;
-    }
-
-    if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo")) {
-        py_svm.attr("unfreeze_vox_geo")();
-    }
-
-    std::cout << "[saveRenderedTsdfMeshPly] Wrote SVRaster-style fused mesh to "
-              << result_path << "\n";
+    saveRenderedTsdfMeshPlySparseCpp(result_path);
 }
 
 void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path)
@@ -1160,17 +746,6 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
     const Eigen::Vector3f extent = bb_max - bb_min;
     SparseTsdfVolume volume(voxel_length, kDefaultEvalSdfTrunc);
 
-    py::gil_scoped_acquire gil;
-    py::object py_svm = voxel_model_->svm();
-    if (py_svm.is_none())
-    {
-        std::cout << "[saveRenderedTsdfMeshPly] Python voxel model unavailable, skipping.\n";
-        return;
-    }
-
-    static py::module_ torch_mod = py::module_::import("torch");
-    py::object py_cuda = torch_mod.attr("device")("cuda");
-
     std::cout << "[saveRenderedTsdfMeshPly] begin kfs=" << keyframes.size()
               << " backend=cpp_sparse_tsdf"
               << " voxel_length=" << std::fixed << std::setprecision(8) << voxel_length
@@ -1183,17 +758,12 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
               << std::endl;
 
     bool froze_geo = false;
-    py::object inference_ctx = torch_mod.attr("inference_mode")();
     try
     {
-        torch_mod.attr("cuda").attr("empty_cache")();
-        inference_ctx.attr("__enter__")();
+        c10::cuda::CUDACachingAllocator::emptyCache();
 
-        if (py::hasattr(py_svm, "freeze_vox_geo"))
-        {
-            py_svm.attr("freeze_vox_geo")();
-            froze_geo = true;
-        }
+        voxel_model_->freezeVoxGeo();
+        froze_geo = true;
 
         std::size_t frame_idx = 0;
         for (const auto& [kfid, pkf] : keyframes)
@@ -1359,17 +929,16 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
                           << " keyframes (last_kfid=" << kfid << ")"
                           << " active_voxels=" << volume.voxels.size() << std::endl;
             }
-            torch_mod.attr("cuda").attr("empty_cache")();
+            c10::cuda::CUDACachingAllocator::emptyCache();
         }
 
         auto mesh = volume.extractMesh(min_weight);
         if (mesh.vertices.empty() || mesh.faces.empty())
         {
             std::cout << "[saveRenderedTsdfMeshPly] extraction produced an empty mesh.\n";
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo"))
+            if (froze_geo)
             {
-                py_svm.attr("unfreeze_vox_geo")();
+                voxel_model_->unfreezeVoxGeo();
             }
             return;
         }
@@ -1388,42 +957,24 @@ void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& 
         {
             throw std::runtime_error("saveRenderedTsdfMeshPly: failed to write no-color mesh PLY");
         }
-
-        inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-    }
-    catch (const py::error_already_set& e)
-    {
-        try
-        {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
-        }
-        catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo"))
-        {
-            py_svm.attr("unfreeze_vox_geo")();
-        }
-        throw std::runtime_error(
-            std::string("saveRenderedTsdfMeshPly C++ sparse TSDF extraction failed: ") + e.what());
     }
     catch (...)
     {
         try
         {
-            inference_ctx.attr("__exit__")(py::none(), py::none(), py::none());
-            torch_mod.attr("cuda").attr("empty_cache")();
+            c10::cuda::CUDACachingAllocator::emptyCache();
         }
         catch (...) {}
-        if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo"))
+        if (froze_geo)
         {
-            py_svm.attr("unfreeze_vox_geo")();
+            voxel_model_->unfreezeVoxGeo();
         }
         throw;
     }
 
-    if (froze_geo && py::hasattr(py_svm, "unfreeze_vox_geo"))
+    if (froze_geo)
     {
-        py_svm.attr("unfreeze_vox_geo")();
+        voxel_model_->unfreezeVoxGeo();
     }
 
     std::cout << "[saveRenderedTsdfMeshPly] Wrote C++ sparse-TSDF fused mesh to "

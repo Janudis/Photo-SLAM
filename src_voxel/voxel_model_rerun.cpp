@@ -3,35 +3,6 @@
 
 namespace sv {
 
-void VoxelModel::logDenseCoreBBoxToRerun(
-    int iteration,
-    const std::string& entity_path) const
-{
-    if (!has_dense_core_bb_ ||
-        !dense_core_bb_min_.defined() ||
-        !dense_core_bb_max_.defined()) {
-        return;
-    }
-
-    auto bb_min = dense_core_bb_min_.to(torch::kFloat32).contiguous().view({1, 3});
-    auto bb_max = dense_core_bb_max_.to(torch::kFloat32).contiguous().view({1, 3});
-    auto bbox_center = (0.5f * (bb_min + bb_max)).contiguous();
-    auto bbox_size = (bb_max - bb_min).contiguous();
-    auto bbox_rgba = torch::zeros(
-        {1, 4},
-        torch::TensorOptions().dtype(torch::kFloat32).device(bbox_center.device()));
-    bbox_rgba.index_put_({0, 1}, 1.0f);
-    bbox_rgba.index_put_({0, 2}, 1.0f);
-    bbox_rgba.index_put_({0, 3}, 0.22f);
-
-    sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-        bbox_center,
-        bbox_size,
-        bbox_rgba,
-        iteration,
-        entity_path);
-}
-
 namespace {
 void logLiveMaskedVoxels(
     const torch::Tensor& centers_all,

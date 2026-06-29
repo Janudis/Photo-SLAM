@@ -5,7 +5,6 @@
 #include <pybind11/numpy.h>
 
 namespace sv {
-
     template <typename T>
     pybind11::array tensor_to_numpy_typed(const torch::Tensor& t) {
         auto t_cpu = t.contiguous().to(torch::kCPU);

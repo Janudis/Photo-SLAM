@@ -16,8 +16,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <pybind11/embed.h>
-
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -74,20 +72,6 @@ void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
 
 int main(int argc, char **argv)
 {
-    pybind11::initialize_interpreter();
-    {
-      // make sure Python torch.cuda is initialized first
-      pybind11::gil_scoped_acquire gil;
-      // add your voxel scripts to PYTHONPATH
-      py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
-      // import the wrapper – this will pull in PyTorch’s cuda module under Python
-      py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-      // also explicitly touch torch.cuda
-      py::module_::import("torch.cuda");
-    }
-    // now we can safely drop the GIL
-    pybind11::gil_scoped_release release;
-
     if (argc != 6 && argc != 7)
     {
         std::cerr << std::endl

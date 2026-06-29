@@ -2,6 +2,11 @@
 #include "include_voxel/voxel_mapper_utils.h"
 #include "include_voxel/voxel_mapper_evaluation.h"
 #include "include/stereo_vision.h"
+#include "include/sh_utils.h"
+
+#include <pybind11/embed.h>
+#include <pybind11/gil.h>
+#include <pybind11/pybind11.h>
 
 #include <algorithm>
 #include <array>
@@ -16,11 +21,42 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include "ORB-SLAM3/include/Atlas.h"
 #include "ORB-SLAM3/include/MapPoint.h"
 
 namespace py = pybind11;
+
+namespace {
+void ensurePythonRuntimeInitialized(bool import_torch_cuda)
+{
+    static bool initialized_by_mapper = false;
+    static PyThreadState* released_main_thread_state = nullptr;
+
+    if (!initialized_by_mapper && Py_IsInitialized() == 0) {
+        py::initialize_interpreter(false);
+        initialized_by_mapper = true;
+        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
+        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+        if (import_torch_cuda) {
+            py::module_::import("torch.cuda");
+        }
+        released_main_thread_state = PyEval_SaveThread();
+        return;
+    }
+
+    {
+        py::gil_scoped_acquire gil;
+        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
+        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+        if (import_torch_cuda) {
+            py::module_::import("torch.cuda");
+        }
+    }
+    (void)released_main_thread_state;
+}
+} // namespace
 
 VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                          const std::filesystem::path& config_file_path,
@@ -294,7 +330,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rgbd_fill_render_holes_max_points_per_kf_ =
             std::max(0, settings_file["Mapper.rgbd_fill_render_holes_max_points_per_kf"].operator int());
     }
-
     sdf_params_.use_tsdf_mapping_ =
         (settings_file["Mapper.use_tsdf_mapping"].operator int()) != 0;
     sdf_params_.use_tsdf_pruning_ =
@@ -306,7 +341,9 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     if (!settings_file["Mapper.tsdf_backend"].empty()) {
         sdf_params_.tsdf_backend_ =
             voxel_utils::toLowerCopy(settings_file["Mapper.tsdf_backend"].operator std::string());
-        if (sdf_params_.tsdf_backend_ != "svraster" && sdf_params_.tsdf_backend_ != "nvblox") {
+        if (sdf_params_.tsdf_backend_.empty()) {
+            sdf_params_.tsdf_backend_ = "svraster";
+        } else if (sdf_params_.tsdf_backend_ != "svraster" && sdf_params_.tsdf_backend_ != "nvblox") {
             std::cerr << "[TSDF] Unknown Mapper.tsdf_backend='" << sdf_params_.tsdf_backend_
                       << "', falling back to 'svraster'.\n";
             sdf_params_.tsdf_backend_ = "svraster";
@@ -317,6 +354,9 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             std::max(0.0f, settings_file["Mapper.tsdf_prune_surface_band_vox"].operator float());
         sdf_params_.tsdf_prune_min_valid_corners_ =
             std::max(1, std::min(8, settings_file["Mapper.tsdf_prune_min_valid_corners"].operator int()));
+        sdf_params_.tsdf_prune_unknown_ =
+            !settings_file["Mapper.tsdf_prune_unknown"].empty() &&
+            (settings_file["Mapper.tsdf_prune_unknown"].operator int()) != 0;
         sdf_params_.tsdf_protect_surface_band_from_pruning_ =
             (settings_file["Mapper.tsdf_protect_surface_band_from_pruning"].operator int()) != 0;
         sdf_params_.tsdf_density_init_ =
@@ -698,11 +738,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     rerun_params_.rerun_rendered_mesh_eval_ =
         !settings_file["Record.rerun_rendered_mesh_eval"].empty() &&
         (settings_file["Record.rerun_rendered_mesh_eval"].operator int()) != 0;
-    rerun_params_.rendered_mesh_backend_ =
-        settings_file["Record.rendered_mesh_backend"].empty()
-            ? 0
-            : settings_file["Record.rendered_mesh_backend"].operator int();
-    rerun_params_.rendered_mesh_backend_ = std::max(0, std::min(1, rerun_params_.rendered_mesh_backend_));
     rerun_params_.rendered_mesh_eval_voxel_size_m_ =
         settings_file["Record.rendered_mesh_eval_voxel_size_m"].empty()
             ? (5.0f / 512.0f)
@@ -743,6 +778,19 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         settings_file["Record.run_maps_stride"].empty()
             ? 1
             : std::max(1, settings_file["Record.run_maps_stride"].operator int());
+    const bool any_rerun_recording_requested =
+        rerun_params_.run_tsdf_pruned_ ||
+        rerun_params_.rerun_tsdf_unknown_voxels_ ||
+        rerun_params_.run_floaters_ ||
+        rerun_params_.run_whole_run_ ||
+        rerun_params_.run_sdf_pruned_nvblox_ ||
+        rerun_params_.rerun_nvblox_mesh_ ||
+        rerun_params_.rerun_gt_mesh_ ||
+        rerun_params_.rerun_rendered_mesh_eval_ ||
+        rerun_params_.rerun_reconstruction_mesh_ ||
+        rerun_params_.rerun_maps_;
+    rerun_params_.enable_rerun_ =
+        rerun_params_.enable_rerun_ && any_rerun_recording_requested;
     if (!rerun_params_.enable_rerun_) {
         rerun_params_.run_tsdf_pruned_ = false;
         rerun_params_.rerun_tsdf_unknown_voxels_ = false;
@@ -763,14 +811,16 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
 
 }
 
+void VoxelMapper::ensureEmbeddedPythonRuntime(bool import_torch_cuda)
+{
+    ensurePythonRuntimeInitialized(import_torch_cuda);
+}
+
 void VoxelMapper::run()
 {
-    /* expose our helper scripts to the embedded Python side */
-    py::gil_scoped_acquire gil;
-    py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
-
     sv::RerunVisualizerBridge::instance().setEnabled(rerun_params_.enable_rerun_);
     if (rerun_params_.enable_rerun_) {
+        ensureEmbeddedPythonRuntime(/*import_torch_cuda=*/false);
         // Initialize Rerun in "headless" mode (no viewer window).
         sv::RerunVisualizerBridge::instance().init(
             "PhotoSLAM-SVRaster",
@@ -1019,11 +1069,6 @@ void VoxelMapper::run()
                 tr_cams.emplace_back(kf.toMiniCam(kf.image_height_, kf.image_width_));
             }
             //  Create voxel model & trainer setup
-            if (rerun_params_.enable_rerun_) {
-                appendAndLogOrbRawMapPcdToRerun(
-                    scene_->cached_point_cloud_,
-                    getIteration());
-            }
             {
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
                 voxel_model_->createFromPcd(scene_->cached_point_cloud_, tr_cams);
@@ -1219,14 +1264,9 @@ void VoxelMapper::run()
 
             if (!tr_cams.empty()) {
                 try {
-                    py::gil_scoped_acquire gil;
-                    static py::module svr_mod = py::module::import("svraster_cuda").attr("renderer");
-                    static py::module torch_mod = py::module::import("torch");
-
-                    auto svm = voxel_model_->svm();
-                    auto octpath = svm.attr("octpath").cast<torch::Tensor>().contiguous();
-                    auto vox_center = svm.attr("vox_center").cast<torch::Tensor>().contiguous();
-                    auto vox_size = svm.attr("vox_size").cast<torch::Tensor>().contiguous();
+                    auto octpath = voxel_model_->octPath().contiguous();
+                    auto vox_center = voxel_model_->voxCenter().contiguous();
+                    auto vox_size = voxel_model_->voxSize().contiguous();
 
                     TORCH_CHECK(octpath.size(0) == n_total_end, "octpath length mismatch at final summary");
                     TORCH_CHECK(vox_center.size(0) == n_total_end, "vox_center length mismatch at final summary");
@@ -1239,35 +1279,9 @@ void VoxelMapper::run()
                         TORCH_CHECK(false, "vox_size must be [N] or [N,1] at final summary");
                     }
 
-                    py::list py_cams;
-                    py::object py_cuda = torch_mod.attr("device")("cuda");
-                    auto move_attr_to_cuda_if_tensor =
-                        [&](py::object& obj, const char* name) {
-                            if (py::hasattr(obj, name)) {
-                                py::object t = obj.attr(name);
-                                if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                                    obj.attr(name) = t.attr("to")(py_cuda);
-                                }
-                            }
-                        };
-
-                    for (const auto& c : tr_cams) {
-                        py::object py_cam = MiniCam_to_py(c);
-                        move_attr_to_cuda_if_tensor(py_cam, "w2c");
-                        move_attr_to_cuda_if_tensor(py_cam, "c2w");
-                        move_attr_to_cuda_if_tensor(py_cam, "position");
-                        move_attr_to_cuda_if_tensor(py_cam, "lookat");
-                        py_cams.append(py_cam);
-                    }
-
                     const float near_thresh = 0.2f;
-                    at::Tensor is_near = svr_mod.attr("mark_near")(
-                        py_cams,
-                        py::cast(octpath),
-                        py::cast(vox_center),
-                        py::cast(vox_size),
-                        py::float_(near_thresh)
-                    ).cast<at::Tensor>();
+                    at::Tensor is_near =
+                        sv::markSvrasterNearDirect(tr_cams, octpath, vox_center, vox_size, near_thresh);
                     if (is_near.dim() == 2 && is_near.size(1) == 1) {
                         is_near = is_near.squeeze(1);
                     }
@@ -1302,12 +1316,30 @@ void VoxelMapper::run()
     }
 
     // Save and clear
+    const std::filesystem::path shutdown_dir =
+        result_dir_ / (std::to_string(getIteration()) + "_shutdown");
+    if (!config_file_path_.empty() && std::filesystem::exists(config_file_path_)) {
+        try {
+            std::filesystem::create_directories(shutdown_dir);
+            std::filesystem::path config_copy_name = config_file_path_.filename();
+            if (config_copy_name.empty()) {
+                config_copy_name = "voxel_mapper.yaml";
+            }
+            std::filesystem::copy_file(
+                config_file_path_,
+                shutdown_dir / config_copy_name,
+                std::filesystem::copy_options::overwrite_existing);
+        } catch (const std::exception& e) {
+            std::cerr << "[VoxelMapper] Failed to copy config file to shutdown folder: "
+                      << e.what() << "\n";
+        }
+    }
     renderAndRecordAllKeyframes("_shutdown");
-    savePly(result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply");
+    savePly(shutdown_dir / "ply");
     {
         const std::filesystem::path ply_dir =
-            result_dir_ / (std::to_string(getIteration()) + "_shutdown") / "ply" /
-            "voxel_model" / ("iteration_" + std::to_string(getIteration()));
+            shutdown_dir / "ply" / "voxel_model" /
+            ("iteration_" + std::to_string(getIteration()));
         const std::filesystem::path eval_mesh_path = ply_dir / "voxel_surface_mesh.ply";
 
         const bool want_rendered_mesh =
@@ -1345,8 +1377,7 @@ void VoxelMapper::run()
                     voxel_utils::resolveNvbloxMeshPath(rerun_params_.saved_nvblox_mesh_path_);
                 if (nvblox_mesh_path.empty()) {
                     const std::filesystem::path nvblox_dir =
-                        result_dir_ / (std::to_string(getIteration()) + "_shutdown") /
-                        "ply" / "nvblox";
+                        shutdown_dir / "ply" / "nvblox";
                     nvblox_mesh_path = nvblox_dir / "nvblox_color_mesh.ply";
                 }
                 std::filesystem::create_directories(nvblox_mesh_path.parent_path());
@@ -1659,10 +1690,7 @@ void VoxelMapper::trainForOneIteration()
     }
 
     voxel_model_->optimizerZeroGrad();   // move this BEFORE backward
-    {
-        py::gil_scoped_release no_gil;
-        loss.backward();
-    }
+    loss.backward();
 
     if (opt_params_.lambda_tv_density_ > 0.f &&
         iter >= opt_params_.tv_from_ &&
@@ -1735,7 +1763,7 @@ void VoxelMapper::trainForOneIteration()
             }
 
             auto stat = voxel_model_->computeTrainingStat(tr_cams);
-            py::object sched_state = voxel_model_->schedulerStateDict();
+            auto sched_state = voxel_model_->schedulerState();
             auto flatten_colvec = [](torch::Tensor t) {
                 if (t.defined() && t.dim() == 2 && t.size(1) == 1) {
                     t = t.squeeze(1);
@@ -2029,7 +2057,9 @@ void VoxelMapper::trainForOneIteration()
                                 // Prune only positive/free-space voxels. Negative-side voxels
                                 // are kept because the sign alone does not prove they are useless.
                                 tsdf_prune_mask =
-                                    tsdf_free_mask.to(torch::kBool); // [N]
+                                    sdf_params_.tsdf_prune_unknown_
+                                        ? (tsdf_free_mask | tsdf_unknown_mask).to(torch::kBool)
+                                        : tsdf_free_mask.to(torch::kBool); // [N]
 
                                 // Ensure device matches prune_mask
                                 if (tsdf_prune_mask.device() != prune_mask.device()) {
@@ -2219,25 +2249,10 @@ void VoxelMapper::trainForOneIteration()
                 // This mimics octlayout_filtering(...) using mark_max_samp_rate + mark_near.
                 if (!tr_cams.empty() && N > 0) {
                     try {
-                        py::gil_scoped_acquire gil;
-                        static py::module_ svr_mod =
-                            py::module_::import("svraster_cuda").attr("renderer");
-                        static py::module_ torch_mod =
-                            py::module_::import("torch");
-
-                        // Access Python SparseVoxelModel
-                        py::object py_svm = voxel_model_->svm();
-                        if (!py_svm.is_none()) {
-
-                            py::object py_octpath   = py_svm.attr("octpath");
-                            py::object py_octlv     = py_svm.attr("octlevel");
-                            py::object py_vox_center= py_svm.attr("vox_center");
-                            py::object py_vox_size  = py_svm.attr("vox_size");
-
-                            at::Tensor octpath = py_octpath.cast<at::Tensor>().contiguous();     // [N,1] int64
-                            at::Tensor L       = py_octlv.cast<at::Tensor>().contiguous();       // [N,1] int8 or int64
-                            at::Tensor vox_center = py_vox_center.cast<at::Tensor>().contiguous(); // [N,3]
-                            at::Tensor vox_size   = py_vox_size.cast<at::Tensor>().contiguous();   // [N,1] or [N]
+                            at::Tensor octpath = voxel_model_->octPath().contiguous();      // [N,1] int64
+                            at::Tensor L = voxel_model_->octLevel().contiguous();           // [N,1] int8
+                            at::Tensor vox_center = voxel_model_->voxCenter().contiguous(); // [N,3]
+                            at::Tensor vox_size = voxel_model_->voxSize().contiguous();     // [N,1]
 
                             // Basic sanity: same N
                             TORCH_CHECK(octpath.size(0) == N,
@@ -2257,41 +2272,13 @@ void VoxelMapper::trainForOneIteration()
                                 TORCH_CHECK(false, "vox_size must be [N] or [N,1]");
                             }
 
-                            // Build Python list of CUDA MiniCams
-                            py::list py_cams;
-                            py::object py_cuda = torch_mod.attr("device")("cuda");
-
-                            auto move_attr_to_cuda_if_tensor =
-                                [&](py::object& obj, const char* name){
-                                    if (py::hasattr(obj, name)) {
-                                        py::object t = obj.attr(name);
-                                        if (py::hasattr(t, "is_cuda") &&
-                                            !py::bool_(t.attr("is_cuda"))) {
-                                            obj.attr(name) = t.attr("to")(py_cuda);
-                                        }
-                                    }
-                                };
-
-                            for (const auto& c : tr_cams) {
-                                py::object py_cam = MiniCam_to_py(c);
-                                move_attr_to_cuda_if_tensor(py_cam, "w2c");
-                                move_attr_to_cuda_if_tensor(py_cam, "c2w");
-                                move_attr_to_cuda_if_tensor(py_cam, "position");
-                                move_attr_to_cuda_if_tensor(py_cam, "lookat");
-                                py_cams.append(py_cam);
-                            }
-
                             auto Nu_before = octpath.size(0);
                             TORCH_CHECK(Nu_before == N,
                                         "octpath.size(0) != N before visibility filter");
 
                             // 1) visibility: rate > 0
-                            at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-                                py_cams,
-                                py::cast(octpath),
-                                py::cast(vox_center),
-                                py::cast(vox_size)
-                            ).cast<at::Tensor>();        // [N,1] or [N]
+                            at::Tensor rate =
+                                sv::markSvrasterMaxSampRateDirect(tr_cams, octpath, vox_center, vox_size);
 
                             if (rate.dim() == 2 && rate.size(1) == 1)
                                 rate = rate.squeeze(1);
@@ -2313,13 +2300,8 @@ void VoxelMapper::trainForOneIteration()
                                 {N},
                                 torch::TensorOptions().dtype(torch::kBool).device(keep_rate.device()));
                             if (near_thresh > 0.0f) {
-                                is_near = svr_mod.attr("mark_near")(
-                                    py_cams,
-                                    py::cast(octpath),
-                                    py::cast(vox_center),
-                                    py::cast(vox_size),
-                                    py::float_(near_thresh)
-                                ).cast<at::Tensor>();       // [N,1] or [N]
+                                is_near =
+                                    sv::markSvrasterNearDirect(tr_cams, octpath, vox_center, vox_size, near_thresh);
                                 if (is_near.dim() == 2 && is_near.size(1) == 1)
                                     is_near = is_near.squeeze(1);
                                 is_near = is_near.to(torch::kBool);
@@ -2385,8 +2367,6 @@ void VoxelMapper::trainForOneIteration()
                             // Combine with existing prune_mask
                             prune_mask = prune_mask | prune_mask_vis;
 
-                        }
-
                     } catch (const std::exception& e) {
                         std::cerr << "[PRUNE/visibility] exception: " << e.what() << "\n";
                     }
@@ -2426,11 +2406,6 @@ void VoxelMapper::trainForOneIteration()
                         voxel_model_->refreshDenseCoreBBFromCurrentVoxels();
                         if (!voxel_model_->hasDenseCoreBB()) {
                             use_far_prune_this_round = false;
-                        }
-                        if (rerun_params_.enable_rerun_ && voxel_model_->hasDenseCoreBB()) {
-                            voxel_model_->logDenseCoreBBoxToRerun(
-                                getIteration(),
-                                "world/dense_core/used_for_prune");
                         }
                     }
                     prune_mask_real_outside_dense_core = torch::zeros(
@@ -2860,13 +2835,10 @@ void VoxelMapper::trainForOneIteration()
                                             sh0.index_select(
                                                 0,
                                                 prune_idx.to(sh0.device()).to(torch::kLong)).contiguous();
-                                        py::gil_scoped_acquire gil2;
-                                        static py::module act_mod =
-                                            py::module::import("src.utils.activation_utils");
-                                        py::object rgb_py =
-                                            act_mod.attr("shzero2rgb")(py::cast(sh0_sel));
                                         selected_colors =
-                                            rgb_py.cast<torch::Tensor>().contiguous();
+                                            (sh0_sel * sh_utils::C0 + 0.5f)
+                                                .clamp(0.0f, 1.0f)
+                                                .contiguous();
                                     }
                                 } catch (const std::exception& e) {
                                     std::cerr << "[RERUN/tsdf_pruned] failed to compute pruned voxel colors: "
@@ -3061,13 +3033,10 @@ void VoxelMapper::trainForOneIteration()
                                             sh0.index_select(
                                                 0,
                                                 prune_idx.to(sh0.device()).to(torch::kLong)).contiguous();
-                                        py::gil_scoped_acquire gil2;
-                                        static py::module act_mod =
-                                            py::module::import("src.utils.activation_utils");
-                                        py::object rgb_py =
-                                            act_mod.attr("shzero2rgb")(py::cast(sh0_sel));
                                         selected_colors =
-                                            rgb_py.cast<torch::Tensor>().contiguous();
+                                            (sh0_sel * sh_utils::C0 + 0.5f)
+                                                .clamp(0.0f, 1.0f)
+                                                .contiguous();
                                     }
                                 } catch (const std::exception& e) {
                                     std::cerr << "[RERUN/sdf_pruned_nvblox] failed to compute voxel colors: "
@@ -3526,13 +3495,9 @@ void VoxelMapper::trainForOneIteration()
                 opt_params_.lr_decay_ckpt_,
                 opt_params_.lr_decay_mult_
             );
-            voxel_model_->schedulerLoadStateDict(sched_state);
+            voxel_model_->schedulerLoadState(sched_state);
             // Empty CUDA cache as SV does
-            {
-                py::gil_scoped_acquire gil;
-                py::module_ torch_mod = py::module_::import("torch");
-                torch_mod.attr("cuda").attr("empty_cache")();
-            }
+            c10::cuda::CUDACachingAllocator::emptyCache();
             last_densify_iter_ = iter;
         }
     }
@@ -3540,12 +3505,6 @@ void VoxelMapper::trainForOneIteration()
     voxel_model_->schedulerStep();
 
     if (rerun_params_.enable_rerun_) {
-        // Keep the Rerun timeline alive for the full optimization, even in
-        // filtered debug modes where no geometry is logged for many iterations.
-        sv::RerunVisualizerBridge::instance().visualizeScalar(
-            static_cast<double>(iter),
-            iter,
-            "world/debug/iteration");
         if (rerun_params_.run_tsdf_pruned_) {
             sv::RerunVisualizerBridge::instance().visualizeDebugScalar(
                 "tsdf_pruned",
@@ -3567,7 +3526,6 @@ void VoxelMapper::trainForOneIteration()
                 iter,
                 "world/debug/iteration");
         }
-
         if (rerun_params_.rerun_tsdf_unknown_voxels_ && rerun_state_.rerun_tsdf_unknown_dirty_) {
             logTsdfUnknownVoxelsToRerun(iter, torch::Tensor());
             rerun_state_.rerun_tsdf_unknown_dirty_ = false;
@@ -3581,345 +3539,12 @@ void VoxelMapper::trainForOneIteration()
         }
         logReconstructionMeshToRerun(iter);
         logNvbloxReconstructionMeshToRerun(iter);
-
-        {
-        // ----- 1) FULL VOXELS (unchanged) -----
-        torch::Tensor centers_all = voxel_model_->voxCenter(); // [N,3]
-        torch::Tensor sizes_all   = voxel_model_->voxSize();   // [N] or [N,1]
-        // colors from SH0 + density as before
-        torch::Tensor colors_all;
-        {
-            torch::Tensor sh0 = voxel_model_->sh0();
-            {
-                py::gil_scoped_acquire gil2;
-                static py::module act_mod = py::module::import("src.utils.activation_utils");
-                py::object rgb_py = act_mod.attr("shzero2rgb")(py::cast(sh0));
-                colors_all = rgb_py.cast<torch::Tensor>().contiguous();
-            }
-
-            torch::Tensor density = voxel_model_->voxelDensityMean();
-            if (density.defined() && density.numel() == centers_all.size(0)) {
-                auto d_cpu = density.view({-1}).to(torch::kCPU);
-                float d_min = d_cpu.min().item().toFloat();
-                float d_max = d_cpu.max().item().toFloat();
-                float eps   = 1e-6f;
-                float range = d_max - d_min;
-
-                torch::Tensor alpha_cpu;
-                if (range < eps) {
-                    alpha_cpu = torch::full_like(d_cpu, 0.8f);
-                } else {
-                    alpha_cpu = (d_cpu - d_min) / range;
-                    alpha_cpu = alpha_cpu.clamp(0.05f, 1.0f);
-                }
-                auto col_cpu = colors_all.to(torch::kCPU);
-                TORCH_CHECK(col_cpu.dim() == 2 &&
-                            col_cpu.size(0) == alpha_cpu.size(0),
-                            "colors and density must have same N");
-                if (col_cpu.size(1) == 3) {
-                    auto N = col_cpu.size(0);
-                    auto col_rgba = torch::zeros({N, 4}, col_cpu.options());
-                    col_rgba.index_put_(
-                        {torch::indexing::Slice(), torch::indexing::Slice(0, 3)},
-                        col_cpu
-                    );
-                    col_rgba.index_put_(
-                        {torch::indexing::Slice(), 3},
-                        alpha_cpu
-                    );
-                    colors_all = col_rgba.to(colors_all.device());
-                } else if (col_cpu.size(1) == 4) {
-                    col_cpu.index_put_(
-                        {torch::indexing::Slice(), 3},
-                        alpha_cpu
-                    );
-                    colors_all = col_cpu.to(colors_all.device());
-                } else {
-                    TORCH_CHECK(false, "colors must be [N,3] or [N,4]");
-                }
-            }
-        }
-        sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-            centers_all, sizes_all, colors_all, iter
-        );
         if (rerun_params_.run_whole_run_) {
-            logWholeRunLiveVoxelsToRerun(iter, centers_all, sizes_all, colors_all);
-        }
-
-        // visualize real-only voxels each iteration:
-        // real from PCD + promoted-artificial voxels
-        {
-            auto art_mask_all = voxel_model_->artificialMask();
-            auto promoted_mask_all = voxel_model_->promotedartificialMask();
-            auto real_mask_all = torch::ones(
-                {centers_all.size(0)},
-                torch::TensorOptions().dtype(torch::kBool).device(centers_all.device()));
-
-            if (art_mask_all.defined()) {
-                if (art_mask_all.dim() == 2 && art_mask_all.size(1) == 1) {
-                    art_mask_all = art_mask_all.squeeze(1);
-                }
-                art_mask_all = art_mask_all.to(centers_all.device()).to(torch::kBool).contiguous().view({-1});
-                if (art_mask_all.numel() == centers_all.size(0)) {
-                    real_mask_all = real_mask_all & (~art_mask_all);
-                }
-            }
-            if (promoted_mask_all.defined()) {
-                if (promoted_mask_all.dim() == 2 && promoted_mask_all.size(1) == 1) {
-                    promoted_mask_all = promoted_mask_all.squeeze(1);
-                }
-                promoted_mask_all = promoted_mask_all.to(centers_all.device()).to(torch::kBool).contiguous().view({-1});
-                if (promoted_mask_all.numel() == centers_all.size(0)) {
-                    real_mask_all = real_mask_all | promoted_mask_all;
-                }
-            }
-
-            auto real_idx = torch::nonzero(real_mask_all).view({-1});
-            if (real_idx.numel() > 0) {
-                auto centers_real = centers_all.index_select(0, real_idx).contiguous();
-                auto sizes_real = sizes_all.index_select(0, real_idx).contiguous();
-                torch::Tensor colors_real;
-                if (colors_all.defined() && colors_all.numel() > 0 &&
-                    colors_all.dim() == 2 && colors_all.size(0) == centers_all.size(0)) {
-                    colors_real = colors_all.index_select(0, real_idx).contiguous();
-                }
-            }
-        }
-        // Keep artificials/all synchronized with final topology state of this iteration.
-        // increasePcd() logs artificial topics at insertion time (pre-adapt); this call
-        // rewrites artificials/all after prune/subdivide so it matches /voxels.
-        {
-            voxel_model_->logLiveOrbVoxels(iter, colors_all);
-            voxel_model_->logLiveInactiveGeoVoxels(iter, colors_all);
-            voxel_model_->logLiveRgbdFillRenderHolesVoxels(iter, colors_all);
-            voxel_model_->logLiveDepthAnythingFillHolesVoxels(iter, colors_all);
-            voxel_model_->logFinalartificialVoxels(iter);
-            voxel_model_->logFinalPromotedartificialVoxels(iter);
-        }
-
-        {
-        // ----- 2) NEAR VOXELS (debug overlay) -----
-        if (debug_has_near &&
-            debug_near_centers.defined() &&
-            debug_near_centers.numel() > 0)
-        {
-            auto centers_near = debug_near_centers;         // [K,3] CUDA or CPU
-            auto sizes_near   = debug_near_sizes;           // [K,1] or [K]
-
-        // ensure sizes_near is [K,1] on CPU
-        if (sizes_near.dim() == 1) {
-            sizes_near = sizes_near.view({sizes_near.size(0), 1});
-        } else if (sizes_near.dim() == 2 && sizes_near.size(1) == 1) {
-            // ok
-        } else {
-            sizes_near = sizes_near.reshape({sizes_near.size(0), 1});
-        }
-
-        auto K = centers_near.size(0);
-        torch::Tensor colors_near = torch::zeros({K, 4}, centers_near.options());
-        colors_near.index_put_({torch::indexing::Slice(), 0}, 1.0f);  // R
-        colors_near.index_put_({torch::indexing::Slice(), 3}, 0.7f);  // alpha
-
-        sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-            centers_near,
-            sizes_near,
-            colors_near,
-            iter,
-            "world/voxels_near"    // <-- separate entity in blueprint
-        );
-        }
-        // ----- 2b) GEOMETRIC-NEAR VOXELS (debug overlay) -----
-        if (debug_has_near_geom &&
-            debug_near_geom_centers.defined() &&
-            debug_near_geom_centers.numel() > 0)
-        {
-            auto centers_near_geom = debug_near_geom_centers; // [K,3]
-            auto sizes_near_geom   = debug_near_geom_sizes;   // [K,1] or [K]
-
-            if (sizes_near_geom.dim() == 1) {
-                sizes_near_geom = sizes_near_geom.view({sizes_near_geom.size(0), 1});
-            } else if (!(sizes_near_geom.dim() == 2 && sizes_near_geom.size(1) == 1)) {
-                sizes_near_geom = sizes_near_geom.reshape({sizes_near_geom.size(0), 1});
-            }
-
-            auto Kg = centers_near_geom.size(0);
-            torch::Tensor colors_near_geom = torch::zeros({Kg, 4}, centers_near_geom.options());
-            colors_near_geom.index_put_({torch::indexing::Slice(), 0}, 1.0f);  // R
-            colors_near_geom.index_put_({torch::indexing::Slice(), 1}, 0.5f);  // G
-            colors_near_geom.index_put_({torch::indexing::Slice(), 3}, 0.8f);  // alpha
-
-            sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                centers_near_geom,
-                sizes_near_geom,
-                colors_near_geom,
+            logWholeRunLiveVoxelsToRerun(
                 iter,
-                "world/voxels_near_geometric");
-        }
-        auto visualize_tsdf_class_boxes =
-            [&](const torch::Tensor& centers_in,
-                const torch::Tensor& sizes_in,
-                bool has,
-                float r,
-                float g,
-                float b,
-                float a,
-                const std::string& entity_path,
-                const std::string& label)
-        {
-            if (!has || !centers_in.defined() || centers_in.numel() == 0) {
-                return;
-            }
-
-            auto centers = centers_in;
-            auto sizes = sizes_in;
-            if (!sizes.defined() || sizes.numel() == 0) {
-                return;
-            }
-            if (sizes.dim() == 1) {
-                sizes = sizes.view({sizes.size(0), 1});
-            } else if (!(sizes.dim() == 2 && sizes.size(1) == 1)) {
-                sizes = sizes.reshape({sizes.size(0), 1});
-            }
-
-            auto K = centers.size(0);
-            torch::Tensor colors = torch::zeros({K, 4}, centers.options());
-            colors.index_put_({torch::indexing::Slice(), 0}, r);
-            colors.index_put_({torch::indexing::Slice(), 1}, g);
-            colors.index_put_({torch::indexing::Slice(), 2}, b);
-            colors.index_put_({torch::indexing::Slice(), 3}, a);
-
-            sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                centers,
-                sizes,
-                colors,
-                iter,
-                entity_path);
-        };
-
-        visualize_tsdf_class_boxes(
-            debug_tsdf_free_centers,
-            debug_tsdf_free_sizes,
-            debug_has_tsdf_free,
-            0.0f, 0.9f, 1.0f, 0.45f,
-            "world/tsdf/free_space",
-            "TSDF free-space");
-        visualize_tsdf_class_boxes(
-            debug_tsdf_occupied_centers,
-            debug_tsdf_occupied_sizes,
-            debug_has_tsdf_occupied,
-            1.0f, 0.0f, 1.0f, 0.45f,
-            "world/tsdf/occupied_side",
-            "TSDF occupied-side");
-        visualize_tsdf_class_boxes(
-            debug_tsdf_surface_centers,
-            debug_tsdf_surface_sizes,
-            debug_has_tsdf_surface,
-            0.0f, 1.0f, 0.0f, 0.35f,
-            "world/tsdf/surface_band",
-            "TSDF surface-band");
-        visualize_tsdf_class_boxes(
-            debug_tsdf_unknown_centers,
-            debug_tsdf_unknown_sizes,
-            debug_has_tsdf_unknown,
-            0.5f, 0.5f, 0.5f, 0.22f,
-            "world/tsdf/unknown",
-            "TSDF unknown");
-
-        auto visualize_tsdf_corner_points =
-            [&](const torch::Tensor& points_in,
-                const torch::Tensor& colors_in,
-                bool has,
-                float r,
-                float g,
-                float b,
-                float a,
-                const std::string& entity_path,
-                const std::string& label)
-        {
-            if (!has || !points_in.defined() || points_in.numel() == 0) {
-                return;
-            }
-            auto points = points_in;
-            if (points.dim() != 2 || points.size(1) != 3) {
-                return;
-            }
-
-            torch::Tensor colors = colors_in;
-            if (!colors.defined() || colors.numel() == 0) {
-                colors = torch::zeros({points.size(0), 4}, points.options());
-                colors.index_put_({torch::indexing::Slice(), 0}, r);
-                colors.index_put_({torch::indexing::Slice(), 1}, g);
-                colors.index_put_({torch::indexing::Slice(), 2}, b);
-                colors.index_put_({torch::indexing::Slice(), 3}, a);
-            }
-
-            sv::RerunVisualizerBridge::instance().visualizePoints3D(
-                points,
-                colors,
-                iter,
-                entity_path,
-                0.012f);
-        };
-
-        visualize_tsdf_corner_points(
-            debug_tsdf_free_corner_points,
-            torch::Tensor(),
-            debug_has_tsdf_free_corners,
-            0.0f, 0.9f, 1.0f, 0.95f,
-            "world/tsdf_samples/free_space_corners",
-            "TSDF free-space");
-        visualize_tsdf_corner_points(
-            debug_tsdf_occupied_corner_points,
-            torch::Tensor(),
-            debug_has_tsdf_occupied_corners,
-            1.0f, 0.0f, 1.0f, 0.95f,
-            "world/tsdf_samples/occupied_side_corners",
-            "TSDF occupied-side");
-        visualize_tsdf_corner_points(
-            debug_tsdf_surface_corner_points,
-            torch::Tensor(),
-            debug_has_tsdf_surface_corners,
-            0.0f, 1.0f, 0.0f, 0.95f,
-            "world/tsdf_samples/surface_band_corners",
-            "TSDF surface-band");
-        visualize_tsdf_corner_points(
-            debug_tsdf_unknown_corner_points,
-            debug_tsdf_unknown_corner_colors,
-            debug_has_tsdf_unknown_corners,
-            0.5f, 0.5f, 0.5f, 0.95f,
-            "world/tsdf_samples/unknown_corners",
-            "TSDF unknown");
-
-        // ----- 6) FAR-ONLY PRUNED VOXELS (debug overlay) -----
-        if (debug_has_far_pruned &&
-            debug_far_pruned_centers.defined() &&
-            debug_far_pruned_centers.numel() > 0)
-        {
-            auto centers_far_pruned = debug_far_pruned_centers; // [K_far,3]
-            auto sizes_far_pruned   = debug_far_pruned_sizes;   // [K_far,1] or [K_far]
-
-            if (sizes_far_pruned.dim() == 1) {
-                sizes_far_pruned = sizes_far_pruned.view({sizes_far_pruned.size(0), 1});
-            } else if (sizes_far_pruned.dim() == 2 && sizes_far_pruned.size(1) == 1) {
-                // ok
-            } else {
-                sizes_far_pruned = sizes_far_pruned.reshape({sizes_far_pruned.size(0), 1});
-            }
-
-            auto Kf = centers_far_pruned.size(0);
-            torch::Tensor colors_far_pruned = torch::zeros({Kf, 4}, centers_far_pruned.options());
-            colors_far_pruned.index_put_({torch::indexing::Slice(), 0}, 1.0f);  // R
-            colors_far_pruned.index_put_({torch::indexing::Slice(), 3}, 0.9f);  // alpha
-
-            sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                centers_far_pruned,
-                sizes_far_pruned,
-                colors_far_pruned,
-                iter,
-                "world/far_voxels");
-        }
-
-        }
+                voxel_model_->voxCenter(),
+                voxel_model_->voxSize(),
+                torch::Tensor());
         }
     }
 
@@ -4023,14 +3648,8 @@ void VoxelMapper::combineMappingOperations()
                     }
                 }
                 if (points.size() >= 30) {
-                    if (rerun_params_.enable_rerun_) {
-                        appendAndLogOrbRawPointBatchToRerun(
-                            points,
-                            colors,
-                            iter);
-                        voxel_model_->setNextRealInsertionRerunEntityPath(
-                            "world/orb/voxels_created");
-                    }
+                    voxel_model_->setNextRealInsertionRerunEntityPath(
+                        "world/orb/voxels_created");
                     voxel_model_->increasePcd(
                         points,
                         colors,
@@ -4045,9 +3664,7 @@ void VoxelMapper::combineMappingOperations()
                             refitSvrasterTsdfFromRegisteredKeyframes("orb_increasePcd");
                         }
                     }
-                    if (rerun_params_.enable_rerun_) {
-                        voxel_model_->setNextRealInsertionRerunEntityPath("");
-                    }
+                    voxel_model_->setNextRealInsertionRerunEntityPath("");
                     if (voxel_model_ && voxel_model_->consumeartificialFillFlag()) {
                         last_artificial_fill_iter_ = static_cast<int64_t>(iter);
                         std::cout << "[VoxelMapper] artificial fill happened at iter "
@@ -4158,14 +3775,8 @@ void VoxelMapper::combineMappingOperations()
                     }
                 }
                 if (points.size() >= 30) {
-                    if (rerun_params_.enable_rerun_) {
-                        appendAndLogOrbRawPointBatchToRerun(
-                            points,
-                            colors,
-                            iter);
-                        voxel_model_->setNextRealInsertionRerunEntityPath(
-                            "world/orb/voxels_created");
-                    }
+                    voxel_model_->setNextRealInsertionRerunEntityPath(
+                        "world/orb/voxels_created");
                     voxel_model_->increasePcd(
                         points,
                         colors,
@@ -4178,9 +3789,7 @@ void VoxelMapper::combineMappingOperations()
                             refitSvrasterTsdfFromRegisteredKeyframes("loop_orb_increasePcd");
                         }
                     }
-                    if (rerun_params_.enable_rerun_) {
-                        voxel_model_->setNextRealInsertionRerunEntityPath("");
-                    }
+                    voxel_model_->setNextRealInsertionRerunEntityPath("");
                     if (voxel_model_ && voxel_model_->consumeartificialFillFlag()) {
                         last_artificial_fill_iter_ = static_cast<int64_t>(iter);
                         std::cout << "[VoxelMapper] artificial fill happened at iter "

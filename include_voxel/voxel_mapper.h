@@ -2,10 +2,6 @@
 
 #include <torch/torch.h>
 #include <jsoncpp/json/json.h>
-#include <pybind11/numpy.h>
-#include <pybind11/embed.h>
-#include <pybind11/gil.h>
-#include <pybind11/pybind11.h>     //  ← for gil_scoped_release
 #include <opencv2/opencv.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudastereo.hpp>
@@ -37,12 +33,10 @@
 #include "include_voxel/mini_cam.h"
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/voxel_constants.h"
-#include "include_voxel/py_utils.h"
 #include "include/loss_utils.h"
 #include "include_voxel/voxel_scene.h"
 #include "include/tensor_utils.h"
 #include "include_voxel/voxel_model.h"
-#include "include_voxel/py_utils.h"
 #include "include_voxel/render_opts.h"  
 #include "include_voxel/voxel_mono_prior_parameters.h"
 #include "include_voxel/voxel_planner_parameters.h"
@@ -211,7 +205,6 @@ protected:
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
     void saveRenderedTsdfMeshPly(const std::filesystem::path& result_path);
-    void saveRenderedTsdfMeshPlySvrasterPython(const std::filesystem::path& result_path);
     void saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path);
 
     // sdf-based mapping -------------------------------------------------------
@@ -259,6 +252,7 @@ protected:
 
     // mono-prior integration --------------------------------------------------
     void readMonoPriorConfigFromSettings(const cv::FileStorage& settings_file);
+    void ensureEmbeddedPythonRuntime(bool import_torch_cuda = false);
     bool monoPriorUsesMetricDepth() const;
     bool ensureMonoPriorForKeyframe(
         const std::shared_ptr<VoxelKeyframe>& kf);
@@ -504,9 +498,6 @@ protected:
     int next_subdiv_iter_   = 0;
     int next_prune_iter_    = 0;
     int next_opacity_reset_ = 0;
-
-    // (optional) Python thread‑state holder ----------------------------------
-    PyThreadState* m_savedState = nullptr;
 
     int64_t last_artificial_fill_iter_ = -1;
     int64_t last_densify_iter_ = -1;

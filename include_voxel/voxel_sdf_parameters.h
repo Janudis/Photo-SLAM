@@ -19,6 +19,7 @@ struct VoxelSdfParameters
     float tsdf_prune_min_weight_ = 1.0f;
     float tsdf_prune_surface_band_vox_ = 2.0f;
     int tsdf_prune_min_valid_corners_ = 8;
+    bool tsdf_prune_unknown_ = false;
     bool tsdf_protect_surface_band_from_pruning_ = true;
     bool tsdf_density_init_ = false;
     float tsdf_density_init_min_weight_ = 1.0f;

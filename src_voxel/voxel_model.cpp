@@ -1,56 +1,261 @@
 #include "include_voxel/voxel_model.h"
-#include "include_voxel/rerun_utils.h"
+#include "src/adam_step.h"
+#include "src/tv_compute.h"
+#include "src/utils.h"
+#include <ATen/ops/isin.h>
+#include <ATen/ops/searchsorted.h>
+#include <ATen/ops/unique_dim.h>
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
 #include <unordered_map>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <optional>
 
-namespace py = pybind11;
-using namespace py::literals;  // enables "name"_a syntax
 namespace sv {
 
 namespace {
-struct GridPointKey3 {
-    int64_t x = 0;
-    int64_t y = 0;
-    int64_t z = 0;
+constexpr float kSHC0 = 0.28209479177387814f;
 
-    bool operator==(const GridPointKey3& other) const {
-        return x == other.x && y == other.y && z == other.z;
-    }
-};
+torch::Tensor rgbToShZero(const torch::Tensor& rgb)
+{
+    return (rgb - 0.5f) / kSHC0;
+}
 
-struct GridPointKey3Hash {
-    std::size_t operator()(const GridPointKey3& k) const {
-        std::size_t h = std::hash<int64_t>{}(k.x);
-        auto combine = [&](std::size_t v) {
-            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        };
-        combine(std::hash<int64_t>{}(k.y));
-        combine(std::hash<int64_t>{}(k.z));
-        return h;
+torch::Tensor shZeroToRgb(const torch::Tensor& sh)
+{
+    return sh * kSHC0 + 0.5f;
+}
+
+torch::Tensor levelToVoxSize(
+    const torch::Tensor& scene_extent,
+    const torch::Tensor& octlevel)
+{
+    return scene_extent * torch::pow(
+        torch::full_like(octlevel.to(torch::kFloat32), 2.0f),
+        -octlevel.to(torch::kFloat32));
+}
+
+torch::Tensor voxSizeToLevel(
+    const torch::Tensor& scene_extent,
+    const torch::Tensor& vox_size)
+{
+    return -torch::log2(vox_size / scene_extent);
+}
+
+std::pair<torch::Tensor, torch::Tensor> decodeOctpath(
+    const torch::Tensor& octpath,
+    const torch::Tensor& octlevel,
+    const torch::Tensor& scene_center,
+    const torch::Tensor& scene_extent)
+{
+    torch::Tensor op = octpath.reshape({-1, 1}).contiguous();
+    torch::Tensor lv = octlevel.reshape({-1, 1}).contiguous();
+    torch::Tensor scene_min_xyz = scene_center - 0.5f * scene_extent;
+    torch::Tensor vox_size = levelToVoxSize(scene_extent, lv);
+    torch::Tensor vox_ijk = UTILS::octpath_2_ijk(op, lv);
+    torch::Tensor vox_center = scene_min_xyz + (vox_ijk.to(torch::kFloat32) + 0.5f) * vox_size;
+    return {vox_center.contiguous(), vox_size.contiguous()};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> uniqueRowsWithInverse(const torch::Tensor& rows);
+
+std::pair<torch::Tensor, torch::Tensor> buildGridPtsLink(
+    const torch::Tensor& octpath,
+    const torch::Tensor& octlevel,
+    int max_num_levels)
+{
+    torch::Tensor op = octpath.reshape({-1, 1}).contiguous();
+    torch::Tensor lv = octlevel.reshape({-1, 1}).contiguous();
+    torch::Tensor vox_ijk = UTILS::octpath_2_ijk(op, lv).to(torch::kLong).contiguous();
+    torch::Tensor lv2max = (max_num_levels - lv.to(torch::kLong)).contiguous();
+    torch::Tensor scale = torch::pow(
+        torch::full_like(lv2max.to(torch::kFloat32), 2.0f),
+        lv2max.to(torch::kFloat32)).to(torch::kLong).contiguous();
+
+    torch::Tensor base_grid_ijk = (vox_ijk * scale).view({-1, 1, 3}).contiguous();
+    torch::Tensor subtree_shift = torch::tensor(
+        {{0, 0, 0}, {0, 0, 1}, {0, 1, 0}, {0, 1, 1},
+         {1, 0, 0}, {1, 0, 1}, {1, 1, 0}, {1, 1, 1}},
+        torch::TensorOptions().dtype(torch::kLong).device(op.device()));
+    torch::Tensor gridpts =
+        base_grid_ijk + subtree_shift.view({1, 8, 3}) * scale.view({-1, 1, 1});
+
+    auto [grid_pts_key, vox_key_flat] = uniqueRowsWithInverse(gridpts.reshape({-1, 3}));
+    torch::Tensor vox_key = vox_key_flat.reshape({-1, 8}).contiguous();
+    return {grid_pts_key.contiguous(), vox_key};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> uniqueRowsWithInverse(const torch::Tensor& rows)
+{
+    auto result = at::unique_dim(
+        rows.contiguous(),
+        /*dim=*/0,
+        /*sorted=*/true,
+        /*return_inverse=*/true,
+        /*return_counts=*/false);
+    return {std::get<0>(result).contiguous(), std::get<1>(result).contiguous()};
+}
+
+std::optional<std::pair<torch::Tensor, float>> mainSceneBoundPcdHeuristicCpp(
+    const torch::Tensor& points_cpu,
+    float pcd_density_rate)
+{
+    if (!points_cpu.defined() || points_cpu.numel() == 0 || points_cpu.size(0) < 1) {
+        return std::nullopt;
     }
-};
+
+    auto pts = points_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (pts.dim() != 2 || pts.size(1) != 3) {
+        return std::nullopt;
+    }
+
+    auto center = std::get<0>(pts.median(/*dim=*/0, /*keepdim=*/false)).contiguous();
+    auto dist = std::get<0>(
+        (pts - center.view({1, 3})).abs().max(/*dim=*/1, /*keepdim=*/false))
+        .to(torch::kFloat32)
+        .contiguous();
+    dist = std::get<0>(dist.sort(/*dim=*/0)).contiguous();
+
+    const int64_t n = dist.size(0);
+    if (n <= 0) {
+        return std::nullopt;
+    }
+
+    auto idx = torch::arange(
+        1, n + 1,
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto density = idx * (dist > 0.0f).to(torch::kFloat32) /
+        ((2.0f * dist).pow(3) + 1e-6f);
+
+    int64_t begin_idx = static_cast<int64_t>(
+        std::llround(static_cast<double>(n) * 0.05));
+    begin_idx = std::max<int64_t>(0, std::min<int64_t>(n - 1, begin_idx));
+
+    auto tail = density.index({torch::indexing::Slice(begin_idx, torch::indexing::None)}).contiguous();
+    if (tail.numel() <= 0) {
+        return std::nullopt;
+    }
+
+    const int64_t max_idx = begin_idx + tail.argmax().item<int64_t>();
+    const float max_density = density.index({max_idx}).item<float>();
+    const float target_density = pcd_density_rate * max_density;
+    auto right = density.index({torch::indexing::Slice(max_idx, torch::indexing::None)}).contiguous();
+    auto below = torch::nonzero(right < target_density).view({-1}).contiguous();
+    if (below.numel() <= 0) {
+        return std::nullopt;
+    }
+
+    const int64_t target_idx = max_idx + below.index({0}).item<int64_t>();
+    const float radius = dist.index({target_idx}).item<float>();
+    if (!std::isfinite(radius) || radius <= 0.0f) {
+        return std::nullopt;
+    }
+
+    return std::make_pair(center.contiguous(), radius);
+}
+
+torch::Tensor aggregateVoxelCornersIntoGridPts(
+    int64_t num_grid_pts,
+    const torch::Tensor& vox_key,
+    const torch::Tensor& vox_val)
+{
+    TORCH_CHECK(vox_key.dim() == 2 && vox_key.size(1) == 8,
+                "aggregateVoxelCornersIntoGridPts expects vox_key [N,8]");
+    TORCH_CHECK(vox_val.dim() >= 3 && vox_val.size(0) == vox_key.size(0) &&
+                    vox_val.size(1) == 8,
+                "aggregateVoxelCornersIntoGridPts expects vox_val [N,8,*]");
+    std::vector<int64_t> out_shape{num_grid_pts};
+    for (int64_t d = 2; d < vox_val.dim(); ++d) {
+        out_shape.push_back(vox_val.size(d));
+    }
+    auto out = torch::zeros(
+        out_shape,
+        torch::TensorOptions().dtype(torch::kFloat32).device(vox_val.device()));
+    out.index_reduce_(
+        /*dim=*/0,
+        /*index=*/vox_key.to(vox_val.device()).flatten(),
+        /*source=*/vox_val.flatten(0, 1).to(torch::kFloat32),
+        /*reduce=*/"mean",
+        /*include_self=*/false);
+    return out.contiguous();
+}
+
+std::pair<torch::Tensor, torch::Tensor> genChildrenOctpath(
+    const torch::Tensor& octpath,
+    const torch::Tensor& octlevel,
+    int max_num_levels)
+{
+    auto op = octpath.reshape({-1, 1}).to(torch::kInt64).contiguous();
+    auto lv = octlevel.reshape({-1, 1}).to(torch::kInt64).contiguous() + 1;
+    TORCH_CHECK(lv.max().item<int64_t>() <= max_num_levels,
+                "Maximum level out of bound after subdivision");
+    auto shift = (3 * (max_num_levels - lv)).to(torch::kFloat32);
+    auto shift_scale = torch::pow(
+        torch::full_like(shift, 2.0f),
+        shift).to(torch::kInt64).contiguous();
+    auto children = torch::arange(
+        8,
+        torch::TensorOptions().dtype(torch::kInt64).device(op.device())).view({1, 8});
+    auto child_bits = children * shift_scale;
+    auto child_path = (op.view({-1, 1}) + child_bits).reshape({-1, 1}).contiguous();
+    auto child_level = lv.to(torch::kInt8).repeat_interleave(8, 0).contiguous();
+    return {child_path, child_level};
+}
+
+torch::Tensor subdivideVoxelCornerValues(const torch::Tensor& vox_val)
+{
+    TORCH_CHECK(vox_val.dim() >= 3 && vox_val.size(1) == 8,
+                "subdivideVoxelCornerValues expects [N,8,*]");
+    std::vector<torch::Tensor> child_blocks;
+    child_blocks.reserve(8);
+    for (int c = 0; c < 8; ++c) {
+        auto v0 = vox_val.index({torch::indexing::Slice(), c});
+        std::vector<torch::Tensor> corners;
+        corners.reserve(8);
+        for (int q = 0; q < 8; ++q) {
+            const int m = c ^ q;
+            if (m == 0) {
+                corners.push_back(v0);
+            } else if (m == 1 || m == 2 || m == 4) {
+                corners.push_back(0.5f * (v0 + vox_val.index({torch::indexing::Slice(), c ^ m})));
+            } else if (m == 3) {
+                corners.push_back(0.25f * (
+                    v0 +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b001}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b010}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b011})));
+            } else if (m == 5) {
+                corners.push_back(0.25f * (
+                    v0 +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b001}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b100}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b101})));
+            } else if (m == 6) {
+                corners.push_back(0.25f * (
+                    v0 +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b010}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b100}) +
+                    vox_val.index({torch::indexing::Slice(), c ^ 0b110})));
+            } else {
+                corners.push_back(vox_val.mean(/*dim=*/1, /*keepdim=*/false));
+            }
+        }
+        child_blocks.push_back(torch::stack(corners, 1).contiguous());
+    }
+    auto stacked = torch::stack(child_blocks, 1).contiguous();
+    std::vector<int64_t> out_shape{vox_val.size(0) * 8, 8};
+    for (int64_t d = 2; d < vox_val.dim(); ++d) {
+        out_shape.push_back(vox_val.size(d));
+    }
+    return stacked.reshape(out_shape).contiguous();
+}
+
 } // namespace
 
-struct __attribute__((visibility("hidden"))) VoxelModel::PyState {
-    py::object svm;        // Python SparseVoxelModel
-    py::object optimizer_py;  // Python SparseAdam
-    py::object scheduler_py; 
-
-    ~PyState() {
-        py::gil_scoped_acquire gil;
-        svm = py::none();
-        optimizer_py = py::none();
-        scheduler_py = py::none();
-    }
-};
-VoxelModel::~VoxelModel() {
-    py::gil_scoped_acquire gil;
-    py_.reset(); // drops optimizer & svm safely under GIL
-}
+VoxelModel::~VoxelModel() = default;
 
 VoxelModel::VoxelModel(const int sh_degree)
     : active_sh_degree_(0)
@@ -65,7 +270,6 @@ VoxelModel::VoxelModel(const int sh_degree)
 
     // Initialize all tensors on chosen device
     VOXEL_MODEL_INIT_TENSORS(this->device_type_);
-    py_ = std::make_unique<PyState>();
 }
 
 VoxelModel::VoxelModel(const VoxelModelParams& model_params)
@@ -83,16 +287,6 @@ VoxelModel::VoxelModel(const VoxelModelParams& model_params)
 
     // Initialize all tensors on chosen device
     VOXEL_MODEL_INIT_TENSORS(this->device_type_);
-    py_ = std::make_unique<PyState>();
-}
-
-py::object VoxelModel::svm() const
-{
-    py::gil_scoped_acquire gil;
-    if (!py_ || py_->svm.is_none()) {
-        return py::none();
-    }
-    return py_->svm;
 }
 
 const torch::Tensor& sv::VoxelModel::geoGridPts() const { return _geo_grid_pts_; }
@@ -214,15 +408,90 @@ bool VoxelModel::hasSvrasterSdfField() const
            svraster_sdf_weights_.size(0) == grid_pts_key_.size(0);
 }
 
+void VoxelModel::setEmptySvrasterSdfField_()
+{
+    auto dev = _geo_grid_pts_.defined()
+        ? _geo_grid_pts_.device()
+        : torch::Device(device_type_);
+    auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+    svraster_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
+    svraster_sdf_weights_ = torch::empty({0, 1}, value_opts);
+}
+
+torch::Tensor VoxelModel::voxelCornerScalarFromGrid_(const torch::Tensor& grid_scalar) const
+{
+    const int64_t N = (vox_key_.defined() && vox_key_.dim() == 2) ? vox_key_.size(0) : 0;
+    auto dev = (grid_scalar.defined() ? grid_scalar.device() :
+                (_geo_grid_pts_.defined() ? _geo_grid_pts_.device() : torch::Device(device_type_)));
+    auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+    if (N == 0 ||
+        !grid_scalar.defined() ||
+        grid_scalar.numel() == 0 ||
+        !vox_key_.defined() ||
+        vox_key_.dim() != 2 ||
+        vox_key_.size(1) != 8) {
+        return torch::zeros({N, 8, 1}, value_opts);
+    }
+
+    auto scalar = grid_scalar.to(dev).to(torch::kFloat32).reshape({-1, 1}).contiguous();
+    return scalar.index({vox_key_.to(dev).to(torch::kLong)}).contiguous();
+}
+
+void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
+    const torch::Tensor& voxel_sdf_values,
+    const torch::Tensor& voxel_sdf_weights)
+{
+    torch::NoGradGuard no_grad;
+    if (!grid_pts_key_.defined() ||
+        grid_pts_key_.dim() != 2 ||
+        grid_pts_key_.size(1) != 3 ||
+        !vox_key_.defined() ||
+        vox_key_.dim() != 2 ||
+        vox_key_.size(1) != 8) {
+        setEmptySvrasterSdfField_();
+        return;
+    }
+
+    const int64_t M = grid_pts_key_.size(0);
+    const int64_t N = vox_key_.size(0);
+    auto dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : grid_pts_key_.device();
+    auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+    if (M == 0) {
+        svraster_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
+        svraster_sdf_weights_ = torch::empty({0, 1}, value_opts);
+        return;
+    }
+    if (N == 0 ||
+        !voxel_sdf_values.defined() ||
+        !voxel_sdf_weights.defined() ||
+        voxel_sdf_values.size(0) != N ||
+        voxel_sdf_values.size(1) != 8 ||
+        voxel_sdf_weights.size(0) != N ||
+        voxel_sdf_weights.size(1) != 8) {
+        svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+        svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+        return;
+    }
+
+    auto sdf_vox = voxel_sdf_values.to(dev).to(torch::kFloat32);
+    auto w_vox = voxel_sdf_weights.to(dev).to(torch::kFloat32);
+    if (sdf_vox.dim() == 2) {
+        sdf_vox = sdf_vox.unsqueeze(-1);
+    }
+    if (w_vox.dim() == 2) {
+        w_vox = w_vox.unsqueeze(-1);
+    }
+
+    svraster_sdf_grid_pts_ =
+        aggregateVoxelCornersIntoGridPts(M, vox_key_.to(dev), sdf_vox).detach().contiguous();
+    svraster_sdf_weights_ =
+        aggregateVoxelCornersIntoGridPts(M, vox_key_.to(dev), w_vox).detach().contiguous();
+}
+
 void VoxelModel::ensureSvrasterSdfField()
 {
     if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
-        svraster_sdf_grid_pts_ = torch::empty(
-            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-        svraster_sdf_weights_ = torch::empty(
-            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-        svraster_sdf_grid_pts_key_ = torch::empty(
-            {0, 3}, torch::TensorOptions().dtype(torch::kInt64).device(device_type_));
+        setEmptySvrasterSdfField_();
         return;
     }
 
@@ -233,7 +502,6 @@ void VoxelModel::ensureSvrasterSdfField()
     auto make_empty_values = [&]() {
         svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
         svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
-        svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
     };
 
     if (M == 0) {
@@ -243,11 +511,8 @@ void VoxelModel::ensureSvrasterSdfField()
 
     if (svraster_sdf_grid_pts_.defined() &&
         svraster_sdf_weights_.defined() &&
-        svraster_sdf_grid_pts_key_.defined() &&
         svraster_sdf_grid_pts_.size(0) == M &&
-        svraster_sdf_weights_.size(0) == M &&
-        svraster_sdf_grid_pts_key_.sizes() == grid_pts_key_.sizes() &&
-        torch::equal(svraster_sdf_grid_pts_key_.to(torch::kCPU), grid_pts_key_.to(torch::kCPU))) {
+        svraster_sdf_weights_.size(0) == M) {
         if (svraster_sdf_grid_pts_.device() != tensor_dev) {
             svraster_sdf_grid_pts_ = svraster_sdf_grid_pts_.to(tensor_dev).contiguous();
             svraster_sdf_weights_ = svraster_sdf_weights_.to(tensor_dev).contiguous();
@@ -255,65 +520,13 @@ void VoxelModel::ensureSvrasterSdfField()
         return;
     }
 
-    if (!svraster_sdf_grid_pts_.defined() ||
-        !svraster_sdf_weights_.defined() ||
-        !svraster_sdf_grid_pts_key_.defined() ||
-        svraster_sdf_grid_pts_key_.dim() != 2 ||
-        svraster_sdf_grid_pts_key_.size(1) != 3 ||
-        svraster_sdf_grid_pts_.size(0) != svraster_sdf_grid_pts_key_.size(0) ||
-        svraster_sdf_weights_.size(0) != svraster_sdf_grid_pts_key_.size(0)) {
-        make_empty_values();
-        return;
-    }
-
-    torch::Tensor old_keys_cpu =
-        svraster_sdf_grid_pts_key_.to(torch::kCPU).to(torch::kInt64).contiguous();
-    torch::Tensor new_keys_cpu =
-        grid_pts_key_.to(torch::kCPU).to(torch::kInt64).contiguous();
-    torch::Tensor old_sdf_cpu =
-        svraster_sdf_grid_pts_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-    torch::Tensor old_w_cpu =
-        svraster_sdf_weights_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-
-    torch::Tensor new_sdf_cpu = torch::zeros({M, 1}, torch::TensorOptions().dtype(torch::kFloat32));
-    torch::Tensor new_w_cpu = torch::zeros({M, 1}, torch::TensorOptions().dtype(torch::kFloat32));
-
-    std::unordered_map<GridPointKey3, int64_t, GridPointKey3Hash> old_index;
-    old_index.reserve(static_cast<size_t>(old_keys_cpu.size(0) * 2 + 1));
-    auto old_acc = old_keys_cpu.accessor<int64_t, 2>();
-    for (int64_t i = 0; i < old_keys_cpu.size(0); ++i) {
-        old_index.emplace(GridPointKey3{old_acc[i][0], old_acc[i][1], old_acc[i][2]}, i);
-    }
-
-    auto new_acc = new_keys_cpu.accessor<int64_t, 2>();
-    auto old_sdf_acc = old_sdf_cpu.accessor<float, 2>();
-    auto old_w_acc = old_w_cpu.accessor<float, 2>();
-    auto new_sdf_acc = new_sdf_cpu.accessor<float, 2>();
-    auto new_w_acc = new_w_cpu.accessor<float, 2>();
-    for (int64_t i = 0; i < M; ++i) {
-        auto it = old_index.find(GridPointKey3{new_acc[i][0], new_acc[i][1], new_acc[i][2]});
-        if (it == old_index.end()) {
-            continue;
-        }
-        const int64_t old_i = it->second;
-        new_sdf_acc[i][0] = old_sdf_acc[old_i][0];
-        new_w_acc[i][0] = old_w_acc[old_i][0];
-    }
-
-    svraster_sdf_grid_pts_ = new_sdf_cpu.to(tensor_dev).contiguous();
-    svraster_sdf_weights_ = new_w_cpu.to(tensor_dev).contiguous();
-    svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
+    make_empty_values();
 }
 
 void VoxelModel::resetSvrasterSdfField()
 {
     if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
-        svraster_sdf_grid_pts_ = torch::empty(
-            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-        svraster_sdf_weights_ = torch::empty(
-            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-        svraster_sdf_grid_pts_key_ = torch::empty(
-            {0, 3}, torch::TensorOptions().dtype(torch::kInt64).device(device_type_));
+        setEmptySvrasterSdfField_();
         return;
     }
 
@@ -322,7 +535,6 @@ void VoxelModel::resetSvrasterSdfField()
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(tensor_dev);
     svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
     svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
-    svraster_sdf_grid_pts_key_ = grid_pts_key_.detach().clone().contiguous();
 }
 
 void VoxelModel::fuseSvrasterSdfGridSamples(
@@ -462,7 +674,6 @@ void VoxelModel::createFromPcd(
     const std::map<point3D_id_t, Point3D>& pcd,
     const std::vector<sv::MiniCam>& cams)
 {
-    namespace py = pybind11;
     std::cout << "VoxelModel::createFromPcd() called with " << pcd.size() << " points.\n";
     fill_empty_cells_done_ = false;
     fill_empty_cells_warmup_notified_ = false;
@@ -490,24 +701,6 @@ void VoxelModel::createFromPcd(
         {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
     artificial_sizes_accum_viz_ = torch::empty(
         {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    inactive_geo_centers_accum_viz_ = torch::empty(
-        {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    inactive_geo_sizes_accum_viz_ = torch::empty(
-        {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    inactive_geo_rgba_accum_viz_ = torch::empty(
-        {0, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    depthanything_fill_holes_created_centers_accum_viz_ = torch::empty(
-        {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    depthanything_fill_holes_created_sizes_accum_viz_ = torch::empty(
-        {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    depthanything_fill_holes_created_rgba_accum_viz_ = torch::empty(
-        {0, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    rendered_depth_created_centers_accum_viz_ = torch::empty(
-        {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    rendered_depth_created_sizes_accum_viz_ = torch::empty(
-        {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-    rendered_depth_created_rgba_accum_viz_ = torch::empty(
-        {0, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
     scene_center_ = torch::tensor(
         {global_scene_center_[0], global_scene_center_[1], global_scene_center_[2]},
         torch::dtype(torch::kFloat32).device(dev)
@@ -581,21 +774,9 @@ void VoxelModel::createFromPcd(
                   << " global_pcd_max=" << global_pcd_max_ << std::endl;
     }
     // ------------------------------------------------------------------------
-    // 1) Compute octlevel from vox_size using utils.vox_size_2_level
-    //    (mirror points_init behavior: round/clamp)
+    // 1) Compute octlevel from vox_size (mirror points_init behavior:
+    //    round/clamp).
     // ------------------------------------------------------------------------
-    py::gil_scoped_acquire gil;
-    static py::module svr_utils = py::module::import("svraster_cuda").attr("utils");
-    static py::module svm_mod = []{
-        py::module sys = py::module::import("sys");
-        sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-        return py::module::import("src.sparse_voxel_model");
-    }();
-    static py::module act_mod   = py::module::import("src.utils.activation_utils");
-    static py::module oct_utils = py::module::import("src.utils.octree_utils");
-    static py::module torch_mod = py::module::import("torch");
-    static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
-
     // Dense-core estimation is deferred until real-point history is seeded
     // near the end of createFromPcd().
     has_dense_core_bb_ = false;
@@ -603,19 +784,13 @@ void VoxelModel::createFromPcd(
     const int MAX_L = max_num_levels_;
     // Level as float (tensor) then rounded like points_init (nearest by default)
     auto vox_size_t = torch::full({1}, fixed_vox_size_, torch::dtype(torch::kFloat32).device(dev)); // [1]
-    py::object L_fp_py = oct_utils.attr("vox_size_2_level")(py::cast(scene_extent_), py::cast(vox_size_t));
-    auto L_fp = L_fp_py.cast<torch::Tensor>().round();                                               // [1] float
+    auto L_fp = voxSizeToLevel(scene_extent_, vox_size_t).round();                                   // [1] float
     auto L_clamped = L_fp.clamp_min(1).clamp_max(MAX_L).to(torch::kInt8).contiguous();               // [1] int8
 
     // cache scalar level
     octlevel_ = L_clamped.item<int8_t>();
     // cache [1,1] effective voxel size
-    py::object vox_eff_py = oct_utils.attr("level_2_vox_size")(
-        py::cast(scene_extent_), 
-        // level_2_vox_size expects [N,1]; give it [1,1] then keep it cached
-        py::cast(L_clamped.view({1,1}))
-    );
-    vox_eff_ = vox_eff_py.cast<torch::Tensor>().view({1,1}).contiguous();    
+    vox_eff_ = levelToVoxSize(scene_extent_, L_clamped.view({1,1})).view({1,1}).contiguous();
     // std::cout << "[createFromPcd] Using octlevel=" << octlevel[0][0].item<int>()
     //           << " (vox_size=" << vox_eff[0][0].item<float>() << " m) for fixed_vox_size_="
     //           << fixed_vox_size_ << " m.\n";
@@ -635,17 +810,7 @@ void VoxelModel::createFromPcd(
     auto ijkl = torch::cat(cat_inputs, /*dim=*/1);     
 
     // Use Python torch.unique(dim=0, return_inverse=True) (simple & robust)
-    torch::Tensor ijkl_unq, invmap;
-    {
-        py::tuple uniq = torch_mod.attr("unique")(
-            py::cast(ijkl.contiguous()),
-            py::arg("dim") = 0,
-            py::arg("sorted") = true,
-            py::arg("return_inverse") = true
-        );
-        ijkl_unq = uniq[0].cast<torch::Tensor>().contiguous(); // [Nu,4]
-        invmap   = uniq[1].cast<torch::Tensor>().contiguous(); // [N]
-    }
+    auto [ijkl_unq, invmap] = uniqueRowsWithInverse(ijkl);
 
     torch::Tensor ijk_u, L_u; 
     auto parts = torch::split_with_sizes(ijkl_unq, {3, 1}, /*dim=*/1); 
@@ -680,51 +845,24 @@ void VoxelModel::createFromPcd(
     // ------------------------------------------------------------------------
     // 3) utils: ijk -> octpath (no constructor calls)
     // ------------------------------------------------------------------------
-    py::object octpath_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_u.contiguous()),
-                                                            py::cast(L_u.contiguous()));
-    auto octpath = octpath_py.cast<torch::Tensor>().contiguous();            // [Nu,1] int64
+    auto octpath = UTILS::ijk_2_octpath(ijk_u.contiguous(), L_u.contiguous()).contiguous(); // [Nu,1] int64
 
     // ------------------------------------------------------------------------
     // 3.5) Optional camera-based filtering for initialization candidates
     //      (same logic family as increasePcd insertion filter)
     // ------------------------------------------------------------------------
     if (!cams.empty() && octpath.size(0) > 0) {
-        py::tuple dec = oct_utils.attr("octpath_decoding")(
-            py::cast(octpath.contiguous()),
-            py::cast(L_u.contiguous()),
-            py::cast(scene_center_.contiguous()),
-            py::cast(scene_extent_.contiguous()));
-        at::Tensor vox_center = dec[0].cast<at::Tensor>().contiguous(); // [Nu,3]
-        at::Tensor vox_size   = dec[1].cast<at::Tensor>().contiguous(); // [Nu,1] or [Nu]
+        auto [vox_center, vox_size] = decodeOctpath(
+            octpath.contiguous(),
+            L_u.contiguous(),
+            scene_center_.contiguous(),
+            scene_extent_.contiguous());
         if (vox_size.dim() == 1) {
             vox_size = vox_size.view({-1, 1});
         }
 
-        py::list py_cams;
-        py::object py_cuda = torch_mod.attr("device")("cuda");
-        auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name) {
-            if (py::hasattr(obj, name)) {
-                py::object t = obj.attr(name);
-                if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                    obj.attr(name) = t.attr("to")(py_cuda);
-                }
-            }
-        };
-        for (const auto& c : cams) {
-            py::object py_cam = MiniCam_to_py(c);
-            move_attr_to_cuda_if_tensor(py_cam, "w2c");
-            move_attr_to_cuda_if_tensor(py_cam, "c2w");
-            move_attr_to_cuda_if_tensor(py_cam, "position");
-            move_attr_to_cuda_if_tensor(py_cam, "lookat");
-            py_cams.append(py_cam);
-        }
-
         const int64_t Nu_before = octpath.size(0);
-        at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-            py_cams,
-            py::cast(octpath),
-            py::cast(vox_center),
-            py::cast(vox_size)).cast<at::Tensor>();
+        at::Tensor rate = markSvrasterMaxSampRateDirect(cams, octpath, vox_center, vox_size);
         if (rate.dim() == 2 && rate.size(1) == 1) {
             rate = rate.squeeze(1);
         }
@@ -733,12 +871,7 @@ void VoxelModel::createFromPcd(
 
         if (filter_near_voxels_) {
             const float near_thresh = 0.2f;
-            at::Tensor is_near = svr_mod.attr("mark_near")(
-                py_cams,
-                py::cast(octpath),
-                py::cast(vox_center),
-                py::cast(vox_size),
-                py::float_(near_thresh)).cast<at::Tensor>();
+            at::Tensor is_near = markSvrasterNearDirect(cams, octpath, vox_center, vox_size, near_thresh);
             if (is_near.dim() == 2 && is_near.size(1) == 1) {
                 is_near = is_near.squeeze(1);
             }
@@ -757,77 +890,54 @@ void VoxelModel::createFromPcd(
             Nu = octpath.size(0);
         }
     }
-    
-    // Create/reuse SVM (DO NOT call model_init/points_init/...)
-    if (!py_->svm || py_->svm.is_none()) {
-        py::object SVM = svm_mod.attr("SparseVoxelModel");
-        py_->svm = SVM(
-            py::arg("sh_degree") = max_sh_degree_,
-            py::arg("white_background") = white_background_,
-            py::arg("black_background") = black_background_);
-    }
-    py_->svm.attr("white_background") = py::bool_(white_background_);
-    py_->svm.attr("black_background") = py::bool_(black_background_);
-
-    // scene tensors (single fixed scene; no outside shells => inside_extent == scene_extent)
-    py_->svm.attr("scene_center")  = scene_center_.contiguous();   // [3]
-    py_->svm.attr("scene_extent")  = scene_extent_.contiguous(); // [1]
-    py_->svm.attr("inside_extent") = inside_extent_.contiguous(); // [1]
-
-    // Topology
-    py_->svm.attr("octpath")  = octpath;                          // [Nu,1] int64
-    py_->svm.attr("octlevel") = L_u.contiguous();
-    // py_->svm.attr("octlevel") = L_u.view({Nu,1}).contiguous();    // [Nu,1] int8
-
     // ------------------------------------------------------------------------
     // 4) Initialize learnables directly
     // ------------------------------------------------------------------------
     // Subdivision priority
     auto subdiv_p = torch::ones({Nu,1}, torch::dtype(torch::kFloat32).device(dev)).requires_grad_();
-    py_->svm.attr("_subdiv_p")     = subdiv_p.detach().requires_grad_(); 
 
     // SH-0 from fused RGB
-    py::object sh0_dc_py = act_mod.attr("rgb2shzero")(py::cast(rgb_u.contiguous()));
-    auto sh0_dc = sh0_dc_py.cast<torch::Tensor>().contiguous().requires_grad_(); // [Nu,3]
-    py_->svm.attr("_sh0")          = sh0_dc.detach().requires_grad_(); 
+    auto sh0_dc = rgbToShZero(rgb_u.contiguous()).contiguous().requires_grad_(); // [Nu,3]
 
     // Higher-degree SH zeros
     const int n_sh_rest = (max_sh_degree_ + 1)*(max_sh_degree_ + 1) - 1;
     auto shs = torch::zeros({Nu, n_sh_rest, 3}, torch::dtype(torch::kFloat32).device(dev)).requires_grad_();
-    py_->svm.attr("_shs")          = shs.detach().requires_grad_(); 
-
-    // Active SH degree
-    py_->svm.attr("active_sh_degree") = py::int_(std::min(max_sh_degree_, 3));
 
     // Grid link => allocate per-grid-point density
-    torch::Tensor grid_pts_key = py_->svm.attr("grid_pts_key").cast<torch::Tensor>(); // [Mg,3] int64
+    auto [grid_pts_key, vox_key] = buildGridPtsLink(octpath, L_u.contiguous(), max_num_levels_);
+    (void)vox_key;
     auto geo_grid = makeGeoGridInitRows_(
         grid_pts_key,
         /*begin=*/0,
         /*end=*/grid_pts_key.size(0),
         /*default_value=*/-10.0f);
-    py_->svm.attr("_geo_grid_pts") = geo_grid.detach().requires_grad_();
 
     // ------------------------------------------------------------------------
-    // 5) Sync to C++ members
+    // 5) Initialize C++ members directly.
     // ------------------------------------------------------------------------
-    auto fetch = [&](const char* name){
-        return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
-    };
-    this->oct_path_      = fetch("octpath");
-    this->oct_level_     = fetch("octlevel");
-    this->center_        = fetch("vox_center");
-    this->size_          = fetch("vox_size").squeeze(1);
+    this->oct_path_      = octpath.contiguous();
+    this->oct_level_     = L_u.contiguous();
+    {
+        auto [center, size] = decodeOctpath(
+            this->oct_path_.contiguous(),
+            this->oct_level_.contiguous(),
+            this->scene_center_.contiguous(),
+            this->scene_extent_.contiguous());
+        auto [grid_pts_key_now, vox_key_now] =
+            buildGridPtsLink(this->oct_path_.contiguous(), this->oct_level_.contiguous(), max_num_levels_);
+        this->center_        = center.contiguous();
+        this->size_          = size.squeeze(1).contiguous();
+        this->grid_pts_key_  = grid_pts_key_now.contiguous();
+        this->vox_key_       = vox_key_now.contiguous();
+    }
     this->vox_size_inv_  = 1.0f / size_;
-    this->grid_pts_key_  = fetch("grid_pts_key");
-    this->vox_key_       = fetch("vox_key");
 
     // learnables
-    this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
+    this->_geo_grid_pts_ = geo_grid.contiguous().detach().requires_grad_(true);
     ensureSvrasterSdfField();
-    this->sh0_           = fetch("_sh0").requires_grad_(true);
-    this->shs_           = fetch("_shs").requires_grad_(true);
-    this->subdiv_p_      = fetch("_subdiv_p").requires_grad_(true);
+    this->sh0_           = sh0_dc.contiguous().detach().requires_grad_(true);
+    this->shs_           = shs.contiguous().detach().requires_grad_(true);
+    this->subdiv_p_      = subdiv_p.contiguous().detach().requires_grad_(true);
     // stats buffer
     this->max_w_ = torch::zeros({center_.size(0), 1}, torch::dtype(torch::kFloat32).device(dev));
     
@@ -904,7 +1014,6 @@ void VoxelModel::increasePcd(
     const int iteration,
     const std::vector<sv::MiniCam>& cams)
 {
-    namespace py = pybind11;
     const int Nf = static_cast<int>(pcd_full.size());
     last_increase_pcd_stats_ = IncreasePcdStats{};
     if (Nf < 3 || colors.size() < 3) return;
@@ -918,8 +1027,8 @@ void VoxelModel::increasePcd(
         pending_insert_rendered_depth_candidate_as_real_protected_;
     TORCH_CHECK(global_scene_extent_ > 0.f && fixed_vox_size_ > 0.f,
                 "increasePcd: scene extent / fixed vox size not set.");
-    TORCH_CHECK(py_->svm && !py_->svm.is_none(),
-                "increasePcd: SVM not initialized; call createFromPcd first.");
+    TORCH_CHECK(oct_path_.defined() && oct_level_.defined() && center_.defined(),
+                "increasePcd: voxel model not initialized; call createFromPcd first.");
 
     // ——— 0) Build CPU tensors from raw arrays, normalize RGB ————————
     torch::Tensor xyz_cpu = torch::from_blob(
@@ -958,16 +1067,6 @@ void VoxelModel::increasePcd(
     });
 
     // --- 2) Compute octlevel from fixed_vox_size_ (same as createFromPcd)
-    py::gil_scoped_acquire gil;
-    static py::module svr_utils = py::module::import("svraster_cuda").attr("utils");
-    static py::module svm_mod = []{
-        py::module sys = py::module::import("sys");
-        sys.attr("path").attr("insert")(0, "/home/dimitris/svraster");
-        return py::module::import("src.sparse_voxel_model");
-    }();
-    static py::module act_mod   = py::module::import("src.utils.activation_utils");
-    static py::module oct_utils = py::module::import("src.utils.octree_utils");
-    static py::module torch_mod = py::module::import("torch");
     const int MAX_L = max_num_levels_;
 
     auto vox_effN  = vox_eff_.expand({N,1});                                                         // [N,1]
@@ -980,17 +1079,7 @@ void VoxelModel::increasePcd(
     std::vector<torch::Tensor> cat_inputs{ijk, L_long};
     auto ijkl = torch::cat(cat_inputs, /*dim=*/1);                                                         // [N,4]
 
-    torch::Tensor ijkl_unq, invmap;
-    {
-        py::tuple uniq = torch_mod.attr("unique")(
-            py::cast(ijkl.contiguous()),
-            py::arg("dim") = 0,
-            py::arg("sorted") = true,
-            py::arg("return_inverse") = true
-        );
-        ijkl_unq = uniq[0].cast<torch::Tensor>().contiguous(); // [Nu,4]
-        invmap   = uniq[1].cast<torch::Tensor>().contiguous(); // [N]
-    }
+    auto [ijkl_unq, invmap] = uniqueRowsWithInverse(ijkl);
     torch::Tensor ijk_u, L_u;
     auto parts = torch::split_with_sizes(ijkl_unq, {3,1}, 1);
     ijk_u = parts[0].contiguous();                                                                    // [Nu,3]
@@ -1013,33 +1102,20 @@ void VoxelModel::increasePcd(
         std::cout << "[increasePcd] OOB detected — reinitializing via createFromPcd().\n";
         // A) Compute scene from this batch using main_scene_bound_pcd_heuristic
         {
-            bool updated_scene_from_py = false;
-            try {
-                py::gil_scoped_acquire gil;
-                static py::module bound_utils = py::module::import("src.utils.bounding_utils");
-                static py::module types       = py::module::import("types");
-
-                // xyz_cpu is a CPU float32 tensor with shape [N,3]
-                py::object ns = types.attr("SimpleNamespace")(
-                    "points"_a = py::cast(xyz_cpu.contiguous()).attr("numpy")()
-                );
-                py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(
-                    ns, py::float_(dense_core_pcd_density_rate_));
-                std::vector<double> c_vec = py::cast<std::vector<double>>(cr[0]);
-                TORCH_CHECK(c_vec.size() == 3, "main_scene_bound_pcd_heuristic: center must have 3 elements");
-                float radius = py::cast<float>(cr[1]);
-                if (std::isfinite(radius) && radius > 0.0f) {
-                    global_scene_center_[0] = static_cast<float>(c_vec[0]);
-                    global_scene_center_[1] = static_cast<float>(c_vec[1]);
-                    global_scene_center_[2] = static_cast<float>(c_vec[2]);
-                    global_scene_extent_    = 2.0f * radius;
-                    updated_scene_from_py = true;
-                }
-            } catch (const std::exception&) {
-                updated_scene_from_py = false;
+            bool updated_scene_from_cpp = false;
+            if (auto bound = mainSceneBoundPcdHeuristicCpp(
+                    xyz_cpu.contiguous(),
+                    dense_core_pcd_density_rate_)) {
+                auto center = bound->first.to(torch::kCPU).to(torch::kFloat32).contiguous();
+                const float radius = bound->second;
+                global_scene_center_[0] = center.index({0}).item<float>();
+                global_scene_center_[1] = center.index({1}).item<float>();
+                global_scene_center_[2] = center.index({2}).item<float>();
+                global_scene_extent_ = 2.0f * radius;
+                updated_scene_from_cpp = true;
             }
 
-            if (!updated_scene_from_py) {
+            if (!updated_scene_from_cpp) {
                 auto pts = xyz_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
                 auto center = std::get<0>(pts.median(/*dim=*/0, /*keepdim=*/false)).contiguous();
                 auto dist = std::get<0>((pts - center.view({1, 3})).abs().max(/*dim=*/1, /*keepdim=*/false))
@@ -1062,12 +1138,7 @@ void VoxelModel::increasePcd(
                 global_scene_extent_ = 2.0f * radius;
             }
         }
-        // B) Reset Python SVM so createFromPcd builds fresh state
-        {
-            py::gil_scoped_acquire gil;
-            py_->svm = py::none();
-        }
-        // C) Convert current batch to a temporary map and call createFromPcd
+        // B) Convert current batch to a temporary map and call createFromPcd
         {
             std::map<point3D_id_t, Point3D> tmp;
             static point3D_id_t id_seed = 1;  // local seq; independent of COLMAP ids, etc.
@@ -1103,56 +1174,24 @@ void VoxelModel::increasePcd(
     );
 
     // ── 4) Build octpath for this batch ─────────────────────────────────────
-    py::object octpath_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_u), py::cast(L_u));
-    auto octpath_new = octpath_py.cast<torch::Tensor>().contiguous();                                   // [Nu,1] int64
+    auto octpath_new = UTILS::ijk_2_octpath(ijk_u.contiguous(), L_u.contiguous()).contiguous();          // [Nu,1] int64
 
     // ---- Active insertion-time SVR-style filtering (kept separate from OLD block) ----
     // Keep this at insertion-time so bad candidates never enter the topology.
     // Prune-time filtering in VoxelMapper remains useful as a second cleanup stage.
     if (!cams.empty() && octpath_new.size(0) > 0) {
-        static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
-        static py::module oct_utils = py::module::import("src.utils.octree_utils");
-
         // Decode voxel centers/sizes for current candidates.
-        py::tuple dec = oct_utils.attr("octpath_decoding")(
-            py::cast(octpath_new.contiguous()),
-            py::cast(L_u.contiguous()),
-            py::cast(scene_center_.contiguous()),
-            py::cast(scene_extent_.contiguous())
-        );
-        at::Tensor vox_center = dec[0].cast<at::Tensor>().contiguous(); // [Nu,3]
-        at::Tensor vox_size   = dec[1].cast<at::Tensor>().contiguous(); // [Nu,1] or [Nu]
+        auto [vox_center, vox_size] = decodeOctpath(
+            octpath_new.contiguous(),
+            L_u.contiguous(),
+            scene_center_.contiguous(),
+            scene_extent_.contiguous());
         if (vox_size.dim() == 1) {
             vox_size = vox_size.view({-1, 1});
         }
 
-        // Build Python list of CUDA MiniCams.
-        py::list py_cams;
-        py::object py_cuda = torch_mod.attr("device")("cuda");
-        auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name) {
-            if (py::hasattr(obj, name)) {
-                py::object t = obj.attr(name);
-                if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                    obj.attr(name) = t.attr("to")(py_cuda);
-                }
-            }
-        };
-        for (const auto& c : cams) {
-            py::object py_cam = MiniCam_to_py(c);
-            move_attr_to_cuda_if_tensor(py_cam, "w2c");
-            move_attr_to_cuda_if_tensor(py_cam, "c2w");
-            move_attr_to_cuda_if_tensor(py_cam, "position");
-            move_attr_to_cuda_if_tensor(py_cam, "lookat");
-            py_cams.append(py_cam);
-        }
-
         // 1) Visibility / sampling-rate filtering
-        at::Tensor rate = svr_mod.attr("mark_max_samp_rate")(
-            py_cams,
-            py::cast(octpath_new),
-            py::cast(vox_center),
-            py::cast(vox_size)
-        ).cast<at::Tensor>();
+        at::Tensor rate = markSvrasterMaxSampRateDirect(cams, octpath_new, vox_center, vox_size);
         if (rate.dim() == 2 && rate.size(1) == 1) {
             rate = rate.squeeze(1);
         }
@@ -1163,13 +1202,8 @@ void VoxelModel::increasePcd(
         // NOTE: Upstream SVRaster layout initialization uses filter_near = -1 (disabled).
         if (filter_near_voxels_) {
             const float near_thresh = 0.2f;
-            at::Tensor is_near = svr_mod.attr("mark_near")(
-                py_cams,
-                py::cast(octpath_new),
-                py::cast(vox_center),
-                py::cast(vox_size),
-                py::float_(near_thresh)
-            ).cast<at::Tensor>();
+            at::Tensor is_near =
+                markSvrasterNearDirect(cams, octpath_new, vox_center, vox_size, near_thresh);
             if (is_near.dim() == 2 && is_near.size(1) == 1) {
                 is_near = is_near.squeeze(1);
             }
@@ -1225,8 +1259,8 @@ void VoxelModel::increasePcd(
             return sorted.index_select(0, keep_idx).contiguous();
         };
 
-        auto octpath_old_adj = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-        auto octlevel_old_adj = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+        auto octpath_old_adj = this->oct_path_.contiguous();
+        auto octlevel_old_adj = this->oct_level_.contiguous();
         if (octpath_old_adj.numel() == 0) {
             std::cout << "[increasePcd/real_adjacency] no existing topology, nothing to attach to.\n";
             pending_insert_rendered_depth_candidate_ = false;
@@ -1305,9 +1339,8 @@ void VoxelModel::increasePcd(
             {real_base_path.size(0), 1},
             static_cast<int64_t>(base_L),
             torch::TensorOptions().dtype(torch::kInt8).device(dev));
-        auto real_base_ijk = svr_utils.attr("octpath_2_ijk")(
-            py::cast(real_base_path),
-            py::cast(L_real_base)).cast<torch::Tensor>().to(torch::kLong).contiguous();
+        auto real_base_ijk =
+            UTILS::octpath_2_ijk(real_base_path, L_real_base).to(torch::kLong).contiguous();
 
         std::vector<int64_t> shift_vals;
         const int adj_radius = std::max(1, rendered_depth_candidate_adjacency_radius_cells_);
@@ -1348,11 +1381,7 @@ void VoxelModel::increasePcd(
         }
         adj_ijk = adj_ijk.index_select(0, adj_keep_idx).contiguous();
 
-        py::object uniq_adj = torch_mod.attr("unique")(
-            py::cast(adj_ijk),
-            py::arg("dim") = 0,
-            py::arg("sorted") = true);
-        adj_ijk = uniq_adj.cast<torch::Tensor>().contiguous();
+        adj_ijk = std::get<0>(uniqueRowsWithInverse(adj_ijk)).contiguous();
         if (adj_ijk.dim() == 1) {
             adj_ijk = adj_ijk.view({-1, 3});
         }
@@ -1361,17 +1390,13 @@ void VoxelModel::increasePcd(
             {adj_ijk.size(0), 1},
             static_cast<int64_t>(base_L),
             torch::TensorOptions().dtype(torch::kInt8).device(dev));
-        auto adj_path = svr_utils.attr("ijk_2_octpath")(
-            py::cast(adj_ijk),
-            py::cast(L_adj)).cast<torch::Tensor>().contiguous();
+        auto adj_path = UTILS::ijk_2_octpath(adj_ijk, L_adj).contiguous();
         auto adj_key = adj_path.view({-1}).to(torch::kInt64).mul(256).add(L_adj.view({-1}).to(torch::kInt64));
         adj_key = unique_sorted_1d(adj_key);
 
         auto cand_key =
             octpath_new.view({-1}).to(torch::kInt64).mul(256).add(L_u.view({-1}).to(torch::kInt64));
-        auto keep_adjacent = torch_mod.attr("isin")(
-            py::cast(cand_key),
-            py::cast(adj_key)).cast<torch::Tensor>().to(torch::kBool).contiguous();
+        auto keep_adjacent = at::isin(cand_key, adj_key).to(torch::kBool).contiguous();
         const int64_t kept_adjacent = keep_adjacent.sum().item<int64_t>();
         std::cout << "[increasePcd/real_adjacency] kept " << kept_adjacent
                   << "/" << octpath_new.size(0)
@@ -1397,9 +1422,12 @@ void VoxelModel::increasePcd(
     }
 
     // ── 5) Dedup against existing voxels (across-batch) ─────────────────────
-    auto octpath_old  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();                    // [No,1] int64
-    auto octlevel_old = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();                   // [No,1] int8
+    auto octpath_old  = this->oct_path_.contiguous();                    // [No,1] int64
+    auto octlevel_old = this->oct_level_.contiguous();                   // [No,1] int8
     const int64_t old_voxel_count = octpath_old.size(0);
+    ensureSvrasterSdfField();
+    torch::Tensor old_vox_sdf_values = voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
+    torch::Tensor old_vox_sdf_weights = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
 
     // Packed 1D key: (octpath<<8) | level
     auto key_new = octpath_new.view({-1}).to(torch::kInt64)
@@ -1491,8 +1519,7 @@ void VoxelModel::increasePcd(
         std::cout << "octpath_old is empty => all new.\n";
         new_mask = torch::ones({Nu}, torch::dtype(torch::kBool).device(dev));
     } else {
-        py::object isin_py = torch_mod.attr("isin")(py::cast(key_new), py::cast(key_old_all));
-        auto is_dup = isin_py.cast<torch::Tensor>().to(torch::kBool);                                    // [Nu]
+        auto is_dup = at::isin(key_new, key_old_all).to(torch::kBool);                                    // [Nu]
         new_mask = ~is_dup;
 
         // If a real observation hits an existing artificial voxel, defer promotion to
@@ -1507,9 +1534,11 @@ void VoxelModel::increasePcd(
                 auto key_old_sorted = std::get<0>(sort_pair).contiguous();
                 auto old_perm = std::get<1>(sort_pair).to(torch::kLong).contiguous();
 
-                auto pos = torch_mod.attr("searchsorted")(
-                    py::cast(key_old_sorted), py::cast(dup_key_new),
-                    py::arg("right") = false).cast<torch::Tensor>()
+                auto pos = at::searchsorted(
+                        key_old_sorted,
+                        dup_key_new,
+                        /*out_int32=*/false,
+                        /*right=*/false)
                     .to(torch::kLong).contiguous();
 
                 auto in_range = (pos >= 0) & (pos < key_old_sorted.size(0));
@@ -1611,9 +1640,8 @@ void VoxelModel::increasePcd(
 
                 // If a candidate NEW (octpath, base_L) matches any ancestor of an existing finer voxel,
                 // then inserting that parent would collide with existing children later.
-                py::object isin_py = torch_mod.attr("isin")(
-                    py::cast(key_new), py::cast(key_children_as_parent));
-                auto would_collide_parent = isin_py.cast<torch::Tensor>().to(torch::kBool);  // [Nu]
+                auto would_collide_parent =
+                    at::isin(key_new, key_children_as_parent).to(torch::kBool);  // [Nu]
 
                 // Promotion path:
                 // Real observations arriving at parent level should promote overlapped child artificials to real,
@@ -1627,9 +1655,8 @@ void VoxelModel::increasePcd(
 
                     auto key_child_rows = op_anc_base.mul(256)
                         .add(torch::full_like(op_anc_base, static_cast<int64_t>(base_L)));
-                    auto child_under_collide = torch_mod.attr("isin")(
-                        py::cast(key_child_rows), py::cast(collide_parent_keys))
-                        .cast<torch::Tensor>().to(torch::kBool);
+                    auto child_under_collide =
+                        at::isin(key_child_rows, collide_parent_keys).to(torch::kBool);
 
                     if (child_under_collide.any().item<bool>()) {
                         auto child_rel_idx = torch::nonzero(child_under_collide).view({-1});
@@ -1709,8 +1736,8 @@ void VoxelModel::increasePcd(
 
     int64_t Nm_added = 0;  // count of artificial voxels added later
     // ── 6) Append topology (old preserved) ──────────────────────────────────
-    py_->svm.attr("octpath")  = torch::cat({octpath_old,  octpath_add}, 0).contiguous();
-    py_->svm.attr("octlevel") = torch::cat({octlevel_old, L_add},       0).contiguous();
+    this->oct_path_ = torch::cat({octpath_old,  octpath_add}, 0).contiguous();
+    this->oct_level_ = torch::cat({octlevel_old, L_add}, 0).contiguous();
     {
         auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(dev);
         auto i32_opts  = torch::TensorOptions().dtype(torch::kInt32).device(dev);
@@ -1887,31 +1914,28 @@ void VoxelModel::increasePcd(
 
     // ── 7) Append learnables for new rows ───────────────────────────────────
     // _subdiv_p
-    auto subdiv_old = py_->svm.attr("_subdiv_p").cast<torch::Tensor>();
     auto subdiv_add = torch::ones({Nk,1}, torch::dtype(torch::kFloat32).device(dev));
-    py_->svm.attr("_subdiv_p") = torch::cat({subdiv_old, subdiv_add}, 0)
-                                .contiguous().detach().requires_grad_();
+    this->subdiv_p_ = torch::cat({this->subdiv_p_.detach(), subdiv_add}, 0)
+                          .contiguous()
+                          .detach()
+                          .requires_grad_();
 
     // _sh0 from fused rgb
     torch::Tensor sh0_add = torch::empty({0, 3}, torch::dtype(torch::kFloat32).device(dev));
     if (Nk > 0) {
-        py::object sh0_add_py = act_mod.attr("rgb2shzero")(py::cast(rgb_add.contiguous())); // [Nk,3]
-        sh0_add = sh0_add_py.cast<torch::Tensor>().contiguous();
+        sh0_add = rgbToShZero(rgb_add.contiguous()).contiguous(); // [Nk,3]
     }
-    auto sh0_old = py_->svm.attr("_sh0").cast<torch::Tensor>();
-    py_->svm.attr("_sh0")      = torch::cat({sh0_old,    sh0_add   }, 0)
-                                    .contiguous().detach().requires_grad_();
-
     // _shs zeros
     const int n_sh_rest = (max_sh_degree_ + 1)*(max_sh_degree_ + 1) - 1;
-    auto shs_old = py_->svm.attr("_shs").cast<torch::Tensor>();
     auto shs_add = torch::zeros({Nk, n_sh_rest, 3}, torch::dtype(torch::kFloat32).device(dev));
-    py_->svm.attr("_shs")      = torch::cat({shs_old,    shs_add   }, 0)
-                                .contiguous().detach().requires_grad_();
 
     // ── 8) Rebuild grid links; grow _geo_grid_pts only if grid expanded ─────
-    // Trigger SVProperties recompute via property access
-    torch::Tensor grid_pts_key_new = py_->svm.attr("grid_pts_key").cast<torch::Tensor>();               // [M,3] int64
+    auto [grid_pts_key_new, vox_key_new] =
+        buildGridPtsLink(
+            this->oct_path_.contiguous(),
+            this->oct_level_.contiguous(),
+            max_num_levels_);
+    (void)vox_key_new;
     const int64_t M_prev = grid_pts_key_.defined() ? grid_pts_key_.size(0) : 0;
     const int64_t M_curr = grid_pts_key_new.size(0);
 
@@ -1924,17 +1948,14 @@ void VoxelModel::increasePcd(
             M_curr,
             /*default_value=*/-10.0f);
     }
-    // ── 9) Append rows to optimizer param groups (and keep py svm in sync) ──
+    // ── 9) Append rows to optimizer param groups ────────────────────────────
     // Important: only call for non-empty additions.
     if (grow.defined() && grow.size(0) > 0) {
-        appendGroup_(/*group_idx=*/0, /*add_rows=*/grow, /*svm_field_name=*/"_geo_grid_pts",
-                    &this->_geo_grid_pts_);
+        appendGroup_(/*group_idx=*/0, /*add_rows=*/grow, &this->_geo_grid_pts_);
     }
     if (Nk > 0) {
-        appendGroup_(/*group_idx=*/1, /*add_rows=*/sh0_add, /*svm_field_name=*/"_sh0",
-                    &this->sh0_);
-        appendGroup_(/*group_idx=*/2, /*add_rows=*/shs_add, /*svm_field_name=*/"_shs",
-                    &this->shs_);
+        appendGroup_(/*group_idx=*/1, /*add_rows=*/sh0_add, &this->sh0_);
+        appendGroup_(/*group_idx=*/2, /*add_rows=*/shs_add, &this->shs_);
     }
 
     auto run_local_frontier_fill = [&]() -> int64_t {
@@ -1962,8 +1983,8 @@ void VoxelModel::increasePcd(
             torch::TensorOptions().dtype(torch::kInt64).device(devL)
         );
 
-        auto octpath_occ  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-        auto octlevel_occ = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+        auto octpath_occ  = this->oct_path_.contiguous();
+        auto octlevel_occ = this->oct_level_.contiguous();
         if (octpath_occ.numel() == 0) {
             return 0;
         }
@@ -2007,18 +2028,14 @@ void VoxelModel::increasePcd(
             auto cand_key = cand_path.mul(256).add(
                 torch::full_like(cand_path, static_cast<int64_t>(level)));
 
-            auto is_occ = torch_mod.attr("isin")(
-                py::cast(cand_key), py::cast(key_occ_exact))
-                .cast<torch::Tensor>().to(torch::kBool);
+            auto is_occ = at::isin(cand_key, key_occ_exact).to(torch::kBool);
 
             for (int anc_l = 1; anc_l < level; ++anc_l) {
                 auto keep_mask_anc = make_keep_mask_for_level(anc_l);
                 auto anc_path = (cand_path & keep_mask_anc);
                 auto anc_key = anc_path.mul(256).add(
                     torch::full_like(anc_path, static_cast<int64_t>(anc_l)));
-                auto has_anc = torch_mod.attr("isin")(
-                    py::cast(anc_key), py::cast(key_occ_exact))
-                    .cast<torch::Tensor>().to(torch::kBool);
+                auto has_anc = at::isin(anc_key, key_occ_exact).to(torch::kBool);
                 is_occ = is_occ | has_anc;
             }
 
@@ -2031,9 +2048,7 @@ void VoxelModel::increasePcd(
                 auto finer_proj_key = finer_proj.mul(256).add(
                     torch::full_like(finer_proj, static_cast<int64_t>(level)));
                 finer_proj_key = unique_sorted_1d(finer_proj_key);
-                auto has_desc = torch_mod.attr("isin")(
-                    py::cast(cand_key), py::cast(finer_proj_key))
-                    .cast<torch::Tensor>().to(torch::kBool);
+                auto has_desc = at::isin(cand_key, finer_proj_key).to(torch::kBool);
                 is_occ = is_occ | has_desc;
             }
             return is_occ.contiguous();
@@ -2055,13 +2070,12 @@ void VoxelModel::increasePcd(
         if (use_dense_core_neighbor_fill_) {
             if (has_dense_core_bb_ &&
                 dense_core_bb_min_.defined() && dense_core_bb_max_.defined()) {
-                py::tuple dec_seed = oct_utils.attr("octpath_decoding")(
-                    py::cast(seed_path_all.contiguous()),
-                    py::cast(seed_level_all.contiguous()),
-                    py::cast(scene_center_.contiguous()),
-                    py::cast(scene_extent_.contiguous())
-                );
-                auto seed_center = dec_seed[0].cast<at::Tensor>().contiguous(); // [N,3]
+                auto [seed_center, seed_size_unused] = decodeOctpath(
+                    seed_path_all.contiguous(),
+                    seed_level_all.contiguous(),
+                    scene_center_.contiguous(),
+                    scene_extent_.contiguous());
+                (void)seed_size_unused;
                 auto bb_min = dense_core_bb_min_.to(devL).contiguous().view({1, 3});
                 auto bb_max = dense_core_bb_max_.to(devL).contiguous().view({1, 3});
                 auto in_dense_core =
@@ -2104,9 +2118,8 @@ void VoxelModel::increasePcd(
                 static_cast<int64_t>(lv),
                 torch::dtype(torch::kInt8).device(devL)).contiguous();
 
-            auto ijk_seed_lv = svr_utils.attr("octpath_2_ijk")(
-                py::cast(seed_path_lv), py::cast(L_seed_lv))
-                .cast<torch::Tensor>().to(torch::kLong).contiguous();
+            auto ijk_seed_lv =
+                UTILS::octpath_2_ijk(seed_path_lv, L_seed_lv).to(torch::kLong).contiguous();
             TORCH_CHECK(
                 ijk_seed_lv.dim() == 2 && ijk_seed_lv.size(1) == 3,
                 "[increasePcd/local_frontier_fill] ijk_seed_lv must be [N,3], got ",
@@ -2124,12 +2137,7 @@ void VoxelModel::increasePcd(
             auto inb_idx_lv = torch::nonzero(inb_lv).view({-1});
             ijk_nbr_lv = ijk_nbr_lv.index_select(0, inb_idx_lv).contiguous();
 
-            py::object uq_nbr = torch_mod.attr("unique")(
-                py::cast(ijk_nbr_lv.contiguous()),
-                py::arg("dim") = 0,
-                py::arg("sorted") = true
-            );
-            ijk_nbr_lv = uq_nbr.cast<torch::Tensor>().contiguous();
+            ijk_nbr_lv = std::get<0>(uniqueRowsWithInverse(ijk_nbr_lv.contiguous())).contiguous();
             if (ijk_nbr_lv.dim() == 1) {
                 ijk_nbr_lv = ijk_nbr_lv.view({-1, 3});
             }
@@ -2139,9 +2147,7 @@ void VoxelModel::increasePcd(
                 std::vector<int64_t>{ijk_nbr_lv.size(0), 1},
                 static_cast<int64_t>(lv),
                 torch::dtype(torch::kInt8).device(devL)).contiguous();
-            auto path_nbr_lv = svr_utils.attr("ijk_2_octpath")(
-                py::cast(ijk_nbr_lv), py::cast(L_nbr_lv))
-                .cast<torch::Tensor>().contiguous();
+            auto path_nbr_lv = UTILS::ijk_2_octpath(ijk_nbr_lv, L_nbr_lv).contiguous();
 
             auto is_occ_lv = occupied_hier_at_level(path_nbr_lv.view({-1}).to(torch::kInt64), lv);
             auto miss_idx_lv = torch::nonzero(~is_occ_lv).view({-1});
@@ -2194,21 +2200,19 @@ void VoxelModel::increasePcd(
         std::cout << "[increasePcd] local_frontier_fill generated candidates="
                   << octpath_box.size(0) << "\n";
 
-        auto ijk_box = svr_utils.attr("octpath_2_ijk")(
-            py::cast(octpath_box), py::cast(L_box)).cast<torch::Tensor>()
-            .to(torch::kLong).contiguous();
+        auto ijk_box =
+            UTILS::octpath_2_ijk(octpath_box, L_box).to(torch::kLong).contiguous();
 
         // Compare with CURRENT topology (which already includes real additions above).
-        auto octpath_cur  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-        auto octlevel_cur = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+        auto octpath_cur  = this->oct_path_.contiguous();
+        auto octlevel_cur = this->oct_level_.contiguous();
 
         auto key_box = octpath_box.view({-1}).to(torch::kInt64).mul(256)
                      + L_box.view({-1}).to(torch::kInt64);
         auto key_cur = octpath_cur.view({-1}).to(torch::kInt64).mul(256)
                      + octlevel_cur.view({-1}).to(torch::kInt64);
 
-        auto is_dup = torch_mod.attr("isin")(py::cast(key_box), py::cast(key_cur))
-                      .cast<torch::Tensor>().to(torch::kBool);
+        auto is_dup = at::isin(key_box, key_cur).to(torch::kBool);
         auto new_mask_box = ~is_dup;
 
         // Drop base-level parents of already-subdivided regions.
@@ -2226,9 +2230,8 @@ void VoxelModel::increasePcd(
                     auto key_children_as_parent = op_anc_base.mul(256)
                         .add(torch::full_like(op_anc_base, static_cast<int64_t>(base_L)));
 
-                    auto would_collide_parent = torch_mod.attr("isin")(
-                        py::cast(key_box), py::cast(key_children_as_parent))
-                        .cast<torch::Tensor>().to(torch::kBool);
+                    auto would_collide_parent =
+                        at::isin(key_box, key_children_as_parent).to(torch::kBool);
                     new_mask_box = new_mask_box & (~would_collide_parent);
                 }
             }
@@ -2244,13 +2247,12 @@ void VoxelModel::increasePcd(
         auto octpath_add2 = octpath_box.index_select(0, sel_local);
         auto L_add2       = L_box.index_select(0, sel_local);
         {
-            py::tuple dec_add = oct_utils.attr("octpath_decoding")(
-                py::cast(octpath_add2.contiguous()),
-                py::cast(L_add2.contiguous()),
-                py::cast(scene_center_.contiguous()),
-                py::cast(scene_extent_.contiguous())
-            );
-            at::Tensor add_center = dec_add[0].cast<at::Tensor>().contiguous(); // [Nm,3]
+            auto [add_center, add_size_unused] = decodeOctpath(
+                octpath_add2.contiguous(),
+                L_add2.contiguous(),
+                scene_center_.contiguous(),
+                scene_extent_.contiguous());
+            (void)add_size_unused;
             bb_min_viz = std::get<0>(add_center.min(/*dim=*/0, /*keepdim=*/false)).contiguous();
             bb_max_viz = std::get<0>(add_center.max(/*dim=*/0, /*keepdim=*/false)).contiguous();
             sel_artificials_viz = torch::arange(
@@ -2258,8 +2260,8 @@ void VoxelModel::increasePcd(
             ijk_box_viz = torch::empty({0, 3}, long_opts);
         }
 
-        py_->svm.attr("octpath")  = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
-        py_->svm.attr("octlevel") = torch::cat({octlevel_cur, L_add2},       0).contiguous();
+        this->oct_path_ = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
+        this->oct_level_ = torch::cat({octlevel_cur, L_add2}, 0).contiguous();
         {
             auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(devL);
             auto i32_opts  = torch::TensorOptions().dtype(torch::kInt32).device(devL);
@@ -2346,10 +2348,14 @@ void VoxelModel::increasePcd(
         }
         auto rgb_add2 = rgb_seed.view({1, 3}).repeat({Nm_local, 1}).contiguous();
 
-        py::object sh0_add2_py = act_mod.attr("rgb2shzero")(py::cast(rgb_add2));
-        auto sh0_add2 = sh0_add2_py.cast<torch::Tensor>().contiguous();
+        auto sh0_add2 = rgbToShZero(rgb_add2).contiguous();
 
-        auto grid_pts_key_new_local = py_->svm.attr("grid_pts_key").cast<torch::Tensor>();
+        auto [grid_pts_key_new_local, vox_key_new_local] =
+            buildGridPtsLink(
+                this->oct_path_.contiguous(),
+                this->oct_level_.contiguous(),
+                max_num_levels_);
+        (void)vox_key_new_local;
         const int64_t M_prev_local = grid_pts_key_.defined() ? grid_pts_key_.size(0) : 0;
         const int64_t M_curr_local = grid_pts_key_new_local.size(0);
         if (M_curr_local > M_prev_local) {
@@ -2358,15 +2364,15 @@ void VoxelModel::increasePcd(
                 M_prev_local,
                 M_curr_local,
                 /*default_value=*/-10.0f);
-            appendGroup_(/*group_idx=*/0, grow2, "_geo_grid_pts", &this->_geo_grid_pts_);
+            appendGroup_(/*group_idx=*/0, grow2, &this->_geo_grid_pts_);
         }
-        appendGroup_(/*group_idx=*/1, sh0_add2, "_sh0", &this->sh0_);
-        appendGroup_(/*group_idx=*/2, shs_add2, "_shs", &this->shs_);
+        appendGroup_(/*group_idx=*/1, sh0_add2, &this->sh0_);
+        appendGroup_(/*group_idx=*/2, shs_add2, &this->shs_);
 
-        auto subdiv_old2 = py_->svm.attr("_subdiv_p").cast<torch::Tensor>();
-        py_->svm.attr("_subdiv_p") = torch::cat({subdiv_old2, subdiv_add2}, 0)
-                                     .contiguous().detach().requires_grad_();
-        this->subdiv_p_ = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
+        this->subdiv_p_ = torch::cat({this->subdiv_p_.detach(), subdiv_add2}, 0)
+                              .contiguous()
+                              .detach()
+                              .requires_grad_(true);
 
         artificial_fill_happened_ = true;
         std::cout << "[increasePcd] local_frontier_fill added " << Nm_local
@@ -2406,7 +2412,7 @@ void VoxelModel::increasePcd(
             std::cout << "[dense_core/refresh][fill] begin points="
                       << fill_pts_cpu.size(0)
                       << " rate=" << dense_core_pcd_density_rate_ << "\n";
-            std::string py_err_msg;
+            std::string heuristic_err_msg;
             bool crossing_ok = false;
             {
                 auto pts_f32 = fill_pts_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
@@ -2459,47 +2465,39 @@ void VoxelModel::increasePcd(
             if (!crossing_ok) {
                 std::cout << "[dense_core/refresh][fill] no_density_crossing at rate="
                           << dense_core_pcd_density_rate_
-                          << "; skipping python heuristic this round.\n";
+                          << "; skipping dense-core heuristic this round.\n";
             } else {
-                try {
-                    static py::module bound_utils = py::module::import("src.utils.bounding_utils");
-                    static py::module types       = py::module::import("types");
-
-                    py::object ns = types.attr("SimpleNamespace")(
-                        "points"_a = py::cast(fill_pts_cpu.contiguous()).attr("numpy")());
-                    py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(
-                        ns, py::float_(dense_core_pcd_density_rate_));
-
-                    py::object center_t_py = torch_mod.attr("from_numpy")(cr[0]); // CPU tensor
-                    auto center_t = center_t_py.cast<torch::Tensor>()
-                        .to(torch::kCUDA).to(torch::kFloat32).contiguous().view({3});
-                    const float radius_f = cr[1].cast<float>();
+                if (auto bound = mainSceneBoundPcdHeuristicCpp(
+                        fill_pts_cpu.contiguous(),
+                        dense_core_pcd_density_rate_)) {
+                    auto center_t = bound->first
+                        .to(torch::kCUDA)
+                        .to(torch::kFloat32)
+                        .contiguous()
+                        .view({3});
+                    const float radius_f = bound->second;
                     if (std::isfinite(radius_f) && radius_f > 0.0f) {
                         auto radius_t = torch::full(
                             {3}, radius_f, torch::dtype(torch::kFloat32).device(torch::kCUDA));
                         bb_min = (center_t - radius_t).contiguous();
                         bb_max = (center_t + radius_t).contiguous();
                         bbox_ready = true;
-                        std::cout << "[dense_core/refresh][fill] done source=python radius="
+                        std::cout << "[dense_core/refresh][fill] done source=cpp radius="
                                   << radius_f << "\n";
                         std::cout << "[increasePcd] fill_empty_cells_: one-shot using accumulated-real-pcd heuristic bbox.\n";
                     } else {
                         std::cout << "[increasePcd] fill_empty_cells_: invalid heuristic radius="
                                   << radius_f << ".\n";
                     }
-                } catch (const py::error_already_set& e) {
-                    py_err_msg = e.what();
-                } catch (const std::exception& e) {
-                    py_err_msg = e.what();
-                } catch (...) {
-                    py_err_msg = "unknown_exception";
+                } else {
+                    heuristic_err_msg = "dense-core heuristic returned no valid center/radius";
                 }
             }
 
             if (!bbox_ready) {
-                if (!py_err_msg.empty()) {
-                    std::cout << "[increasePcd] fill_empty_cells_: python heuristic failed:\n"
-                              << py_err_msg << "\n";
+                if (!heuristic_err_msg.empty()) {
+                    std::cout << "[increasePcd] fill_empty_cells_: dense-core heuristic failed:\n"
+                              << heuristic_err_msg << "\n";
                 }
                 std::cout << "[increasePcd] fill_empty_cells_: bbox unavailable; will retry in next increasePcd.\n";
             }
@@ -2512,22 +2510,6 @@ void VoxelModel::increasePcd(
             has_dense_core_bb_ = true;
             std::cout << "[increasePcd] dense_core_bb_min=" << dense_core_bb_min_
                       << " dense_core_bb_max=" << dense_core_bb_max_ << std::endl;
-            {
-                auto bbox_center = (0.5f * (bb_min + bb_max)).view({1, 3}).contiguous();
-                auto bbox_size = (bb_max - bb_min).view({1, 3}).contiguous();
-                auto bbox_rgba = torch::zeros(
-                    {1, 4},
-                    torch::TensorOptions().dtype(torch::kFloat32).device(bbox_center.device()));
-                bbox_rgba.index_put_({0, 0}, 1.0f);
-                bbox_rgba.index_put_({0, 1}, 0.75f);
-                bbox_rgba.index_put_({0, 3}, 0.18f);
-                sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                    bbox_center,
-                    bbox_size,
-                    bbox_rgba,
-                    iteration,
-                    "world/fill_empty_cells/raw_cube_aabb");
-            }
             fill_empty_cells_done_ = true;
 
             // --- B) Convert bbox (world) -> dense ijk box at cached level/voxel size ---
@@ -2584,58 +2566,25 @@ void VoxelModel::increasePcd(
                 auto L_box = torch::full({ijk_box.size(0),1}, octlevel_, torch::dtype(torch::kInt8).device(dev)).contiguous();
 
                 // Build morton/octpath for those cells
-                py::object octpath_box_py = svr_utils.attr("ijk_2_octpath")(py::cast(ijk_box), py::cast(L_box));
-                auto octpath_box = octpath_box_py.cast<torch::Tensor>().contiguous(); // [Nc,1] int64
+                auto octpath_box = UTILS::ijk_2_octpath(ijk_box, L_box).contiguous(); // [Nc,1] int64
                 
                 // ------------------------------------------------------------------------
                 // B) OPTIONAL: camera-based filtering (mark_max_samp_rate + mark_near)
                 //     so artificial voxels are also consistent with SVRaster camera logic
                 // ------------------------------------------------------------------------
                 if (filter_near_voxels_ && !cams.empty()) {
-                    py::gil_scoped_acquire gil;
-                    static py::module svr_mod   = py::module::import("svraster_cuda").attr("renderer");
-                    static py::module oct_utils = py::module::import("src.utils.octree_utils");
-                    // torch_mod already defined as static at top of increasePcd
-
                     // Decode voxel centers/sizes for artificial voxels
-                    py::tuple dec_box = oct_utils.attr("octpath_decoding")(
-                        py::cast(octpath_box.contiguous()),
-                        py::cast(L_box.contiguous()),
-                        py::cast(scene_center_.contiguous()),
-                        py::cast(scene_extent_.contiguous())
-                    );
-                    at::Tensor vox_center_box = dec_box[0].cast<at::Tensor>(); // [Nc,3] cuda
-                    at::Tensor vox_size_box   = dec_box[1].cast<at::Tensor>(); // [Nc,1] cuda
-
-                    // Build Python list of CUDA MiniCams (same pattern as above)
-                    py::list py_cams;
-                    py::object py_cuda = torch_mod.attr("device")("cuda");
-                    auto move_attr_to_cuda_if_tensor = [&](py::object& obj, const char* name){
-                        if (py::hasattr(obj, name)) {
-                            py::object t = obj.attr(name);
-                            if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                                obj.attr(name) = t.attr("to")(py_cuda);
-                            }
-                        }
-                    };
-                    for (const auto& c : cams) {
-                        py::object py_cam = MiniCam_to_py(c);
-                        move_attr_to_cuda_if_tensor(py_cam, "w2c");
-                        move_attr_to_cuda_if_tensor(py_cam, "c2w");
-                        move_attr_to_cuda_if_tensor(py_cam, "position");
-                        move_attr_to_cuda_if_tensor(py_cam, "lookat");
-                        py_cams.append(py_cam);
-                    }
+                    auto [vox_center_box, vox_size_box] = decodeOctpath(
+                        octpath_box.contiguous(),
+                        L_box.contiguous(),
+                        scene_center_.contiguous(),
+                        scene_extent_.contiguous());
 
                     auto Nc_before = octpath_box.size(0);
 
                     // 1) Visibility / sampling rate
-                    at::Tensor rate_box = svr_mod.attr("mark_max_samp_rate")(
-                        py_cams,
-                        py::cast(octpath_box),
-                        py::cast(vox_center_box),
-                        py::cast(vox_size_box)
-                    ).cast<at::Tensor>();
+                    at::Tensor rate_box =
+                        markSvrasterMaxSampRateDirect(cams, octpath_box, vox_center_box, vox_size_box);
                     at::Tensor kept_cam = rate_box > 0;
                     int64_t n_rate_pos_box = kept_cam.sum().item<int64_t>();
 
@@ -2644,13 +2593,8 @@ void VoxelModel::increasePcd(
                     const float near_thresh = filter_near_voxels_ ? 0.2f : -1.0f;
                     int64_t n_near_hit_box = 0;
                     if (near_thresh > 0.0f) {
-                        at::Tensor is_near_box = svr_mod.attr("mark_near")(
-                            py_cams,
-                            py::cast(octpath_box),
-                            py::cast(vox_center_box),
-                            py::cast(vox_size_box),
-                            py::float_(near_thresh)
-                        ).cast<at::Tensor>();
+                        at::Tensor is_near_box =
+                            markSvrasterNearDirect(cams, octpath_box, vox_center_box, vox_size_box, near_thresh);
                         kept_cam = kept_cam & (~is_near_box);
                         n_near_hit_box = is_near_box.sum().item<int64_t>();
                     }
@@ -2679,16 +2623,15 @@ void VoxelModel::increasePcd(
                 }
 
                 // Compare with CURRENT topology (which already includes real additions above)
-                auto octpath_cur  = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-                auto octlevel_cur = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+                auto octpath_cur  = this->oct_path_.contiguous();
+                auto octlevel_cur = this->oct_level_.contiguous();
 
                 auto key_box = octpath_box.view({-1}).to(torch::kInt64).mul(256)
                             + L_box.view({-1}).to(torch::kInt64);
                 auto key_cur = octpath_cur.view({-1}).to(torch::kInt64).mul(256)
                             + octlevel_cur.view({-1}).to(torch::kInt64);
 
-                py::object isin_py = torch_mod.attr("isin")(py::cast(key_box), py::cast(key_cur));
-                auto is_dup   = isin_py.cast<torch::Tensor>().to(torch::kBool);
+                auto is_dup = at::isin(key_box, key_cur).to(torch::kBool);
                 auto new_mask_box = ~is_dup;
 
                 // --- Also drop base-level parents of already-subdivided regions (L_old > base_L) ---
@@ -2744,9 +2687,8 @@ void VoxelModel::increasePcd(
                             key_children_as_parent = unique_sorted_1d(key_children_as_parent);
 
                             // Any base-level candidate that equals one of these parents must be skipped
-                            py::object isin_py2 = torch_mod.attr("isin")(
-                                py::cast(key_box), py::cast(key_children_as_parent));
-                            auto would_collide_parent = isin_py2.cast<torch::Tensor>().to(torch::kBool); // [Nc]
+                            auto would_collide_parent =
+                                at::isin(key_box, key_children_as_parent).to(torch::kBool); // [Nc]
 
                             new_mask_box = new_mask_box & (~would_collide_parent);
                         }
@@ -2767,8 +2709,8 @@ void VoxelModel::increasePcd(
                     auto L_add2       = L_box.index_select(0, sel);       // [Nm,1]
 
                     // Append topology
-                    py_->svm.attr("octpath")  = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
-                    py_->svm.attr("octlevel") = torch::cat({octlevel_cur, L_add2},       0).contiguous();
+                    this->oct_path_ = torch::cat({octpath_cur,  octpath_add2}, 0).contiguous();
+                    this->oct_level_ = torch::cat({octlevel_cur, L_add2}, 0).contiguous();
                     {
                         auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(dev);
                         auto i32_opts  = torch::TensorOptions().dtype(torch::kInt32).device(dev);
@@ -2853,11 +2795,15 @@ void VoxelModel::increasePcd(
                     rgb_add2.index_put_({torch::indexing::Slice(),1}, artificial_bg_rgb_[1]);
                     rgb_add2.index_put_({torch::indexing::Slice(),2}, artificial_bg_rgb_[2]);
 
-                    py::object sh0_add2_py = act_mod.attr("rgb2shzero")(py::cast(rgb_add2.contiguous()));
-                    auto sh0_add2 = sh0_add2_py.cast<torch::Tensor>().contiguous();
+                    auto sh0_add2 = rgbToShZero(rgb_add2.contiguous()).contiguous();
 
                     // Grid growth and optimizer-preserving appends
-                    auto grid_pts_key_new = py_->svm.attr("grid_pts_key").cast<torch::Tensor>();
+                    auto [grid_pts_key_new, vox_key_new] =
+                        buildGridPtsLink(
+                            this->oct_path_.contiguous(),
+                            this->oct_level_.contiguous(),
+                            max_num_levels_);
+                    (void)vox_key_new;
                     const int64_t M_prev = grid_pts_key_.defined() ? grid_pts_key_.size(0) : 0;
                     const int64_t M_curr = grid_pts_key_new.size(0);
                     if (M_curr > M_prev) {
@@ -2866,16 +2812,16 @@ void VoxelModel::increasePcd(
                             M_prev,
                             M_curr,
                             /*default_value=*/-10.0f);
-                        appendGroup_(/*group_idx=*/0, grow, "_geo_grid_pts", &this->_geo_grid_pts_);
+                        appendGroup_(/*group_idx=*/0, grow, &this->_geo_grid_pts_);
                     }
-                    appendGroup_(/*group_idx=*/1, sh0_add2, "_sh0", &this->sh0_);
-                    appendGroup_(/*group_idx=*/2, shs_add2, "_shs", &this->shs_);
+                    appendGroup_(/*group_idx=*/1, sh0_add2, &this->sh0_);
+                    appendGroup_(/*group_idx=*/2, shs_add2, &this->shs_);
 
                     // subdiv_p (not in optimizer groups)
-                    auto subdiv_old2 = py_->svm.attr("_subdiv_p").cast<torch::Tensor>();
-                    py_->svm.attr("_subdiv_p") = torch::cat({subdiv_old2, subdiv_add2}, 0)
-                                                .contiguous().detach().requires_grad_();
-                    this->subdiv_p_ = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
+                    this->subdiv_p_ = torch::cat({this->subdiv_p_.detach(), subdiv_add2}, 0)
+                                          .contiguous()
+                                          .detach()
+                                          .requires_grad_(true);
                     // NEW: mark that we actually added artificial voxels this call
                     artificial_fill_happened_ = true;
                 }
@@ -2891,20 +2837,45 @@ void VoxelModel::increasePcd(
         } // should_fill
     } // fill_empty_cells_
 
-    // ── 10) Pull back the rest for renderer (topology/derived fields) ───────
-    auto fetch = [&](const char* name){
-        return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
-    };
-    this->oct_path_      = fetch("octpath");
-    this->oct_level_     = fetch("octlevel");
-    this->center_        = fetch("vox_center");
-    this->size_          = fetch("vox_size").squeeze(1);
+    // ── 10) Rebuild renderer fields from the C++ topology ───────────────────
+    this->oct_path_      = this->oct_path_.contiguous();
+    this->oct_level_     = this->oct_level_.contiguous();
+    {
+        auto [center, size] = decodeOctpath(
+            this->oct_path_.contiguous(),
+            this->oct_level_.contiguous(),
+            this->scene_center_.contiguous(),
+            this->scene_extent_.contiguous());
+        auto [grid_pts_key_now, vox_key_now] =
+            buildGridPtsLink(this->oct_path_.contiguous(), this->oct_level_.contiguous(), max_num_levels_);
+        this->center_        = center.contiguous();
+        this->size_          = size.squeeze(1).contiguous();
+        this->grid_pts_key_  = grid_pts_key_now.contiguous();
+        this->vox_key_       = vox_key_now.contiguous();
+    }
     this->vox_size_inv_  = 1.0f / size_;
-    this->grid_pts_key_  = fetch("grid_pts_key");
-    this->vox_key_       = fetch("vox_key");
-    ensureSvrasterSdfField();
+    {
+        const int64_t N_final = this->vox_key_.size(0);
+        const int64_t N_added = std::max<int64_t>(0, N_final - old_voxel_count);
+        auto dev_sdf = old_vox_sdf_values.defined()
+            ? old_vox_sdf_values.device()
+            : (_geo_grid_pts_.defined() ? _geo_grid_pts_.device() : torch::Device(device_type_));
+        auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev_sdf);
+        if (!old_vox_sdf_values.defined() || old_vox_sdf_values.size(0) != old_voxel_count) {
+            old_vox_sdf_values = torch::zeros({old_voxel_count, 8, 1}, value_opts);
+            old_vox_sdf_weights = torch::zeros({old_voxel_count, 8, 1}, value_opts);
+        }
+        auto added_sdf = torch::zeros({N_added, 8, 1}, value_opts);
+        auto added_weights = torch::zeros({N_added, 8, 1}, value_opts);
+        auto vox_sdf = torch::cat({old_vox_sdf_values, added_sdf}, 0).contiguous();
+        auto vox_weights = torch::cat({old_vox_sdf_weights, added_weights}, 0).contiguous();
+        rebuildSvrasterSdfFieldFromVoxelCorners_(vox_sdf, vox_weights);
+    }
     // (optimizer params already set by appendGroup_; just ensure requires_grad)
-    this->subdiv_p_      = py_->svm.attr("_subdiv_p").cast<torch::Tensor>().requires_grad_(true);
+    this->subdiv_p_ = this->subdiv_p_.contiguous();
+    if (!this->subdiv_p_.requires_grad()) {
+        this->subdiv_p_.set_requires_grad(true);
+    }
     // stats buffer resize
     this->max_w_ = torch::zeros({center_.size(0), 1}, torch::dtype(torch::kFloat32).device(dev));
     // Keep provenance tensor aligned with current topology size.
@@ -3153,117 +3124,12 @@ void VoxelModel::increasePcd(
     VOXEL_MODEL_TENSORS_TO_VEC
 
     if (!pending_artificial_insert_rr_entity_path_.empty()) {
-        if (Nk > 0) {
-            const int64_t new_end = old_voxel_count + static_cast<int64_t>(Nk);
-            if (this->center_.defined() && this->size_.defined() &&
-                new_end <= this->center_.size(0) &&
-                new_end <= this->size_.size(0)) {
-                auto idx_new = torch::arange(
-                    old_voxel_count,
-                    new_end,
-                    torch::TensorOptions().dtype(torch::kLong).device(this->center_.device()));
-                auto centers_new = this->center_.index_select(0, idx_new).contiguous();
-                auto sizes_new = this->size_.index_select(0, idx_new).view({-1, 1}).contiguous();
-                auto rgb_new = rgb_add.clamp(0.0f, 1.0f).contiguous();
-                auto alpha_new = torch::full(
-                    {Nk, 1},
-                    0.85f,
-                    torch::TensorOptions().dtype(torch::kFloat32).device(rgb_new.device()));
-                auto rgba_new = torch::cat({rgb_new, alpha_new}, 1).contiguous();
-                auto* accum_centers = &rendered_depth_created_centers_accum_viz_;
-                auto* accum_sizes = &rendered_depth_created_sizes_accum_viz_;
-                auto* accum_rgba = &rendered_depth_created_rgba_accum_viz_;
-
-                if (!accum_centers->defined() || accum_centers->numel() == 0) {
-                    *accum_centers = centers_new.clone();
-                    *accum_sizes = sizes_new.clone();
-                    *accum_rgba = rgba_new.clone();
-                } else {
-                    *accum_centers = torch::cat({*accum_centers, centers_new}, 0).contiguous();
-                    *accum_sizes = torch::cat({*accum_sizes, sizes_new}, 0).contiguous();
-                    *accum_rgba = torch::cat({*accum_rgba, rgba_new}, 0).contiguous();
-                }
-
-                sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                    *accum_centers,
-                    *accum_sizes,
-                    *accum_rgba,
-                    iteration,
-                    pending_artificial_insert_rr_entity_path_);
-            }
-        }
         pending_artificial_insert_rr_entity_path_.clear();
         pending_insert_rendered_depth_candidate_source_kind_ = 0;
         pending_insert_rendered_depth_candidate_as_real_protected_ = false;
     }
 
     if (!pending_real_insert_rr_entity_path_.empty()) {
-        if (Nk > 0) {
-            const int64_t new_real_end = old_voxel_count + static_cast<int64_t>(Nk);
-            if (this->center_.defined() && this->size_.defined() &&
-                new_real_end <= this->center_.size(0) &&
-                new_real_end <= this->size_.size(0)) {
-                auto idx_new_real = torch::arange(
-                    old_voxel_count,
-                    new_real_end,
-                    torch::TensorOptions().dtype(torch::kLong).device(this->center_.device()));
-                auto centers_new_real = this->center_.index_select(0, idx_new_real).contiguous();
-                auto sizes_new_real = this->size_.index_select(0, idx_new_real).view({-1, 1}).contiguous();
-                auto rgb_new_real = rgb_add.clamp(0.0f, 1.0f).contiguous();
-                auto alpha_new_real = torch::full(
-                    {Nk, 1},
-                    0.95f,
-                    torch::TensorOptions().dtype(torch::kFloat32).device(rgb_new_real.device()));
-                auto rgba_new_real = torch::cat({rgb_new_real, alpha_new_real}, 1).contiguous();
-
-                const bool is_depthanything_fill_holes_entity =
-                    pending_real_insert_rr_entity_path_ == "world/mono_prior_fill_holes/created";
-                const bool is_orb_entity =
-                    pending_real_insert_rr_entity_path_ == "world/orb/voxels_created";
-                const bool is_inactive_geo_entity =
-                    pending_real_insert_rr_entity_path_ == "world/voxels_inactive_geo_densify/created";
-                const bool is_rgbd_fill_render_holes_entity =
-                    pending_real_insert_rr_entity_path_ == "world/rgbd_fill_render_holes/created";
-
-                if (is_orb_entity || is_inactive_geo_entity ||
-                    is_rgbd_fill_render_holes_entity ||
-                    is_depthanything_fill_holes_entity) {
-                    // Source topics are logged from the live voxel model in the
-                    // training loop so they stay synchronized with /voxels.
-                } else {
-                    auto* accum_centers_real = is_depthanything_fill_holes_entity
-                        ? &depthanything_fill_holes_created_centers_accum_viz_
-                        : &inactive_geo_centers_accum_viz_;
-                    auto* accum_sizes_real = is_depthanything_fill_holes_entity
-                        ? &depthanything_fill_holes_created_sizes_accum_viz_
-                        : &inactive_geo_sizes_accum_viz_;
-                    auto* accum_rgba_real = is_depthanything_fill_holes_entity
-                        ? &depthanything_fill_holes_created_rgba_accum_viz_
-                        : &inactive_geo_rgba_accum_viz_;
-
-                    if (!accum_centers_real->defined() ||
-                        accum_centers_real->numel() == 0) {
-                        *accum_centers_real = centers_new_real.clone();
-                        *accum_sizes_real = sizes_new_real.clone();
-                        *accum_rgba_real = rgba_new_real.clone();
-                    } else {
-                        *accum_centers_real = torch::cat(
-                            {*accum_centers_real, centers_new_real}, 0).contiguous();
-                        *accum_sizes_real = torch::cat(
-                            {*accum_sizes_real, sizes_new_real}, 0).contiguous();
-                        *accum_rgba_real = torch::cat(
-                            {*accum_rgba_real, rgba_new_real}, 0).contiguous();
-                    }
-
-                    sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                        *accum_centers_real,
-                        *accum_sizes_real,
-                        *accum_rgba_real,
-                        iteration,
-                        pending_real_insert_rr_entity_path_);
-                }
-            }
-        }
         pending_real_insert_rr_entity_path_.clear();
     }
     pending_insert_rendered_depth_candidate_ = false;
@@ -3433,42 +3299,22 @@ bool VoxelModel::refreshDenseCoreBBFromCurrentVoxels()
         return false;
     }
 
-    // 4) Python heuristic (SVRaster) once precheck says crossing exists.
-    std::string py_err_msg;
-    try {
-        py::gil_scoped_acquire gil;
-        static py::module bound_utils = py::module::import("src.utils.bounding_utils");
-        static py::module types = py::module::import("types");
-        static py::module torch_mod = py::module::import("torch");
-
-        py::object ns = types.attr("SimpleNamespace")(
-            "points"_a = py::cast(pts_cpu.contiguous()).attr("numpy")());
-        py::tuple cr = bound_utils.attr("main_scene_bound_pcd_heuristic")(
-            ns, py::float_(dense_core_pcd_density_rate_));
-
-        py::object core_center_py = torch_mod.attr("from_numpy")(cr[0]);
-        auto core_center = core_center_py.cast<torch::Tensor>()
-            .to(torch::kCPU).to(torch::kFloat32).contiguous().view({3}); // [3]
-        const float core_radius = cr[1].cast<float>();
+    // 4) SVRaster pcd heuristic once the precheck says crossing exists.
+    if (auto bound = mainSceneBoundPcdHeuristicCpp(
+            pts_cpu.contiguous(),
+            dense_core_pcd_density_rate_)) {
+        auto core_center = bound->first.to(torch::kCPU).to(torch::kFloat32).contiguous().view({3});
+        const float core_radius = bound->second;
         if (set_dense_core_from_center_radius(core_center, core_radius)) {
-            // std::cout << "[dense_core/refresh] source=python points=" << pts_cpu.size(0)
+            // std::cout << "[dense_core/refresh] source=cpp points=" << pts_cpu.size(0)
             //           << " rate=" << dense_core_pcd_density_rate_
             //           << " radius=" << core_radius << "\n";
             // std::cout << "[dense_core/refresh] dense_core_bb_min=" << dense_core_bb_min_
             //           << " dense_core_bb_max=" << dense_core_bb_max_ << std::endl;
             return true;
         }
-        py_err_msg = "heuristic returned invalid center/radius";
-    } catch (const py::error_already_set& e) {
-        py_err_msg = e.what();
-    } catch (const std::exception& e) {
-        py_err_msg = e.what();
-    } catch (...) {
-        py_err_msg = "unknown_exception";
     }
 
-    // std::cout << "[dense_core/refresh] python heuristic failed: "
-    //           << py_err_msg << "\n";
     // std::cout << "[dense_core/refresh] failed to estimate dense-core bbox.\n";
     return false;
 }
@@ -3567,152 +3413,65 @@ void VoxelModel::promoteRenderedDepthCandidates(const torch::Tensor& promote_mas
     total_promoted_artificial_voxels_ += idx.size(0);
 }
 
-void VoxelModel::syncFromPython_() {
-    py::gil_scoped_acquire gil;
-
-    auto fetch = [&](const char* name){
-        return py_->svm.attr(name).cast<torch::Tensor>().contiguous();
-    };
-
-    // Octree / indexing
-    this->oct_path_   = fetch("octpath");
-    this->oct_level_  = fetch("octlevel");
-    this->vox_key_    = fetch("vox_key");               // [N,8] long
-    this->center_     = fetch("vox_center");            // [N,3] float
-    this->size_       = fetch("vox_size").squeeze(1);   // [N] or [N,1]→[N]
-    this->vox_size_inv_  = 1.0f / this->size_;
-    this->grid_pts_key_  = fetch("grid_pts_key");
-    // Learnables
-    this->_geo_grid_pts_ = fetch("_geo_grid_pts").requires_grad_(true);
-    ensureSvrasterSdfField();
-    this->sh0_ = fetch("_sh0").requires_grad_(true);
-    // this->sh0_ = this->sh0_.view({-1,1,3});
-    this->shs_ = fetch("_shs").requires_grad_(true);
-    this->subdiv_p_ = fetch("_subdiv_p").requires_grad_(true);
-    // Resize any side buffers bound to voxel count
-    this->max_w_ = torch::zeros({center_.size(0), 1},
-              torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-
-    VOXEL_MODEL_TENSORS_TO_VEC
-}
-
 void VoxelModel::createTrainer(float geo_lr, float sh0_lr, float shs_lr,
                                float beta1, float beta2, float eps,
                                const std::vector<int>& milestones,
                                float gamma)
 {
-    py::gil_scoped_acquire gil;
+    optimizer_geo_lr_ = geo_lr;
+    optimizer_sh0_lr_ = sh0_lr;
+    optimizer_shs_lr_ = shs_lr;
+    optimizer_beta1_ = beta1;
+    optimizer_beta2_ = beta2;
+    optimizer_eps_ = eps;
+    scheduler_milestones_ = milestones;
+    std::sort(scheduler_milestones_.begin(), scheduler_milestones_.end());
+    scheduler_gamma_ = gamma;
+    scheduler_epoch_ = -1;
+    optimizer_initialized_ = true;
 
-    // --- Optimizer (SparseAdam) ---
-    py::module sadam = py::module::import("svraster_cuda.sparse_adam");
-    py::object SparseAdam = sadam.attr("SparseAdam");
+    adam_geo_ = AdamGroupState{};
+    adam_sh0_ = AdamGroupState{};
+    adam_shs_ = AdamGroupState{};
 
-    // Build param groups with per-group learning rates (SVRaster style)
-    py::list groups;
-    {
-        py::dict g0;
-        g0["params"] = py::make_tuple(this->_geo_grid_pts_);
-        g0["lr"]     = geo_lr;
-        groups.append(g0);
-    }
-    {
-        py::dict g1;
-        g1["params"] = py::make_tuple(this->sh0_);
-        g1["lr"]     = sh0_lr;
-        groups.append(g1);
-    }
-    {
-        py::dict g2;
-        g2["params"] = py::make_tuple(this->shs_);
-        g2["lr"]     = shs_lr;
-        groups.append(g2);
-    }
-
-    // Same call style as Python (group-specific lrs; global lr unused)
-    py_->optimizer_py = SparseAdam(groups,
-                                   "betas"_a = py::make_tuple(beta1, beta2),
-                                   "eps"_a   = eps);
-
-    // --- Scheduler (MultiStepLR) ---
-    py::module lr_sched = py::module::import("torch.optim.lr_scheduler");
-    py_->scheduler_py = lr_sched.attr("MultiStepLR")(
-        py_->optimizer_py,
-        "milestones"_a = py::cast(milestones),
-        "gamma"_a = gamma
-    );
+    _geo_grid_pts_ = _geo_grid_pts_.contiguous().detach().requires_grad_(true);
+    sh0_ = sh0_.contiguous().detach().requires_grad_(true);
+    shs_ = shs_.contiguous().detach().requires_grad_(true);
 }
 
 std::tuple<double,double,double> VoxelModel::currentLearningRates() const {
-    py::gil_scoped_acquire gil;
-    if (py_->optimizer_py.is_none()) {
+    if (!optimizer_initialized_) {
         return {std::numeric_limits<double>::quiet_NaN(),
                 std::numeric_limits<double>::quiet_NaN(),
                 std::numeric_limits<double>::quiet_NaN()};
     }
-    py::list groups = py_->optimizer_py.attr("param_groups");
-    auto g0 = groups[0].cast<py::dict>();
-    auto g1 = groups[1].cast<py::dict>();
-    auto g2 = groups[2].cast<py::dict>();
-    double geo = g0["lr"].cast<double>();
-    double sh0 = g1["lr"].cast<double>();
-    double shs = g2["lr"].cast<double>();
-    return {geo, sh0, shs};
+    return {optimizer_geo_lr_, optimizer_sh0_lr_, optimizer_shs_lr_};
 }
 
 void VoxelModel::appendGroup_(int group_idx,
                               const torch::Tensor& add_rows,
-                              const char* svm_field_name,
                               torch::Tensor* out_member_param) {
-    namespace py = pybind11;
-    py::gil_scoped_acquire gil;
+    torch::Tensor old_param = *out_member_param;
+    torch::Tensor new_param =
+        torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().detach().requires_grad_(true);
 
-    if (!py_->optimizer_py || py_->optimizer_py.is_none()) return;
+    auto extend_state = [&](AdamGroupState& state) {
+        if (!state.exp_avg.defined() || !state.exp_avg_sq.defined()) {
+            return;
+        }
+        torch::Tensor zeros = torch::zeros_like(add_rows);
+        state.exp_avg = torch::cat({state.exp_avg, zeros}, 0).contiguous();
+        state.exp_avg_sq = torch::cat({state.exp_avg_sq, zeros}, 0).contiguous();
+    };
 
-    // 1) param_groups[i]['params'][0]
-    py::list groups = py_->optimizer_py.attr("param_groups");
-    auto g = groups[group_idx].cast<py::dict>();
-    py::list gparams = g["params"].cast<py::list>();
-    torch::Tensor old_param = gparams[0].cast<torch::Tensor>();
-
-    // 2) state dict (tensor-keyed)
-    py::dict state = py_->optimizer_py.attr("state").cast<py::dict>();
-    bool had_state = state.contains(py::cast(old_param));
-
-    // 3) Build new concatenated param (cat along dim=0)
-    // torch::Tensor new_param = torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().requires_grad_(true);
-    torch::Tensor new_param = torch::cat({old_param, add_rows}, /*dim=*/0).contiguous().detach().requires_grad_(true); // leaf
-
-    // 4) Move/extend state if present
-    if (had_state) {
-        py::dict old_s = state[py::cast(old_param)].cast<py::dict>();
-        // Copy step
-        py::object step_obj = old_s["step"];
-        // Extend exp_avg / exp_avg_sq
-        torch::Tensor exp_avg    = old_s["exp_avg"].cast<torch::Tensor>();
-        torch::Tensor exp_avg_sq = old_s["exp_avg_sq"].cast<torch::Tensor>();
-        torch::Tensor z = torch::zeros_like(add_rows);
-
-        torch::Tensor exp_avg_new    = torch::cat({exp_avg,    z}, 0).contiguous();
-        torch::Tensor exp_avg_sq_new = torch::cat({exp_avg_sq, z}, 0).contiguous();
-
-        // Construct new state
-        py::dict new_s;
-        new_s["step"]       = step_obj;         // keep same scalar
-        new_s["exp_avg"]    = exp_avg_new;
-        new_s["exp_avg_sq"] = exp_avg_sq_new;
-
-        // Swap state key from old tensor to new tensor
-        state.attr("__delitem__")(py::cast(old_param));
-        state[py::cast(new_param)] = new_s;
+    if (group_idx == 0) {
+        extend_state(adam_geo_);
+    } else if (group_idx == 1) {
+        extend_state(adam_sh0_);
+    } else if (group_idx == 2) {
+        extend_state(adam_shs_);
     }
-    // If no state existed yet, that's fine — SparseAdam lazily initializes on first .step()
 
-    // 5) Rebind group param to the *same* new tensor object
-    gparams[0] = py::cast(new_param);
-    g["params"] = gparams;     // write back (usually not necessary, but explicit)
-
-    // 6) Keep Python SVM and C++ members in sync with the *same* tensor object
-    py_->svm.attr(svm_field_name) = new_param;
     *out_member_param = new_param;
 }
 
@@ -3731,13 +3490,17 @@ VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
     for (const auto& cam : cams) {
         // std::cout << "rendering cam " << cam.width << "x" << cam.height << "\n";
         // auto pkg = render(cam, torch::Tensor(), cam.height, cam.width, color_mode='dontcare', track_max_w=True);
-        auto pkg = render(
-            cam, 
-            cam.height, 
-            cam.width, 
-            torch::Tensor(),
-            "dontcare", 
-            true);
+        std::unordered_map<std::string, torch::Tensor> pkg;
+        {
+            torch::NoGradGuard no_grad;
+            pkg = render(
+                cam,
+                cam.height,
+                cam.width,
+                torch::Tensor(),
+                "dontcare",
+                true);
+        }
         
         if (!pkg.count("max_w") || !pkg.at("max_w").defined())
             continue;
@@ -3772,26 +3535,72 @@ VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
 }
 
 void VoxelModel::optimizerZeroGrad() {
-    py::gil_scoped_acquire gil;
-    if (!py_->optimizer_py.is_none())
-        py_->optimizer_py.attr("zero_grad")(py::arg("set_to_none") = true);
+    _geo_grid_pts_.mutable_grad() = torch::Tensor();
+    sh0_.mutable_grad() = torch::Tensor();
+    shs_.mutable_grad() = torch::Tensor();
 }
 
 void VoxelModel::optimizerStep() {
-    py::gil_scoped_acquire gil;
-    if (!py_->optimizer_py.is_none())
-        py_->optimizer_py.attr("step")();
+    if (!optimizer_initialized_) {
+        return;
+    }
+    torch::NoGradGuard no_grad;
+
+    auto step_group = [&](torch::Tensor& param,
+                          AdamGroupState& state,
+                          const float lr) {
+        torch::Tensor grad = param.grad();
+        if (!grad.defined()) {
+            return;
+        }
+        if (!grad.is_contiguous()) {
+            grad = grad.contiguous();
+        }
+        if (!state.exp_avg.defined() ||
+            !state.exp_avg_sq.defined() ||
+            state.exp_avg.sizes() != param.sizes() ||
+            state.exp_avg_sq.sizes() != param.sizes()) {
+            state.exp_avg = torch::zeros_like(param);
+            state.exp_avg_sq = torch::zeros_like(param);
+            state.step = 0;
+        }
+
+        state.step += 1;
+        ADAM_STEP::unbiased_adam_step(
+            /*sparse=*/false,
+            param,
+            grad,
+            state.exp_avg,
+            state.exp_avg_sq,
+            static_cast<double>(state.step),
+            static_cast<double>(lr),
+            static_cast<double>(optimizer_beta1_),
+            static_cast<double>(optimizer_beta2_),
+            optimizer_eps_);
+    };
+
+    step_group(_geo_grid_pts_, adam_geo_, optimizer_geo_lr_);
+    step_group(sh0_, adam_sh0_, optimizer_sh0_lr_);
+    step_group(shs_, adam_shs_, optimizer_shs_lr_);
 }
 
 void VoxelModel::schedulerStep()
 {
-    py::gil_scoped_acquire gil;
-    if (!py_->scheduler_py.is_none())
-        py_->scheduler_py.attr("step")();
+    if (!optimizer_initialized_) {
+        return;
+    }
+    scheduler_epoch_ += 1;
+    if (std::binary_search(
+            scheduler_milestones_.begin(),
+            scheduler_milestones_.end(),
+            static_cast<int>(scheduler_epoch_))) {
+        optimizer_geo_lr_ *= scheduler_gamma_;
+        optimizer_sh0_lr_ *= scheduler_gamma_;
+        optimizer_shs_lr_ *= scheduler_gamma_;
+    }
 }
 
 void VoxelModel::pruning(const torch::Tensor& prune_mask) {
-    py::gil_scoped_acquire gil;
     // accept [N] or [N,1] bool/byte
     auto mask = prune_mask.to(torch::kBool).to(device_type_).contiguous();
     if (mask.dim() == 2 && mask.size(1) == 1) {
@@ -3919,8 +3728,8 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     const int64_t n_prune_total = mask.sum().item<int64_t>();
     const int64_t n_prune_art = (mask & art_before).sum().item<int64_t>();
     const int64_t n_prune_real = n_prune_total - n_prune_art;
-    auto old_octpath = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-    auto old_octlevel = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+    auto old_octpath = this->oct_path_.contiguous();
+    auto old_octlevel = this->oct_level_.contiguous();
     auto old_key_cpu = (old_octpath.view({-1}).to(torch::kInt64).mul(256)
                       + old_octlevel.view({-1}).to(torch::kInt64))
                       .to(torch::kCPU).contiguous();
@@ -3941,8 +3750,65 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     auto old_rendered_depth_source_cpu =
         rendered_depth_candidate_source_kind_.to(torch::kCPU).to(torch::kInt32).contiguous();
 
-    py_->svm.attr("pruning")(mask);
-    syncFromPython_();
+    auto kept_idx = torch::nonzero(~mask).view({-1}).to(torch::kLong).contiguous();
+    if (kept_idx.numel() == 0) {
+        return;
+    }
+
+    auto old_vox_key = this->vox_key_.contiguous().clone();
+    auto old_geo_grid_pts = this->_geo_grid_pts_.detach().contiguous();
+    auto old_vox_grid_pts_val =
+        old_geo_grid_pts.index({old_vox_key.to(old_geo_grid_pts.device())}).contiguous();
+    ensureSvrasterSdfField();
+    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
+    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+
+    this->oct_path_ = old_octpath.index_select(0, kept_idx.to(old_octpath.device())).contiguous();
+    this->oct_level_ = old_octlevel.index_select(0, kept_idx.to(old_octlevel.device())).contiguous();
+    auto [new_center, new_size] = decodeOctpath(
+        this->oct_path_.contiguous(),
+        this->oct_level_.contiguous(),
+        this->scene_center_.contiguous(),
+        this->scene_extent_.contiguous());
+    auto [new_grid_pts_key, new_vox_key] =
+        buildGridPtsLink(this->oct_path_.contiguous(), this->oct_level_.contiguous(), max_num_levels_);
+    this->center_ = new_center.contiguous();
+    this->size_ = new_size.squeeze(1).contiguous();
+    this->vox_size_inv_ = 1.0f / this->size_;
+    this->grid_pts_key_ = new_grid_pts_key.contiguous();
+    this->vox_key_ = new_vox_key.contiguous();
+
+    auto kept_idx_sh0 = kept_idx.to(this->sh0_.device());
+    auto old_subdiv_grad = this->subdiv_p_.grad();
+    this->sh0_ = this->sh0_.detach().index_select(0, kept_idx_sh0).contiguous().requires_grad_(true);
+    this->shs_ = this->shs_.detach().index_select(0, kept_idx_sh0).contiguous().requires_grad_(true);
+    this->subdiv_p_ =
+        this->subdiv_p_.detach().index_select(0, kept_idx.to(this->subdiv_p_.device()))
+            .contiguous().requires_grad_(true);
+    if (old_subdiv_grad.defined()) {
+        this->subdiv_p_.mutable_grad() =
+            old_subdiv_grad.index_select(0, kept_idx.to(old_subdiv_grad.device())).contiguous();
+    }
+
+    auto new_vox_val =
+        old_vox_grid_pts_val.index_select(0, kept_idx.to(old_vox_grid_pts_val.device())).contiguous();
+    this->_geo_grid_pts_ =
+        aggregateVoxelCornersIntoGridPts(
+            this->grid_pts_key_.size(0),
+            this->vox_key_,
+            new_vox_val).detach().contiguous().requires_grad_(true);
+    {
+        auto kept_sdf = old_vox_sdf_values
+            .index_select(0, kept_idx.to(old_vox_sdf_values.device()))
+            .contiguous();
+        auto kept_weights = old_vox_sdf_weights
+            .index_select(0, kept_idx.to(old_vox_sdf_weights.device()))
+            .contiguous();
+        rebuildSvrasterSdfFieldFromVoxelCorners_(kept_sdf, kept_weights);
+    }
+    this->max_w_ = torch::zeros(
+        {center_.size(0), 1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
 
     auto new_key_cpu = (this->oct_path_.view({-1}).to(torch::kInt64).mul(256)
                       + this->oct_level_.view({-1}).to(torch::kInt64))
@@ -4067,7 +3933,6 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
 }
 
 void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
-    py::gil_scoped_acquire gil;
     auto mask = subdivide_mask.to(torch::kBool).to(device_type_).contiguous();
     if (mask.dim() == 2 && mask.size(1) == 1) {
         mask = mask.squeeze(1);
@@ -4204,8 +4069,8 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
         n_subdiv_promoted_parents = promoted_sel.sum().item<int64_t>();
     }
 
-    auto old_octpath = py_->svm.attr("octpath").cast<torch::Tensor>().contiguous();
-    auto old_octlevel = py_->svm.attr("octlevel").cast<torch::Tensor>().contiguous();
+    auto old_octpath = this->oct_path_.contiguous();
+    auto old_octlevel = this->oct_level_.contiguous();
     auto old_key_cpu = (old_octpath.view({-1}).to(torch::kInt64).mul(256)
                       + old_octlevel.view({-1}).to(torch::kInt64))
                       .to(torch::kCPU).contiguous();
@@ -4226,8 +4091,110 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     auto old_rendered_depth_source_cpu =
         rendered_depth_candidate_source_kind_.to(torch::kCPU).to(torch::kInt32).contiguous();
 
-    py_->svm.attr("subdividing")(mask);
-    syncFromPython_();
+    auto kept_idx = torch::nonzero(~mask).view({-1}).to(torch::kLong).contiguous();
+    if (subdiv_idx.numel() == 0) {
+        return;
+    }
+
+    auto old_vox_key = this->vox_key_.contiguous().clone();
+    auto old_geo_grid_pts = this->_geo_grid_pts_.detach().contiguous();
+    auto old_vox_grid_pts_val =
+        old_geo_grid_pts.index({old_vox_key.to(old_geo_grid_pts.device())}).contiguous();
+    ensureSvrasterSdfField();
+    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
+    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+
+    auto [child_octpath, child_octlevel] =
+        genChildrenOctpath(
+            old_octpath.index_select(0, subdiv_idx.to(old_octpath.device())).contiguous(),
+            old_octlevel.index_select(0, subdiv_idx.to(old_octlevel.device())).contiguous(),
+            max_num_levels_);
+    this->oct_path_ = torch::cat(
+        {old_octpath.index_select(0, kept_idx.to(old_octpath.device())).contiguous(),
+         child_octpath.to(old_octpath.device()).contiguous()}, 0).contiguous();
+    this->oct_level_ = torch::cat(
+        {old_octlevel.index_select(0, kept_idx.to(old_octlevel.device())).contiguous(),
+         child_octlevel.to(old_octlevel.device()).contiguous()}, 0).contiguous();
+
+    auto old_subdiv_grad = this->subdiv_p_.grad();
+    auto subdiv_children =
+        this->subdiv_p_.detach()
+            .index_select(0, subdiv_idx.to(this->subdiv_p_.device()))
+            .repeat_interleave(8, 0)
+            .contiguous();
+    this->subdiv_p_ = torch::cat(
+        {this->subdiv_p_.detach().index_select(0, kept_idx.to(this->subdiv_p_.device())).contiguous(),
+         subdiv_children}, 0).contiguous().requires_grad_(true);
+    if (old_subdiv_grad.defined()) {
+        this->subdiv_p_.mutable_grad() = torch::cat(
+            {old_subdiv_grad.index_select(0, kept_idx.to(old_subdiv_grad.device())).contiguous(),
+             subdiv_children.to(old_subdiv_grad.device()).contiguous()}, 0).contiguous();
+    }
+
+    auto sh0_children =
+        this->sh0_.detach()
+            .index_select(0, subdiv_idx.to(this->sh0_.device()))
+            .repeat_interleave(8, 0)
+            .contiguous();
+    this->sh0_ = torch::cat(
+        {this->sh0_.detach().index_select(0, kept_idx.to(this->sh0_.device())).contiguous(),
+         sh0_children}, 0).contiguous().requires_grad_(true);
+
+    auto shs_children =
+        this->shs_.detach()
+            .index_select(0, subdiv_idx.to(this->shs_.device()))
+            .repeat_interleave(8, 0)
+            .contiguous();
+    this->shs_ = torch::cat(
+        {this->shs_.detach().index_select(0, kept_idx.to(this->shs_.device())).contiguous(),
+         shs_children}, 0).contiguous().requires_grad_(true);
+
+    auto [new_center, new_size] = decodeOctpath(
+        this->oct_path_.contiguous(),
+        this->oct_level_.contiguous(),
+        this->scene_center_.contiguous(),
+        this->scene_extent_.contiguous());
+    auto [new_grid_pts_key, new_vox_key] =
+        buildGridPtsLink(this->oct_path_.contiguous(), this->oct_level_.contiguous(), max_num_levels_);
+    this->center_ = new_center.contiguous();
+    this->size_ = new_size.squeeze(1).contiguous();
+    this->vox_size_inv_ = 1.0f / this->size_;
+    this->grid_pts_key_ = new_grid_pts_key.contiguous();
+    this->vox_key_ = new_vox_key.contiguous();
+
+    auto kept_vox_val =
+        old_vox_grid_pts_val.index_select(0, kept_idx.to(old_vox_grid_pts_val.device())).contiguous();
+    auto subdiv_vox_val =
+        subdivideVoxelCornerValues(
+            old_vox_grid_pts_val.index_select(
+                0, subdiv_idx.to(old_vox_grid_pts_val.device())).contiguous());
+    auto new_vox_val = torch::cat({kept_vox_val, subdiv_vox_val}, 0).contiguous();
+    this->_geo_grid_pts_ =
+        aggregateVoxelCornersIntoGridPts(
+            this->grid_pts_key_.size(0),
+            this->vox_key_,
+            new_vox_val).detach().contiguous().requires_grad_(true);
+    {
+        auto kept_sdf =
+            old_vox_sdf_values.index_select(0, kept_idx.to(old_vox_sdf_values.device())).contiguous();
+        auto subdiv_sdf =
+            subdivideVoxelCornerValues(
+                old_vox_sdf_values.index_select(
+                    0, subdiv_idx.to(old_vox_sdf_values.device())).contiguous());
+        auto new_sdf = torch::cat({kept_sdf, subdiv_sdf}, 0).contiguous();
+
+        auto kept_weights =
+            old_vox_sdf_weights.index_select(0, kept_idx.to(old_vox_sdf_weights.device())).contiguous();
+        auto subdiv_weights =
+            subdivideVoxelCornerValues(
+                old_vox_sdf_weights.index_select(
+                    0, subdiv_idx.to(old_vox_sdf_weights.device())).contiguous());
+        auto new_weights = torch::cat({kept_weights, subdiv_weights}, 0).contiguous();
+        rebuildSvrasterSdfFieldFromVoxelCorners_(new_sdf, new_weights);
+    }
+    this->max_w_ = torch::zeros(
+        {center_.size(0), 1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
 
     auto new_key_cpu = (this->oct_path_.view({-1}).to(torch::kInt64).mul(256)
                       + this->oct_level_.view({-1}).to(torch::kInt64))
@@ -4360,7 +4327,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
 
         ++unmatched;
     }
-
     // if (unmatched > 0) {
     //     std::cout << "[SUBDIV/provenance] WARNING: unmatched voxels after key/parent remap: "
     //               << unmatched << "/" << N_after << "\n";
@@ -4424,81 +4390,18 @@ void VoxelModel::resetSubdivisionPriority() {
 }
 
 void VoxelModel::freezeVoxGeo() {
-    py::gil_scoped_acquire gil;
-
     const int64_t N = center_.size(0);
     auto care_idx = torch::arange(N, torch::dtype(torch::kLong).device(device_type_));
-
-    auto torch_mod = py::module_::import("torch");
-    auto no_grad   = torch_mod.attr("no_grad")();
-    no_grad.attr("__enter__")();
-    try {
-        auto renderer = py::module_::import("svraster_cuda.renderer");
-        auto Gather   = renderer.attr("GatherGeoParams");
-        // returns a torch.Tensor
-        py::object py_frozen = Gather.attr("apply")(vox_key_, care_idx, _geo_grid_pts_);
-        frozen_vox_geo_ = py_frozen.cast<torch::Tensor>().contiguous();
-        _geo_grid_pts_.set_requires_grad(false);
-        no_grad.attr("__exit__")(py::none(), py::none(), py::none());
-    } catch (...) {
-        no_grad.attr("__exit__")(py::none(), py::none(), py::none());
-        throw;
-    }
+    torch::NoGradGuard no_grad;
+    frozen_vox_geo_ = gatherSvrasterGeoParams(vox_key_, care_idx, _geo_grid_pts_)[0].contiguous();
+    _geo_grid_pts_.set_requires_grad(false);
 }
 
 void VoxelModel::unfreezeVoxGeo() {
-    py::gil_scoped_acquire gil;
     frozen_vox_geo_.reset();              // make it undefined
     _geo_grid_pts_.set_requires_grad(true);
 }
 
-static inline py::dict make_kwargs_from(
-    const sv::RenderOpts& a,
-    // explicit function params (after color_mode)
-    bool track_max_w,
-    std::optional<float> ss,
-    bool output_depth,
-    bool output_normal,
-    bool output_T,
-    bool rand_bg,
-    bool use_auto_exposure)
-{
-    py::dict kw;
-
-    // 1) Start with struct — these become **other_opt
-    if (a.lambda_dist.has_value())       kw["lambda_dist"]      = *a.lambda_dist;
-    if (a.lambda_ascending.has_value())  kw["lambda_ascending"] = *a.lambda_ascending;
-    if (a.lambda_scaling_penalty.has_value()) kw["lambda_scaling_penalty"] = *a.lambda_scaling_penalty;
-    if (a.min_voxel_size.has_value())    kw["min_voxel_size"]   = *a.min_voxel_size;
-    if (a.lambda_R_concen.has_value())  kw["lambda_R_concen"] = *a.lambda_R_concen;
-    if (a.gt_color.defined())            kw["gt_color"]         = a.gt_color;
-    if (a.vox_feats.defined())           kw["vox_feats"]        = a.vox_feats;
-    // If you have other non-overlapping keys (e.g., n_samp_per_vox), add them here as well:
-    // if (a.n_samp_per_vox.has_value()) kw["n_samp_per_vox"] = *a.n_samp_per_vox;
-
-    // Overlapping names: add **only** to kwargs (we won’t pass them positionally)
-    // struct values (if set) first…
-    if (a.track_max_w)        kw["track_max_w"]       = true;
-    if (a.ss.has_value())     kw["ss"]                = *a.ss;
-    if (a.output_depth)       kw["output_depth"]      = true;
-    if (a.output_normal)      kw["output_normal"]     = true;
-    if (a.output_T)           kw["output_T"]          = true;
-    if (a.rand_bg)            kw["rand_bg"]           = true;
-    if (a.use_auto_exposure)  kw["use_auto_exposure"] = true;
-
-    // …then override with explicit function arguments if caller set them.
-    if (track_max_w)          kw["track_max_w"]       = true;
-    if (ss.has_value())       kw["ss"]                = *ss;
-    if (output_depth)         kw["output_depth"]      = true;
-    if (output_normal)        kw["output_normal"]     = true;
-    if (output_T)             kw["output_T"]          = true;
-    if (rand_bg)              kw["rand_bg"]           = true;
-    if (use_auto_exposure)    kw["use_auto_exposure"] = true;
-
-    return kw;
-}
-
-// std::unordered_map<std::string, torch::Tensor> VoxelModel::render(const MiniCam& cam, torch::Tensor gt_image, int image_height, int image_width, float ss, bool track_max_w) const
 std::unordered_map<std::string, torch::Tensor> VoxelModel::render(
     const sv::MiniCam& cam,
     int im_height,
@@ -4514,121 +4417,81 @@ std::unordered_map<std::string, torch::Tensor> VoxelModel::render(
     bool use_auto_exposure,
     const sv::RenderOpts& other_opt) const
 {
-    /* 1) import the python entry-point once                                 */
-    py::gil_scoped_acquire gil;
-    static py::object py_render;
-    if (!py_render) {
-        try {
-            py_render = py::module_::import(
-                            "scripts_voxel.python_svraster_bridge.renderer_wrapper")
-                            .attr("render");
-            // std::cerr << "[INFO] Python-side renderer imported OK.\n";
-        } catch (const py::error_already_set& e) {
-            std::cerr << "[PYBIND11] Could not import renderer_wrapper:\n"
-                      << e.what() << std::endl;
-            return {};
-        }
-    }
-
-    py::dict d;
-    d["_geo_grid_pts"]      = this->_geo_grid_pts_;
-    d["sh0"]               = this->sh0_;
-    d["shs"]               = this->shs_;
-    d["subdiv_p"]          = this->subdiv_p_;
-    d["octpath"]           = this->oct_path_;
-    d["octlevel"]          = this->oct_level_;
-    d["center"]            = this->center_;
-    d["vox_size"]          = this->size_;
-    d["vox_key"]           = this->vox_key_;
-    d["active_sh_degree"]  = py::int_(this->active_sh_degree_);
-
-    d["white_background"] = py::bool_(this->white_background_);
-    d["black_background"] = py::bool_(this->black_background_);
-    d["ss"]               = py::float_(this->ss_);       // default SS (used if ss=None)
-    d["n_samp_per_vox"]   = py::int_(this->n_samp_per_vox_);
-    d["num_voxels"]        = static_cast<long long>(this->center_.size(0));
-
-    // Optional: expose pre-gathered geo if present
-    if (this->frozen_vox_geo_.defined() && this->frozen_vox_geo_.numel() > 0) {
-        d["frozen_vox_geo"] = this->frozen_vox_geo_;
-    }
-
-    // Build kwargs (**other_opt). IMPORTANT: do NOT pass overlapping args positionally.
-    py::dict kwargs = make_kwargs_from(
-        other_opt, track_max_w, ss, output_depth, output_normal,
-        output_T, rand_bg, use_auto_exposure);
-    // std::cout << "kwargs" << kwargs << std::endl;   
-    /* 4) call python                                                        */
-    py::object py_cam  = MiniCam_to_py(cam);
-    py::object py_out;
-    py::tuple args = py::make_tuple(
-        d,
-        py_cam,
+    return renderSvrasterDirect(
+        cam,
         im_height,
         im_width,
+        _geo_grid_pts_,
+        sh0_,
+        shs_,
+        subdiv_p_,
+        oct_path_,
+        center_,
+        size_,
+        vox_key_,
+        frozen_vox_geo_,
+        active_sh_degree_,
+        white_background_,
+        black_background_,
+        ss_,
+        n_samp_per_vox_,
         gt_image,
-        color_mode
-    ); 
-    try {
-        py_out = py_render(*args, **kwargs);
-        // py_out = py_render(
-        //     d,
-        //     py_cam,
-        //     im_height,
-        //     im_width,
-        //     gt_image,
-        //     color_mode,
-        //     py::kwargs(kwargs) );
-        // py_out = py_render(py_cam, d, gt_image, image_height, image_width, ss, track_max_w);
-    } catch (const py::error_already_set& e) {
-        std::cerr << "[PYBIND11] Exception thrown by renderer:\n"
-                  << e.what() << std::endl;
-        return {};
-    }
-    py::dict out_dict = py_out.cast<py::dict>();
-
-    /* 6) copy every tensor into a C++ map                                   */
-    std::unordered_map<std::string, torch::Tensor> pkg;
-    for (auto item : out_dict) {
-        const std::string key = py::str(item.first);
-        torch::Tensor t;
-        bool is_tensor = true;
-        try {
-            t = item.second.cast<torch::Tensor>();
-        } catch (...) {
-            is_tensor = false;
-        }
-        if (t.defined())
-            pkg.emplace(key, std::move(t));
-    }   
-    return pkg;                       // may be empty on error
+        color_mode,
+        track_max_w,
+        ss,
+        output_depth,
+        output_normal,
+        output_T,
+        rand_bg,
+        use_auto_exposure,
+        other_opt);
 }
 
 void VoxelModel::applyTvOnDensityField(float lambda_tv_density) {
-    // Must NOT be inside a NoGrad guard — we want to add to _geo_grid_pts.grad
-    py::gil_scoped_acquire gil;
-    try {
-        // Uses SVProperties.apply_tv_on_density_field(self, weight)
-        // which sets up grad if needed and calls svraster_cuda.grid_loss_bw.total_variation
-        py_->svm.attr("apply_tv_on_density_field")(lambda_tv_density);
-    } catch (const py::error_already_set& e) {
-        std::cerr << "[TV] apply_tv_on_density_field failed: " << e.what() << std::endl;
+    if (!_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0 ||
+        !vox_key_.defined() || vox_key_.numel() == 0 ||
+        !vox_size_inv_.defined() || vox_size_inv_.numel() == 0) {
+        return;
     }
+
+    torch::Tensor grad = _geo_grid_pts_.grad();
+    if (!grad.defined() || grad.sizes() != _geo_grid_pts_.sizes()) {
+        _geo_grid_pts_.mutable_grad() = torch::zeros_like(_geo_grid_pts_);
+        grad = _geo_grid_pts_.grad();
+    } else if (!grad.is_contiguous()) {
+        _geo_grid_pts_.mutable_grad() = grad.contiguous();
+        grad = _geo_grid_pts_.grad();
+    }
+    TV_COMPUTE::total_variation_bw(
+        _geo_grid_pts_,
+        vox_key_,
+        lambda_tv_density,
+        vox_size_inv_,
+        /*no_tv_s=*/true,
+        /*tv_sparse=*/false,
+        grad);
 }
 
-py::object VoxelModel::schedulerStateDict()
+VoxelModel::SchedulerState VoxelModel::schedulerState() const
 {
-    py::gil_scoped_acquire gil;
-    if (py_->scheduler_py.is_none()) return py::none();
-    return py_->scheduler_py.attr("state_dict")();
+    SchedulerState state;
+    state.valid = optimizer_initialized_;
+    state.last_epoch = scheduler_epoch_;
+    state.geo_lr = optimizer_geo_lr_;
+    state.sh0_lr = optimizer_sh0_lr_;
+    state.shs_lr = optimizer_shs_lr_;
+    return state;
 }
 
-void VoxelModel::schedulerLoadStateDict(const py::object& state)
+void VoxelModel::schedulerLoadState(const SchedulerState& state)
 {
-    if (state.is_none()) return;
-    py::gil_scoped_acquire gil;
-    if (!py_->scheduler_py.is_none())
-        py_->scheduler_py.attr("load_state_dict")(state);
+    if (!state.valid) {
+        return;
+    }
+    scheduler_epoch_ = state.last_epoch;
+    optimizer_geo_lr_ = state.geo_lr;
+    optimizer_sh0_lr_ = state.sh0_lr;
+    optimizer_shs_lr_ = state.shs_lr;
 }
 
 /* static */ torch::Tensor

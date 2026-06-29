@@ -10,10 +10,6 @@
 #include <functional>
 #include <torch/torch.h>
 #include <c10/cuda/CUDACachingAllocator.h>
-#include <Python.h>  
-#include <pybind11/embed.h>                         // for Python bridge
-#include <pybind11/stl.h>
-#include <pybind11/pybind11.h>
 #include <torch/extension.h>
 #include <iostream>
 #include <cstdlib>
@@ -37,9 +33,9 @@
 #include "include_voxel/voxel_keyframe.h"
 #include "include_voxel/mini_cam.h"
 #include "include_voxel/voxel_camera.h"
-#include "include_voxel/py_utils.h"
 #include "include_voxel/voxel_constants.h"
 #include "include_voxel/render_opts.h" 
+#include "include_voxel/voxel_svraster_rasterizer.h"
 
 #define VOXEL_MODEL_TENSORS_TO_VEC                       \
     this->Tensor_vec_geo_       = { this->_geo_grid_pts_ };       \
@@ -58,7 +54,6 @@
     this->max_w_        = torch::empty({0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(device_type)); \
     VOXEL_MODEL_TENSORS_TO_VEC
 
-// namespace py = pybind11;
 namespace sv {
 
 class VoxelModel 
@@ -128,9 +123,16 @@ public:
                        float beta1=0.9f, float beta2=0.999f, float eps=1e-15f,
                        const std::vector<int>& milestones = {},
                        float gamma = 0.1f);
-    py::object schedulerStateDict();
+    struct SchedulerState {
+        bool valid = false;
+        int64_t last_epoch = -1;
+        float geo_lr = 0.0f;
+        float sh0_lr = 0.0f;
+        float shs_lr = 0.0f;
+    };
+    SchedulerState schedulerState() const;
     void schedulerStep();
-    void schedulerLoadStateDict(const py::object& state_dict);
+    void schedulerLoadState(const SchedulerState& state);
     std::tuple<double,double,double> currentLearningRates() const;
 
     // === Adaptive API (SVRaster style) ===
@@ -141,7 +143,7 @@ public:
     };
     // Compute per-voxel stats over a list of training cameras.
     StatPkg computeTrainingStat(const std::vector<MiniCam>& cams);
-    // Topology changes (mirrors python SparseVoxelModel)
+    // Topology changes.
     void pruning(const torch::Tensor& prune_mask);         // mask: [N] or [N,1] bool/byte
     void subdividing(const torch::Tensor& subdivide_mask); // mask: [N] or [N,1] bool/byte
     // Maintenance
@@ -218,9 +220,6 @@ public:
     torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
     torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
     bool refreshDenseCoreBBFromCurrentVoxels();
-    void logDenseCoreBBoxToRerun(
-        int iteration,
-        const std::string& entity_path = "world/dense_core/used_for_prune") const;
     void setGeometricallyUnstableMask(const torch::Tensor& mask);
     void setEnableArtificialPromotion(const bool enable) { enable_artificial_promotion_ = enable; }
     void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
@@ -267,9 +266,12 @@ private:
     int last_artificial_iter_ = -1;
     
     torch::Tensor art_key_before_iter_; // [K] int64 artificial keys at start of current iter
-    void appendGroup_(int group_idx, const torch::Tensor& add_rows, const char* svm_field_name, torch::Tensor* out_member_param);
-    // Pull all core tensors from the Python SVM after any topology change.
-    void syncFromPython_();
+    void appendGroup_(int group_idx, const torch::Tensor& add_rows, torch::Tensor* out_member_param);
+    void setEmptySvrasterSdfField_();
+    torch::Tensor voxelCornerScalarFromGrid_(const torch::Tensor& grid_scalar) const;
+    void rebuildSvrasterSdfFieldFromVoxelCorners_(
+        const torch::Tensor& voxel_sdf_values,
+        const torch::Tensor& voxel_sdf_weights);
     // Helper math
     static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
     static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
@@ -300,7 +302,6 @@ public:
     
     torch::Tensor svraster_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each SVRaster grid-point
     torch::Tensor svraster_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
-    torch::Tensor svraster_sdf_grid_pts_key_; // [M,3] int64 keys aligned with SDF buffers
 
     std::vector<torch::Tensor>  Tensor_vec_geo_,
                                 Tensor_vec_sh0_,
@@ -333,15 +334,6 @@ public:
     torch::Tensor bb_min_viz, bb_max_viz, sel_artificials_viz, ijk_box_viz;
     torch::Tensor artificial_centers_accum_viz_; // [K,3] accumulated artificial centers
     torch::Tensor artificial_sizes_accum_viz_;   // [K,1] accumulated artificial sizes
-    torch::Tensor inactive_geo_centers_accum_viz_; // [K,3] accumulated real voxels created by inactive geo densify
-    torch::Tensor inactive_geo_sizes_accum_viz_;   // [K,1] accumulated sizes for inactive geo densify voxels
-    torch::Tensor inactive_geo_rgba_accum_viz_;    // [K,4] accumulated colors for inactive geo densify voxels
-    torch::Tensor depthanything_fill_holes_created_centers_accum_viz_; // [K,3] accumulated real voxels created by depthanything hole fill
-    torch::Tensor depthanything_fill_holes_created_sizes_accum_viz_;   // [K,1]
-    torch::Tensor depthanything_fill_holes_created_rgba_accum_viz_;    // [K,4]
-    torch::Tensor rendered_depth_created_centers_accum_viz_; // [K,3] accumulated artificial voxels from rendered depth insertion
-    torch::Tensor rendered_depth_created_sizes_accum_viz_;   // [K,1]
-    torch::Tensor rendered_depth_created_rgba_accum_viz_;    // [K,4]
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_artificial_voxel_;          // [N] bool provenance: false=real, true=artificial/support
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
@@ -359,8 +351,6 @@ public:
     // This is kept after promotion so live debug views can trace current voxels
     // back to their insertion path (depth-insert vs hole-fill).
     torch::Tensor rendered_depth_candidate_source_kind_;
-    py::object svm() const;
-
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
     torch::Tensor global_pcd_max_;   // [3], CPU or CUDA
     torch::Tensor dense_core_bb_min_; // [3], fixed dense-core min from createFromPcd
@@ -396,10 +386,24 @@ protected:
     bool  black_background_ = false;
     int   n_samp_per_vox_ = 3;
     /// The Adam optimizer
-    // std::shared_ptr<torch::optim::Adam> optimizer_;
-    // py::object optimizer_py_;
-    struct PyState;                // forward declaration only
-    std::unique_ptr<PyState> py_;  // holds all pybind objects
+    struct AdamGroupState {
+        torch::Tensor exp_avg;
+        torch::Tensor exp_avg_sq;
+        int64_t step = 0;
+    };
+    AdamGroupState adam_geo_;
+    AdamGroupState adam_sh0_;
+    AdamGroupState adam_shs_;
+    float optimizer_geo_lr_ = 0.0f;
+    float optimizer_sh0_lr_ = 0.0f;
+    float optimizer_shs_lr_ = 0.0f;
+    float optimizer_beta1_ = 0.9f;
+    float optimizer_beta2_ = 0.999f;
+    float optimizer_eps_ = 1e-15f;
+    std::vector<int> scheduler_milestones_;
+    float scheduler_gamma_ = 0.1f;
+    int64_t scheduler_epoch_ = -1;
+    bool optimizer_initialized_ = false;
     std::mutex mutex_settings_;
     // Cache MAX_NUM_LEVELS
     const int max_num_levels_ = 16; // safe default; overwritten at init  

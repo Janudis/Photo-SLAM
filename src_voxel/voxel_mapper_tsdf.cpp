@@ -22,8 +22,6 @@
 #include "ORB-SLAM3/include/Atlas.h"
 #include "ORB-SLAM3/include/MapPoint.h"
 
-namespace py = pybind11;
-
 namespace {
 // sv::Camera  →  nvblox::Camera
 inline nvblox::Camera toNvbloxCamera(const VoxelKeyframe& kf)
@@ -632,6 +630,9 @@ torch::Tensor VoxelMapper::computeSvrasterProjectiveDensityInitForGridPoints(
                         .dtype(torch::kFloat32)
                         .device(grid_points_world.device());
     torch::Tensor raw_init = torch::full({N, 1}, -10.0f, out_opts);
+    if (N == 0) {
+        return raw_init;
+    }
     if (N == 0 ||
         !sdf_state_.svraster_tsdf_init_context_valid_ ||
         sdf_state_.svraster_tsdf_init_depth_meters_.empty() ||
@@ -1620,12 +1621,6 @@ void VoxelMapper::runFinalSpecialPrune()
             std::cout << "[FINAL/special_prune] dense-core refresh failed; "
                       << "using last available bbox.\n";
         }
-        if (rerun_params_.enable_rerun_ &&
-            voxel_model_->hasDenseCoreBB()) {
-            voxel_model_->logDenseCoreBBoxToRerun(
-                getIteration(),
-                "world/dense_core/used_for_prune");
-        }
     }
 
     if (use_far_final_special && voxel_model_->hasDenseCoreBB()) {
@@ -1661,14 +1656,9 @@ void VoxelMapper::runFinalSpecialPrune()
             near_valid_final_special = true;
         } else {
             try {
-                py::gil_scoped_acquire gil;
-                static py::module svr_mod = py::module::import("svraster_cuda").attr("renderer");
-                static py::module torch_mod = py::module::import("torch");
-
-                auto svm = voxel_model_->svm();
-                auto octpath = svm.attr("octpath").cast<torch::Tensor>().contiguous();
-                auto vox_center = svm.attr("vox_center").cast<torch::Tensor>().contiguous();
-                auto vox_size = svm.attr("vox_size").cast<torch::Tensor>().contiguous();
+                auto octpath = voxel_model_->octPath().contiguous();
+                auto vox_center = voxel_model_->voxCenter().contiguous();
+                auto vox_size = voxel_model_->voxSize().contiguous();
 
                 TORCH_CHECK(octpath.size(0) == before_final_special,
                             "octpath length mismatch at final special prune");
@@ -1685,35 +1675,9 @@ void VoxelMapper::runFinalSpecialPrune()
                     TORCH_CHECK(false, "vox_size must be [N] or [N,1] at final special prune");
                 }
 
-                py::list py_cams;
-                py::object py_cuda = torch_mod.attr("device")("cuda");
-                auto move_attr_to_cuda_if_tensor =
-                    [&](py::object& obj, const char* name) {
-                        if (py::hasattr(obj, name)) {
-                            py::object t = obj.attr(name);
-                            if (py::hasattr(t, "is_cuda") && !py::bool_(t.attr("is_cuda"))) {
-                                obj.attr(name) = t.attr("to")(py_cuda);
-                            }
-                        }
-                    };
-
-                for (const auto& c : tr_cams) {
-                    py::object py_cam = MiniCam_to_py(c);
-                    move_attr_to_cuda_if_tensor(py_cam, "w2c");
-                    move_attr_to_cuda_if_tensor(py_cam, "c2w");
-                    move_attr_to_cuda_if_tensor(py_cam, "position");
-                    move_attr_to_cuda_if_tensor(py_cam, "lookat");
-                    py_cams.append(py_cam);
-                }
-
                 const float near_thresh = 0.2f;
-                at::Tensor is_near = svr_mod.attr("mark_near")(
-                    py_cams,
-                    py::cast(octpath),
-                    py::cast(vox_center),
-                    py::cast(vox_size),
-                    py::float_(near_thresh)
-                ).cast<at::Tensor>();
+                at::Tensor is_near =
+                    sv::markSvrasterNearDirect(tr_cams, octpath, vox_center, vox_size, near_thresh);
                 if (is_near.dim() == 2 && is_near.size(1) == 1) {
                     is_near = is_near.squeeze(1);
                 }
@@ -1792,57 +1756,6 @@ void VoxelMapper::runFinalSpecialPrune()
                 torch::Tensor(),
                 final_special_mask);
         }
-    }
-
-    if (rerun_params_.enable_rerun_ && n_selected_final_special > 0) {
-        auto log_final_special_mask =
-            [&](const torch::Tensor& mask_in,
-                float r,
-                float g,
-                float b,
-                float a,
-                const std::string& entity_path,
-                const std::string& label)
-        {
-            if (!mask_in.defined() || mask_in.numel() != before_final_special ||
-                !centers.defined() || !sizes.defined()) {
-                return;
-            }
-            torch::Tensor mask = mask_in.to(centers.device()).to(torch::kBool).view({-1});
-            torch::Tensor idx = mask.nonzero().squeeze(1);
-            if (idx.numel() <= 0) {
-                return;
-            }
-
-            torch::Tensor centers_sel = centers.index_select(0, idx).contiguous();
-            torch::Tensor sizes_for_log = sizes;
-            if (sizes_for_log.dim() == 1) {
-                sizes_for_log = sizes_for_log.view({sizes_for_log.size(0), 1});
-            } else if (!(sizes_for_log.dim() == 2 && sizes_for_log.size(1) == 1)) {
-                sizes_for_log = sizes_for_log.reshape({sizes_for_log.size(0), 1});
-            }
-            torch::Tensor sizes_sel = sizes_for_log.index_select(0, idx).contiguous();
-            torch::Tensor colors = torch::zeros({idx.size(0), 4}, centers_sel.options());
-            colors.index_put_({torch::indexing::Slice(), 0}, r);
-            colors.index_put_({torch::indexing::Slice(), 1}, g);
-            colors.index_put_({torch::indexing::Slice(), 2}, b);
-            colors.index_put_({torch::indexing::Slice(), 3}, a);
-
-            std::cout << "[FINAL/special_prune/rerun] visualizing "
-                      << idx.size(0) << " " << label << " voxels\n";
-            sv::RerunVisualizerBridge::instance().visualizeVoxelBoxes(
-                centers_sel,
-                sizes_sel,
-                colors,
-                getIteration(),
-                entity_path);
-        };
-
-        log_final_special_mask(
-            prune_mask_final_special,
-            1.0f, 0.65f, 0.0f, 0.65f,
-            "world/final_special_prune/selected",
-            "final-special selected");
     }
 
     if (n_selected_final_special > 0) {

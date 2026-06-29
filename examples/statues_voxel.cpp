@@ -16,8 +16,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <pybind11/embed.h>
-
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -202,18 +200,7 @@ static std::filesystem::path EnsureRgbTxtFromTransforms(
 
 int main(int argc, char **argv)
 {
-    namespace py = pybind11;
     namespace fs = std::filesystem;
-
-    // Python init (same as tum_mono_voxel.cpp)
-    py::initialize_interpreter();
-    {
-        py::gil_scoped_acquire gil;
-        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
-        py::module_::import("scripts_voxel.python_svraster_bridge.renderer_wrapper");
-        py::module_::import("torch.cuda");
-    }
-    py::gil_scoped_release release;
 
     // Args:
     //   1 vocab

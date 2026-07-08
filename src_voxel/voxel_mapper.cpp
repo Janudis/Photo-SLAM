@@ -111,6 +111,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     scene_ = std::make_shared<sv::VoxelScene>(model_params_);
 
     voxel_model_->fill_empty_cells_ = fill_empty_cells_;
+    voxel_model_->dense_core_pcd_density_rate_ = dense_core_pcd_density_rate_;
     voxel_model_->setFilterNearVoxels(opt_params_.filter_near_voxels_);
     voxel_model_->setRenderedDepthCandidateRealAdjacency(
         rendered_depth_insert_require_real_adjacency_,
@@ -330,6 +331,18 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rgbd_fill_render_holes_max_points_per_kf_ =
             std::max(0, settings_file["Mapper.rgbd_fill_render_holes_max_points_per_kf"].operator int());
     }
+    if (!settings_file["Mapper.rgbd_surface_band_support"].empty()) {
+        rgbd_surface_band_support_ =
+            (settings_file["Mapper.rgbd_surface_band_support"].operator int()) != 0;
+    }
+    if (!settings_file["Mapper.rgbd_surface_band_half_width_ratio"].empty()) {
+        rgbd_surface_band_half_width_ratio_ =
+            std::max(0.0f, settings_file["Mapper.rgbd_surface_band_half_width_ratio"].operator float());
+    }
+    if (!settings_file["Mapper.rgbd_surface_band_sample_spacing_vox"].empty()) {
+        rgbd_surface_band_sample_spacing_vox_ =
+            std::max(1.0e-3f, settings_file["Mapper.rgbd_surface_band_sample_spacing_vox"].operator float());
+    }
     sdf_params_.use_tsdf_mapping_ =
         (settings_file["Mapper.use_tsdf_mapping"].operator int()) != 0;
     sdf_params_.use_tsdf_pruning_ =
@@ -354,9 +367,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             std::max(0.0f, settings_file["Mapper.tsdf_prune_surface_band_vox"].operator float());
         sdf_params_.tsdf_prune_min_valid_corners_ =
             std::max(1, std::min(8, settings_file["Mapper.tsdf_prune_min_valid_corners"].operator int()));
-        sdf_params_.tsdf_prune_unknown_ =
-            !settings_file["Mapper.tsdf_prune_unknown"].empty() &&
-            (settings_file["Mapper.tsdf_prune_unknown"].operator int()) != 0;
         sdf_params_.tsdf_protect_surface_band_from_pruning_ =
             (settings_file["Mapper.tsdf_protect_surface_band_from_pruning"].operator int()) != 0;
         sdf_params_.tsdf_density_init_ =
@@ -373,6 +383,30 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             std::max(1.0e-6f, settings_file["Mapper.svraster_tsdf_max_weight"].operator float());
         sdf_params_.svraster_tsdf_refit_on_topology_change_ =
             (settings_file["Mapper.svraster_tsdf_refit_on_topology_change"].operator int()) != 0;
+        if (!settings_file["Mapper.sdf_evidence_densify"].empty()) {
+            sdf_params_.sdf_evidence_densify_ =
+                (settings_file["Mapper.sdf_evidence_densify"].operator int()) != 0;
+        }
+        if (!settings_file["Mapper.sdf_evidence_zero_crossing_refresh"].empty()) {
+            sdf_params_.sdf_evidence_zero_crossing_refresh_ =
+                (settings_file["Mapper.sdf_evidence_zero_crossing_refresh"].operator int()) != 0;
+        }
+        if (!settings_file["Mapper.tsdf_subdivide_near_zero_crossing"].empty()) {
+            sdf_params_.tsdf_subdivide_near_zero_crossing_ =
+                (settings_file["Mapper.tsdf_subdivide_near_zero_crossing"].operator int()) != 0;
+        }
+        if (!settings_file["Mapper.tsdf_subdivide_min_weight"].empty()) {
+            sdf_params_.tsdf_subdivide_min_weight_ =
+                std::max(0.0f, settings_file["Mapper.tsdf_subdivide_min_weight"].operator float());
+        }
+        if (!settings_file["Mapper.tsdf_subdivide_surface_band_vox"].empty()) {
+            sdf_params_.tsdf_subdivide_surface_band_vox_ =
+                std::max(0.0f, settings_file["Mapper.tsdf_subdivide_surface_band_vox"].operator float());
+        }
+        if (!settings_file["Mapper.tsdf_subdivide_min_valid_corners"].empty()) {
+            sdf_params_.tsdf_subdivide_min_valid_corners_ =
+                std::max(1, std::min(8, settings_file["Mapper.tsdf_subdivide_min_valid_corners"].operator int()));
+        }
         sdf_params_.tsdf_density_init_bell_a_ =
             std::max(1.0e-4f, settings_file["Mapper.tsdf_density_init_bell_a"].operator float());
         sdf_params_.tsdf_density_init_bell_b_ =
@@ -392,6 +426,10 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     if (!settings_file["Mapper.fill_empty_cells"].empty()) {
         fill_empty_cells_ =
             (settings_file["Mapper.fill_empty_cells"].operator int()) != 0;
+    }
+    if (!settings_file["Mapper.dense_core_pcd_density_rate"].empty()) {
+        dense_core_pcd_density_rate_ =
+            std::max(1.0e-6f, settings_file["Mapper.dense_core_pcd_density_rate"].operator float());
     }
     if (!settings_file["Mapper.rendered_depth_insert"].empty()) {
         rendered_depth_insert_ =
@@ -678,8 +716,11 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         !settings_file["Record.run_tsdf_pruned"].empty() &&
         (settings_file["Record.run_tsdf_pruned"].operator int()) != 0;
     rerun_params_.rerun_tsdf_unknown_voxels_ =
-        !settings_file["Record.run_tsdf_unknown"].empty() &&
-        (settings_file["Record.run_tsdf_unknown"].operator int()) != 0;
+        !settings_file["Record.rerun_unknown"].empty() &&
+        (settings_file["Record.rerun_unknown"].operator int()) != 0;
+    rerun_params_.rerun_unstable_ =
+        !settings_file["Record.rerun_unstable"].empty() &&
+        (settings_file["Record.rerun_unstable"].operator int()) != 0;
     rerun_params_.run_floaters_ =
         !settings_file["Record.run_floaters"].empty() &&
         (settings_file["Record.run_floaters"].operator int()) != 0;
@@ -784,6 +825,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rerun_params_.run_floaters_ ||
         rerun_params_.run_whole_run_ ||
         rerun_params_.run_sdf_pruned_nvblox_ ||
+        rerun_params_.rerun_unstable_ ||
         rerun_params_.rerun_nvblox_mesh_ ||
         rerun_params_.rerun_gt_mesh_ ||
         rerun_params_.rerun_rendered_mesh_eval_ ||
@@ -797,6 +839,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rerun_params_.run_floaters_ = false;
         rerun_params_.run_whole_run_ = false;
         rerun_params_.run_sdf_pruned_nvblox_ = false;
+        rerun_params_.rerun_unstable_ = false;
         rerun_params_.rerun_nvblox_mesh_ = false;
         rerun_params_.rerun_gt_mesh_ = false;
         rerun_params_.rerun_rendered_mesh_eval_ = false;
@@ -862,7 +905,7 @@ void VoxelMapper::run()
             }
             if (rerun_params_.rerun_tsdf_unknown_voxels_ && rerun_params_.rerun_tsdf_pruned_log_gt_mesh_) {
                 sv::RerunVisualizerBridge::instance().visualizeDebugGtSdfMesh(
-                    "tsdf_unknown",
+                    "unknown",
                     tsdf_pruned_gt_mesh,
                     rerun_params_.rerun_tsdf_pruned_align_gt_to_slam_,
                     rerun_params_.rerun_tsdf_pruned_gt_traj_path_,
@@ -901,15 +944,35 @@ void VoxelMapper::run()
         }
     }
 
-    if (rerun_params_.enable_rerun_ && rerun_params_.rerun_nvblox_mesh_ && rerun_params_.load_saved_nvblox_mesh_) {
+    if (rerun_params_.enable_rerun_ &&
+        (rerun_params_.rerun_nvblox_mesh_ ||
+         rerun_params_.rerun_tsdf_unknown_voxels_ ||
+         rerun_params_.rerun_unstable_) &&
+        rerun_params_.load_saved_nvblox_mesh_) {
         const std::filesystem::path saved_nvblox_mesh_file =
             voxel_utils::resolveNvbloxMeshPath(rerun_params_.saved_nvblox_mesh_path_);
         if (!saved_nvblox_mesh_file.empty() &&
             std::filesystem::exists(saved_nvblox_mesh_file)) {
-            sv::RerunVisualizerBridge::instance().visualizeNvbloxPlyMesh(
-                saved_nvblox_mesh_file.string(),
-                0,
-                "world/nvblox_mesh/reference");
+            if (rerun_params_.rerun_nvblox_mesh_) {
+                sv::RerunVisualizerBridge::instance().visualizeNvbloxPlyMesh(
+                    saved_nvblox_mesh_file.string(),
+                    0,
+                    "world/nvblox_mesh/reference");
+            }
+            if (rerun_params_.rerun_tsdf_unknown_voxels_) {
+                sv::RerunVisualizerBridge::instance().visualizeDebugNvbloxPlyMesh(
+                    "unknown",
+                    saved_nvblox_mesh_file.string(),
+                    0,
+                    "world/nvblox_mesh/reference");
+            }
+            if (rerun_params_.rerun_unstable_) {
+                sv::RerunVisualizerBridge::instance().visualizeDebugNvbloxPlyMesh(
+                    "unstable",
+                    saved_nvblox_mesh_file.string(),
+                    0,
+                    "world/nvblox_mesh/reference");
+            }
             std::cout << "[NVBLOX] loaded saved reference mesh into Rerun: "
                       << saved_nvblox_mesh_file << "\n";
         } else {
@@ -926,6 +989,8 @@ void VoxelMapper::run()
         (rerun_params_.enable_rerun_ && rerun_params_.rerun_reconstruction_mesh_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.run_whole_run_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.run_sdf_pruned_nvblox_) ||
+        (rerun_params_.enable_rerun_ && rerun_params_.rerun_unstable_ && !rerun_params_.load_saved_nvblox_mesh_) ||
+        (rerun_params_.enable_rerun_ && rerun_params_.rerun_tsdf_unknown_voxels_ && !rerun_params_.load_saved_nvblox_mesh_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.rerun_nvblox_mesh_ && !rerun_params_.load_saved_nvblox_mesh_);
     if (sensor_type_ == RGBD && need_nvblox)
     {
@@ -1071,7 +1136,12 @@ void VoxelMapper::run()
             //  Create voxel model & trainer setup
             {
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                recent_unstable_checked_birth_kfs_.clear();
+                pending_recent_unstable_prune_mask_ = torch::Tensor();
                 voxel_model_->createFromPcd(scene_->cached_point_cloud_, tr_cams);
+                if (rerun_params_.run_whole_run_) {
+                    rerun_state_.whole_run_live_voxels_dirty_ = true;
+                }
                 if (sensor_type_ == RGBD && sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
                     for (const auto& kv : scene_->keyframes()) {
                         if (!kv.second) {
@@ -1136,6 +1206,8 @@ void VoxelMapper::run()
                     }
                 }
             }
+
+            refreshPendingRecentUnstablePruneMask();
 
             // One warm-up optimization step
             trainForOneIteration();
@@ -1369,7 +1441,9 @@ void VoxelMapper::run()
             !rerun_params_.load_saved_nvblox_mesh_ &&
             (rerun_params_.save_nvblox_mesh_eval_ ||
              (rerun_params_.enable_rerun_ && rerun_params_.rerun_nvblox_mesh_) ||
-             (rerun_params_.enable_rerun_ && rerun_params_.run_sdf_pruned_nvblox_));
+             (rerun_params_.enable_rerun_ && rerun_params_.run_sdf_pruned_nvblox_) ||
+             (rerun_params_.enable_rerun_ && rerun_params_.rerun_unstable_) ||
+             (rerun_params_.enable_rerun_ && rerun_params_.rerun_tsdf_unknown_voxels_));
         if (want_nvblox_mesh && sdf_mapper_) {
             try {
                 sdf_mapper_->updateColorMesh();
@@ -1388,6 +1462,20 @@ void VoxelMapper::run()
 
                 if (rerun_params_.enable_rerun_ && rerun_params_.rerun_nvblox_mesh_) {
                     sv::RerunVisualizerBridge::instance().visualizeNvbloxPlyMesh(
+                        nvblox_mesh_path.string(),
+                        getIteration(),
+                        "world/nvblox_mesh/final");
+                }
+                if (rerun_params_.enable_rerun_ && rerun_params_.rerun_tsdf_unknown_voxels_) {
+                    sv::RerunVisualizerBridge::instance().visualizeDebugNvbloxPlyMesh(
+                        "unknown",
+                        nvblox_mesh_path.string(),
+                        getIteration(),
+                        "world/nvblox_mesh/final");
+                }
+                if (rerun_params_.enable_rerun_ && rerun_params_.rerun_unstable_) {
+                    sv::RerunVisualizerBridge::instance().visualizeDebugNvbloxPlyMesh(
+                        "unstable",
                         nvblox_mesh_path.string(),
                         getIteration(),
                         "world/nvblox_mesh/final");
@@ -1807,6 +1895,18 @@ void VoxelMapper::trainForOneIteration()
 
                 // 1) Base Photo-SLAM / SVRaster pruning by max weight.
                 auto max_w_1d = flatten_colvec(stat.max_w).to(torch::kFloat32); // [N]
+                torch::Tensor sdf_evidence_mask = voxel_model_->sdfEvidenceOnlyMask();
+                if (sdf_evidence_mask.defined()) {
+                    sdf_evidence_mask =
+                        flatten_colvec(sdf_evidence_mask.to(torch::kBool));
+                }
+                if (!sdf_evidence_mask.defined() || sdf_evidence_mask.numel() != N) {
+                    sdf_evidence_mask = torch::zeros(
+                        {N},
+                        torch::TensorOptions().dtype(torch::kBool).device(max_w_1d.device()));
+                } else {
+                    sdf_evidence_mask = sdf_evidence_mask.to(max_w_1d.device()).to(torch::kBool).contiguous();
+                }
                 torch::Tensor art_mask_for_base;
                 if (use_artificial_voxels) {
                     art_mask_for_base = voxel_model_->artificialMask();
@@ -1963,6 +2063,9 @@ void VoxelMapper::trainForOneIteration()
                     (prune_mask_base_real |
                      prune_mask_base_artificial |
                      rendered_depth_candidate_stale_prune).to(torch::kBool); // [N]
+                prune_mask_base = (prune_mask_base & (~sdf_evidence_mask)).to(torch::kBool);
+                prune_mask_base_real = (prune_mask_base_real & (~sdf_evidence_mask)).to(torch::kBool);
+                prune_mask_base_artificial = (prune_mask_base_artificial & (~sdf_evidence_mask)).to(torch::kBool);
                 auto prune_mask = prune_mask_base.clone(); // [N] bool
                 const int n_prune_base =
                     prune_mask_base.defined()
@@ -2056,10 +2159,7 @@ void VoxelMapper::trainForOneIteration()
 
                                 // Prune only positive/free-space voxels. Negative-side voxels
                                 // are kept because the sign alone does not prove they are useless.
-                                tsdf_prune_mask =
-                                    sdf_params_.tsdf_prune_unknown_
-                                        ? (tsdf_free_mask | tsdf_unknown_mask).to(torch::kBool)
-                                        : tsdf_free_mask.to(torch::kBool); // [N]
+                                tsdf_prune_mask = tsdf_free_mask.to(torch::kBool); // [N]
 
                                 // Ensure device matches prune_mask
                                 if (tsdf_prune_mask.device() != prune_mask.device()) {
@@ -2361,8 +2461,13 @@ void VoxelMapper::trainForOneIteration()
                             }
 
                             keep_rate = keep_rate.view({-1}).to(torch::kBool);    // [N]
-                            prune_mask_vis = (~keep_rate);     // [N], visibility only
-                            prune_mask_near = prune_near_union.view({-1}).to(torch::kBool); // [N], near only
+                            prune_mask_vis =
+                                ((~keep_rate) & (~sdf_evidence_mask.to(keep_rate.device()).to(torch::kBool)))
+                                    .to(torch::kBool);     // [N], visibility only
+                            prune_mask_near =
+                                (prune_near_union.view({-1}).to(torch::kBool) &
+                                 (~sdf_evidence_mask.to(prune_near_union.device()).to(torch::kBool)))
+                                    .to(torch::kBool); // [N], near only
 
                             // Combine with existing prune_mask
                             prune_mask = prune_mask | prune_mask_vis;
@@ -2451,33 +2556,31 @@ void VoxelMapper::trainForOneIteration()
                                         (centers >= bb_min).all(/*dim=*/1) &
                                         (centers <= bb_max).all(/*dim=*/1);
                                     prune_mask_real_outside_dense_core =
-                                        (real_mask & (~in_dense_core.to(torch::kBool))).to(torch::kBool);
+                                        (real_mask &
+                                         (~in_dense_core.to(torch::kBool)) &
+                                         (~sdf_evidence_mask.to(prune_mask.device()).to(torch::kBool)))
+                                            .to(torch::kBool);
                                 }
                             }
 
                             if (opt_params_.prune_recent_unstable_) {
-                                const int32_t current_kf_count = static_cast<int32_t>(tr_cams.size());
-                                const int recent_kf_span = std::max(0, opt_params_.prune_recent_keyframes_);
-                                auto born_valid_mask = (exist_since_kf >= 0).to(torch::kBool);
-                                auto age_kf = (current_kf_count - exist_since_kf).to(torch::kInt32);
-                                auto recent_mask =
-                                    (born_valid_mask & (age_kf <= recent_kf_span)).to(torch::kBool);
-                                auto other_view_cnt = torch::clamp_min(view_cnt - 1.0f, 0.0f);
-
-                                auto prune_recent_real =
-                                    recent_mask &
-                                    real_mask &
-                                    (other_view_cnt < static_cast<float>(opt_params_.prune_recent_min_views_real_));
-                                auto prune_recent_artificial =
-                                    recent_mask &
-                                    art_mask &
-                                    (other_view_cnt < static_cast<float>(opt_params_.prune_recent_min_views_artificial_));
-
-                                prune_mask_gslam_real = prune_recent_real.to(torch::kBool);
-                                prune_mask_gslam_artificial = prune_recent_artificial.to(torch::kBool);
-                                prune_mask_gslam_unstable =
-                                    (prune_mask_gslam_real | prune_mask_gslam_artificial).to(torch::kBool);
-                                geometrically_unstable_mask = prune_mask_gslam_unstable.clone();
+                                if (pending_recent_unstable_prune_mask_.defined() &&
+                                    pending_recent_unstable_prune_mask_.numel() == N) {
+                                    prune_mask_gslam_unstable =
+                                        pending_recent_unstable_prune_mask_
+                                            .to(prune_mask.device())
+                                            .to(torch::kBool)
+                                            .contiguous();
+                                    prune_mask_gslam_unstable =
+                                        (prune_mask_gslam_unstable &
+                                         (~sdf_evidence_mask.to(prune_mask.device()).to(torch::kBool)))
+                                            .to(torch::kBool);
+                                    prune_mask_gslam_real =
+                                        (prune_mask_gslam_unstable & real_mask).to(torch::kBool);
+                                    prune_mask_gslam_artificial =
+                                        (prune_mask_gslam_unstable & art_mask).to(torch::kBool);
+                                    geometrically_unstable_mask = prune_mask_gslam_unstable.clone();
+                                }
                             }
                         }
                     }
@@ -3159,6 +3262,11 @@ void VoxelMapper::trainForOneIteration()
 	                                whole_run_pruned_by_tsdf,
 	                                whole_run_pruned_by_near,
 	                                whole_run_pruned_by_recent_unstable);
+                                appendUnstablePrunedVoxels(
+                                    iter,
+                                    pruned_centers,
+                                    pruned_sizes,
+                                    whole_run_pruned_by_recent_unstable);
 
                             // Save far-only pruned voxels for a dedicated rerun topic.
                             debug_has_far_pruned = false;
@@ -3184,7 +3292,12 @@ void VoxelMapper::trainForOneIteration()
 	                    debug_has_far_pruned = false;
 	                }
 
-                voxel_model_->pruning(prune_mask);
+	                voxel_model_->pruning(prune_mask);
+                if (rerun_params_.run_whole_run_) {
+                    rerun_state_.whole_run_live_voxels_dirty_ = true;
+                }
+                pending_recent_unstable_prune_mask_ = torch::Tensor();
+                voxel_model_->setGeometricallyUnstableMask(torch::Tensor());
                 if (rerun_params_.rerun_tsdf_unknown_voxels_) {
                     rerun_state_.rerun_tsdf_unknown_dirty_ = true;
                 }
@@ -3231,6 +3344,8 @@ void VoxelMapper::trainForOneIteration()
                     bool did_subdivide = false;
                     int64_t n_normal_candidates = 0;
                     int64_t n_subdiv_normal_selected = 0;
+                    int64_t n_tsdf_subdiv_candidates = 0;
+                    int64_t n_subdiv_tsdf_selected = 0;
                     int64_t n_rendered_depth_blocked_normal = 0;
 
                     // 0) Helper masks and source accounting for subdivision.
@@ -3364,15 +3479,57 @@ void VoxelMapper::trainForOneIteration()
 
                         auto rendered_depth_candidate_mask =
                             rendered_depth_candidate_mask_for(M, vox_size_1d.device());
+                        auto sdf_evidence_subdivide_mask =
+                            voxel_model_->sdfEvidenceOnlyMask();
+                        if (sdf_evidence_subdivide_mask.defined() &&
+                            sdf_evidence_subdivide_mask.numel() == M) {
+                            sdf_evidence_subdivide_mask =
+                                sdf_evidence_subdivide_mask
+                                    .to(vox_size_1d.device())
+                                    .to(torch::kBool)
+                                    .contiguous()
+                                    .view({M});
+                        } else {
+                            sdf_evidence_subdivide_mask = torch::zeros(
+                                {M},
+                                torch::TensorOptions().dtype(torch::kBool).device(vox_size_1d.device()));
+                        }
                         n_rendered_depth_blocked_normal =
                             rendered_depth_candidate_mask.sum().item<int64_t>();
                         auto valid_mask_svraster =
                             (large_enough &
                              non_finest &
-                             (~rendered_depth_candidate_mask))
+                             (~rendered_depth_candidate_mask) &
+                             (~sdf_evidence_subdivide_mask))
                                 .to(torch::kBool); // [M]
                         auto normal_candidate_mask = valid_mask_svraster.clone();
                         n_normal_candidates = normal_candidate_mask.sum().item<int64_t>();
+                        torch::Tensor tsdf_subdivide_candidate_mask;
+                        if (sdf_params_.tsdf_subdivide_near_zero_crossing_ &&
+                            sensor_type_ == RGBD &&
+                            hasTsdfForSampling()) {
+                            TsdfCornerSample tsdf_corners =
+                                sampleTsdfAtSvrasterGridCornersWorld();
+                            TsdfSupportMasks tsdf_support =
+                                computeTsdfSupportMasksFromCorners(
+                                    tsdf_corners,
+                                    sdf_params_.tsdf_subdivide_min_weight_,
+                                    sdf_params_.tsdf_subdivide_surface_band_vox_,
+                                    sdf_params_.tsdf_subdivide_min_valid_corners_);
+                            if (tsdf_support.surface_support.defined() &&
+                                tsdf_support.surface_support.numel() == M) {
+                                tsdf_subdivide_candidate_mask =
+                                    (tsdf_support.surface_support
+                                         .to(vox_size_1d.device())
+                                         .to(torch::kBool)
+                                         .contiguous()
+                                         .view({M}) &
+                                     valid_mask_svraster)
+                                        .to(torch::kBool);
+                                n_tsdf_subdiv_candidates =
+                                    tsdf_subdivide_candidate_mask.sum().item<int64_t>();
+                            }
+                        }
 
                         // Priority: may be undefined/empty right after structural changes.
                         auto priority = voxel_model_->subdivisionPriority(); // [M]
@@ -3388,6 +3545,16 @@ void VoxelMapper::trainForOneIteration()
 
                         if (n_normal_candidates > 0) {
                             priority = priority * normal_candidate_mask.to(priority.scalar_type());
+                            if (tsdf_subdivide_candidate_mask.defined() &&
+                                tsdf_subdivide_candidate_mask.numel() == M &&
+                                n_tsdf_subdiv_candidates > 0) {
+                                torch::Tensor priority_boost =
+                                    priority.abs().max() + torch::full_like(priority, 1.0f);
+                                priority = torch::where(
+                                    tsdf_subdivide_candidate_mask,
+                                    priority + priority_boost,
+                                    priority);
+                            }
 
                             auto normal_selected_mask =
                                 torch::zeros_like(normal_candidate_mask, torch::kBool);
@@ -3407,7 +3574,6 @@ void VoxelMapper::trainForOneIteration()
                                         (normal_selected_mask & normal_candidate_mask).to(torch::kBool);
                                 }
                             }
-
                             int max_n_subdiv = compute_max_n_subdiv();
                             if (max_n_subdiv <= 0) {
                                 std::cout << "[SUBDIV:skip] cap reached before normal stage (max_n_subdiv<=0)\n";
@@ -3431,15 +3597,28 @@ void VoxelMapper::trainForOneIteration()
 
                             n_subdiv_normal_selected =
                                 normal_selected_mask.sum().item<int64_t>();
+                            if (tsdf_subdivide_candidate_mask.defined() &&
+                                tsdf_subdivide_candidate_mask.numel() == M &&
+                                n_subdiv_normal_selected > 0) {
+                                n_subdiv_tsdf_selected =
+                                    (normal_selected_mask & tsdf_subdivide_candidate_mask)
+                                        .sum()
+                                        .item<int64_t>();
+                            }
                             if (n_subdiv_normal_selected > 0) {
                                 const std::array<int64_t, 3> source_counts_before_subdiv =
                                     source_counts_for_current_voxels();
-                                const std::array<int64_t, 3> selected_parent_counts =
-                                    selected_source_counts(normal_selected_mask);
-                                voxel_model_->subdividing(normal_selected_mask);
-                                account_subdivision_lineage_births(
-                                    source_counts_before_subdiv,
-                                    selected_parent_counts);
+	                                const std::array<int64_t, 3> selected_parent_counts =
+	                                    selected_source_counts(normal_selected_mask);
+	                                voxel_model_->subdividing(normal_selected_mask);
+                                    if (rerun_params_.run_whole_run_) {
+                                        rerun_state_.whole_run_live_voxels_dirty_ = true;
+                                    }
+	                                pending_recent_unstable_prune_mask_ = torch::Tensor();
+	                                voxel_model_->setGeometricallyUnstableMask(torch::Tensor());
+	                                account_subdivision_lineage_births(
+	                                    source_counts_before_subdiv,
+	                                    selected_parent_counts);
                                 did_subdivide = true;
                             }
                         }
@@ -3463,6 +3642,14 @@ void VoxelMapper::trainForOneIteration()
                                   << " => "          << std::setw(7) << after
                                   << " (x" << std::fixed << std::setprecision(2)
                                   << (double)after / std::max(1, before) << ")\n";
+                        if (sdf_params_.tsdf_subdivide_near_zero_crossing_) {
+                            std::cout << "[SUBDIV/tsdf] candidates=" << n_tsdf_subdiv_candidates
+                                      << " selected=" << n_subdiv_tsdf_selected
+                                      << " min_weight=" << sdf_params_.tsdf_subdivide_min_weight_
+                                      << " band_vox=" << sdf_params_.tsdf_subdivide_surface_band_vox_
+                                      << " min_corners=" << sdf_params_.tsdf_subdivide_min_valid_corners_
+                                      << "\n";
+                        }
                         refitSvrasterTsdfFromRegisteredKeyframes("subdivide");
                         if (rerun_params_.rerun_tsdf_unknown_voxels_) {
                             rerun_state_.rerun_tsdf_unknown_dirty_ = true;
@@ -3514,7 +3701,7 @@ void VoxelMapper::trainForOneIteration()
         }
         if (rerun_params_.rerun_tsdf_unknown_voxels_) {
             sv::RerunVisualizerBridge::instance().visualizeDebugScalar(
-                "tsdf_unknown",
+                "unknown",
                 static_cast<double>(iter),
                 iter,
                 "world/debug/iteration");
@@ -3539,12 +3726,21 @@ void VoxelMapper::trainForOneIteration()
         }
         logReconstructionMeshToRerun(iter);
         logNvbloxReconstructionMeshToRerun(iter);
-        if (rerun_params_.run_whole_run_) {
+        if (rerun_params_.run_whole_run_ &&
+            rerun_state_.whole_run_live_voxels_dirty_) {
+            torch::Tensor whole_run_view_count =
+                rerun_state_.whole_run_live_local_view_counts_cache_;
+            if (whole_run_view_count.defined() &&
+                whole_run_view_count.numel() != voxel_model_->numVoxels()) {
+                whole_run_view_count = torch::Tensor();
+            }
             logWholeRunLiveVoxelsToRerun(
                 iter,
                 voxel_model_->voxCenter(),
                 voxel_model_->voxSize(),
-                torch::Tensor());
+                torch::Tensor(),
+                whole_run_view_count);
+            rerun_state_.whole_run_live_voxels_dirty_ = false;
         }
     }
 
@@ -3624,11 +3820,12 @@ void VoxelMapper::combineMappingOperations()
                     // Give local BA keyframes times of use
                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
                     kf_changed = true;
-                }
-                else {
-                handleNewKeyframe(kf);                   // still void
-                }
-            }
+	                }
+	                else {
+	                handleNewKeyframe(kf);                   // still void
+                    kf_changed = true;
+	                }
+	            }
             // Get new points
             auto& associated_points = opr.associatedMapPoints();
             auto& points = std::get<0>(associated_points);
@@ -3670,10 +3867,13 @@ void VoxelMapper::combineMappingOperations()
                         std::cout << "[VoxelMapper] artificial fill happened at iter "
                                 << iter << "\n";
                     }
+	                }
+	            }
+                if (kf_changed || (initial_mapped_ && points.size() >= 30)) {
+                    refreshPendingRecentUnstablePruneMask();
                 }
-            }
 
-        }
+	        }
         break;
 
         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
@@ -3744,11 +3944,12 @@ void VoxelMapper::combineMappingOperations()
 
 	                    kf_changed = true;
 	                 }
-                 else {
-                     handleNewKeyframe(kf);
-                     pkf = scene_->getKeyframe(kfid);
-                 }
-             }
+	                 else {
+	                     handleNewKeyframe(kf);
+	                     pkf = scene_->getKeyframe(kfid);
+                         kf_changed = true;
+	                 }
+	             }
              if (record_loop_ply_)
                  savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
 	             // Get new points (scaled transformation applied in ORB-SLAM3, so this step is performed at last to avoid scaling twice)
@@ -3796,10 +3997,13 @@ void VoxelMapper::combineMappingOperations()
                                 << iter << "\n";
                     }
                 }
-             }
+	             }
+                 if (kf_changed || (initial_mapped_ && points.size() >= 30)) {
+                     refreshPendingRecentUnstablePruneMask();
+                 }
 
-            // Mark this iteration
-            loop_closure_iteration_ = true;
+	            // Mark this iteration
+	            loop_closure_iteration_ = true;
          }
          break;
  
@@ -3951,6 +4155,260 @@ std::shared_ptr<VoxelKeyframe> VoxelMapper::useOneRandomKeyframe()
      return viewpoint_cam;
  }
 
+std::vector<std::shared_ptr<VoxelKeyframe>>
+VoxelMapper::buildRecentPruneLocalWindowKeyframes(int window_size)
+{
+    std::vector<std::shared_ptr<VoxelKeyframe>> window;
+    if (!scene_ || scene_->keyframes().empty() || window_size <= 0) {
+        return window;
+    }
+
+    const int max_window_size =
+        std::min<int>(window_size, static_cast<int>(scene_->keyframes().size()));
+    window.reserve(static_cast<size_t>(max_window_size));
+
+    auto newest_it = scene_->keyframes().rbegin();
+    if (newest_it == scene_->keyframes().rend() || !newest_it->second) {
+        return window;
+    }
+    const std::size_t newest_fid = newest_it->first;
+    window.push_back(newest_it->second);
+
+    std::unordered_set<std::size_t> used_fids;
+    used_fids.insert(newest_fid);
+
+    std::map<unsigned long, ORB_SLAM3::KeyFrame*> orb_kfs_by_id;
+    if (mpSLAM && mpSLAM->getAtlas()) {
+        for (ORB_SLAM3::KeyFrame* pKF : mpSLAM->getAtlas()->GetAllKeyFrames()) {
+            if (pKF && !pKF->isBad()) {
+                orb_kfs_by_id[pKF->mnId] = pKF;
+            }
+        }
+    }
+
+    auto orb_newest_it = orb_kfs_by_id.find(static_cast<unsigned long>(newest_fid));
+    if (orb_newest_it != orb_kfs_by_id.end() && orb_newest_it->second) {
+        const int n_cov = std::max(0, max_window_size - 1);
+        std::vector<ORB_SLAM3::KeyFrame*> covisible =
+            orb_newest_it->second->GetBestCovisibilityKeyFrames(n_cov);
+        for (ORB_SLAM3::KeyFrame* pKF : covisible) {
+            if (!pKF || pKF->isBad()) {
+                continue;
+            }
+            const std::size_t fid = static_cast<std::size_t>(pKF->mnId);
+            if (used_fids.count(fid) > 0) {
+                continue;
+            }
+            auto scene_it = scene_->keyframes().find(fid);
+            if (scene_it == scene_->keyframes().end() || !scene_it->second) {
+                continue;
+            }
+            window.push_back(scene_it->second);
+            used_fids.insert(fid);
+            if (static_cast<int>(window.size()) >= max_window_size) {
+                break;
+            }
+        }
+    }
+
+    for (auto it = scene_->keyframes().rbegin();
+         it != scene_->keyframes().rend() && static_cast<int>(window.size()) < max_window_size;
+         ++it) {
+        if (!it->second || used_fids.count(it->first) > 0) {
+            continue;
+        }
+        window.push_back(it->second);
+        used_fids.insert(it->first);
+    }
+
+    return window;
+}
+
+torch::Tensor VoxelMapper::computeRecentUnstablePruneMaskFromBirthGroups()
+{
+    const int N = voxel_model_ ? voxel_model_->numVoxels() : 0;
+    torch::Device device = mDevice;
+    if (voxel_model_ && voxel_model_->voxCenter().defined()) {
+        device = voxel_model_->voxCenter().device();
+    }
+
+    auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device);
+    torch::Tensor empty_mask = torch::zeros({std::max(0, N)}, bool_opts);
+    if (!opt_params_.prune_recent_unstable_ || N <= 0 || !scene_) {
+        return empty_mask;
+    }
+
+    const int local_window_size = std::max(1, opt_params_.prune_recent_keyframes_);
+    if (static_cast<int>(scene_->keyframes().size()) <= local_window_size) {
+        return empty_mask;
+    }
+
+    torch::Tensor exist_since_kf = voxel_model_->existSinceKf();
+    if (!exist_since_kf.defined() || exist_since_kf.numel() != N) {
+        return empty_mask;
+    }
+
+    auto flatten_colvec = [](torch::Tensor t) {
+        if (t.defined() && t.dim() == 2 && t.size(1) == 1) {
+            t = t.squeeze(1);
+        }
+        return t.contiguous().view({-1});
+    };
+
+    exist_since_kf = flatten_colvec(exist_since_kf.to(device).to(torch::kInt32));
+    torch::Tensor exist_cpu =
+        exist_since_kf.to(torch::kCPU).to(torch::kInt32).contiguous().view({-1});
+    const int32_t* exist_ptr = exist_cpu.data_ptr<int32_t>();
+
+    std::vector<int32_t> birth_kfs;
+    birth_kfs.reserve(static_cast<size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        const int32_t birth_kf = exist_ptr[i];
+        if (birth_kf < 0 ||
+            recent_unstable_checked_birth_kfs_.count(birth_kf) > 0) {
+            continue;
+        }
+        birth_kfs.push_back(birth_kf);
+    }
+    if (birth_kfs.empty()) {
+        return empty_mask;
+    }
+
+    std::sort(birth_kfs.begin(), birth_kfs.end());
+    birth_kfs.erase(std::unique(birth_kfs.begin(), birth_kfs.end()), birth_kfs.end());
+
+    torch::Tensor art_mask = voxel_model_->artificialMask();
+    if (art_mask.defined() && art_mask.numel() == N) {
+        art_mask = flatten_colvec(art_mask.to(device).to(torch::kBool));
+    } else {
+        art_mask = torch::zeros({N}, bool_opts);
+    }
+    torch::Tensor real_mask = (~art_mask).to(torch::kBool);
+
+    const bool need_local_view_count_for_rerun =
+        rerun_params_.enable_rerun_ && rerun_params_.run_whole_run_;
+    torch::Tensor view_count_cache;
+    bool view_count_cache_updated = false;
+    if (need_local_view_count_for_rerun) {
+        torch::Tensor existing_cache =
+            rerun_state_.whole_run_live_local_view_counts_cache_;
+        if (existing_cache.defined() && existing_cache.numel() == N) {
+            view_count_cache =
+                existing_cache.to(device).to(torch::kFloat32).contiguous().view({N}).clone();
+        } else {
+            view_count_cache =
+                torch::full({N}, -1.0f,
+                            torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        }
+    }
+
+    torch::Tensor unstable_mask = torch::zeros({N}, bool_opts);
+    for (const int32_t birth_kf : birth_kfs) {
+        std::vector<std::shared_ptr<VoxelKeyframe>> eval_kfs;
+        eval_kfs.reserve(static_cast<size_t>(local_window_size));
+
+        int32_t ordinal = 0;
+        for (const auto& kv : scene_->keyframes()) {
+            ++ordinal;
+            if (ordinal <= birth_kf) {
+                continue;
+            }
+            if (!kv.second) {
+                continue;
+            }
+            eval_kfs.push_back(kv.second);
+            if (static_cast<int>(eval_kfs.size()) >= local_window_size) {
+                break;
+            }
+        }
+
+        if (static_cast<int>(eval_kfs.size()) < local_window_size) {
+            continue;
+        }
+
+        std::vector<sv::MiniCam> local_cams;
+        local_cams.reserve(eval_kfs.size());
+        for (const auto& kf : eval_kfs) {
+            if (!kf) {
+                continue;
+            }
+            local_cams.push_back(kf->toMiniCam(kf->image_height_, kf->image_width_));
+        }
+        if (static_cast<int>(local_cams.size()) < local_window_size) {
+            continue;
+        }
+
+        sv::VoxelModel::StatPkg local_stat = voxel_model_->computeTrainingStat(local_cams);
+        torch::Tensor local_view_cnt = local_stat.view_cnt;
+        if (!local_view_cnt.defined() || local_view_cnt.numel() != N) {
+            continue;
+        }
+
+        local_view_cnt = flatten_colvec(local_view_cnt.to(device).to(torch::kFloat32));
+        torch::Tensor birth_mask = (exist_since_kf == birth_kf).to(torch::kBool);
+        if (need_local_view_count_for_rerun && view_count_cache.defined()) {
+            view_count_cache.index_put_({birth_mask}, local_view_cnt.index({birth_mask}));
+            view_count_cache_updated = true;
+        }
+        torch::Tensor prune_real =
+            birth_mask &
+            real_mask &
+            (local_view_cnt < static_cast<float>(opt_params_.prune_recent_min_views_real_));
+        torch::Tensor prune_artificial =
+            birth_mask &
+            art_mask &
+            (local_view_cnt < static_cast<float>(opt_params_.prune_recent_min_views_artificial_));
+
+        unstable_mask =
+            (unstable_mask | prune_real | prune_artificial).to(torch::kBool).contiguous();
+        recent_unstable_checked_birth_kfs_.insert(birth_kf);
+    }
+
+    if (view_count_cache_updated) {
+        rerun_state_.whole_run_live_local_view_counts_cache_ =
+            view_count_cache.detach().contiguous();
+    }
+
+    return unstable_mask.to(torch::kBool).contiguous();
+}
+
+void VoxelMapper::refreshPendingRecentUnstablePruneMask()
+{
+    std::unique_lock<std::mutex> lock_render(mutex_render_);
+    torch::Tensor new_mask = computeRecentUnstablePruneMaskFromBirthGroups();
+    if (!new_mask.defined()) {
+        return;
+    }
+
+    new_mask = new_mask.to(torch::kBool).contiguous().view({-1});
+    const int64_t N = new_mask.numel();
+    torch::Tensor pending_aligned;
+    if (pending_recent_unstable_prune_mask_.defined() &&
+        pending_recent_unstable_prune_mask_.numel() > 0) {
+        pending_aligned = torch::zeros(
+            {N},
+            torch::TensorOptions().dtype(torch::kBool).device(new_mask.device()));
+        torch::Tensor old =
+            pending_recent_unstable_prune_mask_
+                .to(new_mask.device())
+                .to(torch::kBool)
+                .contiguous()
+                .view({-1});
+        const int64_t copy_n = std::min<int64_t>(old.numel(), N);
+        if (copy_n > 0) {
+            pending_aligned.index_put_(
+                {torch::indexing::Slice(0, copy_n)},
+                old.index({torch::indexing::Slice(0, copy_n)}));
+        }
+    } else {
+        pending_aligned = torch::zeros_like(new_mask, torch::kBool);
+    }
+
+    pending_recent_unstable_prune_mask_ =
+        (pending_aligned | new_mask).to(torch::kBool).contiguous();
+    voxel_model_->setGeometricallyUnstableMask(pending_recent_unstable_prune_mask_);
+}
+
 void VoxelMapper::cullKeyframes()
 {
     // Ask ORB-SLAM3 which keyframe IDs are still “live”
@@ -4079,6 +4537,8 @@ void VoxelMapper::handleNewKeyframe(
         (rerun_params_.enable_rerun_ && rerun_params_.rerun_reconstruction_mesh_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.run_whole_run_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.run_sdf_pruned_nvblox_) ||
+        (rerun_params_.enable_rerun_ && rerun_params_.rerun_unstable_ && !rerun_params_.load_saved_nvblox_mesh_) ||
+        (rerun_params_.enable_rerun_ && rerun_params_.rerun_tsdf_unknown_voxels_ && !rerun_params_.load_saved_nvblox_mesh_) ||
         (rerun_params_.enable_rerun_ && rerun_params_.rerun_nvblox_mesh_ && !rerun_params_.load_saved_nvblox_mesh_);
     if (sensor_type_ == RGBD && (need_nvblox ||
                                  (sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()))) {
@@ -4094,7 +4554,13 @@ void VoxelMapper::handleNewKeyframe(
                 }
             }
             if (sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
+                if (sdf_params_.sdf_evidence_densify_) {
+                    integrateKeyframeSdfEvidenceVoxels(pkf, depth_meters);
+                }
                 integrateKeyframeIntoSvrasterSdf(*pkf, depth_meters);
+                if (sdf_params_.sdf_evidence_densify_) {
+                    promoteSdfEvidenceVoxelsFromTsdfField();
+                }
                 if (rerun_params_.rerun_tsdf_unknown_voxels_) {
                     rerun_state_.rerun_tsdf_unknown_dirty_ = true;
                 }
@@ -4103,6 +4569,10 @@ void VoxelMapper::handleNewKeyframe(
                 }
             }
         }
+    }
+
+    if (rerun_params_.run_whole_run_) {
+        rerun_state_.whole_run_live_voxels_dirty_ = true;
     }
 }
 
@@ -4301,6 +4771,7 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
         torch::Tensor rgbd_render_hole_flags = torch::zeros_like(point_valid_flags);
 
         int64_t rgbd_render_hole_selected = 0;
+        std::vector<int64_t> rgbd_render_hole_selected_idx;
         if (rgbd_fill_render_holes_ && voxel_model_ &&
             pkf->image_height_ > 0 && pkf->image_width_ > 0) {
             std::unordered_map<std::string, torch::Tensor> render_pkg;
@@ -4348,8 +4819,7 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
                 const int active_hole_max_n_contrib = 0;
                 const int stride = std::max(1, rgbd_fill_render_holes_stride_);
-                std::vector<int64_t> selected_idx;
-                selected_idx.reserve(
+                rgbd_render_hole_selected_idx.reserve(
                     static_cast<size_t>((pkf->image_height_ + stride - 1) / stride) *
                     static_cast<size_t>((pkf->image_width_ + stride - 1) / stride));
 
@@ -4373,7 +4843,7 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
                         }
 
                         if ((x % stride) == 0 && (y % stride) == 0) {
-                            selected_idx.push_back(
+                            rgbd_render_hole_selected_idx.push_back(
                                 static_cast<int64_t>(y) *
                                 static_cast<int64_t>(pkf->image_width_) +
                                 static_cast<int64_t>(x));
@@ -4381,33 +4851,50 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
                     }
                 }
 
+                const int samples_per_ray_for_cap =
+                    (rgbd_surface_band_support_ && voxel_model_)
+                        ? std::max(
+                              1,
+                              static_cast<int>(
+                                  std::ceil(
+                                      (2.0f * std::max(0.0f, rgbd_surface_band_half_width_ratio_) *
+                                       RGBD_max_depth_) /
+                                      std::max(
+                                          1.0e-6f,
+                                          std::max(1.0e-3f, rgbd_surface_band_sample_spacing_vox_) *
+                                              voxel_model_->fixedVoxSize()))) + 1)
+                        : 1;
                 if (rgbd_fill_render_holes_max_points_per_kf_ > 0 &&
-                    static_cast<int>(selected_idx.size()) >
-                        rgbd_fill_render_holes_max_points_per_kf_) {
+                    static_cast<int64_t>(rgbd_render_hole_selected_idx.size()) *
+                            static_cast<int64_t>(samples_per_ray_for_cap) >
+                        static_cast<int64_t>(rgbd_fill_render_holes_max_points_per_kf_)) {
                     std::vector<int64_t> keep;
-                    keep.reserve(static_cast<size_t>(
-                        rgbd_fill_render_holes_max_points_per_kf_));
-                    if (rgbd_fill_render_holes_max_points_per_kf_ == 1) {
-                        keep.push_back(selected_idx[selected_idx.size() / 2]);
+                    const int max_selected_rays =
+                        std::max(1, rgbd_fill_render_holes_max_points_per_kf_ / samples_per_ray_for_cap);
+                    keep.reserve(static_cast<size_t>(max_selected_rays));
+                    if (max_selected_rays == 1) {
+                        keep.push_back(
+                            rgbd_render_hole_selected_idx[
+                                rgbd_render_hole_selected_idx.size() / 2]);
                     } else {
                         const double step =
-                            static_cast<double>(selected_idx.size() - 1) /
-                            static_cast<double>(
-                                rgbd_fill_render_holes_max_points_per_kf_ - 1);
-                        for (int i = 0; i < rgbd_fill_render_holes_max_points_per_kf_; ++i) {
+                            static_cast<double>(rgbd_render_hole_selected_idx.size() - 1) /
+                            static_cast<double>(max_selected_rays - 1);
+                        for (int i = 0; i < max_selected_rays; ++i) {
                             const size_t idx = static_cast<size_t>(
                                 std::llround(step * static_cast<double>(i)));
-                            keep.push_back(selected_idx[
-                                std::min(idx, selected_idx.size() - 1)]);
+                            keep.push_back(rgbd_render_hole_selected_idx[
+                                std::min(idx, rgbd_render_hole_selected_idx.size() - 1)]);
                         }
                     }
-                    selected_idx.swap(keep);
+                    rgbd_render_hole_selected_idx.swap(keep);
                 }
 
-                for (const int64_t idx : selected_idx) {
+                for (const int64_t idx : rgbd_render_hole_selected_idx) {
                     fill_mask[static_cast<size_t>(idx)] = 1;
                 }
-                rgbd_render_hole_selected = static_cast<int64_t>(selected_idx.size());
+                rgbd_render_hole_selected =
+                    static_cast<int64_t>(rgbd_render_hole_selected_idx.size());
 
                 if (rgbd_render_hole_selected > 0) {
                     torch::Tensor fill_flags =
@@ -4426,6 +4913,19 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
                         (inactive_geo_flags | rgbd_render_hole_flags).to(torch::kBool);
                     rgbd_render_hole_selected =
                         rgbd_render_hole_flags.sum().item<int64_t>();
+                    rgbd_render_hole_selected_idx.clear();
+                    torch::Tensor final_idx_cpu =
+                        torch::nonzero(
+                            rgbd_render_hole_flags.to(torch::kCPU).to(torch::kBool))
+                            .view({-1})
+                            .to(torch::kInt64)
+                            .contiguous();
+                    auto final_idx_acc = final_idx_cpu.accessor<int64_t, 1>();
+                    rgbd_render_hole_selected_idx.reserve(
+                        static_cast<size_t>(final_idx_cpu.size(0)));
+                    for (int64_t i = 0; i < final_idx_cpu.size(0); ++i) {
+                        rgbd_render_hole_selected_idx.push_back(final_idx_acc[i]);
+                    }
                 }
             }
         }
@@ -4460,8 +4960,109 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
         torch::Tensor points3D_inactive_geo = points3D_all.index({inactive_geo_flags});
         torch::Tensor colors_inactive_geo = rgb.index({inactive_geo_flags});
-        torch::Tensor points3D_rgbd_holes = points3D_all.index({rgbd_render_hole_flags});
-        torch::Tensor colors_rgbd_holes = rgb.index({rgbd_render_hole_flags});
+        torch::Tensor points3D_rgbd_holes;
+        torch::Tensor colors_rgbd_holes;
+        if (rgbd_surface_band_support_ &&
+            !rgbd_render_hole_selected_idx.empty() &&
+            camera.model_id_ == Camera::PINHOLE &&
+            pkf->intr_.size() >= 4) {
+            const float fx = pkf->intr_[0];
+            const float fy = pkf->intr_[1];
+            const float cx = pkf->intr_[2];
+            const float cy = pkf->intr_[3];
+            const float sample_step =
+                std::max(1.0e-6f,
+                         std::max(1.0e-3f, rgbd_surface_band_sample_spacing_vox_) *
+                             voxel_model_->fixedVoxSize());
+            const int reserve_samples_per_ray =
+                std::max(
+                    1,
+                    static_cast<int>(
+                        std::ceil(
+                            (2.0f * std::max(0.0f, rgbd_surface_band_half_width_ratio_) *
+                             RGBD_max_depth_) /
+                            sample_step)) + 1);
+
+            std::vector<float> band_points;
+            std::vector<int64_t> band_color_idx;
+            band_points.reserve(
+                rgbd_render_hole_selected_idx.size() *
+                static_cast<size_t>(reserve_samples_per_ray) * 3);
+            band_color_idx.reserve(
+                rgbd_render_hole_selected_idx.size() *
+                static_cast<size_t>(reserve_samples_per_ray));
+
+            torch::Tensor depth_cpu =
+                depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+            auto depth_acc = depth_cpu.accessor<float, 1>();
+            for (const int64_t flat_idx : rgbd_render_hole_selected_idx) {
+                const float z_rgbd = depth_acc[flat_idx];
+                if (!std::isfinite(z_rgbd) ||
+                    z_rgbd <= RGBD_min_depth_ ||
+                    z_rgbd >= RGBD_max_depth_) {
+                    continue;
+                }
+
+                const int x = static_cast<int>(
+                    flat_idx % static_cast<int64_t>(pkf->image_width_));
+                const int y = static_cast<int>(
+                    flat_idx / static_cast<int64_t>(pkf->image_width_));
+                const float half_width =
+                    std::max(0.0f, rgbd_surface_band_half_width_ratio_) * z_rgbd;
+                const int samples_per_ray =
+                    std::max(
+                        1,
+                        static_cast<int>(
+                            std::ceil((2.0f * half_width) / sample_step)) + 1);
+                for (int s = 0; s < samples_per_ray; ++s) {
+                    const float alpha =
+                        (samples_per_ray == 1)
+                            ? 0.0f
+                            : (-1.0f + 2.0f * static_cast<float>(s) /
+                                           static_cast<float>(samples_per_ray - 1));
+                    const float z = z_rgbd + alpha * half_width;
+                    if (!std::isfinite(z) ||
+                        z <= RGBD_min_depth_ ||
+                        z >= RGBD_max_depth_) {
+                        continue;
+                    }
+                    const float x_cam =
+                        (static_cast<float>(x) - cx) / fx * z;
+                    const float y_cam =
+                        (static_cast<float>(y) - cy) / fy * z;
+                    band_points.push_back(x_cam);
+                    band_points.push_back(y_cam);
+                    band_points.push_back(z);
+                    band_color_idx.push_back(flat_idx);
+                }
+            }
+
+            if (!band_color_idx.empty()) {
+                points3D_rgbd_holes =
+                    torch::from_blob(
+                        band_points.data(),
+                        {static_cast<int64_t>(band_color_idx.size()), 3},
+                        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                        .clone()
+                        .to(device_type_);
+                torch::Tensor color_idx =
+                    torch::from_blob(
+                        band_color_idx.data(),
+                        {static_cast<int64_t>(band_color_idx.size())},
+                        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
+                        .clone()
+                        .to(device_type_);
+                colors_rgbd_holes = rgb.index({color_idx});
+            } else {
+                points3D_rgbd_holes =
+                    torch::empty({0, 3}, points3D_all.options());
+                colors_rgbd_holes =
+                    torch::empty({0, 3}, rgb.options());
+            }
+        } else {
+            points3D_rgbd_holes = points3D_all.index({rgbd_render_hole_flags});
+            colors_rgbd_holes = rgb.index({rgbd_render_hole_flags});
+        }
         // Transform to world coordinates
         torch::Tensor Twc_tensor =
             tensor_utils::EigenMatrix2TorchTensor(

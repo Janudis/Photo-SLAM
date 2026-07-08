@@ -38,6 +38,7 @@ void VoxelMapper::logKeyframeCameraToRerunRecordings(
         rerun_params_.run_sdf_pruned_nvblox_ ||
         (log_reconstruction_mesh && rerun_params_.rerun_reconstruction_mesh_) ||
         rerun_params_.rerun_tsdf_unknown_voxels_ ||
+        rerun_params_.rerun_unstable_ ||
         rerun_params_.run_floaters_ ||
         rerun_params_.run_whole_run_;
     if (!needs_camera_recording) {
@@ -99,12 +100,13 @@ void VoxelMapper::logKeyframeCameraToRerunRecordings(
         log_debug_camera(
             log_reconstruction_mesh && rerun_params_.rerun_reconstruction_mesh_,
             "reconstruction_mesh");
-        log_debug_camera(rerun_params_.rerun_tsdf_unknown_voxels_, "tsdf_unknown");
+        log_debug_camera(rerun_params_.rerun_tsdf_unknown_voxels_, "unknown");
         if (rerun_params_.run_floaters_) {
             log_debug_camera(true, "floaters");
             rerun_state_.run_floaters_dirty_ = true;
         }
         log_debug_camera(rerun_params_.run_whole_run_, "whole_run");
+        log_debug_camera(rerun_params_.rerun_unstable_, "unstable");
     } catch (const c10::Error& e) {
         (void)e;
     } catch (const std::exception& e) {
@@ -142,8 +144,13 @@ void VoxelMapper::saveRerunRecordingsAtShutdown()
             rerun_state_.rerun_tsdf_unknown_dirty_ = false;
         }
         sv::RerunVisualizerBridge::instance().saveDebugRecording(
-            "tsdf_unknown",
-            (rrd_dir / "run_tsdf_unknown.rrd").string());
+            "unknown",
+            (rrd_dir / "unknown.rrd").string());
+    }
+    if (rerun_params_.rerun_unstable_) {
+        sv::RerunVisualizerBridge::instance().saveDebugRecording(
+            "unstable",
+            (rrd_dir / "unstable.rrd").string());
     }
     if (rerun_params_.run_floaters_) {
         logFloatersToRerun(getIteration());
@@ -1310,7 +1317,8 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
     int iteration,
     const torch::Tensor& centers_in,
     const torch::Tensor& sizes_in,
-    const torch::Tensor& colors_in)
+    const torch::Tensor& colors_in,
+    const torch::Tensor& local_view_counts_in)
 {
     if (!rerun_params_.enable_rerun_ || !rerun_params_.run_whole_run_ || !voxel_model_) {
         return;
@@ -1370,14 +1378,53 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
         sizes = sizes.reshape({N, 1});
     }
 
+    torch::Tensor live_view_counts;
+    if (local_view_counts_in.defined() && local_view_counts_in.numel() == N) {
+        live_view_counts =
+            local_view_counts_in.detach()
+                .to(dev)
+                .to(torch::kFloat32)
+                .contiguous()
+                .view({N});
+    }
+    torch::Tensor birth_kfs;
+    torch::Tensor birth_kfs_in = voxel_model_->existSinceKf();
+    if (birth_kfs_in.defined() && birth_kfs_in.numel() == N) {
+        birth_kfs =
+            birth_kfs_in.detach()
+                .to(dev)
+                .to(torch::kInt32)
+                .contiguous()
+                .view({N});
+    }
+
     torch::Tensor orb_mask =
         normalizeBoolMaskOrZeros(voxel_model_->orbVoxelMask(), N, dev);
     torch::Tensor inactive_geo_mask =
         normalizeBoolMaskOrZeros(voxel_model_->inactiveGeoVoxelMask(), N, dev);
     torch::Tensor rgbd_fill_mask =
         normalizeBoolMaskOrZeros(voxel_model_->rgbdFillRenderHolesVoxelMask(), N, dev);
-    orb_mask = (orb_mask & (~inactive_geo_mask) & (~rgbd_fill_mask)).to(torch::kBool);
-
+    torch::Tensor sdf_evidence_mask =
+        normalizeBoolMaskOrZeros(voxel_model_->sdfEvidenceDensifyVoxelMask(), N, dev);
+    torch::Tensor active_mask =
+        normalizeBoolMaskOrZeros(voxel_model_->activeRenderableMask(), N, dev);
+    torch::Tensor sdf_evidence_live_mask =
+        (sdf_evidence_mask & active_mask).to(torch::kBool);
+    torch::Tensor rgbd_fill_live_mask =
+        (rgbd_fill_mask & active_mask & (~sdf_evidence_live_mask)).to(torch::kBool);
+    torch::Tensor inactive_geo_live_mask =
+        (inactive_geo_mask &
+         active_mask &
+         (~sdf_evidence_live_mask) &
+         (~rgbd_fill_live_mask))
+            .to(torch::kBool);
+    orb_mask =
+        (orb_mask &
+         active_mask &
+         (~inactive_geo_mask) &
+         (~rgbd_fill_mask) &
+         (~sdf_evidence_live_mask))
+            .to(torch::kBool);
     auto colors_for_indices =
         [&](const torch::Tensor& idx_in,
             const std::array<float, 4>& fallback_rgba) -> torch::Tensor
@@ -1415,14 +1462,21 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
     auto log_subset =
         [&](const torch::Tensor& mask_in,
             const std::string& entity_path,
-            const std::array<float, 4>& fallback_rgba)
+            const std::array<float, 4>& fallback_rgba,
+            bool force_log,
+            bool include_metadata)
     {
         torch::Tensor mask = normalizeBoolMaskOrZeros(mask_in, N, dev);
         torch::Tensor idx = mask.nonzero().squeeze(1);
+        if ((!idx.defined() || idx.numel() <= 0) && !force_log) {
+            return;
+        }
 
         torch::Tensor centers_sel;
         torch::Tensor sizes_sel;
         torch::Tensor colors_sel;
+        torch::Tensor view_counts_sel;
+        torch::Tensor birth_kfs_sel;
         if (!idx.defined() || idx.numel() <= 0) {
             centers_sel = torch::empty(
                 {0, 3},
@@ -1433,11 +1487,29 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
             colors_sel = torch::empty(
                 {0, 4},
                 torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+            if (include_metadata && live_view_counts.defined()) {
+                view_counts_sel = torch::empty(
+                    {0},
+                    torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+            }
+            if (include_metadata && birth_kfs.defined()) {
+                birth_kfs_sel = torch::empty(
+                    {0},
+                    torch::TensorOptions().dtype(torch::kInt32).device(dev));
+            }
         } else {
             torch::Tensor idx_dev = idx.to(dev).to(torch::kLong);
             centers_sel = centers_in.index_select(0, idx_dev).contiguous();
             sizes_sel = sizes.index_select(0, idx_dev).contiguous();
             colors_sel = colors_for_indices(idx_dev, fallback_rgba);
+            if (include_metadata && live_view_counts.defined()) {
+                view_counts_sel =
+                    live_view_counts.index_select(0, idx_dev).contiguous();
+            }
+            if (include_metadata && birth_kfs.defined()) {
+                birth_kfs_sel =
+                    birth_kfs.index_select(0, idx_dev).contiguous();
+            }
         }
 
         sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
@@ -1446,16 +1518,31 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
             sizes_sel,
             colors_sel,
             iteration,
-            entity_path);
+            entity_path,
+            view_counts_sel,
+            birth_kfs_sel);
     };
 
-    torch::Tensor all_mask = torch::ones(
-        {N},
-        torch::TensorOptions().dtype(torch::kBool).device(dev));
-    log_subset(all_mask, "world/voxels", {0.75f, 0.75f, 0.75f, 0.45f});
-    log_subset(orb_mask, "world/voxels/source/orb", {0.1f, 0.8f, 1.0f, 0.7f});
-    log_subset(inactive_geo_mask, "world/voxels/source/inactive_geo_densify", {0.7f, 0.45f, 0.2f, 0.7f});
-    log_subset(rgbd_fill_mask, "world/voxels/source/rgbd_fill_render_holes", {0.95f, 0.25f, 0.85f, 0.7f});
+    log_subset(active_mask, "world/voxels", {0.75f, 0.75f, 0.75f, 0.45f}, true, true);
+    log_subset(orb_mask, "world/voxels/source/orb", {0.1f, 0.8f, 1.0f, 0.7f}, true, false);
+    log_subset(
+        inactive_geo_live_mask,
+        "world/voxels/source/inactive_geo_densify",
+        {0.7f, 0.45f, 0.2f, 0.7f},
+        inactive_geo_densify_,
+        false);
+    log_subset(
+        rgbd_fill_live_mask,
+        "world/voxels/source/rgbd_fill_render_holes",
+        {0.95f, 0.25f, 0.85f, 0.7f},
+        rgbd_fill_render_holes_,
+        false);
+    log_subset(
+        sdf_evidence_live_mask,
+        "world/voxels/source/sdf_evidence_densify",
+        {0.25f, 0.95f, 0.45f, 0.7f},
+        sdf_params_.sdf_evidence_densify_,
+        false);
 }
 
 void VoxelMapper::appendWholeRunPrunedVoxels(
@@ -1646,6 +1733,79 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         rerun_state_.whole_run_pruned_final_special_colors_accum_,
         {1.0f, 0.45f, 0.0f, 0.85f},
         "world/pruned/source/final_special_prune_enable");
+}
+
+void VoxelMapper::appendUnstablePrunedVoxels(
+    int iteration,
+    const torch::Tensor& centers_in,
+    const torch::Tensor& sizes_in,
+    const torch::Tensor& pruned_by_recent_unstable_in)
+{
+    if (!rerun_params_.enable_rerun_ || !rerun_params_.rerun_unstable_) {
+        return;
+    }
+    if (!centers_in.defined() || !sizes_in.defined() ||
+        centers_in.dim() != 2 || centers_in.size(1) != 3 ||
+        centers_in.size(0) <= 0 ||
+        !pruned_by_recent_unstable_in.defined() ||
+        pruned_by_recent_unstable_in.numel() != centers_in.size(0)) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+
+    const int64_t K = centers_in.size(0);
+    torch::Tensor mask =
+        pruned_by_recent_unstable_in.detach()
+            .to(torch::kCPU)
+            .to(torch::kBool)
+            .contiguous()
+            .view({K});
+    torch::Tensor idx = mask.nonzero().squeeze(1);
+    if (!idx.defined() || idx.numel() <= 0) {
+        return;
+    }
+
+    torch::Tensor centers =
+        centers_in.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    torch::Tensor sizes = sizes_in.detach().to(torch::kCPU).to(torch::kFloat32);
+    if (sizes.dim() == 1) {
+        sizes = sizes.view({K, 1});
+    } else if (!(sizes.dim() == 2 && sizes.size(1) == 1)) {
+        sizes = sizes.reshape({K, 1});
+    }
+    sizes = sizes.contiguous();
+
+    torch::Tensor centers_sel = centers.index_select(0, idx).contiguous();
+    torch::Tensor sizes_sel = sizes.index_select(0, idx).contiguous();
+    torch::Tensor colors_sel = torch::zeros(
+        {idx.numel(), 4},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    colors_sel.index_put_({torch::indexing::Slice(), 0}, 0.85f);
+    colors_sel.index_put_({torch::indexing::Slice(), 1}, 0.20f);
+    colors_sel.index_put_({torch::indexing::Slice(), 2}, 1.00f);
+    colors_sel.index_put_({torch::indexing::Slice(), 3}, 0.85f);
+
+    if (!rerun_state_.unstable_pruned_centers_accum_.defined()) {
+        rerun_state_.unstable_pruned_centers_accum_ = centers_sel;
+        rerun_state_.unstable_pruned_sizes_accum_ = sizes_sel;
+        rerun_state_.unstable_pruned_colors_accum_ = colors_sel;
+    } else {
+        rerun_state_.unstable_pruned_centers_accum_ =
+            torch::cat({rerun_state_.unstable_pruned_centers_accum_, centers_sel}, 0).contiguous();
+        rerun_state_.unstable_pruned_sizes_accum_ =
+            torch::cat({rerun_state_.unstable_pruned_sizes_accum_, sizes_sel}, 0).contiguous();
+        rerun_state_.unstable_pruned_colors_accum_ =
+            torch::cat({rerun_state_.unstable_pruned_colors_accum_, colors_sel}, 0).contiguous();
+    }
+
+    sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
+        "unstable",
+        rerun_state_.unstable_pruned_centers_accum_,
+        rerun_state_.unstable_pruned_sizes_accum_,
+        rerun_state_.unstable_pruned_colors_accum_,
+        iteration,
+        "world/pruned/source/recent_unstable");
 }
 
 torch::Tensor VoxelMapper::computeNvbloxProjectiveSdfForCorners(
@@ -1842,60 +2002,6 @@ void VoxelMapper::logTsdfUnknownVoxelsToRerun(
 
     const std::string root = "world/unknown_voxels";
 
-    struct TsdfDebugKfContext
-    {
-        std::size_t kfid = 0;
-        cv::Mat depth_meters;
-        Eigen::Matrix3f Rcw = Eigen::Matrix3f::Identity();
-        Eigen::Vector3f tcw = Eigen::Vector3f::Zero();
-        float fx = 0.0f;
-        float fy = 0.0f;
-        float cx = 0.0f;
-        float cy = 0.0f;
-        int width = 0;
-        int height = 0;
-    };
-
-    std::vector<TsdfDebugKfContext> tsdf_debug_kfs;
-    if (scene_) {
-        tsdf_debug_kfs.reserve(scene_->keyframes().size());
-        for (const auto& kv : scene_->keyframes()) {
-            const auto& kf = kv.second;
-            if (!kf || kf->img_auxiliary_undist_.empty()) {
-                continue;
-            }
-            cv::Mat depth_meters;
-            if (!depthMatToMeters(kf->img_auxiliary_undist_, depth_meters) ||
-                depth_meters.empty()) {
-                continue;
-            }
-            if (depth_meters.channels() > 1) {
-                cv::extractChannel(depth_meters, depth_meters, 0);
-            }
-            if (depth_meters.type() != CV_32FC1) {
-                depth_meters.convertTo(depth_meters, CV_32FC1);
-            }
-            const float fx = kf->cam_.fx();
-            const float fy = kf->cam_.fy();
-            if (fx <= 1.0e-6f || fy <= 1.0e-6f) {
-                continue;
-            }
-            TsdfDebugKfContext ctx;
-            ctx.kfid = kf->fid_;
-            ctx.depth_meters = depth_meters;
-            Sophus::SE3f Tcw = kf->getPosef();
-            ctx.Rcw = Tcw.rotationMatrix();
-            ctx.tcw = Tcw.translation();
-            ctx.fx = fx;
-            ctx.fy = fy;
-            ctx.cx = kf->cam_.cx();
-            ctx.cy = kf->cam_.cy();
-            ctx.width = depth_meters.cols;
-            ctx.height = depth_meters.rows;
-            tsdf_debug_kfs.push_back(std::move(ctx));
-        }
-    }
-
     auto colors_for_indices =
         [&](const torch::Tensor& idx_in,
             const std::array<float, 4>& fallback_rgba) -> torch::Tensor
@@ -1959,7 +2065,7 @@ void VoxelMapper::logTsdfUnknownVoxelsToRerun(
         }
 
         sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
-            "tsdf_unknown",
+            "unknown",
             centers_sel,
             sizes_sel,
             colors_sel,
@@ -1983,389 +2089,6 @@ void VoxelMapper::logTsdfUnknownVoxelsToRerun(
         (unknown_mask & rgbd_fill_mask).to(torch::kBool),
         root + "/source/rgbd_fill_render_holes",
         {0.95f, 0.25f, 0.85f, 0.7f});
-
-    auto log_unknown_corners =
-        [&](const torch::Tensor& voxel_mask_in,
-            const std::string& entity_path,
-            const std::string& source_name)
-    {
-        torch::Tensor empty_points = torch::empty(
-            {0, 3},
-            torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-        torch::Tensor empty_colors = torch::empty(
-            {0, 4},
-            torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-
-        if (!c.points_world.defined() || c.points_world.numel() == 0 ||
-            c.points_world.dim() != 3 || c.points_world.size(0) != N ||
-            c.points_world.size(1) != 8 || c.points_world.size(2) != 3) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugPoints3D(
-                "tsdf_unknown",
-                empty_points,
-                empty_colors,
-                iteration,
-                entity_path,
-                0.006f,
-                {});
-            return;
-        }
-
-        torch::Tensor voxel_mask =
-            (normalizeBoolMaskOrZeros(voxel_mask_in, N, dev) & unknown_mask)
-                .to(torch::kBool);
-        torch::Tensor unknown_corner_mask =
-            (voxel_mask.view({N, 1}) & (~corner_valid)).to(torch::kBool);
-        torch::Tensor unknown_corner_pairs = unknown_corner_mask.nonzero();
-        if (!unknown_corner_pairs.defined() || unknown_corner_pairs.numel() <= 0) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugPoints3D(
-                "tsdf_unknown",
-                empty_points,
-                empty_colors,
-                iteration,
-                entity_path,
-                0.006f,
-                {});
-            return;
-        }
-
-        torch::Tensor unknown_corner_vox_idx =
-            unknown_corner_pairs.index({torch::indexing::Slice(), 0}).to(dev).to(torch::kLong);
-        torch::Tensor unknown_corner_local_idx =
-            unknown_corner_pairs.index({torch::indexing::Slice(), 1}).to(dev).to(torch::kLong);
-        torch::Tensor unknown_corner_flat_idx =
-            unknown_corner_vox_idx * 8 + unknown_corner_local_idx;
-
-        torch::Tensor corner_points =
-            c.points_world.to(dev).to(torch::kFloat32)
-                .reshape({N * 8, 3})
-                .index_select(0, unknown_corner_flat_idx)
-                .contiguous();
-        torch::Tensor tsdf_sel =
-            c.tsdf.to(dev).to(torch::kFloat32)
-                .reshape({N * 8})
-                .index_select(0, unknown_corner_flat_idx)
-                .contiguous();
-        torch::Tensor weight_sel =
-            w8.reshape({N * 8})
-                .index_select(0, unknown_corner_flat_idx)
-                .contiguous();
-
-        torch::Tensor corner_colors = torch::zeros(
-            {corner_points.size(0), 4},
-            torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-        corner_colors.index_put_({torch::indexing::Slice(), 0}, 1.0f);
-        corner_colors.index_put_({torch::indexing::Slice(), 3}, 1.0f);
-
-        std::vector<std::string> labels;
-        labels.reserve(static_cast<size_t>(corner_points.size(0)));
-        torch::Tensor unknown_corner_vox_cpu =
-            unknown_corner_vox_idx.to(torch::kCPU).to(torch::kLong).contiguous();
-        torch::Tensor unknown_corner_local_cpu =
-            unknown_corner_local_idx.to(torch::kCPU).to(torch::kLong).contiguous();
-        torch::Tensor tsdf_cpu = tsdf_sel.to(torch::kCPU).to(torch::kFloat32).contiguous();
-        torch::Tensor weight_cpu = weight_sel.to(torch::kCPU).to(torch::kFloat32).contiguous();
-        torch::Tensor corner_points_cpu =
-            corner_points.to(torch::kCPU).to(torch::kFloat32).contiguous();
-        auto unknown_vox_acc = unknown_corner_vox_cpu.accessor<int64_t, 1>();
-        auto unknown_corner_acc = unknown_corner_local_cpu.accessor<int64_t, 1>();
-        auto tsdf_acc = tsdf_cpu.accessor<float, 1>();
-        auto weight_acc = weight_cpu.accessor<float, 1>();
-        auto point_acc = corner_points_cpu.accessor<float, 2>();
-        const bool has_latest_tsdf_context =
-            sdf_state_.svraster_tsdf_last_context_valid_ &&
-            !sdf_state_.svraster_tsdf_last_depth_meters_.empty() &&
-            sdf_state_.svraster_tsdf_last_width_ > 0 &&
-            sdf_state_.svraster_tsdf_last_height_ > 0 &&
-            sdf_state_.svraster_tsdf_last_fx_ > 1.0e-6f &&
-            sdf_state_.svraster_tsdf_last_fy_ > 1.0e-6f;
-        Eigen::Matrix3f latest_Rcw = Eigen::Matrix3f::Identity();
-        Eigen::Vector3f latest_tcw = Eigen::Vector3f::Zero();
-        if (has_latest_tsdf_context) {
-            latest_Rcw = sdf_state_.svraster_tsdf_last_Tcw_.rotationMatrix();
-            latest_tcw = sdf_state_.svraster_tsdf_last_Tcw_.translation();
-        }
-        const float latest_trunc_m =
-            std::max(1.0e-6f, sdf_params_.tsdf_density_init_trunc_vox_ * tsdfMetricVoxelSize());
-
-        struct LatestGateInfo
-        {
-            std::string reason;
-            std::string label;
-            bool would_update_but_weight_zero = false;
-        };
-
-        auto latest_gate_label =
-            [&](int64_t i) -> LatestGateInfo
-        {
-            if (!has_latest_tsdf_context) {
-                return {"no_latest_tsdf_context", "latest_gate=no_latest_tsdf_context", false};
-            }
-            const Eigen::Vector3f p_W(
-                point_acc[i][0],
-                point_acc[i][1],
-                point_acc[i][2]);
-            const Eigen::Vector3f p_C = latest_Rcw * p_W + latest_tcw;
-            const float z = p_C.z();
-            if (!std::isfinite(z) || z <= RGBD_min_depth_) {
-                std::ostringstream oss;
-                oss << "latest_gate=z_invalid latest_kf=" << sdf_state_.svraster_tsdf_last_kfid_
-                    << " z=" << std::fixed << std::setprecision(5) << z;
-                return {"z_invalid", oss.str(), false};
-            }
-
-            const float u = sdf_state_.svraster_tsdf_last_fx_ * p_C.x() / z + sdf_state_.svraster_tsdf_last_cx_;
-            const float v = sdf_state_.svraster_tsdf_last_fy_ * p_C.y() / z + sdf_state_.svraster_tsdf_last_cy_;
-            if (!std::isfinite(u) || !std::isfinite(v) ||
-                u < 0.0f || u >= static_cast<float>(sdf_state_.svraster_tsdf_last_width_) ||
-                v < 0.0f || v >= static_cast<float>(sdf_state_.svraster_tsdf_last_height_)) {
-                std::ostringstream oss;
-                oss << "latest_gate=out_of_image latest_kf=" << sdf_state_.svraster_tsdf_last_kfid_
-                    << " u=" << std::fixed << std::setprecision(2) << u
-                    << " v=" << v
-                    << " z=" << std::setprecision(5) << z;
-                return {"out_of_image", oss.str(), false};
-            }
-
-            const int uu = std::clamp(
-                static_cast<int>(std::floor(u)),
-                0,
-                std::max(0, sdf_state_.svraster_tsdf_last_width_ - 1));
-            const int vv = std::clamp(
-                static_cast<int>(std::floor(v)),
-                0,
-                std::max(0, sdf_state_.svraster_tsdf_last_height_ - 1));
-            const float sampled_depth =
-                sdf_state_.svraster_tsdf_last_depth_meters_.at<float>(vv, uu);
-            if (!std::isfinite(sampled_depth)) {
-                std::ostringstream oss;
-                oss << "latest_gate=depth_not_finite latest_kf="
-                    << sdf_state_.svraster_tsdf_last_kfid_
-                    << " px=(" << uu << "," << vv << ")";
-                return {"depth_not_finite", oss.str(), false};
-            }
-            if (sampled_depth <= RGBD_min_depth_) {
-                std::ostringstream oss;
-                oss << "latest_gate=depth_le_min latest_kf="
-                    << sdf_state_.svraster_tsdf_last_kfid_
-                    << " depth=" << std::fixed << std::setprecision(5)
-                    << sampled_depth
-                    << " px=(" << uu << "," << vv << ")";
-                return {"depth_le_min", oss.str(), false};
-            }
-            if (sampled_depth >= RGBD_max_depth_) {
-                std::ostringstream oss;
-                oss << "latest_gate=depth_ge_max latest_kf="
-                    << sdf_state_.svraster_tsdf_last_kfid_
-                    << " depth=" << std::fixed << std::setprecision(5)
-                    << sampled_depth
-                    << " px=(" << uu << "," << vv << ")";
-                return {"depth_ge_max", oss.str(), false};
-            }
-            if (!(z < sampled_depth + latest_trunc_m)) {
-                std::ostringstream oss;
-                oss << "latest_gate=behind_surface_trunc latest_kf="
-                    << sdf_state_.svraster_tsdf_last_kfid_
-                    << " z=" << std::fixed << std::setprecision(5) << z
-                    << " depth=" << sampled_depth
-                    << " trunc=" << latest_trunc_m
-                    << " px=(" << uu << "," << vv << ")";
-                return {"behind_surface_trunc", oss.str(), false};
-            }
-
-            std::ostringstream oss;
-            oss << "latest_gate=would_update latest_kf="
-                << sdf_state_.svraster_tsdf_last_kfid_
-                << " z=" << std::fixed << std::setprecision(5) << z
-                << " depth=" << sampled_depth
-                << " sdf=" << (sampled_depth - z)
-                << " px=(" << uu << "," << vv << ")";
-            bool would_update_but_weight_zero = false;
-            if (weight_acc[i] <= 0.0f) {
-                oss << " warning=would_update_but_weight_zero";
-                would_update_but_weight_zero = true;
-            }
-            return {"would_update", oss.str(), would_update_but_weight_zero};
-        };
-
-        std::map<std::string, int64_t> reason_counts;
-        int64_t would_update_but_weight_zero_count = 0;
-        std::vector<std::string> sample_labels_for_stdout;
-        constexpr int kMaxUnknownReasonSamples = 3;
-        std::map<std::string, int64_t> history_counts;
-        std::vector<std::string> history_samples_for_stdout;
-
-        auto historical_gate_reason =
-            [&](int64_t i) -> std::string
-        {
-            if (tsdf_debug_kfs.empty()) {
-                return "no_keyframe_contexts";
-            }
-            const Eigen::Vector3f p_W(
-                point_acc[i][0],
-                point_acc[i][1],
-                point_acc[i][2]);
-
-            bool ever_front = false;
-            bool ever_in_image = false;
-            bool ever_finite_depth = false;
-            bool ever_depth_range = false;
-            for (const TsdfDebugKfContext& ctx : tsdf_debug_kfs) {
-                if (ctx.width <= 0 || ctx.height <= 0 || ctx.depth_meters.empty()) {
-                    continue;
-                }
-                const Eigen::Vector3f p_C = ctx.Rcw * p_W + ctx.tcw;
-                const float z = p_C.z();
-                if (!std::isfinite(z) || z <= RGBD_min_depth_) {
-                    continue;
-                }
-                ever_front = true;
-
-                const float u = ctx.fx * p_C.x() / z + ctx.cx;
-                const float v = ctx.fy * p_C.y() / z + ctx.cy;
-                if (!std::isfinite(u) || !std::isfinite(v) ||
-                    u < 0.0f || u >= static_cast<float>(ctx.width) ||
-                    v < 0.0f || v >= static_cast<float>(ctx.height)) {
-                    continue;
-                }
-                ever_in_image = true;
-
-                const int uu = std::clamp(
-                    static_cast<int>(std::floor(u)),
-                    0,
-                    std::max(0, ctx.width - 1));
-                const int vv = std::clamp(
-                    static_cast<int>(std::floor(v)),
-                    0,
-                    std::max(0, ctx.height - 1));
-                const float sampled_depth = ctx.depth_meters.at<float>(vv, uu);
-                if (!std::isfinite(sampled_depth)) {
-                    continue;
-                }
-                ever_finite_depth = true;
-                if (sampled_depth <= RGBD_min_depth_ ||
-                    sampled_depth >= RGBD_max_depth_) {
-                    continue;
-                }
-                ever_depth_range = true;
-                if (z < sampled_depth + latest_trunc_m) {
-                    return "would_update_any_keyframe";
-                }
-            }
-
-            if (ever_depth_range) {
-                return "behind_surface_trunc_all_keyframes";
-            }
-            if (ever_finite_depth) {
-                return "depth_out_of_range_all_keyframes";
-            }
-            if (ever_in_image) {
-                return "depth_not_finite_all_keyframes";
-            }
-            if (ever_front) {
-                return "out_of_image_all_keyframes";
-            }
-            return "z_invalid_all_keyframes";
-        };
-
-        for (int64_t i = 0; i < unknown_corner_vox_cpu.size(0); ++i) {
-            const int64_t voxel_id = unknown_vox_acc[i];
-            const int64_t corner_id = unknown_corner_acc[i];
-            LatestGateInfo gate = latest_gate_label(i);
-            reason_counts[gate.reason] += 1;
-            if (gate.would_update_but_weight_zero) {
-                ++would_update_but_weight_zero_count;
-            }
-            const std::string history_reason = historical_gate_reason(i);
-            history_counts[history_reason] += 1;
-            std::ostringstream rr_label;
-            rr_label << "voxel_id=" << voxel_id
-                     << " corner=" << corner_id
-                     << " weight=" << std::fixed << std::setprecision(3)
-                     << weight_acc[i]
-                     << " " << gate.label
-                     << " history_gate=" << history_reason;
-            const std::string label = rr_label.str();
-
-            std::ostringstream stdout_label;
-            stdout_label << "voxel_id=" << voxel_id
-                         << " corner=" << corner_id
-                         << " latest=" << gate.reason
-                         << " history=" << history_reason;
-            const std::string compact_label = stdout_label.str();
-
-            if (static_cast<int>(sample_labels_for_stdout.size()) < kMaxUnknownReasonSamples) {
-                sample_labels_for_stdout.push_back(compact_label);
-            }
-            if (history_reason == "would_update_any_keyframe" &&
-                static_cast<int>(history_samples_for_stdout.size()) < kMaxUnknownReasonSamples) {
-                history_samples_for_stdout.push_back(compact_label);
-            }
-            labels.push_back(label);
-        }
-
-        {
-            torch::Tensor voxel_mask =
-                (normalizeBoolMaskOrZeros(voxel_mask_in, N, dev) & unknown_mask)
-                    .to(torch::kBool);
-            const int64_t unknown_voxels =
-                voxel_mask.sum().item<int64_t>();
-            std::ostringstream oss;
-            oss << "[TSDF UNKNOWN REASONS] iter=" << iteration
-                << " source=" << source_name
-                << " unknown_voxels=" << unknown_voxels
-                << " unknown_corners=" << unknown_corner_vox_cpu.size(0)
-                << " latest_kf="
-                << (has_latest_tsdf_context ? static_cast<long long>(sdf_state_.svraster_tsdf_last_kfid_) : -1)
-                << " would_update_but_weight_zero="
-                << would_update_but_weight_zero_count;
-            for (const auto& kv : reason_counts) {
-                oss << " " << kv.first << "=" << kv.second;
-            }
-            std::cout << oss.str() << "\n";
-            for (const std::string& sample : sample_labels_for_stdout) {
-                std::cout << "  [TSDF UNKNOWN SAMPLE] source="
-                          << source_name << " " << sample << "\n";
-            }
-        }
-
-        {
-            std::ostringstream oss;
-            oss << "[TSDF UNKNOWN HISTORY] iter=" << iteration
-                << " source=" << source_name
-                << " keyframes_checked=" << tsdf_debug_kfs.size()
-                << " unknown_corners=" << unknown_corner_vox_cpu.size(0);
-            for (const auto& kv : history_counts) {
-                oss << " " << kv.first << "=" << kv.second;
-            }
-            std::cout << oss.str() << "\n";
-            for (const std::string& sample : history_samples_for_stdout) {
-                std::cout << "  [TSDF UNKNOWN HISTORY SAMPLE] source="
-                          << source_name << " " << sample << "\n";
-            }
-        }
-
-        sv::RerunVisualizerBridge::instance().visualizeDebugPoints3D(
-            "tsdf_unknown",
-            corner_points,
-            corner_colors,
-            iteration,
-            entity_path,
-            0.006f,
-            labels);
-    };
-
-    log_unknown_corners(
-        (unknown_mask & orb_mask).to(torch::kBool),
-        root + "/source/orb/corners",
-        "orb");
-    log_unknown_corners(
-        (unknown_mask & inactive_geo_mask).to(torch::kBool),
-        root + "/source/inactive_geo_densify/corners",
-        "inactive_geo_densify");
-    log_unknown_corners(
-        (unknown_mask & rgbd_fill_mask).to(torch::kBool),
-        root + "/source/rgbd_fill_render_holes/corners",
-        "rgbd_fill_render_holes");
 }
 
 void VoxelMapper::logFloatersToRerun(int iteration)

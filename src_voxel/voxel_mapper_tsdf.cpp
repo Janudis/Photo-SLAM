@@ -1,4 +1,5 @@
 #include "include_voxel/voxel_mapper.h"
+#include "include_voxel/voxel_mapper_utils.h"
 #include "include/stereo_vision.h"
 
 #include <algorithm>
@@ -1071,7 +1072,8 @@ torch::Tensor VoxelMapper::computeTsdfDensityInitForGridPoints(
     return raw_init;
 }
 
-VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld()
+VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld(
+    bool include_points_world)
 {
     TORCH_CHECK(voxel_model_ != nullptr, "voxel_model_ is null");
 
@@ -1129,13 +1131,72 @@ VoxelMapper::TsdfCornerSample VoxelMapper::sampleTsdfAtSvrasterGridCornersWorld(
     torch::Tensor tsdf8 = g.tsdf.index_select(0, idx).view({N, 8}).contiguous();
     torch::Tensor w8    = g.weight.index_select(0, idx).view({N, 8}).contiguous();
     torch::Tensor ok8   = g.success.index_select(0, idx).view({N, 8}).contiguous();
-    torch::Tensor points8 =
-        grid_xyz.index_select(0, idx).view({N, 8, 3}).contiguous();
-
     out.tsdf    = tsdf8;
     out.weight  = w8;
     out.success = ok8;
-    out.points_world = points8;
+    if (include_points_world) {
+        out.points_world =
+            grid_xyz.index_select(0, idx).view({N, 8, 3}).contiguous();
+    }
+    return out;
+}
+
+VoxelMapper::TsdfSupportMasks VoxelMapper::computeTsdfSupportMasksFromCorners(
+    const TsdfCornerSample& corners,
+    float min_weight,
+    float surface_band_vox,
+    int min_valid_corners) const
+{
+    TsdfSupportMasks out;
+    if (!corners.tsdf.defined() ||
+        !corners.weight.defined() ||
+        !corners.success.defined() ||
+        corners.tsdf.dim() != 2 ||
+        corners.weight.dim() != 2 ||
+        corners.success.dim() != 2 ||
+        corners.tsdf.size(1) != 8 ||
+        corners.weight.size(1) != 8 ||
+        corners.success.size(1) != 8 ||
+        corners.tsdf.size(0) != corners.weight.size(0) ||
+        corners.tsdf.size(0) != corners.success.size(0)) {
+        return out;
+    }
+
+    torch::Tensor tsdf8 = corners.tsdf.to(torch::kFloat32).contiguous();
+    torch::Tensor w8 = corners.weight.to(tsdf8.device()).to(torch::kFloat32).contiguous();
+    torch::Tensor ok8 = corners.success.to(tsdf8.device()).to(torch::kBool).contiguous();
+    const int64_t N = tsdf8.size(0);
+    const int valid_corner_count = std::max(1, std::min(8, min_valid_corners));
+    const float min_w = std::max(0.0f, min_weight);
+    const float band_m = std::max(0.0f, surface_band_vox) * tsdfMetricVoxelSize();
+
+    torch::Tensor finite = torch::isfinite(tsdf8).to(torch::kBool);
+    torch::Tensor corner_valid = (ok8 & finite & (w8 >= min_w)).to(torch::kBool);
+    torch::Tensor valid_count = corner_valid.to(torch::kInt32).sum(/*dim=*/1);
+    out.valid = (valid_count >= valid_corner_count).to(torch::kBool);
+
+    torch::Tensor pos =
+        (corner_valid & (tsdf8 > 0.0f)).to(torch::kBool).any(/*dim=*/1);
+    torch::Tensor neg =
+        (corner_valid & (tsdf8 < 0.0f)).to(torch::kBool).any(/*dim=*/1);
+    torch::Tensor zero =
+        (corner_valid & (torch::abs(tsdf8) <= 1.0e-6f))
+            .to(torch::kBool)
+            .any(/*dim=*/1);
+    out.has_zero_crossing = (out.valid & (zero | (pos & neg))).to(torch::kBool);
+
+    torch::Tensor abs_for_min =
+        torch::where(
+            corner_valid,
+            torch::abs(tsdf8),
+            torch::full_like(tsdf8, std::numeric_limits<float>::infinity()));
+    torch::Tensor min_abs = std::get<0>(abs_for_min.min(/*dim=*/1));
+    out.near_surface = (out.valid & (min_abs <= band_m)).to(torch::kBool);
+    out.surface_support =
+        (out.valid & (out.has_zero_crossing | out.near_surface)).to(torch::kBool);
+    out.free_space =
+        (out.valid & pos & (~neg) & (~zero) & (min_abs > band_m)).to(torch::kBool);
+
     return out;
 }
 
@@ -1363,6 +1424,431 @@ void VoxelMapper::integrateKeyframeIntoSvrasterSdf(
                   << " trunc_m=" << trunc_m
                   << " backend=" << sdf_params_.tsdf_backend_
                   << "\n";
+    }
+}
+
+void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const cv::Mat& depth_meters)
+{
+    if (!kf || !voxel_model_ ||
+        !sdf_params_.sdf_evidence_densify_ ||
+        !sdf_params_.use_tsdf_mapping_ ||
+        sensor_type_ != RGBD ||
+        !useSvrasterTsdfBackend() ||
+        depth_meters.empty() ||
+        kf->image_width_ <= 0 ||
+        kf->image_height_ <= 0) {
+        return;
+    }
+
+    cv::Mat depth32 = depth_meters;
+    if (depth32.channels() > 1) {
+        cv::extractChannel(depth32, depth32, 0);
+    }
+    if (depth32.type() != CV_32FC1) {
+        depth32.convertTo(depth32, CV_32FC1);
+    }
+    if (depth32.empty()) {
+        return;
+    }
+
+    if (kf->cam_.model_id_ != sv::Camera::PINHOLE) {
+        return;
+    }
+
+    const float fx = kf->cam_.fx();
+    const float fy = kf->cam_.fy();
+    const float cx = kf->cam_.cx();
+    const float cy = kf->cam_.cy();
+    if (!(fx > 0.0f && fy > 0.0f)) {
+        return;
+    }
+
+    const float vox_m = std::max(1.0e-6f, tsdfMetricVoxelSize());
+    const float trunc_m =
+        std::max(1.0e-6f, sdf_params_.tsdf_density_init_trunc_vox_ * vox_m);
+    const float sample_step = vox_m;
+
+    const cv::Mat& image = kf->img_undist_;
+    const bool has_color =
+        !image.empty() &&
+        image.rows == depth32.rows &&
+        image.cols == depth32.cols &&
+        image.channels() >= 3;
+    auto read_color = [&](int y, int x, float& r, float& g, float& b) {
+        r = g = b = 0.5f;
+        if (!has_color) {
+            return;
+        }
+        if (image.depth() == CV_32F) {
+            const cv::Vec3f c = image.at<cv::Vec3f>(y, x);
+            r = std::clamp(c[0], 0.0f, 1.0f);
+            g = std::clamp(c[1], 0.0f, 1.0f);
+            b = std::clamp(c[2], 0.0f, 1.0f);
+        } else if (image.depth() == CV_8U) {
+            const cv::Vec3b c = image.at<cv::Vec3b>(y, x);
+            r = static_cast<float>(c[0]) / 255.0f;
+            g = static_cast<float>(c[1]) / 255.0f;
+            b = static_cast<float>(c[2]) / 255.0f;
+        }
+    };
+
+    std::vector<float> pts_cam;
+    std::vector<float> colors;
+    const int samples_per_full_ray =
+        std::max(1, static_cast<int>(std::ceil((2.0f * trunc_m) / sample_step)) + 1);
+    pts_cam.reserve(static_cast<size_t>(1024) * static_cast<size_t>(samples_per_full_ray) * 3);
+    colors.reserve(static_cast<size_t>(1024) * static_cast<size_t>(samples_per_full_ray) * 3);
+
+    for (int y = 0; y < depth32.rows; ++y) {
+        const float* depth_row = depth32.ptr<float>(y);
+        for (int x = 0; x < depth32.cols; ++x) {
+            const float d = depth_row[x];
+            if (!std::isfinite(d) ||
+                d <= RGBD_min_depth_ ||
+                d >= RGBD_max_depth_) {
+                continue;
+            }
+            if (sdf_params_.svraster_tsdf_max_integration_distance_m_ > 0.0f &&
+                d > sdf_params_.svraster_tsdf_max_integration_distance_m_) {
+                continue;
+            }
+
+            const float z_min = std::max(RGBD_min_depth_, d - trunc_m);
+            const float z_max = std::min(RGBD_max_depth_, d + trunc_m);
+            const int samples =
+                std::max(1, static_cast<int>(std::ceil((z_max - z_min) / sample_step)) + 1);
+            float r, g, b;
+            read_color(y, x, r, g, b);
+            for (int s = 0; s < samples; ++s) {
+                const float alpha =
+                    (samples == 1)
+                        ? 0.0f
+                        : static_cast<float>(s) / static_cast<float>(samples - 1);
+                const float z = z_min + alpha * (z_max - z_min);
+                if (!std::isfinite(z) ||
+                    z <= RGBD_min_depth_ ||
+                    z >= RGBD_max_depth_) {
+                    continue;
+                }
+                const float x_cam = (static_cast<float>(x) - cx) / fx * z;
+                const float y_cam = (static_cast<float>(y) - cy) / fy * z;
+                pts_cam.push_back(x_cam);
+                pts_cam.push_back(y_cam);
+                pts_cam.push_back(z);
+                colors.push_back(r);
+                colors.push_back(g);
+                colors.push_back(b);
+            }
+        }
+    }
+
+    if (pts_cam.empty()) {
+        return;
+    }
+
+    if (rgbd_fill_render_holes_max_points_per_kf_ > 0 &&
+        static_cast<int64_t>(pts_cam.size() / 3) >
+            static_cast<int64_t>(rgbd_fill_render_holes_max_points_per_kf_)) {
+        const int64_t total = static_cast<int64_t>(pts_cam.size() / 3);
+        const int64_t keep_n = std::max<int64_t>(1, rgbd_fill_render_holes_max_points_per_kf_);
+        std::vector<float> pts_keep;
+        std::vector<float> colors_keep;
+        pts_keep.reserve(static_cast<size_t>(keep_n) * 3);
+        colors_keep.reserve(static_cast<size_t>(keep_n) * 3);
+        const double step =
+            (keep_n == 1)
+                ? 0.0
+                : static_cast<double>(total - 1) / static_cast<double>(keep_n - 1);
+        for (int64_t i = 0; i < keep_n; ++i) {
+            const int64_t src =
+                (keep_n == 1)
+                    ? total / 2
+                    : std::min<int64_t>(
+                          total - 1,
+                          static_cast<int64_t>(std::llround(step * static_cast<double>(i))));
+            for (int c = 0; c < 3; ++c) {
+                pts_keep.push_back(pts_cam[static_cast<size_t>(3 * src + c)]);
+                colors_keep.push_back(colors[static_cast<size_t>(3 * src + c)]);
+            }
+        }
+        pts_cam.swap(pts_keep);
+        colors.swap(colors_keep);
+    }
+
+    torch::Tensor points =
+        torch::from_blob(
+            pts_cam.data(),
+            {static_cast<int64_t>(pts_cam.size() / 3), 3},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+            .clone()
+            .to(device_type_);
+    torch::Tensor color_tensor =
+        torch::from_blob(
+            colors.data(),
+            {static_cast<int64_t>(colors.size() / 3), 3},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+            .clone()
+            .to(device_type_);
+
+    Sophus::SE3f Twc = kf->getPosef().inverse();
+    torch::Tensor Twc_tensor =
+        tensor_utils::EigenMatrix2TorchTensor(Twc.matrix(), device_type_).transpose(0, 1);
+    voxel_utils::transformPoints(points, Twc_tensor);
+
+    std::vector<sv::MiniCam> tr_cams;
+    tr_cams.reserve(scene_->keyframes().size());
+    for (const auto& kv : scene_->keyframes()) {
+        if (kv.second) {
+            tr_cams.push_back(
+                kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
+        }
+    }
+
+    std::unique_lock<std::mutex> lock_render(mutex_render_);
+    voxel_model_->setNextRealInsertionRerunEntityPath("world/sdf_evidence/created");
+    voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::SdfEvidenceOnly);
+    voxel_model_->increasePcd(points, color_tensor, getIteration(), tr_cams);
+    voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
+    voxel_model_->setNextRealInsertionRerunEntityPath("");
+}
+
+void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
+{
+    if (!voxel_model_ ||
+        !scene_ ||
+        !sdf_params_.sdf_evidence_densify_ ||
+        !sdf_params_.use_tsdf_mapping_ ||
+        sensor_type_ != RGBD ||
+        !useSvrasterTsdfBackend()) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor evidence_mask = voxel_model_->sdfEvidenceOnlyMask();
+    if (!evidence_mask.defined() || evidence_mask.numel() == 0 ||
+        !evidence_mask.any().item<bool>()) {
+        return;
+    }
+
+    TsdfCornerSample corners =
+        sampleTsdfAtSvrasterGridCornersWorld(
+            sdf_params_.sdf_evidence_zero_crossing_refresh_);
+    if (!corners.tsdf.defined() ||
+        corners.tsdf.dim() != 2 ||
+        corners.tsdf.size(1) != 8) {
+        return;
+    }
+    torch::Tensor tsdf8 = corners.tsdf.to(device_type_).to(torch::kFloat32).contiguous();
+    torch::Tensor w8 = corners.weight.to(device_type_).to(torch::kFloat32).contiguous();
+    torch::Tensor ok8 = corners.success.to(device_type_).to(torch::kBool).contiguous();
+    const int64_t N = tsdf8.size(0);
+    if (evidence_mask.numel() != N) {
+        return;
+    }
+
+    evidence_mask = evidence_mask.to(device_type_).to(torch::kBool).contiguous().view({N});
+    const float min_weight = std::max(0.0f, sdf_params_.tsdf_prune_min_weight_);
+    const float surface_band =
+        std::max(0.0f, sdf_params_.tsdf_prune_surface_band_vox_) *
+        tsdfMetricVoxelSize();
+    const float trunc_m =
+        std::max(1.0e-6f, sdf_params_.tsdf_density_init_trunc_vox_ * tsdfMetricVoxelSize());
+    torch::Tensor corner_valid = (ok8 & (w8 >= min_weight)).to(torch::kBool);
+    torch::Tensor valid_count = corner_valid.to(torch::kInt32).sum(/*dim=*/1);
+    torch::Tensor tsdf_valid_for_min =
+        torch::where(corner_valid, tsdf8, torch::full_like(tsdf8, trunc_m));
+    torch::Tensor tsdf_valid_for_max =
+        torch::where(corner_valid, tsdf8, torch::full_like(tsdf8, -trunc_m));
+    torch::Tensor min_tsdf = std::get<0>(tsdf_valid_for_min.min(/*dim=*/1));
+    torch::Tensor max_tsdf = std::get<0>(tsdf_valid_for_max.max(/*dim=*/1));
+    torch::Tensor surface_or_crossing_support =
+        ((valid_count >= std::max(1, sdf_params_.tsdf_prune_min_valid_corners_)) &
+         (min_tsdf <= surface_band) &
+         (max_tsdf >= -surface_band))
+            .to(torch::kBool);
+
+    torch::Tensor edge_surface_support =
+        torch::zeros({N}, torch::TensorOptions().dtype(torch::kBool).device(device_type_));
+    std::vector<torch::Tensor> zero_crossing_points;
+    std::vector<torch::Tensor> zero_crossing_colors;
+    if (sdf_params_.sdf_evidence_zero_crossing_refresh_ &&
+        corners.points_world.defined() &&
+        corners.points_world.dim() == 3 &&
+        corners.points_world.size(0) == N &&
+        corners.points_world.size(1) == 8 &&
+        corners.points_world.size(2) == 3) {
+        using torch::indexing::Slice;
+        torch::Tensor points8 =
+            corners.points_world.to(device_type_).to(torch::kFloat32).contiguous();
+        torch::Tensor sh0 = voxel_model_->sh0().detach();
+        torch::Tensor colors_all;
+        if (sh0.defined() && sh0.numel() > 0) {
+            sh0 = sh0.to(device_type_).to(torch::kFloat32);
+            if (sh0.dim() == 3 && sh0.size(1) == 1 && sh0.size(2) == 3) {
+                sh0 = sh0.view({sh0.size(0), 3});
+            }
+            if (sh0.dim() == 2 && sh0.size(0) == N && sh0.size(1) == 3) {
+                constexpr float kSHC0 = 0.28209479177387814f;
+                colors_all = torch::clamp(sh0 * kSHC0 + 0.5f, 0.0f, 1.0f).contiguous();
+            }
+        }
+        if (!colors_all.defined()) {
+            colors_all = torch::full(
+                {N, 3},
+                0.5f,
+                torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
+        }
+
+        const std::array<std::array<int, 2>, 12> edges{{
+            {{0, 1}}, {{0, 2}}, {{0, 4}},
+            {{1, 3}}, {{1, 5}},
+            {{2, 3}}, {{2, 6}},
+            {{3, 7}},
+            {{4, 5}}, {{4, 6}},
+            {{5, 7}},
+            {{6, 7}},
+        }};
+
+        for (const auto& edge : edges) {
+            const int a = edge[0];
+            const int b = edge[1];
+            torch::Tensor v0 = tsdf8.index({Slice(), a});
+            torch::Tensor v1 = tsdf8.index({Slice(), b});
+            torch::Tensor edge_valid =
+                (evidence_mask &
+                 corner_valid.index({Slice(), a}) &
+                 corner_valid.index({Slice(), b}))
+                    .to(torch::kBool);
+            torch::Tensor sign_change =
+                (((v0 <= 0.0f) & (v1 >= 0.0f)) |
+                 ((v0 >= 0.0f) & (v1 <= 0.0f)))
+                    .to(torch::kBool);
+            torch::Tensor edge_support =
+                (edge_valid & sign_change).to(torch::kBool);
+            edge_surface_support =
+                (edge_surface_support | edge_support).to(torch::kBool);
+
+            torch::Tensor edge_idx = torch::nonzero(edge_support).view({-1});
+            if (!edge_idx.defined() || edge_idx.numel() == 0) {
+                continue;
+            }
+
+            torch::Tensor v0_sel = v0.index_select(0, edge_idx).to(torch::kFloat32);
+            torch::Tensor v1_sel = v1.index_select(0, edge_idx).to(torch::kFloat32);
+            torch::Tensor denom = (v0_sel - v1_sel);
+            torch::Tensor alpha_cross =
+                torch::clamp(
+                    torch::where(
+                        torch::abs(denom) > 1.0e-8f,
+                        v0_sel / denom,
+                        torch::full_like(v0_sel, 0.5f)),
+                    0.0f,
+                    1.0f);
+            torch::Tensor alpha = alpha_cross.view({-1, 1});
+
+            torch::Tensor p0 = points8.index({edge_idx, a, Slice()});
+            torch::Tensor p1 = points8.index({edge_idx, b, Slice()});
+            torch::Tensor p = p0 + alpha * (p1 - p0);
+            zero_crossing_points.push_back(p.contiguous());
+            zero_crossing_colors.push_back(
+                colors_all.index_select(0, edge_idx).contiguous());
+        }
+    }
+
+    torch::Tensor promotion_support =
+        sdf_params_.sdf_evidence_zero_crossing_refresh_
+            ? edge_surface_support
+            : surface_or_crossing_support;
+    torch::Tensor eligible_evidence =
+        (evidence_mask & promotion_support).to(torch::kBool);
+    torch::Tensor promote_mask = eligible_evidence.to(torch::kBool).contiguous();
+    {
+        std::vector<sv::MiniCam> tr_cams;
+        tr_cams.reserve(scene_->keyframes().size());
+        for (const auto& kv : scene_->keyframes()) {
+            if (kv.second) {
+                tr_cams.push_back(
+                    kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
+            }
+        }
+        if (!tr_cams.empty()) {
+            torch::Tensor octpath = voxel_model_->octPath();
+            torch::Tensor centers = voxel_model_->voxCenter();
+            torch::Tensor sizes = voxel_model_->voxSize();
+            if (octpath.defined() && centers.defined() && sizes.defined() &&
+                octpath.size(0) == N &&
+                centers.dim() == 2 && centers.size(0) == N && centers.size(1) == 3 &&
+                sizes.numel() == N) {
+                octpath = octpath.to(device_type_).contiguous();
+                centers = centers.to(device_type_).to(torch::kFloat32).contiguous();
+                sizes = sizes.to(device_type_).to(torch::kFloat32).contiguous();
+                if (sizes.dim() == 1) {
+                    sizes = sizes.view({N, 1});
+                } else if (sizes.dim() != 2 || sizes.size(1) != 1) {
+                    sizes = sizes.reshape({N, 1});
+                }
+
+                at::Tensor rate =
+                    sv::markSvrasterMaxSampRateDirect(tr_cams, octpath, centers, sizes);
+                if (rate.dim() == 2 && rate.size(1) == 1) {
+                    rate = rate.squeeze(1);
+                }
+                torch::Tensor visible = (rate.to(device_type_).to(torch::kFloat32) > 0.0f)
+                                            .to(torch::kBool)
+                                            .contiguous()
+                                            .view({N});
+                promote_mask = (promote_mask & visible).to(torch::kBool);
+
+                if (opt_params_.filter_near_voxels_) {
+                    const float near_thresh = 0.2f;
+                    at::Tensor is_near =
+                        sv::markSvrasterNearDirect(tr_cams, octpath, centers, sizes, near_thresh);
+                    if (is_near.dim() == 2 && is_near.size(1) == 1) {
+                        is_near = is_near.squeeze(1);
+                    }
+                    is_near =
+                        is_near.to(device_type_).to(torch::kBool).contiguous().view({N});
+                    promote_mask = (promote_mask & (~is_near)).to(torch::kBool);
+                }
+            }
+        }
+    }
+    const int64_t promoted = promote_mask.sum().item<int64_t>();
+
+    if (!zero_crossing_points.empty()) {
+        torch::Tensor surface_points =
+            torch::cat(zero_crossing_points, 0).to(device_type_).to(torch::kFloat32).contiguous();
+        torch::Tensor surface_colors =
+            torch::cat(zero_crossing_colors, 0).to(device_type_).to(torch::kFloat32).contiguous();
+        std::vector<sv::MiniCam> tr_cams;
+        tr_cams.reserve(scene_->keyframes().size());
+        for (const auto& kv : scene_->keyframes()) {
+            if (kv.second) {
+                tr_cams.push_back(
+                    kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
+            }
+        }
+        if (surface_points.numel() > 0 && !tr_cams.empty()) {
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            voxel_model_->setNextRealInsertionRerunEntityPath("world/sdf_evidence/created");
+            voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
+            voxel_model_->increasePcd(surface_points, surface_colors, getIteration(), tr_cams);
+            voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
+            voxel_model_->setNextRealInsertionRerunEntityPath("");
+            if (rerun_params_.run_whole_run_) {
+                rerun_state_.whole_run_live_voxels_dirty_ = true;
+            }
+        }
+    }
+
+    if (promoted > 0) {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        voxel_model_->promoteSdfEvidenceVoxels(promote_mask);
+        if (rerun_params_.run_whole_run_) {
+            rerun_state_.whole_run_live_voxels_dirty_ = true;
+        }
     }
 }
 
@@ -1606,8 +2092,11 @@ void VoxelMapper::runFinalSpecialPrune()
     int64_t n_far_final_special = 0;
     int64_t n_near_final_special = 0;
     int64_t n_near_geom_final_special = 0;
+    int64_t n_unstable_final_special = 0;
     bool far_valid_final_special = false;
     bool near_valid_final_special = false;
+    bool unstable_valid_final_special = false;
+    torch::Tensor unstable_mask_final_special;
 
     bool use_far_final_special = opt_params_.prune_far_voxels_;
     if (use_far_final_special) {
@@ -1725,6 +2214,35 @@ void VoxelMapper::runFinalSpecialPrune()
         }
     }
 
+    if (opt_params_.prune_recent_unstable_) {
+        try {
+            torch::Tensor unstable_mask = torch::zeros(
+                {before_final_special},
+                torch::TensorOptions().dtype(torch::kBool).device(prune_mask_final_special.device()));
+
+            if (pending_recent_unstable_prune_mask_.defined() &&
+                pending_recent_unstable_prune_mask_.numel() == before_final_special) {
+                torch::Tensor pending_unstable =
+                    pending_recent_unstable_prune_mask_
+                        .to(prune_mask_final_special.device())
+                        .to(torch::kBool)
+                        .contiguous()
+                        .view({before_final_special});
+                unstable_mask =
+                    (unstable_mask | pending_unstable).to(torch::kBool);
+            }
+
+            unstable_mask_final_special = unstable_mask;
+            n_unstable_final_special = unstable_mask.sum().item<int64_t>();
+            prune_mask_final_special =
+                (prune_mask_final_special | unstable_mask).to(torch::kBool);
+            unstable_valid_final_special = true;
+        } catch (const std::exception& e) {
+            std::cerr << "[FINAL/special_prune] failed to compute unstable voxels: "
+                      << e.what() << "\n";
+        }
+    }
+
     const int64_t n_selected_final_special =
         prune_mask_final_special.to(torch::kBool).sum().item<int64_t>();
     if (n_selected_final_special > 0) {
@@ -1747,6 +2265,18 @@ void VoxelMapper::runFinalSpecialPrune()
             torch::Tensor final_special_mask = torch::ones(
                 {final_idx.numel()},
                 torch::TensorOptions().dtype(torch::kBool).device(final_centers.device()));
+            torch::Tensor final_unstable_mask;
+            if (unstable_mask_final_special.defined() &&
+                unstable_mask_final_special.numel() == before_final_special) {
+                final_unstable_mask =
+                    unstable_mask_final_special
+                        .to(final_idx.device())
+                        .to(torch::kBool)
+                        .contiguous()
+                        .view({before_final_special})
+                        .index_select(0, final_idx.to(torch::kLong))
+                        .contiguous();
+            }
             appendWholeRunPrunedVoxels(
                 getIteration(),
                 final_centers,
@@ -1755,17 +2285,29 @@ void VoxelMapper::runFinalSpecialPrune()
                 torch::Tensor(),
                 torch::Tensor(),
                 final_special_mask);
+            appendUnstablePrunedVoxels(
+                getIteration(),
+                final_centers,
+                final_sizes,
+                final_unstable_mask);
         }
     }
 
     if (n_selected_final_special > 0) {
         voxel_model_->pruning(prune_mask_final_special);
         if (rerun_params_.run_whole_run_) {
+            torch::Tensor final_view_count =
+                rerun_state_.whole_run_live_local_view_counts_cache_;
+            if (final_view_count.defined() &&
+                final_view_count.numel() != voxel_model_->numVoxels()) {
+                final_view_count = torch::Tensor();
+            }
             logWholeRunLiveVoxelsToRerun(
                 getIteration(),
                 voxel_model_->voxCenter(),
                 voxel_model_->voxSize(),
-                torch::Tensor());
+                torch::Tensor(),
+                final_view_count);
         }
         if (rerun_params_.rerun_tsdf_unknown_voxels_) {
             rerun_state_.rerun_tsdf_unknown_dirty_ = true;
@@ -1782,6 +2324,7 @@ void VoxelMapper::runFinalSpecialPrune()
               << " far=" << (far_valid_final_special ? std::to_string(n_far_final_special) : std::string("N/A"))
               << " near=" << (near_valid_final_special ? std::to_string(n_near_final_special) : std::string("N/A"))
               << " near_geom=" << (near_valid_final_special ? std::to_string(n_near_geom_final_special) : std::string("N/A"))
+              << " unstable=" << (unstable_valid_final_special ? std::to_string(n_unstable_final_special) : std::string("N/A"))
               << "\n";
 }
 

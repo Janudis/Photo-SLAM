@@ -19,7 +19,6 @@ struct VoxelSdfParameters
     float tsdf_prune_min_weight_ = 1.0f;
     float tsdf_prune_surface_band_vox_ = 2.0f;
     int tsdf_prune_min_valid_corners_ = 8;
-    bool tsdf_prune_unknown_ = false;
     bool tsdf_protect_surface_band_from_pruning_ = true;
     bool tsdf_density_init_ = false;
     float tsdf_density_init_min_weight_ = 1.0f;
@@ -28,6 +27,12 @@ struct VoxelSdfParameters
     bool svraster_tsdf_inverse_square_weighting_ = true;
     float svraster_tsdf_max_weight_ = 5.0f;
     bool svraster_tsdf_refit_on_topology_change_ = true;
+    bool sdf_evidence_densify_ = false;
+    bool sdf_evidence_zero_crossing_refresh_ = false;
+    bool tsdf_subdivide_near_zero_crossing_ = false;
+    float tsdf_subdivide_min_weight_ = 0.5f;
+    float tsdf_subdivide_surface_band_vox_ = 2.0f;
+    int tsdf_subdivide_min_valid_corners_ = 2;
     float tsdf_density_init_bell_a_ = 0.1f;
     float tsdf_density_init_bell_b_ = 0.5f;
     float tsdf_density_init_alpha_min_ = 0.0002f;

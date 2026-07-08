@@ -96,7 +96,9 @@ public:
         const torch::Tensor& sizes,     // [N] or [N,1] or [N,3] float
         const torch::Tensor& colors,     // [N,3] float or uint8, can be undefined
         int iteration,
-        const std::string& entity_path = "world/voxels"
+        const std::string& entity_path = "world/voxels",
+        const torch::Tensor& view_counts = torch::Tensor(),
+        const torch::Tensor& birth_kfs = torch::Tensor()
     );
 
     void visualizeNvbloxMesh(

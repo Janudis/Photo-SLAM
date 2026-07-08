@@ -56,6 +56,11 @@
 
 namespace sv {
 
+enum class VoxelRuntimeState : int32_t {
+    ActiveRenderable = 0,
+    SdfEvidenceOnly = 1,
+};
+
 class VoxelModel 
 {
 public:
@@ -203,11 +208,18 @@ public:
         int64_t begin,
         int64_t end,
         float default_value);
+    torch::Tensor makeGeoGridInitRowsForKeys_(
+        const torch::Tensor& grid_pts_key_rows,
+        float default_value);
+    void rebuildGeoGridForNewGridKeys_(
+        const torch::Tensor& grid_pts_key_new,
+        float default_value);
     
     torch::Tensor artificialMask() const { return this->is_artificial_voxel_; } // [N] bool, true=artificial
     torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
     torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
     torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
+    torch::Tensor sdfEvidenceDensifyVoxelMask() const { return this->is_sdf_evidence_densify_voxel_; } // [N] bool
     torch::Tensor promotedartificialMask() const { return this->is_promoted_artificial_voxel_; } // [N] bool
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
@@ -215,6 +227,9 @@ public:
     torch::Tensor renderedDepthCandidateSupportCount() const { return this->rendered_depth_candidate_support_count_; } // [N] int32
     torch::Tensor renderedDepthCandidateLastSeenKf() const { return this->rendered_depth_candidate_last_seen_kf_; } // [N] int32
     torch::Tensor renderedDepthCandidateSourceKind() const { return this->rendered_depth_candidate_source_kind_; } // [N] int32
+    torch::Tensor voxelState() const { return this->voxel_state_; } // [N] int32
+    torch::Tensor activeRenderableMask() const;
+    torch::Tensor sdfEvidenceOnlyMask() const;
     
     bool hasDenseCoreBB() const { return has_dense_core_bb_; }
     torch::Tensor denseCoreBBMin() const { return dense_core_bb_min_; } // [3]
@@ -236,6 +251,9 @@ public:
     void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
         pending_real_insert_rr_entity_path_ = entity_path;
     }
+    void setNextInsertionVoxelState(VoxelRuntimeState state) {
+        pending_insertion_voxel_state_ = static_cast<int32_t>(state);
+    }
     void setNextRenderedDepthCandidateInsertion(const bool enable,
                                                 const std::string& entity_path = "",
                                                 const int source_kind = 1,
@@ -255,6 +273,7 @@ public:
         topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
     void promoteRenderedDepthCandidates(const torch::Tensor& promote_mask);
+    void promoteSdfEvidenceVoxels(const torch::Tensor& promote_mask);
     void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
@@ -325,7 +344,7 @@ public:
     int    fill_empty_cells_warmup_iters_ = 300; // delay one-shot bbox fill until this iteration
     bool   use_local_frontier_fill_ = false;  // preferred over dense bbox fill
     bool   use_dense_core_neighbor_fill_ = false; // controlled fill in dense-core region
-    float  dense_core_pcd_density_rate_ = 0.001f; // same meaning as SVRaster heuristic - smaller the bigger the area
+    float  dense_core_pcd_density_rate_ = 0.005f; // same meaning as SVRaster heuristic - smaller the bigger the area
     int64_t max_dense_core_fill_cells_ = 50000; // cap dense-core support cells per call
     int64_t max_real_pcd_points_ = 800000;      // cap accumulated real PCD points
     int64_t max_artificial_cells_ = 1000000; // safety cap
@@ -339,6 +358,7 @@ public:
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
     torch::Tensor is_inactive_geo_voxel_;        // [N] bool provenance: true=created by inactive-geo densification
     torch::Tensor is_rgbd_fill_render_holes_voxel_; // [N] bool provenance: true=created by RGB-D render-hole fill
+    torch::Tensor is_sdf_evidence_densify_voxel_; // [N] bool provenance: true=created by SDF evidence densification
     torch::Tensor is_depthanything_fill_holes_voxel_; // [N] bool provenance: true=created by DepthAnything fill-hole insertion
     torch::Tensor is_promoted_artificial_voxel_; // [N] bool provenance: true if voxel was artificial and got promoted to real
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
@@ -351,6 +371,7 @@ public:
     // This is kept after promotion so live debug views can trace current voxels
     // back to their insertion path (depth-insert vs hole-fill).
     torch::Tensor rendered_depth_candidate_source_kind_;
+    torch::Tensor voxel_state_; // [N] int32, see VoxelRuntimeState
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
     torch::Tensor global_pcd_max_;   // [3], CPU or CUDA
     torch::Tensor dense_core_bb_min_; // [3], fixed dense-core min from createFromPcd
@@ -369,6 +390,8 @@ public:
     bool pending_insert_rendered_depth_candidate_ = false;
     int pending_insert_rendered_depth_candidate_source_kind_ = 0;
     bool pending_insert_rendered_depth_candidate_as_real_protected_ = false;
+    int32_t pending_insertion_voxel_state_ =
+        static_cast<int32_t>(VoxelRuntimeState::ActiveRenderable);
     GeoGridInitCallback geo_grid_init_callback_;
     int64_t total_promoted_artificial_voxels_ = 0;
     int32_t topology_birth_iter_ = -1;

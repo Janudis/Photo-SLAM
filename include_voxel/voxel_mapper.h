@@ -171,6 +171,9 @@ protected:
     void generateKfidRandomShuffle();
     std::shared_ptr<VoxelKeyframe> useOneRandomSlidingWindowKeyframe();  
     std::shared_ptr<VoxelKeyframe> useOneRandomKeyframe();   
+    std::vector<std::shared_ptr<VoxelKeyframe>> buildRecentPruneLocalWindowKeyframes(int window_size);
+    torch::Tensor computeRecentUnstablePruneMaskFromBirthGroups();
+    void refreshPendingRecentUnstablePruneMask();
     void increaseKeyframeTimesOfUse(const std::shared_ptr<VoxelKeyframe>& kf, int n);
     void cullKeyframes();                  
 
@@ -217,6 +220,10 @@ protected:
     float tsdfMetricVoxelSize() const;
     void integrateKeyframeIntoSvrasterSdf(VoxelKeyframe& kf,
                                           const cv::Mat& depth_meters);
+    void integrateKeyframeSdfEvidenceVoxels(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const cv::Mat& depth_meters);
+    void promoteSdfEvidenceVoxelsFromTsdfField();
     void refitSvrasterTsdfFromRegisteredKeyframes(const std::string& reason);
     bool prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf);
     void clearSvrasterTsdfInitContext();
@@ -239,11 +246,23 @@ protected:
         torch::Tensor success; // [N,8] bool
         torch::Tensor points_world; // [N,8,3] float32, sampled SVRaster corners
     };
+    struct TsdfSupportMasks {
+        torch::Tensor valid;           // [N] bool, enough weighted TSDF corners
+        torch::Tensor has_zero_crossing; // [N] bool, weighted corners straddle zero
+        torch::Tensor near_surface;    // [N] bool, at least one weighted corner inside the surface band
+        torch::Tensor surface_support; // [N] bool, zero crossing or near surface
+        torch::Tensor free_space;      // [N] bool, valid and positive outside the surface band
+    };
     TsdfCornerSample sampleTsdfAtVoxelCornersWorld(
         const torch::Tensor& centers_world,  // [N,3]
         const torch::Tensor& sizes_world     // [N,1] or [N]
     );
-    TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld();
+    TsdfCornerSample sampleTsdfAtSvrasterGridCornersWorld(bool include_points_world = false);
+    TsdfSupportMasks computeTsdfSupportMasksFromCorners(
+        const TsdfCornerSample& corners,
+        float min_weight,
+        float surface_band_vox,
+        int min_valid_corners) const;
     void recordTsdfPruneAblation(
         const torch::Tensor& tsdf_prune_mask,
         const std::string& tag);
@@ -311,7 +330,8 @@ protected:
         int iteration,
         const torch::Tensor& centers,
         const torch::Tensor& sizes,
-        const torch::Tensor& colors);
+        const torch::Tensor& colors,
+        const torch::Tensor& local_view_counts = torch::Tensor());
     torch::Tensor computeNvbloxProjectiveSdfForCorners(
         const torch::Tensor& corner_points,
         const std::string& nvblox_mesh_path);
@@ -323,6 +343,11 @@ protected:
         const torch::Tensor& pruned_by_near,
         const torch::Tensor& pruned_by_recent_unstable,
         const torch::Tensor& pruned_by_final_special = torch::Tensor());
+    void appendUnstablePrunedVoxels(
+        int iteration,
+        const torch::Tensor& centers,
+        const torch::Tensor& sizes,
+        const torch::Tensor& pruned_by_recent_unstable);
     void logWholeRunNvbloxMeshToRerun(int iteration);
     void logReconstructionMeshToRerun(int iteration);
     void logNvbloxReconstructionMeshToRerun(int iteration);
@@ -411,6 +436,8 @@ protected:
     std::vector<std::size_t> kfid_shuffle_;
     std::size_t kfid_shuffle_idx_ = 0;
     std::map<std::size_t,int> kfs_used_times_;
+    torch::Tensor pending_recent_unstable_prune_mask_;
+    std::unordered_set<int32_t> recent_unstable_checked_birth_kfs_;
 
     // Status
     bool initial_mapped_;
@@ -445,6 +472,7 @@ protected:
 
     // Artificial dense-core fill
     bool fill_empty_cells_ = false;
+    float dense_core_pcd_density_rate_ = 0.005f;
 
     // RGBD fill holes
     torch::Tensor rgbd_fill_render_holes_cache_points_;
@@ -452,6 +480,9 @@ protected:
     bool rgbd_fill_render_holes_ = false;
     int rgbd_fill_render_holes_stride_ = 2;
     int rgbd_fill_render_holes_max_points_per_kf_ = 20000;
+    bool rgbd_surface_band_support_ = false;
+    float rgbd_surface_band_half_width_ratio_ = 0.05f;
+    float rgbd_surface_band_sample_spacing_vox_ = 1.0f;
 
     // Monocular flood-full fill holes
     bool rendered_depth_insert_ = false;

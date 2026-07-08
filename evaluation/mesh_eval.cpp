@@ -1044,8 +1044,8 @@ bool loadNpyPoints3(const std::string& npy_path, std::vector<cv::Point3f>& pts)
 
     std::smatch m;
     std::regex descr_re("'descr'\\s*:\\s*'([^']+)'");
-    std::regex fortran_re("fortran_order\\s*:\\s*(True|False)");
-    std::regex shape_re("shape\\s*:\\s*\\(([^\\)]*)\\)");
+    std::regex fortran_re("'?fortran_order'?\\s*:\\s*(True|False)");
+    std::regex shape_re("'?shape'?\\s*:\\s*\\(([^\\)]*)\\)");
 
     std::string descr;
     bool fortran = false;
@@ -2301,7 +2301,7 @@ int main(int argc, char** argv)
         "{align_stride  |1| stride for trajectory pair sampling in Sim(3) fit }"
         "{align_max_pairs|0| max pose pairs for Sim(3) fit (0=all sampled pairs) }"
         "{save_aligned_mesh|0| save the aligned reconstruction mesh to the output directory }"
-        "{gs_unseen_npy | | unseen GT point cloud .npy for gaussian_slam random-view rejection }"
+        "{gs_unseen_npy | | unseen GT point cloud .npy for gaussian_slam random-view rejection; if empty and --gt ends with _culled.ply, infer _pc_unseen.npy }"
         "{gs_depth_views|1000| number of random views for gaussian_slam depth evaluation }"
         "{gs_depth_w    |500| gaussian_slam depth image width }"
         "{gs_depth_h    |500| gaussian_slam depth image height }"
@@ -2344,7 +2344,7 @@ int main(int argc, char** argv)
     const int align_stride = parser.get<int>("align_stride");
     const int align_max_pairs = parser.get<int>("align_max_pairs");
     const bool save_aligned_mesh = parser.get<int>("save_aligned_mesh") != 0;
-    const std::string gs_unseen_npy = parser.get<std::string>("gs_unseen_npy");
+    std::string gs_unseen_npy = parser.get<std::string>("gs_unseen_npy");
 
     std::filesystem::create_directories(out_dir);
     DepthHeatmapSettings heatmap_settings;
@@ -2375,6 +2375,26 @@ int main(int argc, char** argv)
     {
         std::cerr << "[mesh_eval] gt not found: " << gt_path << "\n";
         return 1;
+    }
+    if (gs_unseen_npy.empty())
+    {
+        const std::string suffix = "_culled.ply";
+        if (gt_path.size() >= suffix.size() &&
+            gt_path.compare(gt_path.size() - suffix.size(), suffix.size(), suffix) == 0)
+        {
+            gs_unseen_npy = gt_path.substr(0, gt_path.size() - suffix.size()) + "_pc_unseen.npy";
+            if (!std::filesystem::exists(gs_unseen_npy))
+            {
+                std::cout << "[mesh_eval] inferred gaussian_slam unseen file not found: "
+                          << gs_unseen_npy << "\n";
+                gs_unseen_npy.clear();
+            }
+            else
+            {
+                std::cout << "[mesh_eval] inferred gaussian_slam unseen file: "
+                          << gs_unseen_npy << "\n";
+            }
+        }
     }
 
     EvalMode eval_mode = EvalMode::Current;
@@ -2897,52 +2917,39 @@ int main(int argc, char** argv)
     return 0;
 }
 
-// voxel photoslam
+// Replica 
 // ./bin/mesh_eval \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
-//   --gt=scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/mesh_eval \
-//   --tau_cm=5.0 \
-//   --recon_samples=500000 \
-//   --gt_samples=500000 \
+//   --eval_mode=gaussian_slam_sim3 \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5881_shutdown/ply/voxel_model/iteration_5881/voxel_surface_mesh.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5881_shutdown/mesh_eval_gs_sim3 \
+//   --tau_cm=1.0 \
 //   --eval_depth_mesh=1 \
-//   --traj=scripts/data/Replica/office0/traj.txt \
-//   --traj_mode=c2w \
-//   --cam_json=scripts/data/Replica/cam_params.json \
-//   --frame_stride=1 \
-//   --max_frames=1000 \
-//   --near=0.05 \
-//   --far=20.0 \
 //   --align_recon_to_gt=1 \
+//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
+
+// TUM
+//   ./bin/mesh_eval \
+//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments/5881_shutdown/ply/voxel_model/iteration_5881/voxel_surface_mesh.ply \
+//   --gt=results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply \
+//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments/5881_shutdown/mesh_eval_nvblox \
+//   --tau_cm=5.0 \
+//   --recon_samples=500000 \
+//   --gt_samples=500000
+
 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/6801_shutdown/ply/voxel_model/iteration_6801/voxel_surface_mesh.ply \
-//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/6801_shutdown/mesh_eval_gs_sim3 \
-//   --tau_cm=5.0 \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments/sdf_evidence_zero_crossing_refresh/ply/voxel_model/iteration_2896/voxel_surface_mesh.ply \
+//   --gt=/home/dimitris/Photo-SLAM/third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments/sdf_evidence_zero_crossing_refresh/mesh_eval_gs_table3 \
+//   --tau_cm=1.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
 //   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
-
-// ./bin/mesh_eval \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/ply/voxel_model/iteration_3771/voxel_surface_mesh.ply \
-//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/3771_shutdown/mesh_eval_aligned \
-//   --tau_cm=5.0 \
-//   --eval_depth_mesh=1 \
-//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
-//   --traj_mode=c2w \
-//   --cam_json=/home/dimitris/Photo-SLAM/scripts/data/Replica/cam_params.json \
-//   --align_recon_to_gt=1 \
-//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
-//   --save_aligned_mesh=1 \
-//   --save_depth_heatmaps=1 \
-//   --frame_stride=1 --max_frames=1000 --depth_heatmap_max_frames=50
-
-  

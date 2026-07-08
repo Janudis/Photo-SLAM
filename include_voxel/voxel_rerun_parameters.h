@@ -13,6 +13,7 @@ struct VoxelRerunParameters
     int rerun_keyframe_start_ = 0;
     bool run_tsdf_pruned_ = false;
     bool rerun_tsdf_unknown_voxels_ = false;
+    bool rerun_unstable_ = false;
     bool run_floaters_ = false;
     bool run_whole_run_ = false;
     bool run_sdf_pruned_nvblox_ = false;
@@ -48,6 +49,7 @@ struct VoxelRerunState
 {
     bool rerun_tsdf_unknown_dirty_ = false;
     bool run_floaters_dirty_ = false;
+    bool whole_run_live_voxels_dirty_ = true;
 
     torch::Tensor whole_run_pruned_centers_accum_;
     torch::Tensor whole_run_pruned_sizes_accum_;
@@ -67,6 +69,10 @@ struct VoxelRerunState
     torch::Tensor whole_run_pruned_final_special_centers_accum_;
     torch::Tensor whole_run_pruned_final_special_sizes_accum_;
     torch::Tensor whole_run_pruned_final_special_colors_accum_;
+    torch::Tensor whole_run_live_local_view_counts_cache_;
+    torch::Tensor unstable_pruned_centers_accum_;
+    torch::Tensor unstable_pruned_sizes_accum_;
+    torch::Tensor unstable_pruned_colors_accum_;
 
     torch::Tensor rerun_gt_sdf_grid_keys_cpu_;
     torch::Tensor rerun_gt_sdf_grid_pts_cpu_;

@@ -752,6 +752,7 @@ class RerunVisualizer:
         entity_path: str = "world/voxels",
         max_boxes: int = 1000000,
         iteration: Optional[int] = None,
+        metadata: Optional[dict] = None,
     ) -> None:
         """
         Visualize voxel grid as 3D boxes.
@@ -797,6 +798,15 @@ class RerunVisualizer:
                 print("[PY][voxels] colors length mismatch, ignoring colors")
                 colors = None
 
+        metadata_values = {}
+        if metadata is not None:
+            for key, value in dict(metadata).items():
+                arr = np.asarray(value)
+                if arr.shape[0] == N:
+                    metadata_values[str(key)] = arr
+                else:
+                    print(f"[PY][voxels] metadata '{key}' length mismatch, ignoring it")
+
         # Downsample if too many
         # print(f"[PY][voxels] visualizing {N} boxes")
         if max_boxes is not None and int(max_boxes) > 0 and N > int(max_boxes):
@@ -806,7 +816,23 @@ class RerunVisualizer:
             half_sizes = half_sizes[idx]
             if colors is not None:
                 colors = colors[idx]
+            if metadata_values:
+                metadata_values = {
+                    key: np.asarray(value)[idx]
+                    for key, value in metadata_values.items()
+                }
             N = int(max_boxes)
+
+        labels = None
+        if metadata_values:
+            label_parts = []
+            for key in sorted(metadata_values.keys()):
+                values = np.asarray(metadata_values[key]).reshape(-1)
+                label_parts.append((key, values))
+            labels = [
+                " ".join(f"{key}={values[i]}" for key, values in label_parts)
+                for i in range(N)
+            ]
 
         # print(
         #     f"[PY][voxels] logging {N} boxes to '{entity_path}' "
@@ -814,15 +840,15 @@ class RerunVisualizer:
         #     f"hs_min={half_sizes.min()}, hs_max={half_sizes.max()}"
         # )
 
-        rr.log(
-            entity_path,
-            rr.Boxes3D(
-                centers=centers,
-                half_sizes=half_sizes,
-                colors=colors,
-                fill_mode="solid",
-            ),
+        box_kwargs = dict(
+            centers=centers,
+            half_sizes=half_sizes,
+            colors=colors,
+            fill_mode="solid",
         )
+        if labels is not None:
+            box_kwargs["labels"] = labels
+        rr.log(entity_path, rr.Boxes3D(**box_kwargs))
 
     def visualize_voxels_mesh(
         self,
@@ -1104,6 +1130,7 @@ class RerunVisualizer:
         entity_path: str = "world/voxels",
         max_boxes: int = 1000000,
         iteration: Optional[int] = None,
+        metadata: Optional[dict] = None,
     ) -> None:
         rec = self._ensure_debug_recording(str(recording_name))
         if rec is None:
@@ -1116,6 +1143,7 @@ class RerunVisualizer:
                 entity_path=entity_path,
                 max_boxes=max_boxes,
                 iteration=iteration,
+                metadata=metadata,
             )
 
     def visualize_sdf_voxels_recording(

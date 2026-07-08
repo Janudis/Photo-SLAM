@@ -67,6 +67,7 @@ Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.enable_rerun: 0  # 0:disable all rerun logging/saving, 1:enable
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
+Record.rerun_unstable: 0 # write unstable.rrd with voxels pruned by prune_recent_unstable
 Record.save_nvblox_mesh_eval: 0 # RGB-D only: run nvblox and save one final reference mesh at shutdown
 Record.load_saved_nvblox_mesh: 9 # RGB-D only: load an existing reference mesh instead of running nvblox
 Record.saved_nvblox_mesh_path: "/home/dimitris/Photo-SLAM/results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply"

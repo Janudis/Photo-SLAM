@@ -17,7 +17,7 @@ class RerunVisualizer:
     """
     Rerun visualizer for Photo-SLAM + SVRaster.
 
-    This is intentionally very close to nvblox_torch's RerunVisualizer:
+    This is a thin mesh/voxel logging helper for Photo-SLAM Rerun recordings:
     - world/camera_0: pose, axes, image, observations
     - world/trajectory: camera trajectory
     - world/mesh: color mesh (TSDF or voxel mesh)
@@ -188,7 +188,7 @@ class RerunVisualizer:
             print(f"[RERUN] Failed to save debug recording {name} to {path}: {e}")
 
     # ----------------------------------------------------------------------
-    #  Low-level helpers (similar to nvblox RerunVisualizer)
+    #  Low-level mesh helpers
     # ----------------------------------------------------------------------
 
     def _log_rig_pose(self, t_W_C: npt.NDArray, q_W_C_xyzw: npt.NDArray) -> None:
@@ -516,29 +516,29 @@ class RerunVisualizer:
                 self._visualize_mesh(verts, faces, colors, entity_path=entity_path)
                 self._debug_gt_mesh_logged.add(key)
 
-    def visualize_nvblox_ply(
+    def visualize_ply_mesh(
         self,
         ply_path: str,
         iteration: int,
-        entity_path: str = "world/tsdf_mesh/live",
+        entity_path: str = "world/sdf_mesh/live",
     ):
         """
         Called from C++:
-            impl_->visualizer.attr("visualize_nvblox_ply")(py::str(ply_path), iteration, entity_path)
-        Loads the NVBlox color mesh PLY and logs it to Rerun.
+            impl_->visualizer.attr("visualize_ply_mesh")(py::str(ply_path), iteration, entity_path)
+        Loads a triangle mesh PLY and logs it to Rerun.
         """
-        # print("[RERUN] visualize_nvblox_ply called")
+        # print("[RERUN] visualize_ply_mesh called")
         # print("         ply_path:", ply_path)
         # print("         iteration:", iteration)
 
         if not os.path.exists(ply_path):
-            print("[RERUN] visualize_nvblox_ply: file does not exist")
+            print("[RERUN] visualize_ply_mesh: file does not exist")
             return
 
         # 1) Load mesh using Open3D
         mesh = o3d.io.read_triangle_mesh(ply_path)
         if mesh.is_empty():
-            print("[RERUN] visualize_nvblox_ply: loaded mesh is EMPTY")
+            print("[RERUN] visualize_ply_mesh: loaded mesh is EMPTY")
             return
 
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -547,11 +547,11 @@ class RerunVisualizer:
         v_colors = np.asarray(mesh.vertex_colors)
         if v_colors.size == 0:
             colors = None
-            print("[RERUN] visualize_nvblox_ply: no vertex colors in mesh")
+            print("[RERUN] visualize_ply_mesh: no vertex colors in mesh")
         else:
             if v_colors.shape[0] != vertices.shape[0]:
                 print(
-                    "[RERUN] visualize_nvblox_ply: colors/vertices mismatch, "
+                    "[RERUN] visualize_ply_mesh: colors/vertices mismatch, "
                     f"vertices={vertices.shape[0]}, colors={v_colors.shape[0]} – ignoring colors"
                 )
                 colors = None
@@ -574,18 +574,30 @@ class RerunVisualizer:
         # 4) Log
         self._visualize_mesh(vertices, faces, colors, entity_path=entity_path)
 
-    def visualize_nvblox_ply_recording(
+    def visualize_nvblox_ply(self, ply_path: str, iteration: int, entity_path: str = "world/sdf_mesh/live"):
+        self.visualize_ply_mesh(ply_path, iteration, entity_path)
+
+    def visualize_ply_mesh_recording(
         self,
         recording_name: str,
         ply_path: str,
         iteration: int,
-        entity_path: str = "world/nvblox_mesh/reference",
+        entity_path: str = "world/mesh/reference",
     ) -> None:
         rec = self._ensure_debug_recording(str(recording_name))
         if rec is None:
             return
         with rec:
-            self.visualize_nvblox_ply(ply_path, iteration, entity_path)
+            self.visualize_ply_mesh(ply_path, iteration, entity_path)
+
+    def visualize_nvblox_ply_recording(
+        self,
+        recording_name: str,
+        ply_path: str,
+        iteration: int,
+        entity_path: str = "world/mesh/reference",
+    ) -> None:
+        self.visualize_ply_mesh_recording(recording_name, ply_path, iteration, entity_path)
 
     def _visualize_mesh(
         self,
@@ -646,7 +658,7 @@ class RerunVisualizer:
         # print("[RERUN] logging Mesh3D to", entity_path)
         rr.log(entity_path, mesh)
 
-    def visualize_nvblox(
+    def visualize_triangle_mesh(
         self,
         vertices: npt.NDArray,
         colors: Optional[npt.NDArray],
@@ -654,7 +666,7 @@ class RerunVisualizer:
         iteration: Optional[int] = None,
     ) -> None:
         """
-        Visualize a mesh (e.g. from nvblox TSDF or a voxel mesh exported from SVRaster).
+        Visualize a triangle mesh.
 
         Args:
             vertices:  (N,3) float32
@@ -678,9 +690,18 @@ class RerunVisualizer:
             else:
                 c = None
 
-        self._visualize_mesh(v, f, c, entity_path="world/tsdf_mesh/live")
+        self._visualize_mesh(v, f, c, entity_path="world/sdf_mesh/live")
 
-    def visualize_nvblox_recording(
+    def visualize_nvblox(
+        self,
+        vertices: npt.NDArray,
+        colors: Optional[npt.NDArray],
+        triangles: npt.NDArray,
+        iteration: Optional[int] = None,
+    ) -> None:
+        self.visualize_triangle_mesh(vertices, colors, triangles, iteration)
+
+    def visualize_triangle_mesh_recording(
         self,
         recording_name: str,
         vertices: npt.NDArray,
@@ -709,6 +730,18 @@ class RerunVisualizer:
                     c = None
 
             self._visualize_mesh(v, f, c, entity_path=entity_path)
+
+    def visualize_nvblox_recording(
+        self,
+        recording_name: str,
+        vertices: npt.NDArray,
+        colors: Optional[npt.NDArray],
+        triangles: npt.NDArray,
+        iteration: Optional[int] = None,
+        entity_path: str = "world/mesh",
+    ) -> None:
+        self.visualize_triangle_mesh_recording(
+            recording_name, vertices, colors, triangles, iteration, entity_path)
 
     def visualize_camera(
         self,

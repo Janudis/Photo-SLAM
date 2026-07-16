@@ -1,4 +1,4 @@
-#include "include_voxel/voxel_svraster_rasterizer.h"
+#include "include_voxel/voxel_svrecon_rasterizer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -7,12 +7,27 @@
 #include <ATen/TensorIndexing.h>
 #include <torch/nn/functional/upsampling.h>
 
-#include "src/backward.h"
-#include "src/forward.h"
-#include "src/geo_params_gather.h"
-#include "src/preprocess.h"
-#include "src/raster_state.h"
-#include "src/sh_compute.h"
+#define PREPROCESS SVRECON_PREPROCESS
+#define FORWARD SVRECON_FORWARD
+#define BACKWARD SVRECON_BACKWARD
+#define RASTER_STATE SVRECON_RASTER_STATE
+#define GEO_PARAMS_GATHER SVRECON_GEO_PARAMS_GATHER
+#define SH_COMPUTE SVRECON_SH_COMPUTE
+#define TV_COMPUTE SVRECON_TV_COMPUTE
+#define VG_COMPUTE SVRECON_VG_COMPUTE
+#define GE_COMPUTE SVRECON_GE_COMPUTE
+#define LS_COMPUTE SVRECON_LS_COMPUTE
+#define PL_COMPUTE SVRECON_PL_COMPUTE
+#define UTILS SVRECON_UTILS
+#define ADAM_STEP SVRECON_ADAM_STEP
+
+#include "third_party/SVRecon/cuda/src/backward.h"
+#include "third_party/SVRecon/cuda/src/config.h"
+#include "third_party/SVRecon/cuda/src/forward.h"
+#include "third_party/SVRecon/cuda/src/geo_params_gather.h"
+#include "third_party/SVRecon/cuda/src/preprocess.h"
+#include "third_party/SVRecon/cuda/src/raster_state.h"
+#include "third_party/SVRecon/cuda/src/sh_compute.h"
 
 namespace sv {
 namespace {
@@ -33,14 +48,33 @@ torch::Tensor resizeRendering(
     const std::vector<int64_t>& size,
     const std::string& mode = "bilinear") {
     namespace F = torch::nn::functional;
-    auto input = render.unsqueeze(0);
+    torch::Tensor input;
+    int squeeze_dims = 0;
+    if (render.dim() == 2) {
+        input = render.unsqueeze(0).unsqueeze(0);
+        squeeze_dims = 2;
+    } else if (render.dim() == 3) {
+        input = render.unsqueeze(0);
+        squeeze_dims = 1;
+    } else if (render.dim() == 4) {
+        input = render;
+    } else {
+        return render;
+    }
     auto opts = F::InterpolateFuncOptions().size(size);
     if (mode == "nearest") {
         opts = opts.mode(torch::kNearest);
     } else {
         opts = opts.mode(torch::kBilinear).align_corners(false);
     }
-    return F::interpolate(input, opts).squeeze(0);
+    auto out = F::interpolate(input, opts);
+    if (squeeze_dims == 2) {
+        return out.squeeze(0).squeeze(0);
+    }
+    if (squeeze_dims == 1) {
+        return out.squeeze(0);
+    }
+    return out;
 }
 
 std::string normalizeColorMode(const char* color_mode, int& active_sh_degree) {
@@ -60,7 +94,7 @@ std::string normalizeColorMode(const char* color_mode, int& active_sh_degree) {
     return mode;
 }
 
-class SvrasterGatherGeoFunction : public torch::autograd::Function<SvrasterGatherGeoFunction> {
+class SvreconGatherGeoFunction : public torch::autograd::Function<SvreconGatherGeoFunction> {
 public:
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
@@ -68,11 +102,11 @@ public:
         torch::Tensor care_idx,
         torch::Tensor grid_pts) {
         TORCH_CHECK(vox_key.dim() == 2 && vox_key.size(1) == 8,
-                    "SvrasterGatherGeoFunction: vox_key must be [N,8]");
+                    "SvreconGatherGeoFunction: vox_key must be [N,8]");
         TORCH_CHECK(care_idx.dim() == 1,
-                    "SvrasterGatherGeoFunction: care_idx must be [K]");
+                    "SvreconGatherGeoFunction: care_idx must be [K]");
         TORCH_CHECK(grid_pts.numel() == grid_pts.size(0),
-                    "SvrasterGatherGeoFunction: grid_pts must be [M] or [M,1]");
+                    "SvreconGatherGeoFunction: grid_pts must be [M] or [M,1]");
         torch::Tensor grid_flat = grid_pts.contiguous().view({-1, 1});
         torch::Tensor geo = GEO_PARAMS_GATHER::gather_triinterp_geo_params(
             vox_key.contiguous(),
@@ -102,7 +136,7 @@ public:
     }
 };
 
-class SvrasterSHFunction : public torch::autograd::Function<SvrasterSHFunction> {
+class SvreconSHFunction : public torch::autograd::Function<SvreconSHFunction> {
 public:
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
@@ -151,11 +185,11 @@ public:
     }
 };
 
-class SvrasterVoxelsFunction : public torch::autograd::Function<SvrasterVoxelsFunction> {
+class SvreconVoxelsFunction : public torch::autograd::Function<SvreconVoxelsFunction> {
 public:
     static torch::autograd::tensor_list forward(
         torch::autograd::AutogradContext* ctx,
-        SvrasterRasterizationSettings raster_settings,
+        SvreconRasterizationSettings raster_settings,
         torch::Tensor geomBuffer,
         torch::Tensor octree_paths,
         torch::Tensor vox_centers,
@@ -163,10 +197,12 @@ public:
         torch::Tensor geos,
         torch::Tensor rgbs,
         torch::Tensor vox_feats,
-        torch::Tensor subdiv_p) {
+        torch::Tensor subdiv_p,
+        torch::Tensor s_val) {
         const bool need_distortion = raster_settings.lambda_dist > 0.0f;
         auto result = FORWARD::rasterize_voxels(
-            raster_settings.n_samp_per_vox,
+            VOX_TRIINTERP1_MODE,
+            SDF_MODE,
             raster_settings.image_width,
             raster_settings.image_height,
             raster_settings.tanfovx,
@@ -175,7 +211,8 @@ public:
             raster_settings.cy,
             raster_settings.w2c_matrix.contiguous(),
             raster_settings.c2w_matrix.contiguous(),
-            raster_settings.bg_color,
+            raster_settings.bg_color.contiguous(),
+            raster_settings.cam_mode,
             raster_settings.need_depth,
             need_distortion,
             raster_settings.need_normal,
@@ -187,7 +224,8 @@ public:
             rgbs.contiguous(),
             vox_feats.contiguous(),
             geomBuffer.contiguous(),
-            raster_settings.debug);
+            raster_settings.debug,
+            s_val.contiguous());
 
         int num_rendered = std::get<0>(result);
         torch::Tensor binningBuffer = std::get<1>(result);
@@ -197,7 +235,8 @@ public:
         torch::Tensor out_normal = std::get<5>(result);
         torch::Tensor out_T = std::get<6>(result);
         torch::Tensor max_w = std::get<7>(result);
-        torch::Tensor out_feat = std::get<8>(result);
+        torch::Tensor out_sdf0 = std::get<8>(result);
+        torch::Tensor out_feat = std::get<9>(result);
         auto image_state = RASTER_STATE::unpack_ImageState(
             raster_settings.image_width,
             raster_settings.image_height,
@@ -205,18 +244,14 @@ public:
         torch::Tensor n_contrib = std::get<2>(image_state);
 
         ctx->saved_data["num_rendered"] = num_rendered;
-        ctx->saved_data["n_samp_per_vox"] = raster_settings.n_samp_per_vox;
         ctx->saved_data["image_width"] = raster_settings.image_width;
         ctx->saved_data["image_height"] = raster_settings.image_height;
         ctx->saved_data["tanfovx"] = raster_settings.tanfovx;
         ctx->saved_data["tanfovy"] = raster_settings.tanfovy;
         ctx->saved_data["cx"] = raster_settings.cx;
         ctx->saved_data["cy"] = raster_settings.cy;
-        ctx->saved_data["bg_color"] = raster_settings.bg_color;
         ctx->saved_data["lambda_R_concen"] = raster_settings.lambda_R_concen;
         ctx->saved_data["lambda_ascending"] = raster_settings.lambda_ascending;
-        ctx->saved_data["lambda_scaling_penalty"] = raster_settings.lambda_scaling_penalty;
-        ctx->saved_data["min_voxel_size"] = raster_settings.min_voxel_size;
         ctx->saved_data["lambda_dist"] = raster_settings.lambda_dist;
         ctx->saved_data["need_depth"] = raster_settings.need_depth;
         ctx->saved_data["need_normal"] = raster_settings.need_normal;
@@ -224,6 +259,7 @@ public:
         ctx->save_for_backward({
             raster_settings.w2c_matrix.contiguous(),
             raster_settings.c2w_matrix.contiguous(),
+            raster_settings.bg_color.contiguous(),
             raster_settings.gt_color.defined() ? raster_settings.gt_color.contiguous()
                                                : emptyCudaLike(out_color, {0}),
             octree_paths.contiguous(),
@@ -234,10 +270,11 @@ public:
             geomBuffer.contiguous(),
             binningBuffer.contiguous(),
             imgBuffer.contiguous(),
-            out_color.contiguous(),
             out_T.contiguous(),
             out_depth.contiguous(),
-            out_normal.contiguous()});
+            out_normal.contiguous(),
+            s_val.contiguous(),
+            out_sdf0.contiguous()});
 
         return {out_color, out_depth, out_normal, out_T, max_w, n_contrib, out_feat};
     }
@@ -248,28 +285,34 @@ public:
         auto saved = ctx->get_saved_variables();
         auto w2c = saved[0];
         auto c2w = saved[1];
-        auto gt_color = saved[2];
-        auto octree_paths = saved[3];
-        auto vox_centers = saved[4];
-        auto vox_lengths = saved[5];
-        auto geos = saved[6];
-        auto rgbs = saved[7];
-        auto geomBuffer = saved[8];
-        auto binningBuffer = saved[9];
-        auto imgBuffer = saved[10];
-        auto out_color = saved[11];
+        auto bg_color = saved[2];
+        auto gt_color = saved[3];
+        auto octree_paths = saved[4];
+        auto vox_centers = saved[5];
+        auto vox_lengths = saved[6];
+        auto geos = saved[7];
+        auto rgbs = saved[8];
+        auto geomBuffer = saved[9];
+        auto binningBuffer = saved[10];
+        auto imgBuffer = saved[11];
         auto out_T = saved[12];
         auto out_depth = saved[13];
         auto out_normal = saved[14];
+        auto s_val = saved[15];
+        auto out_sdf0 = saved[16];
 
-        torch::Tensor dcolor = definedOrZerosLike(grad_outputs[0], out_color);
+        torch::Tensor dcolor = definedOrZerosLike(grad_outputs[0], rgbs.new_zeros({3, 1, 1}));
+        if (grad_outputs[0].defined()) {
+            dcolor = grad_outputs[0].contiguous();
+        }
         torch::Tensor ddepth = definedOrZerosLike(grad_outputs[1], out_depth);
         torch::Tensor dnormal = definedOrZerosLike(grad_outputs[2], out_normal);
         torch::Tensor dT = definedOrZerosLike(grad_outputs[3], out_T);
 
         auto bw = BACKWARD::rasterize_voxels_backward(
             ctx->saved_data["num_rendered"].toInt(),
-            ctx->saved_data["n_samp_per_vox"].toInt(),
+            VOX_TRIINTERP1_MODE,
+            SDF_MODE,
             ctx->saved_data["image_width"].toInt(),
             ctx->saved_data["image_height"].toInt(),
             static_cast<float>(ctx->saved_data["tanfovx"].toDouble()),
@@ -278,7 +321,7 @@ public:
             static_cast<float>(ctx->saved_data["cy"].toDouble()),
             w2c,
             c2w,
-            static_cast<float>(ctx->saved_data["bg_color"].toDouble()),
+            bg_color,
             octree_paths,
             vox_centers,
             vox_lengths,
@@ -295,14 +338,14 @@ public:
             static_cast<float>(ctx->saved_data["lambda_R_concen"].toDouble()),
             gt_color,
             static_cast<float>(ctx->saved_data["lambda_ascending"].toDouble()),
-            static_cast<float>(ctx->saved_data["lambda_scaling_penalty"].toDouble()),
-            static_cast<float>(ctx->saved_data["min_voxel_size"].toDouble()),
             static_cast<float>(ctx->saved_data["lambda_dist"].toDouble()),
             ctx->saved_data["need_depth"].toBool(),
             ctx->saved_data["need_normal"].toBool(),
             out_depth,
             out_normal,
-            ctx->saved_data["debug"].toBool());
+            ctx->saved_data["debug"].toBool(),
+            s_val,
+            out_sdf0);
 
         return {
             torch::Tensor(), // raster settings
@@ -313,12 +356,13 @@ public:
             std::get<0>(bw),
             std::get<1>(bw),
             torch::Tensor(), // vox_feats
-            std::get<2>(bw)};
+            std::get<2>(bw),
+            std::get<3>(bw)};
     }
 };
 
-torch::autograd::tensor_list rasterizeSvrasterVoxels(
-    SvrasterRasterizationSettings& settings,
+torch::autograd::tensor_list rasterizeSvreconVoxels(
+    SvreconRasterizationSettings& settings,
     torch::Tensor geomBuffer,
     torch::Tensor octree_paths,
     torch::Tensor vox_centers,
@@ -326,8 +370,9 @@ torch::autograd::tensor_list rasterizeSvrasterVoxels(
     torch::Tensor geos,
     torch::Tensor rgbs,
     torch::Tensor vox_feats,
-    torch::Tensor subdiv_p) {
-    return SvrasterVoxelsFunction::apply(
+    torch::Tensor subdiv_p,
+    torch::Tensor s_val) {
+    return SvreconVoxelsFunction::apply(
         settings,
         geomBuffer,
         octree_paths,
@@ -336,40 +381,43 @@ torch::autograd::tensor_list rasterizeSvrasterVoxels(
         geos,
         rgbs,
         vox_feats,
-        subdiv_p);
+        subdiv_p,
+        s_val);
 }
 
 } // namespace
 
-torch::autograd::tensor_list gatherSvrasterGeoParams(
+torch::autograd::tensor_list gatherSvreconGeoParams(
     torch::Tensor& vox_key,
     torch::Tensor& care_idx,
     torch::Tensor& grid_pts) {
-    torch::Tensor out = SvrasterGatherGeoFunction::apply(vox_key, care_idx, grid_pts);
+    torch::Tensor out = SvreconGatherGeoFunction::apply(vox_key, care_idx, grid_pts);
     return {out};
 }
 
-torch::autograd::tensor_list evalSvrasterSH(
+torch::autograd::tensor_list evalSvreconSH(
     int active_sh_degree,
     torch::Tensor& idx,
     torch::Tensor& vox_centers,
     torch::Tensor& cam_pos,
     torch::Tensor& sh0,
     torch::Tensor& shs) {
-    torch::Tensor out = SvrasterSHFunction::apply(
+    torch::Tensor out = SvreconSHFunction::apply(
         active_sh_degree, idx, vox_centers, cam_pos, sh0, shs);
     return {out};
 }
 
-std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
+std::unordered_map<std::string, torch::Tensor> renderSvreconDirect(
     const MiniCam& cam,
     int im_height,
     int im_width,
-    torch::Tensor geo_grid_pts,
+    torch::Tensor sdf_grid_pts,
     torch::Tensor sh0,
     torch::Tensor shs,
     torch::Tensor subdiv_p,
+    torch::Tensor log_s,
     torch::Tensor oct_path,
+    torch::Tensor is_leaf,
     torch::Tensor center,
     torch::Tensor vox_size,
     torch::Tensor vox_key,
@@ -378,7 +426,6 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
     bool white_background,
     bool black_background,
     float default_ss,
-    int n_samp_per_vox,
     const torch::Tensor& gt_image,
     const char* color_mode,
     bool track_max_w,
@@ -404,11 +451,22 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
         vox_size = vox_size.view({-1, 1});
     }
     oct_path = oct_path.to(device).contiguous().view({-1});
+    if (!is_leaf.defined() || is_leaf.numel() != center.size(0)) {
+        is_leaf = torch::ones(
+            {center.size(0)},
+            torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    } else {
+        is_leaf = is_leaf.to(device).to(torch::kUInt8).contiguous().view({-1});
+    }
     vox_key = vox_key.to(device).contiguous();
-    geo_grid_pts = geo_grid_pts.to(device).contiguous().view({-1, 1});
+    sdf_grid_pts = sdf_grid_pts.to(device).contiguous().view({-1, 1});
     sh0 = sh0.to(device).contiguous();
     shs = shs.to(device).contiguous();
     subdiv_p = subdiv_p.to(device).contiguous().view({-1, 1});
+    log_s = log_s.to(device).contiguous().view({-1});
+    if (log_s.numel() == 0) {
+        log_s = torch::full({1}, 0.3f, center.options());
+    }
 
     const float render_ss =
         ss.has_value() ? *ss : (other_opt.ss.has_value() ? *other_opt.ss : default_ss);
@@ -422,9 +480,8 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
     int active_degree = active_sh_degree;
     const std::string mode = normalizeColorMode(color_mode, active_degree);
 
-    SvrasterRasterizationSettings settings;
+    SvreconRasterizationSettings settings;
     settings.color_mode = mode;
-    settings.n_samp_per_vox = n_samp_per_vox;
     settings.image_width = w;
     settings.image_height = h;
     settings.tanfovx = cam.tanfovx;
@@ -433,15 +490,15 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
     settings.cy = cam.cy * h_ss;
     settings.w2c_matrix = cam.w2c.to(device).contiguous();
     settings.c2w_matrix = cam.c2w.to(device).contiguous();
-    settings.bg_color = white_background ? 1.0f : 0.0f;
-    settings.near = 0.01f;
+    const float bg = white_background ? 1.0f : 0.0f;
+    settings.bg_color = torch::full({3}, bg, center.options());
+    settings.cam_mode = CAM_PERSP;
+    settings.near = 0.02f;
     settings.need_depth = output_depth || other_opt.output_depth;
     settings.need_normal = output_normal || other_opt.output_normal;
     settings.track_max_w = track_max_w || other_opt.track_max_w;
     settings.lambda_R_concen = other_opt.lambda_R_concen.value_or(0.0f);
     settings.lambda_ascending = other_opt.lambda_ascending.value_or(0.0f);
-    settings.lambda_scaling_penalty = other_opt.lambda_scaling_penalty.value_or(0.0f);
-    settings.min_voxel_size = other_opt.min_voxel_size.value_or(0.0f);
     settings.lambda_dist = other_opt.lambda_dist.value_or(0.0f);
     settings.gt_color = other_opt.gt_color.defined()
         ? other_opt.gt_color.to(device).contiguous()
@@ -456,10 +513,12 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
         settings.cy,
         settings.w2c_matrix,
         settings.c2w_matrix,
+        settings.cam_mode,
         settings.near,
         oct_path,
         center,
         vox_size,
+        is_leaf,
         settings.debug);
     torch::Tensor n_duplicates = std::get<0>(prep);
     torch::Tensor geomBuffer = std::get<1>(prep);
@@ -469,26 +528,27 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
     if (frozen_vox_geo.defined() && frozen_vox_geo.numel() > 0) {
         geos = frozen_vox_geo.to(device).contiguous();
     } else {
-        geos = SvrasterGatherGeoFunction::apply(vox_key, in_frusts_idx, geo_grid_pts);
+        geos = SvreconGatherGeoFunction::apply(vox_key, in_frusts_idx, sdf_grid_pts);
     }
 
     torch::Tensor rgbs;
     if (mode == "sh") {
         torch::Tensor cam_pos = settings.c2w_matrix.index({torch::indexing::Slice(0, 3), 3}).contiguous();
-        rgbs = SvrasterSHFunction::apply(active_degree, in_frusts_idx, center, cam_pos, sh0, shs);
+        rgbs = SvreconSHFunction::apply(active_degree, in_frusts_idx, center, cam_pos, sh0, shs);
     } else if (mode == "rand") {
         rgbs = torch::rand({center.size(0), 3}, center.options());
     } else if (mode == "dontcare") {
         rgbs = torch::empty({center.size(0), 3}, center.options());
     } else {
-        throw std::runtime_error("Unsupported SVRaster color mode: " + mode);
+        throw std::runtime_error("Unsupported SVRecon color mode: " + mode);
     }
 
     torch::Tensor vox_feats = other_opt.vox_feats.defined() && other_opt.vox_feats.numel() > 0
         ? other_opt.vox_feats.to(device).contiguous()
         : torch::empty({center.size(0), 0}, center.options());
+    torch::Tensor s_val = torch::exp(log_s * 10.0f).contiguous();
 
-    auto result = rasterizeSvrasterVoxels(
+    auto result = rasterizeSvreconVoxels(
         settings,
         geomBuffer,
         oct_path,
@@ -497,7 +557,8 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
         geos,
         rgbs,
         vox_feats,
-        subdiv_p);
+        subdiv_p,
+        s_val);
 
     torch::Tensor color = result[0];
     torch::Tensor depth = result[1];
@@ -561,7 +622,7 @@ std::unordered_map<std::string, torch::Tensor> renderSvrasterDirect(
     return render_pkg;
 }
 
-torch::Tensor markSvrasterMaxSampRateDirect(
+torch::Tensor markSvreconMaxSampRateDirect(
     const std::vector<MiniCam>& cameras,
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
@@ -578,6 +639,8 @@ torch::Tensor markSvrasterMaxSampRateDirect(
     torch::Device device = centers.device();
     torch::Tensor max_samp_rate =
         torch::zeros({N}, centers.options().dtype(torch::kFloat32));
+    torch::Tensor is_leaf =
+        torch::ones({N}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
 
     for (const auto& cam : cameras) {
         auto prep = PREPROCESS::rasterize_preprocess(
@@ -589,10 +652,12 @@ torch::Tensor markSvrasterMaxSampRateDirect(
             cam.cy,
             cam.w2c.to(device).contiguous(),
             cam.c2w.to(device).contiguous(),
+            CAM_PERSP,
             near,
             octree_paths.contiguous(),
             centers,
             vox_lengths.contiguous(),
+            is_leaf,
             /*debug=*/false);
         torch::Tensor n_duplicates = std::get<0>(prep);
         torch::Tensor pos = cam.position.to(device).to(torch::kFloat32).view({1, 3});
@@ -612,7 +677,7 @@ torch::Tensor markSvrasterMaxSampRateDirect(
     return max_samp_rate.contiguous();
 }
 
-torch::Tensor markSvrasterNearDirect(
+torch::Tensor markSvreconNearDirect(
     const std::vector<MiniCam>& cameras,
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
@@ -629,6 +694,8 @@ torch::Tensor markSvrasterNearDirect(
     torch::Device device = centers.device();
     torch::Tensor is_near =
         torch::zeros({N}, centers.options().dtype(torch::kBool));
+    torch::Tensor is_leaf =
+        torch::ones({N}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
 
     for (const auto& cam : cameras) {
         auto prep = PREPROCESS::rasterize_preprocess(
@@ -640,13 +707,16 @@ torch::Tensor markSvrasterNearDirect(
             cam.cy,
             cam.w2c.to(device).contiguous(),
             cam.c2w.to(device).contiguous(),
+            CAM_PERSP,
             near,
             octree_paths.contiguous(),
             centers,
             vox_lengths.contiguous(),
+            is_leaf,
             /*debug=*/false);
         torch::Tensor n_duplicates = std::get<0>(prep);
-        torch::Tensor vis_idx = torch::nonzero(n_duplicates > 0).view({-1}).to(torch::kLong);
+        torch::Tensor vis_idx =
+            torch::nonzero(n_duplicates > 0).view({-1}).to(torch::kLong);
         if (vis_idx.numel() == 0) {
             continue;
         }

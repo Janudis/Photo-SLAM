@@ -90,17 +90,6 @@ void saveKeyframeFrameIdMap(
         out << kf_id << " " << source_frame_id << "\n";
     }
 }
-std::filesystem::path resolveNvbloxMeshPath(const std::string& configured_path)
-{
-    if (configured_path.empty()) {
-        return {};
-    }
-    std::filesystem::path path(configured_path);
-    if (path.has_extension()) {
-        return path;
-    }
-    return path / "nvblox_color_mesh.ply";
-}
 bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters)
 {
     if (depth_in.empty()) {

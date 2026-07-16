@@ -6,12 +6,14 @@
 #include <jsoncpp/json/json.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -32,6 +34,48 @@ struct MeshData
     std::vector<cv::Point3f> vertices;
     std::vector<cv::Vec3i> faces;
     std::vector<cv::Vec3b> colors;
+    // Optional original 3DGS parameters. These remain in their saved raw form:
+    // opacity logits, log-scales, and wxyz quaternions.
+    std::vector<float> gaussian_opacity;
+    std::vector<cv::Vec3f> gaussian_log_scales;
+    std::vector<cv::Vec4f> gaussian_rotations;
+    // Optional SVRecon voxel-model parameters. Vertex positions are voxel
+    // centers; octlevel and scene_extent determine each cube's edge length.
+    std::vector<uint8_t> voxel_octlevels;
+    std::vector<std::array<float, 8>> voxel_sdf_corners;
+    float voxel_scene_extent = std::numeric_limits<float>::quiet_NaN();
+
+    bool hasGaussianAttributes() const
+    {
+        return !vertices.empty() &&
+               gaussian_opacity.size() == vertices.size() &&
+               gaussian_log_scales.size() == vertices.size() &&
+               gaussian_rotations.size() == vertices.size();
+    }
+
+    bool hasVoxelAttributes() const
+    {
+        return !vertices.empty() &&
+               voxel_octlevels.size() == vertices.size() &&
+               voxel_sdf_corners.size() == vertices.size() &&
+               std::isfinite(voxel_scene_extent) && voxel_scene_extent > 0.0f;
+    }
+};
+
+struct FloaterThresholdStats
+{
+    float threshold_m = 0.0f;
+    uint64_t farther_count = 0;
+    double farther_ratio = 0.0;
+};
+
+struct FloaterSummary
+{
+    uint64_t count = 0;
+    double mean_m = 0.0;
+    double p95_m = 0.0;
+    double p99_m = 0.0;
+    std::vector<FloaterThresholdStats> thresholds;
 };
 
 struct CameraIntrinsics
@@ -193,6 +237,20 @@ uint8_t readPlyScalarAsU8Color(const char* p, PlyScalarType t)
     }
 }
 
+bool parseSceneExtentComment(const std::string& comment, float& scene_extent)
+{
+    std::istringstream iss(comment);
+    std::string key;
+    float value = 0.0f;
+    if (!(iss >> key >> value) || key != "scene_extent" ||
+        !std::isfinite(value) || !(value > 0.0f))
+    {
+        return false;
+    }
+    scene_extent = value;
+    return true;
+}
+
 bool loadPlyMeshBinaryFallback(const std::string& ply_path, MeshData& mesh)
 {
     std::ifstream in(ply_path, std::ios::binary);
@@ -207,11 +265,16 @@ bool loadPlyMeshBinaryFallback(const std::string& ply_path, MeshData& mesh)
     PlyScalarType face_count_type = PlyScalarType::INVALID;
     PlyScalarType face_index_type = PlyScalarType::INVALID;
     bool have_face_indices = false;
+    float voxel_scene_extent = std::numeric_limits<float>::quiet_NaN();
 
     while (std::getline(in, line))
     {
         if (line == "end_header") break;
-        if (line.rfind("format ", 0) == 0)
+        if (line.rfind("comment ", 0) == 0)
+        {
+            parseSceneExtentComment(line.substr(8), voxel_scene_extent);
+        }
+        else if (line.rfind("format ", 0) == 0)
         {
             std::istringstream iss(line);
             std::string tok;
@@ -271,6 +334,11 @@ bool loadPlyMeshBinaryFallback(const std::string& ply_path, MeshData& mesh)
     int r_prop = -1;
     int g_prop = -1;
     int b_prop = -1;
+    int opacity_prop = -1;
+    int octlevel_prop = -1;
+    std::array<int, 3> scale_props{{-1, -1, -1}};
+    std::array<int, 4> rotation_props{{-1, -1, -1, -1}};
+    std::array<int, 8> sdf_props{{-1, -1, -1, -1, -1, -1, -1, -1}};
     for (int i = 0; i < static_cast<int>(vertex_props.size()); ++i)
     {
         vertex_props[i].offset = vertex_stride;
@@ -283,15 +351,61 @@ bool loadPlyMeshBinaryFallback(const std::string& ply_path, MeshData& mesh)
         else if (vertex_props[i].name == "red" || vertex_props[i].name == "r") r_prop = i;
         else if (vertex_props[i].name == "green" || vertex_props[i].name == "g") g_prop = i;
         else if (vertex_props[i].name == "blue" || vertex_props[i].name == "b") b_prop = i;
+        else if (vertex_props[i].name == "opacity") opacity_prop = i;
+        else if (vertex_props[i].name == "octlevel") octlevel_prop = i;
+        else if (vertex_props[i].name == "scale_0") scale_props[0] = i;
+        else if (vertex_props[i].name == "scale_1") scale_props[1] = i;
+        else if (vertex_props[i].name == "scale_2") scale_props[2] = i;
+        else if (vertex_props[i].name == "rot_0") rotation_props[0] = i;
+        else if (vertex_props[i].name == "rot_1") rotation_props[1] = i;
+        else if (vertex_props[i].name == "rot_2") rotation_props[2] = i;
+        else if (vertex_props[i].name == "rot_3") rotation_props[3] = i;
+        else
+        {
+            for (int corner = 0; corner < 8; ++corner)
+            {
+                if (vertex_props[i].name ==
+                    "grid" + std::to_string(corner) + "_value")
+                {
+                    sdf_props[corner] = i;
+                    break;
+                }
+            }
+        }
     }
     if (x_prop < 0 || y_prop < 0 || z_prop < 0) return false;
     const bool has_colors = r_prop >= 0 && g_prop >= 0 && b_prop >= 0;
+    const bool has_gaussian_attributes =
+        opacity_prop >= 0 &&
+        std::all_of(scale_props.begin(), scale_props.end(), [](int p) { return p >= 0; }) &&
+        std::all_of(rotation_props.begin(), rotation_props.end(), [](int p) { return p >= 0; });
+    const bool has_voxel_attributes =
+        octlevel_prop >= 0 && std::isfinite(voxel_scene_extent) && voxel_scene_extent > 0.0f &&
+        std::all_of(sdf_props.begin(), sdf_props.end(), [](int p) { return p >= 0; });
 
     mesh.vertices.clear();
     mesh.faces.clear();
     mesh.colors.clear();
+    mesh.gaussian_opacity.clear();
+    mesh.gaussian_log_scales.clear();
+    mesh.gaussian_rotations.clear();
+    mesh.voxel_octlevels.clear();
+    mesh.voxel_sdf_corners.clear();
+    mesh.voxel_scene_extent = std::numeric_limits<float>::quiet_NaN();
     mesh.vertices.reserve(vertex_count);
     if (has_colors) mesh.colors.reserve(vertex_count);
+    if (has_gaussian_attributes)
+    {
+        mesh.gaussian_opacity.reserve(vertex_count);
+        mesh.gaussian_log_scales.reserve(vertex_count);
+        mesh.gaussian_rotations.reserve(vertex_count);
+    }
+    if (has_voxel_attributes)
+    {
+        mesh.voxel_octlevels.reserve(vertex_count);
+        mesh.voxel_sdf_corners.reserve(vertex_count);
+        mesh.voxel_scene_extent = voxel_scene_extent;
+    }
     std::vector<char> vb(vertex_stride);
     for (size_t i = 0; i < vertex_count; ++i)
     {
@@ -305,6 +419,31 @@ bool loadPlyMeshBinaryFallback(const std::string& ply_path, MeshData& mesh)
         };
 
         mesh.vertices.emplace_back(read_prop(x_prop), read_prop(y_prop), read_prop(z_prop));
+        if (has_gaussian_attributes)
+        {
+            mesh.gaussian_opacity.push_back(read_prop(opacity_prop));
+            mesh.gaussian_log_scales.emplace_back(
+                read_prop(scale_props[0]),
+                read_prop(scale_props[1]),
+                read_prop(scale_props[2]));
+            mesh.gaussian_rotations.emplace_back(
+                read_prop(rotation_props[0]),
+                read_prop(rotation_props[1]),
+                read_prop(rotation_props[2]),
+                read_prop(rotation_props[3]));
+        }
+        if (has_voxel_attributes)
+        {
+            const int level = static_cast<int>(std::lround(read_prop(octlevel_prop)));
+            mesh.voxel_octlevels.push_back(
+                static_cast<uint8_t>(std::clamp(level, 0, 255)));
+            std::array<float, 8> sdf{};
+            for (int corner = 0; corner < 8; ++corner)
+            {
+                sdf[corner] = read_prop(sdf_props[corner]);
+            }
+            mesh.voxel_sdf_corners.push_back(sdf);
+        }
         if (has_colors)
         {
             const auto read_color = [&](int pi) -> uint8_t
@@ -377,6 +516,74 @@ void copyVertexColorsRGB(const std::shared_ptr<tinyply::PlyData>& rgb, std::vect
 }
 
 template <typename T>
+void copyVertexScalars(const std::shared_ptr<tinyply::PlyData>& data, std::vector<float>& out)
+{
+    const T* ptr = reinterpret_cast<const T*>(data->buffer.get());
+    out.resize(data->count);
+    for (size_t i = 0; i < data->count; ++i)
+    {
+        out[i] = static_cast<float>(ptr[i]);
+    }
+}
+
+template <typename T>
+void copyVertexVec3(const std::shared_ptr<tinyply::PlyData>& data, std::vector<cv::Vec3f>& out)
+{
+    const T* ptr = reinterpret_cast<const T*>(data->buffer.get());
+    out.resize(data->count);
+    for (size_t i = 0; i < data->count; ++i)
+    {
+        out[i] = cv::Vec3f(
+            static_cast<float>(ptr[3 * i + 0]),
+            static_cast<float>(ptr[3 * i + 1]),
+            static_cast<float>(ptr[3 * i + 2]));
+    }
+}
+
+template <typename T>
+void copyVertexVec4(const std::shared_ptr<tinyply::PlyData>& data, std::vector<cv::Vec4f>& out)
+{
+    const T* ptr = reinterpret_cast<const T*>(data->buffer.get());
+    out.resize(data->count);
+    for (size_t i = 0; i < data->count; ++i)
+    {
+        out[i] = cv::Vec4f(
+            static_cast<float>(ptr[4 * i + 0]),
+            static_cast<float>(ptr[4 * i + 1]),
+            static_cast<float>(ptr[4 * i + 2]),
+            static_cast<float>(ptr[4 * i + 3]));
+    }
+}
+
+template <typename T>
+void copyVertexLevels(const std::shared_ptr<tinyply::PlyData>& data, std::vector<uint8_t>& out)
+{
+    const T* ptr = reinterpret_cast<const T*>(data->buffer.get());
+    out.resize(data->count);
+    for (size_t i = 0; i < data->count; ++i)
+    {
+        const int level = static_cast<int>(std::lround(static_cast<double>(ptr[i])));
+        out[i] = static_cast<uint8_t>(std::clamp(level, 0, 255));
+    }
+}
+
+template <typename T>
+void copyVertexSdfCorners(
+    const std::shared_ptr<tinyply::PlyData>& data,
+    std::vector<std::array<float, 8>>& out)
+{
+    const T* ptr = reinterpret_cast<const T*>(data->buffer.get());
+    out.resize(data->count);
+    for (size_t i = 0; i < data->count; ++i)
+    {
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            out[i][corner] = static_cast<float>(ptr[8 * i + corner]);
+        }
+    }
+}
+
+template <typename T>
 void copyFacesIdx3(const std::shared_ptr<tinyply::PlyData>& face_idx, std::vector<cv::Vec3i>& out)
 {
     const T* ptr = reinterpret_cast<const T*>(face_idx->buffer.get());
@@ -406,6 +613,17 @@ bool loadPlyMesh(const std::string& ply_path, MeshData& mesh)
         std::shared_ptr<tinyply::PlyData> xyz;
         std::shared_ptr<tinyply::PlyData> face_idx;
         std::shared_ptr<tinyply::PlyData> rgb;
+        std::shared_ptr<tinyply::PlyData> gaussian_opacity;
+        std::shared_ptr<tinyply::PlyData> gaussian_scales;
+        std::shared_ptr<tinyply::PlyData> gaussian_rotations;
+        std::shared_ptr<tinyply::PlyData> voxel_octlevels;
+        std::shared_ptr<tinyply::PlyData> voxel_sdf_corners;
+
+        mesh.voxel_scene_extent = std::numeric_limits<float>::quiet_NaN();
+        for (const auto& comment : ply_file.get_comments())
+        {
+            parseSceneExtentComment(comment, mesh.voxel_scene_extent);
+        }
 
         try { xyz = ply_file.request_properties_from_element("vertex", { "x", "y", "z" }); }
         catch (const std::exception& e)
@@ -433,6 +651,35 @@ bool loadPlyMesh(const std::string& ply_path, MeshData& mesh)
             }
             catch (...) { rgb.reset(); }
         }
+
+        try { gaussian_opacity = ply_file.request_properties_from_element("vertex", {"opacity"}); }
+        catch (...) { gaussian_opacity.reset(); }
+        try
+        {
+            gaussian_scales = ply_file.request_properties_from_element(
+                "vertex", {"scale_0", "scale_1", "scale_2"});
+        }
+        catch (...) { gaussian_scales.reset(); }
+        try
+        {
+            gaussian_rotations = ply_file.request_properties_from_element(
+                "vertex", {"rot_0", "rot_1", "rot_2", "rot_3"});
+        }
+        catch (...) { gaussian_rotations.reset(); }
+        try
+        {
+            voxel_octlevels = ply_file.request_properties_from_element(
+                "vertex", {"octlevel"});
+        }
+        catch (...) { voxel_octlevels.reset(); }
+        try
+        {
+            voxel_sdf_corners = ply_file.request_properties_from_element(
+                "vertex",
+                {"grid0_value", "grid1_value", "grid2_value", "grid3_value",
+                 "grid4_value", "grid5_value", "grid6_value", "grid7_value"});
+        }
+        catch (...) { voxel_sdf_corners.reset(); }
 
         ply_file.read(in);
         if (!xyz || xyz->count == 0)
@@ -473,6 +720,52 @@ bool loadPlyMesh(const std::string& ply_path, MeshData& mesh)
                     std::cerr << "[mesh_eval] unsupported vertex color type in: " << ply_path << "\n";
                     mesh.colors.clear();
                     break;
+            }
+        }
+
+        mesh.gaussian_opacity.clear();
+        mesh.gaussian_log_scales.clear();
+        mesh.gaussian_rotations.clear();
+        const bool have_gaussian_attributes =
+            gaussian_opacity && gaussian_scales && gaussian_rotations &&
+            gaussian_opacity->count == xyz->count &&
+            gaussian_scales->count == xyz->count &&
+            gaussian_rotations->count == xyz->count &&
+            gaussian_opacity->t == tinyply::Type::FLOAT32 &&
+            gaussian_scales->t == tinyply::Type::FLOAT32 &&
+            gaussian_rotations->t == tinyply::Type::FLOAT32;
+        if (have_gaussian_attributes)
+        {
+            copyVertexScalars<float>(gaussian_opacity, mesh.gaussian_opacity);
+            copyVertexVec3<float>(gaussian_scales, mesh.gaussian_log_scales);
+            copyVertexVec4<float>(gaussian_rotations, mesh.gaussian_rotations);
+        }
+
+        mesh.voxel_octlevels.clear();
+        mesh.voxel_sdf_corners.clear();
+        const bool have_voxel_attributes =
+            voxel_octlevels && voxel_sdf_corners &&
+            voxel_octlevels->count == xyz->count &&
+            voxel_sdf_corners->count == xyz->count &&
+            voxel_sdf_corners->t == tinyply::Type::FLOAT32 &&
+            std::isfinite(mesh.voxel_scene_extent) && mesh.voxel_scene_extent > 0.0f;
+        if (have_voxel_attributes)
+        {
+            switch (voxel_octlevels->t)
+            {
+                case tinyply::Type::INT32:   copyVertexLevels<int32_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::UINT32:  copyVertexLevels<uint32_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::INT16:   copyVertexLevels<int16_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::UINT16:  copyVertexLevels<uint16_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::INT8:    copyVertexLevels<int8_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::UINT8:   copyVertexLevels<uint8_t>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::FLOAT32: copyVertexLevels<float>(voxel_octlevels, mesh.voxel_octlevels); break;
+                case tinyply::Type::FLOAT64: copyVertexLevels<double>(voxel_octlevels, mesh.voxel_octlevels); break;
+                default: mesh.voxel_octlevels.clear(); break;
+            }
+            if (!mesh.voxel_octlevels.empty())
+            {
+                copyVertexSdfCorners<float>(voxel_sdf_corners, mesh.voxel_sdf_corners);
             }
         }
 
@@ -1411,6 +1704,288 @@ std::vector<cv::Point3f> sampleMeshPoints(
     return out;
 }
 
+struct GaussianSupportSampleResult
+{
+    std::vector<cv::Point3f> points;
+    size_t eligible_gaussians = 0;
+    size_t samples_per_primitive = 0;
+    double opacity_weight = 0.0;
+};
+
+float sigmoidStable(float value)
+{
+    if (value >= 0.0f)
+    {
+        const float e = std::exp(-value);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = std::exp(value);
+    return e / (1.0f + e);
+}
+
+cv::Matx33d quaternionWxyzToRotation(const cv::Vec4f& raw_q)
+{
+    const double norm = std::sqrt(
+        static_cast<double>(raw_q[0]) * raw_q[0] +
+        static_cast<double>(raw_q[1]) * raw_q[1] +
+        static_cast<double>(raw_q[2]) * raw_q[2] +
+        static_cast<double>(raw_q[3]) * raw_q[3]);
+    if (!(norm > 1.0e-12) || !std::isfinite(norm)) return cv::Matx33d::eye();
+    const double w = raw_q[0] / norm;
+    const double x = raw_q[1] / norm;
+    const double y = raw_q[2] / norm;
+    const double z = raw_q[3] / norm;
+    return cv::Matx33d(
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y));
+}
+
+GaussianSupportSampleResult sampleGaussianSupport(
+    const MeshData& mesh,
+    size_t samples_per_primitive,
+    float sigma,
+    float min_opacity,
+    double alignment_scale,
+    const cv::Matx33d& alignment_rotation,
+    uint32_t seed)
+{
+    GaussianSupportSampleResult result;
+    if (!mesh.hasGaussianAttributes() || samples_per_primitive == 0 || !(sigma > 0.0f))
+        return result;
+
+    struct Primitive
+    {
+        cv::Vec3d center;
+        cv::Vec3d axes;
+        cv::Matx33d rotation;
+    };
+    std::vector<Primitive> primitives;
+    primitives.reserve(mesh.vertices.size());
+    const double world_scale = std::abs(alignment_scale);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i)
+    {
+        const float opacity = sigmoidStable(mesh.gaussian_opacity[i]);
+        if (!std::isfinite(opacity) || opacity < min_opacity) continue;
+
+        cv::Vec3d axes;
+        bool valid = true;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            const double log_scale = std::clamp(
+                static_cast<double>(mesh.gaussian_log_scales[i][axis]), -20.0, 10.0);
+            axes[axis] = static_cast<double>(sigma) * world_scale * std::exp(log_scale);
+            valid = valid && std::isfinite(axes[axis]) && axes[axis] > 0.0;
+        }
+        if (!valid) continue;
+        const double weight = static_cast<double>(opacity);
+        if (!(weight > 0.0) || !std::isfinite(weight)) continue;
+
+        const cv::Point3f& center = mesh.vertices[i];
+        Primitive primitive;
+        primitive.center = cv::Vec3d(center.x, center.y, center.z);
+        primitive.axes = axes;
+        primitive.rotation =
+            alignment_rotation * quaternionWxyzToRotation(mesh.gaussian_rotations[i]);
+        primitives.push_back(primitive);
+        result.opacity_weight += weight;
+    }
+    result.eligible_gaussians = primitives.size();
+    result.samples_per_primitive = samples_per_primitive;
+    if (primitives.empty()) return result;
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> normal(0.0, 1.0);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    result.points.reserve(primitives.size() * samples_per_primitive);
+    for (const Primitive& primitive : primitives)
+    {
+        for (size_t sample = 0; sample < samples_per_primitive; ++sample)
+        {
+            cv::Vec3d local(0.0, 0.0, 0.0);
+            if (sample < 6)
+            {
+                const int axis = static_cast<int>(sample / 2);
+                local[axis] = (sample % 2 == 0 ? -1.0 : 1.0) * primitive.axes[axis];
+            }
+            else
+            {
+                cv::Vec3d direction(1.0, 0.0, 0.0);
+                bool accepted = false;
+                for (int attempt = 0; attempt < 64; ++attempt)
+                {
+                    direction = cv::Vec3d(normal(rng), normal(rng), normal(rng));
+                    const double norm = cv::norm(direction);
+                    if (!(norm > 1.0e-12)) continue;
+                    direction *= 1.0 / norm;
+
+                    // Correct transformed-sphere sampling to be uniform over ellipsoid area.
+                    const cv::Vec3d inverse_scaled(
+                        direction[0] / primitive.axes[0],
+                        direction[1] / primitive.axes[1],
+                        direction[2] / primitive.axes[2]);
+                    const double min_axis = std::min({
+                        primitive.axes[0], primitive.axes[1], primitive.axes[2]});
+                    const double accept_probability = std::clamp(
+                        min_axis * cv::norm(inverse_scaled), 0.0, 1.0);
+                    if (uniform(rng) <= accept_probability)
+                    {
+                        accepted = true;
+                        break;
+                    }
+                }
+                if (!accepted)
+                {
+                    const double norm = cv::norm(direction);
+                    if (norm > 1.0e-12) direction *= 1.0 / norm;
+                }
+                local = cv::Vec3d(
+                    primitive.axes[0] * direction[0],
+                    primitive.axes[1] * direction[1],
+                    primitive.axes[2] * direction[2]);
+            }
+            const cv::Vec3d world = primitive.center + primitive.rotation * local;
+            result.points.emplace_back(
+                static_cast<float>(world[0]),
+                static_cast<float>(world[1]),
+                static_cast<float>(world[2]));
+        }
+    }
+    return result;
+}
+
+struct VoxelSupportSampleResult
+{
+    std::vector<cv::Point3f> points;
+    size_t total_voxels = 0;
+    size_t eligible_zero_crossing_voxels = 0;
+    size_t samples_per_primitive = 0;
+    double min_edge_m = 0.0;
+    double max_edge_m = 0.0;
+};
+
+bool hasSdfSignChange(const std::array<float, 8>& sdf)
+{
+    int min_sign = 1;
+    int max_sign = -1;
+    for (float value : sdf)
+    {
+        if (!std::isfinite(value)) return false;
+        const int sign = value < 0.0f ? -1 : (value > 0.0f ? 1 : 0);
+        min_sign = std::min(min_sign, sign);
+        max_sign = std::max(max_sign, sign);
+    }
+    // Matches SVRecon's `signs.min() != signs.max()` surface-cell test.
+    return min_sign != max_sign;
+}
+
+VoxelSupportSampleResult sampleVoxelSupport(
+    const MeshData& mesh,
+    size_t samples_per_primitive,
+    double alignment_scale,
+    const cv::Matx33d& alignment_rotation,
+    uint32_t seed)
+{
+    VoxelSupportSampleResult result;
+    if (!mesh.hasVoxelAttributes() || samples_per_primitive == 0) return result;
+    result.total_voxels = mesh.vertices.size();
+
+    struct Primitive
+    {
+        cv::Vec3d center;
+        double half_edge = 0.0;
+    };
+    std::vector<Primitive> primitives;
+    primitives.reserve(mesh.vertices.size());
+    const double world_scale = std::abs(alignment_scale);
+    result.min_edge_m = std::numeric_limits<double>::infinity();
+    result.max_edge_m = 0.0;
+    for (size_t i = 0; i < mesh.vertices.size(); ++i)
+    {
+        if (!hasSdfSignChange(mesh.voxel_sdf_corners[i])) continue;
+        const int level = static_cast<int>(mesh.voxel_octlevels[i]);
+        const double edge = world_scale * std::ldexp(
+            static_cast<double>(mesh.voxel_scene_extent), -level);
+        if (!(edge > 0.0) || !std::isfinite(edge)) continue;
+
+        const cv::Point3f& center = mesh.vertices[i];
+        primitives.push_back({cv::Vec3d(center.x, center.y, center.z), 0.5 * edge});
+        result.min_edge_m = std::min(result.min_edge_m, edge);
+        result.max_edge_m = std::max(result.max_edge_m, edge);
+    }
+    result.eligible_zero_crossing_voxels = primitives.size();
+    result.samples_per_primitive = samples_per_primitive;
+    if (primitives.empty())
+    {
+        result.min_edge_m = 0.0;
+        return result;
+    }
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> choose_face(0, 5);
+    std::uniform_real_distribution<double> uniform(-1.0, 1.0);
+    result.points.reserve(primitives.size() * samples_per_primitive);
+    for (const Primitive& primitive : primitives)
+    {
+        for (size_t sample = 0; sample < samples_per_primitive; ++sample)
+        {
+            const double h = primitive.half_edge;
+            cv::Vec3d local;
+            if (sample < 8)
+            {
+                local = cv::Vec3d(
+                    (sample & 1u) ? h : -h,
+                    (sample & 2u) ? h : -h,
+                    (sample & 4u) ? h : -h);
+            }
+            else
+            {
+                const double u = h * uniform(rng);
+                const double v = h * uniform(rng);
+                switch (choose_face(rng))
+                {
+                    case 0: local = cv::Vec3d(-h, u, v); break;
+                    case 1: local = cv::Vec3d( h, u, v); break;
+                    case 2: local = cv::Vec3d(u, -h, v); break;
+                    case 3: local = cv::Vec3d(u,  h, v); break;
+                    case 4: local = cv::Vec3d(u, v, -h); break;
+                    default: local = cv::Vec3d(u, v, h); break;
+                }
+            }
+            const cv::Vec3d world = primitive.center + alignment_rotation * local;
+            result.points.emplace_back(
+                static_cast<float>(world[0]),
+                static_cast<float>(world[1]),
+                static_cast<float>(world[2]));
+        }
+    }
+    return result;
+}
+
+std::vector<float> maxSupportDistancePerPrimitive(
+    const std::vector<float>& support_distances,
+    size_t primitive_count,
+    size_t samples_per_primitive)
+{
+    if (primitive_count == 0 || samples_per_primitive == 0 ||
+        support_distances.size() != primitive_count * samples_per_primitive)
+    {
+        return {};
+    }
+    std::vector<float> primitive_distances(
+        primitive_count, -std::numeric_limits<float>::infinity());
+    for (size_t primitive = 0; primitive < primitive_count; ++primitive)
+    {
+        const size_t begin = primitive * samples_per_primitive;
+        for (size_t sample = 0; sample < samples_per_primitive; ++sample)
+        {
+            primitive_distances[primitive] = std::max(
+                primitive_distances[primitive], support_distances[begin + sample]);
+        }
+    }
+    return primitive_distances;
+}
+
 bool computeOrientedBounds(
     const MeshData& mesh,
     cv::Matx33d& basis_rows,
@@ -1679,6 +2254,171 @@ double ratioBelow(const std::vector<float>& v, float th)
     size_t c = 0;
     for (float x : v) if (x < th) ++c;
     return static_cast<double>(c) / static_cast<double>(v.size());
+}
+
+double percentileOf(const std::vector<float>& values, double quantile)
+{
+    if (values.empty()) return 0.0;
+    std::vector<float> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    const double q = std::clamp(quantile, 0.0, 1.0);
+    const double position = q * static_cast<double>(sorted.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const size_t upper = static_cast<size_t>(std::ceil(position));
+    const double fraction = position - static_cast<double>(lower);
+    return (1.0 - fraction) * static_cast<double>(sorted[lower]) +
+           fraction * static_cast<double>(sorted[upper]);
+}
+
+FloaterSummary summarizeFloaters(
+    const std::vector<float>& distances,
+    const std::vector<float>& thresholds_m)
+{
+    FloaterSummary summary;
+    summary.count = static_cast<uint64_t>(distances.size());
+    summary.mean_m = meanOf(distances);
+    summary.p95_m = percentileOf(distances, 0.95);
+    summary.p99_m = percentileOf(distances, 0.99);
+    if (distances.empty()) return summary;
+
+    summary.thresholds.reserve(thresholds_m.size());
+    for (float threshold_m : thresholds_m)
+    {
+        FloaterThresholdStats stats;
+        stats.threshold_m = threshold_m;
+        for (size_t i = 0; i < distances.size(); ++i)
+        {
+            if (distances[i] < threshold_m) continue;
+            ++stats.farther_count;
+        }
+        stats.farther_ratio =
+            static_cast<double>(stats.farther_count) / static_cast<double>(distances.size());
+        summary.thresholds.push_back(stats);
+    }
+    return summary;
+}
+
+void drawChartFrame(
+    cv::Mat& image,
+    const std::string& title,
+    const std::string& x_label,
+    const std::string& y_label,
+    int left,
+    int top,
+    int right,
+    int bottom)
+{
+    const cv::Scalar text_color(45, 45, 45);
+    const cv::Scalar axis_color(90, 90, 90);
+    cv::line(image, cv::Point(left, bottom), cv::Point(right, bottom), axis_color, 1, cv::LINE_AA);
+    cv::line(image, cv::Point(left, bottom), cv::Point(left, top), axis_color, 1, cv::LINE_AA);
+    cv::putText(image, title, cv::Point(left, 38), cv::FONT_HERSHEY_SIMPLEX,
+                0.75, text_color, 2, cv::LINE_AA);
+    cv::putText(image, x_label, cv::Point((left + right) / 2 - 75, image.rows - 18),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, text_color, 1, cv::LINE_AA);
+    cv::putText(image, y_label, cv::Point(10, top - 12),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv::LINE_AA);
+}
+
+bool writeFloaterCountCurve(
+    const std::filesystem::path& out_dir,
+    const std::vector<float>& distances,
+    float threshold_step_m,
+    float max_distance_m,
+    const std::string& artifact_stem,
+    const std::string& chart_title,
+    const std::string& sample_column,
+    const std::string& y_label,
+    const cv::Scalar& bar_color)
+{
+    if (distances.empty() || !(threshold_step_m > 0.0f) || !(max_distance_m > 0.0f)) return false;
+
+    static constexpr std::array<const char*, 8> kLegacyArtifacts = {{
+        "surface_floater_histogram.csv", "surface_floater_histogram.png",
+        "surface_floater_tail_curve.csv", "surface_floater_tail_curve.png",
+        "voxel_floater_histogram.csv", "voxel_floater_histogram.png",
+        "voxel_floater_tail_curve.csv", "voxel_floater_tail_curve.png"
+    }};
+    for (const char* filename : kLegacyArtifacts)
+    {
+        std::error_code ignored;
+        std::filesystem::remove(out_dir / filename, ignored);
+    }
+
+    const int threshold_count =
+        std::max(1, static_cast<int>(std::floor(max_distance_m / threshold_step_m)));
+    std::vector<uint64_t> farther_counts(static_cast<size_t>(threshold_count), 0);
+    for (int step = 1; step <= threshold_count; ++step)
+    {
+        const float threshold = static_cast<float>(step) * threshold_step_m;
+        uint64_t count = 0;
+        for (float distance : distances)
+        {
+            if (distance >= threshold) ++count;
+        }
+        farther_counts[static_cast<size_t>(step - 1)] = count;
+    }
+
+    const auto csv_path = out_dir / (artifact_stem + ".csv");
+    const auto png_path = out_dir / (artifact_stem + ".png");
+    {
+        std::ofstream out(csv_path);
+        out << "distance_threshold_cm," << sample_column << ",fraction_farther\n";
+        out << std::fixed << std::setprecision(6);
+        for (int step = 1; step <= threshold_count; ++step)
+        {
+            const uint64_t count = farther_counts[static_cast<size_t>(step - 1)];
+            out << 100.0 * static_cast<double>(step) * threshold_step_m << ','
+                << count << ','
+                << static_cast<double>(count) / static_cast<double>(distances.size()) << '\n';
+        }
+    }
+
+    constexpr int width = 1100;
+    constexpr int height = 650;
+    constexpr int left = 95;
+    constexpr int top = 70;
+    constexpr int right = width - 35;
+    constexpr int bottom = height - 75;
+    const cv::Scalar grid_color(225, 225, 225);
+    const cv::Scalar text_color(70, 70, 70);
+
+    cv::Mat image(height, width, CV_8UC3, cv::Scalar(250, 250, 250));
+    drawChartFrame(image, chart_title,
+                   "Distance threshold (cm)", y_label, left, top, right, bottom);
+    const uint64_t max_count = *std::max_element(farther_counts.begin(), farther_counts.end());
+    const double y_max = static_cast<double>(std::max<uint64_t>(1, max_count));
+    for (int grid = 0; grid <= 5; ++grid)
+    {
+        const int y = bottom - (bottom - top) * grid / 5;
+        cv::line(image, cv::Point(left, y), cv::Point(right, y), grid_color, 1, cv::LINE_AA);
+        const uint64_t label = static_cast<uint64_t>(std::llround(y_max * grid / 5.0));
+        cv::putText(image, std::to_string(label), cv::Point(8, y + 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.42, text_color, 1, cv::LINE_AA);
+    }
+    const double slot_width = static_cast<double>(right - left) / threshold_count;
+    for (int step = 0; step < threshold_count; ++step)
+    {
+        const int x0 = left + static_cast<int>(std::floor(step * slot_width));
+        const int x1 = left + static_cast<int>(std::floor((step + 1) * slot_width)) - 1;
+        const int y = bottom - static_cast<int>(std::round(
+            (bottom - top) * farther_counts[static_cast<size_t>(step)] / y_max));
+        cv::rectangle(image, cv::Point(x0 + 1, y), cv::Point(std::max(x0 + 1, x1), bottom - 1),
+                      bar_color, cv::FILLED);
+    }
+    const int tick_every = std::max(1, static_cast<int>(std::lround(0.10f / threshold_step_m)));
+    for (int step = tick_every; step <= threshold_count; step += tick_every)
+    {
+        const int x = left + static_cast<int>(std::round((right - left) *
+            static_cast<double>(step) / threshold_count));
+        cv::line(image, cv::Point(x, bottom), cv::Point(x, bottom + 5), text_color, 1);
+        const int cm = static_cast<int>(std::lround(100.0f * step * threshold_step_m));
+        cv::putText(image, std::to_string(cm), cv::Point(x - 10, bottom + 22),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1, cv::LINE_AA);
+    }
+    cv::imwrite(png_path.string(), image);
+
+    return true;
 }
 
 static inline float edgeFunction(const cv::Point2f& a, const cv::Point2f& b, const cv::Point2f& p)
@@ -2275,6 +3015,15 @@ int main(int argc, char** argv)
         "{gt            | | ground-truth mesh ply }"
         "{out           | | output directory }"
         "{tau_cm        |1.0| F-score threshold in cm (for both geometry and depth F1) }"
+        "{eval_floaters |1| write surface/voxel floater metrics, CSV distributions, and plots }"
+        "{floater_samples|100000| fixed number of reconstructed-surface samples for floater counts }"
+        "{floater_bin_cm|1.0| distance-threshold step in cm for cumulative floater counts }"
+        "{floater_max_cm|50.0| maximum plotted floater threshold in cm }"
+        "{eval_gaussian_support|1| evaluate covariance support when Gaussian PLY attributes are present }"
+        "{gaussian_support_sigma|3.0| finite Gaussian support contour in standard deviations }"
+        "{gaussian_min_opacity|0.0| minimum activated opacity included in support sampling }"
+        "{eval_voxel_support|1| evaluate cube support of zero-crossing SVRecon voxels when attributes are present }"
+        "{support_samples_per_primitive|32| boundary probes used to assign one max-support distance per voxel/Gaussian }"
         "{recon_samples |500000| number of sampled points from reconstruction }"
         "{gt_samples    |500000| number of sampled points from GT }"
         "{seed          |0| random seed }"
@@ -2311,7 +3060,7 @@ int main(int argc, char** argv)
         "{gs_icp_max_points|100000| gaussian_slam rigid ICP max sampled vertices per mesh }";
 
     cv::CommandLineParser parser(argc, argv, keys);
-    parser.about("Mesh evaluation: Accuracy, Completeness, Chamfer, F-score@tau, optional mesh-depth metrics");
+    parser.about("Mesh evaluation: geometry, floater distributions, and optional mesh-depth metrics");
     if (parser.has("help") || !parser.has("recon") || !parser.has("gt") || !parser.has("out"))
     {
         parser.printMessage();
@@ -2323,6 +3072,16 @@ int main(int argc, char** argv)
     const std::string out_dir = parser.get<std::string>("out");
     const float tau_cm = parser.get<float>("tau_cm");
     const float tau_m = tau_cm / 100.0f;
+    const bool eval_floaters = parser.get<int>("eval_floaters") != 0;
+    const int floater_samples = parser.get<int>("floater_samples");
+    const float floater_bin_cm = parser.get<float>("floater_bin_cm");
+    const float floater_max_cm = parser.get<float>("floater_max_cm");
+    const bool eval_gaussian_support = parser.get<int>("eval_gaussian_support") != 0;
+    const float gaussian_support_sigma = parser.get<float>("gaussian_support_sigma");
+    const float gaussian_min_opacity = parser.get<float>("gaussian_min_opacity");
+    const bool eval_voxel_support = parser.get<int>("eval_voxel_support") != 0;
+    const int support_samples_per_primitive =
+        parser.get<int>("support_samples_per_primitive");
     const int recon_samples = parser.get<int>("recon_samples");
     const int gt_samples = parser.get<int>("gt_samples");
     const int seed = parser.get<int>("seed");
@@ -2374,6 +3133,24 @@ int main(int argc, char** argv)
     if (!std::filesystem::exists(gt_path))
     {
         std::cerr << "[mesh_eval] gt not found: " << gt_path << "\n";
+        return 1;
+    }
+    if (eval_floaters &&
+        (floater_samples <= 0 || !(floater_bin_cm > 0.0f) || !(floater_max_cm > 0.0f)))
+    {
+        std::cerr << "[mesh_eval] floater_samples, floater_bin_cm, and floater_max_cm must be positive\n";
+        return 1;
+    }
+    if (eval_gaussian_support &&
+        (support_samples_per_primitive <= 0 || !(gaussian_support_sigma > 0.0f) ||
+         gaussian_min_opacity < 0.0f || gaussian_min_opacity > 1.0f))
+    {
+        std::cerr << "[mesh_eval] invalid Gaussian support sampling parameters\n";
+        return 1;
+    }
+    if (eval_voxel_support && support_samples_per_primitive <= 0)
+    {
+        std::cerr << "[mesh_eval] support_samples_per_primitive must be positive\n";
         return 1;
     }
     if (gs_unseen_npy.empty())
@@ -2607,6 +3384,189 @@ int main(int argc, char** argv)
                               ? (2.0 * precision * recall / (precision + recall))
                               : 0.0;
 
+    std::vector<float> floater_thresholds_m = {0.01f, 0.02f, 0.05f, 0.10f};
+    floater_thresholds_m.push_back(tau_m);
+    std::sort(floater_thresholds_m.begin(), floater_thresholds_m.end());
+    floater_thresholds_m.erase(
+        std::unique(
+            floater_thresholds_m.begin(),
+            floater_thresholds_m.end(),
+            [](float a, float b) { return std::abs(a - b) < 1.0e-6f; }),
+        floater_thresholds_m.end());
+
+    FloaterSummary surface_floater_summary;
+    bool surface_floater_artifacts_saved = false;
+    uint64_t surface_floater_count_at_tau = 0;
+    double surface_floater_ratio_at_tau = 0.0;
+    if (eval_floaters)
+    {
+        const auto floater_recon_pts = sampleMeshPoints(
+            recon_mesh,
+            static_cast<size_t>(floater_samples),
+            static_cast<uint32_t>(seed + 101));
+        const auto floater_gt_pts = sampleMeshPoints(
+            gt_mesh,
+            static_cast<size_t>(std::max(1, gt_samples)),
+            static_cast<uint32_t>(seed + 102));
+        const auto floater_distances = nearestDistancesL2(floater_recon_pts, floater_gt_pts);
+        surface_floater_summary = summarizeFloaters(floater_distances, floater_thresholds_m);
+        for (const auto& stats : surface_floater_summary.thresholds)
+        {
+            if (std::abs(stats.threshold_m - tau_m) >= 1.0e-6f) continue;
+            surface_floater_count_at_tau = stats.farther_count;
+            surface_floater_ratio_at_tau = stats.farther_ratio;
+            break;
+        }
+        surface_floater_artifacts_saved = writeFloaterCountCurve(
+            out_dir,
+            floater_distances,
+            floater_bin_cm / 100.0f,
+            floater_max_cm / 100.0f,
+            "surface_floater_count",
+            recon_has_faces ? "Reconstructed surface floaters" : "Primitive-center floaters",
+            recon_has_faces ? "surface_samples_farther" : "primitive_centers_farther",
+            recon_has_faces ? "Surface samples farther" : "Primitive centers farther",
+            cv::Scalar(190, 116, 45));
+    }
+
+    FloaterSummary gaussian_support_summary;
+    bool gaussian_support_evaluated = false;
+    bool gaussian_support_artifacts_saved = false;
+    size_t gaussian_support_eligible = 0;
+    double gaussian_support_opacity_weight = 0.0;
+    uint64_t gaussian_support_count_at_tau = 0;
+    double gaussian_support_ratio_at_tau = 0.0;
+    if (eval_gaussian_support && recon_mesh.hasGaussianAttributes())
+    {
+        auto support_samples = sampleGaussianSupport(
+            recon_mesh,
+            static_cast<size_t>(support_samples_per_primitive),
+            gaussian_support_sigma,
+            gaussian_min_opacity,
+            alignment_ok ? align_scale : 1.0,
+            alignment_ok ? align_R : cv::Matx33d::eye(),
+            static_cast<uint32_t>(seed + 201));
+        gaussian_support_eligible = support_samples.eligible_gaussians;
+        gaussian_support_opacity_weight = support_samples.opacity_weight;
+        if (!support_samples.points.empty())
+        {
+            const auto support_gt_pts = sampleMeshPoints(
+                gt_mesh,
+                static_cast<size_t>(std::max(1, gt_samples)),
+                static_cast<uint32_t>(seed + 202));
+            const auto support_distances = nearestDistancesL2(
+                support_samples.points, support_gt_pts);
+            const auto primitive_distances = maxSupportDistancePerPrimitive(
+                support_distances,
+                support_samples.eligible_gaussians,
+                support_samples.samples_per_primitive);
+            gaussian_support_summary = summarizeFloaters(
+                primitive_distances, floater_thresholds_m);
+            for (const auto& stats : gaussian_support_summary.thresholds)
+            {
+                if (std::abs(stats.threshold_m - tau_m) >= 1.0e-6f) continue;
+                gaussian_support_count_at_tau = stats.farther_count;
+                gaussian_support_ratio_at_tau = stats.farther_ratio;
+                break;
+            }
+            gaussian_support_artifacts_saved = writeFloaterCountCurve(
+                out_dir,
+                primitive_distances,
+                floater_bin_cm / 100.0f,
+                floater_max_cm / 100.0f,
+                "gaussian_support_floater_count",
+                "Gaussian 3-sigma support floaters",
+                "gaussians_farther",
+                "Gaussians farther",
+                cv::Scalar(72, 72, 210));
+            gaussian_support_evaluated = true;
+            std::cout << "[mesh_eval] Gaussian support: sigma="
+                      << gaussian_support_sigma
+                      << " eligible=" << gaussian_support_eligible
+                      << " probes=" << support_samples.points.size()
+                      << " probes_per_gaussian=" << support_samples.samples_per_primitive
+                      << " opacity_weight=" << gaussian_support_opacity_weight
+                      << "\n";
+        }
+    }
+    else if (eval_gaussian_support)
+    {
+        std::cout << "[mesh_eval] Gaussian support skipped: PLY has no complete "
+                     "opacity/scale/rotation attributes.\n";
+    }
+
+    FloaterSummary voxel_support_summary;
+    bool voxel_support_evaluated = false;
+    bool voxel_support_artifacts_saved = false;
+    size_t voxel_support_total = 0;
+    size_t voxel_support_eligible = 0;
+    double voxel_support_min_edge_m = 0.0;
+    double voxel_support_max_edge_m = 0.0;
+    uint64_t voxel_support_count_at_tau = 0;
+    double voxel_support_ratio_at_tau = 0.0;
+    if (eval_voxel_support && recon_mesh.hasVoxelAttributes())
+    {
+        auto support_samples = sampleVoxelSupport(
+            recon_mesh,
+            static_cast<size_t>(support_samples_per_primitive),
+            alignment_ok ? align_scale : 1.0,
+            alignment_ok ? align_R : cv::Matx33d::eye(),
+            static_cast<uint32_t>(seed + 301));
+        voxel_support_total = support_samples.total_voxels;
+        voxel_support_eligible = support_samples.eligible_zero_crossing_voxels;
+        voxel_support_min_edge_m = support_samples.min_edge_m;
+        voxel_support_max_edge_m = support_samples.max_edge_m;
+        if (!support_samples.points.empty())
+        {
+            const auto support_gt_pts = sampleMeshPoints(
+                gt_mesh,
+                static_cast<size_t>(std::max(1, gt_samples)),
+                static_cast<uint32_t>(seed + 302));
+            const auto support_distances = nearestDistancesL2(
+                support_samples.points, support_gt_pts);
+            const auto primitive_distances = maxSupportDistancePerPrimitive(
+                support_distances,
+                support_samples.eligible_zero_crossing_voxels,
+                support_samples.samples_per_primitive);
+            voxel_support_summary = summarizeFloaters(
+                primitive_distances, floater_thresholds_m);
+            for (const auto& stats : voxel_support_summary.thresholds)
+            {
+                if (std::abs(stats.threshold_m - tau_m) >= 1.0e-6f) continue;
+                voxel_support_count_at_tau = stats.farther_count;
+                voxel_support_ratio_at_tau = stats.farther_ratio;
+                break;
+            }
+            voxel_support_artifacts_saved = writeFloaterCountCurve(
+                out_dir,
+                primitive_distances,
+                floater_bin_cm / 100.0f,
+                floater_max_cm / 100.0f,
+                "voxel_support_floater_count",
+                "Zero-crossing voxel cube-support floaters",
+                "voxels_farther",
+                "Voxels farther",
+                cv::Scalar(70, 155, 70));
+            voxel_support_evaluated = true;
+            std::cout << "[mesh_eval] Voxel support: total="
+                      << voxel_support_total
+                      << " zero_crossing=" << voxel_support_eligible
+                      << " probes=" << support_samples.points.size()
+                      << " probes_per_voxel=" << support_samples.samples_per_primitive
+                      << " edge_m=[" << voxel_support_min_edge_m
+                      << "," << voxel_support_max_edge_m << "]\n";
+        }
+        else
+        {
+            std::cout << "[mesh_eval] Voxel support skipped: no zero-crossing cells.\n";
+        }
+    }
+    else if (eval_voxel_support)
+    {
+        std::cout << "[mesh_eval] Voxel support skipped: PLY has no complete "
+                     "scene_extent/octlevel/grid[0..7]_value attributes.\n";
+    }
+
     DepthEvalStats depth_stats;
     bool depth_ok = false;
     if (eval_depth_mesh)
@@ -2743,6 +3703,122 @@ int main(int argc, char** argv)
     root["threshold_cm"] = tau_cm;
     root["n_recon_samples"] = static_cast<Json::UInt64>(recon_pts.size());
     root["n_gt_samples"] = static_cast<Json::UInt64>(gt_pts.size());
+    root["floater_evaluation_enabled"] = eval_floaters;
+    root["floater_samples"] = floater_samples;
+    root["floater_bin_cm"] = floater_bin_cm;
+    root["floater_max_cm"] = floater_max_cm;
+    if (eval_floaters)
+    {
+        root["surface_floater_count"] = static_cast<Json::UInt64>(surface_floater_count_at_tau);
+        root["surface_floater_samples"] = static_cast<Json::UInt64>(surface_floater_summary.count);
+        root["surface_floater_ratio"] = surface_floater_ratio_at_tau;
+        root["surface_floater_threshold_cm"] = tau_cm;
+        root["surface_distance_mean_m"] = surface_floater_summary.mean_m;
+        root["surface_distance_p95_m"] = surface_floater_summary.p95_m;
+        root["surface_distance_p99_m"] = surface_floater_summary.p99_m;
+        root["surface_floater_artifacts_saved"] = surface_floater_artifacts_saved;
+        if (surface_floater_artifacts_saved)
+        {
+            root["surface_floater_count_csv"] =
+                (std::filesystem::path(out_dir) / "surface_floater_count.csv").string();
+            root["surface_floater_count_png"] =
+                (std::filesystem::path(out_dir) / "surface_floater_count.png").string();
+        }
+        Json::Value thresholds(Json::arrayValue);
+        for (const auto& stats : surface_floater_summary.thresholds)
+        {
+            Json::Value item;
+            item["threshold_cm"] = 100.0 * stats.threshold_m;
+            item["farther_count"] = static_cast<Json::UInt64>(stats.farther_count);
+            item["farther_ratio"] = stats.farther_ratio;
+            thresholds.append(item);
+        }
+        root["surface_floater_thresholds"] = thresholds;
+    }
+    root["gaussian_support_requested"] = eval_gaussian_support;
+    root["gaussian_support_evaluated"] = gaussian_support_evaluated;
+    root["gaussian_support_sigma"] = gaussian_support_sigma;
+    root["gaussian_support_min_opacity"] = gaussian_min_opacity;
+    root["gaussian_support_samples_per_primitive"] = support_samples_per_primitive;
+    if (gaussian_support_evaluated)
+    {
+        root["gaussian_support_eligible_gaussians"] =
+            static_cast<Json::UInt64>(gaussian_support_eligible);
+        root["gaussian_support_opacity_weight"] = gaussian_support_opacity_weight;
+        root["gaussian_support_primitive_count"] =
+            static_cast<Json::UInt64>(gaussian_support_summary.count);
+        root["gaussian_support_probe_samples"] = static_cast<Json::UInt64>(
+            gaussian_support_eligible * static_cast<size_t>(support_samples_per_primitive));
+        root["gaussian_support_distance_statistic"] = "max_boundary_distance";
+        root["gaussian_support_floater_count"] =
+            static_cast<Json::UInt64>(gaussian_support_count_at_tau);
+        root["gaussian_support_floater_ratio"] = gaussian_support_ratio_at_tau;
+        root["gaussian_support_floater_threshold_cm"] = tau_cm;
+        root["gaussian_support_distance_mean_m"] = gaussian_support_summary.mean_m;
+        root["gaussian_support_distance_p95_m"] = gaussian_support_summary.p95_m;
+        root["gaussian_support_distance_p99_m"] = gaussian_support_summary.p99_m;
+        root["gaussian_support_artifacts_saved"] = gaussian_support_artifacts_saved;
+        if (gaussian_support_artifacts_saved)
+        {
+            root["gaussian_support_floater_count_csv"] =
+                (std::filesystem::path(out_dir) / "gaussian_support_floater_count.csv").string();
+            root["gaussian_support_floater_count_png"] =
+                (std::filesystem::path(out_dir) / "gaussian_support_floater_count.png").string();
+        }
+        Json::Value thresholds(Json::arrayValue);
+        for (const auto& stats : gaussian_support_summary.thresholds)
+        {
+            Json::Value item;
+            item["threshold_cm"] = 100.0 * stats.threshold_m;
+            item["farther_count"] = static_cast<Json::UInt64>(stats.farther_count);
+            item["farther_ratio"] = stats.farther_ratio;
+            thresholds.append(item);
+        }
+        root["gaussian_support_floater_thresholds"] = thresholds;
+    }
+    root["voxel_support_requested"] = eval_voxel_support;
+    root["voxel_support_evaluated"] = voxel_support_evaluated;
+    root["voxel_support_samples_per_primitive"] = support_samples_per_primitive;
+    if (voxel_support_evaluated)
+    {
+        root["voxel_support_total_voxels"] =
+            static_cast<Json::UInt64>(voxel_support_total);
+        root["voxel_support_eligible_zero_crossing_voxels"] =
+            static_cast<Json::UInt64>(voxel_support_eligible);
+        root["voxel_support_scene_extent"] = recon_mesh.voxel_scene_extent;
+        root["voxel_support_min_edge_m"] = voxel_support_min_edge_m;
+        root["voxel_support_max_edge_m"] = voxel_support_max_edge_m;
+        root["voxel_support_primitive_count"] =
+            static_cast<Json::UInt64>(voxel_support_summary.count);
+        root["voxel_support_probe_samples"] = static_cast<Json::UInt64>(
+            voxel_support_eligible * static_cast<size_t>(support_samples_per_primitive));
+        root["voxel_support_distance_statistic"] = "max_boundary_distance";
+        root["voxel_support_floater_count"] =
+            static_cast<Json::UInt64>(voxel_support_count_at_tau);
+        root["voxel_support_floater_ratio"] = voxel_support_ratio_at_tau;
+        root["voxel_support_floater_threshold_cm"] = tau_cm;
+        root["voxel_support_distance_mean_m"] = voxel_support_summary.mean_m;
+        root["voxel_support_distance_p95_m"] = voxel_support_summary.p95_m;
+        root["voxel_support_distance_p99_m"] = voxel_support_summary.p99_m;
+        root["voxel_support_artifacts_saved"] = voxel_support_artifacts_saved;
+        if (voxel_support_artifacts_saved)
+        {
+            root["voxel_support_floater_count_csv"] =
+                (std::filesystem::path(out_dir) / "voxel_support_floater_count.csv").string();
+            root["voxel_support_floater_count_png"] =
+                (std::filesystem::path(out_dir) / "voxel_support_floater_count.png").string();
+        }
+        Json::Value thresholds(Json::arrayValue);
+        for (const auto& stats : voxel_support_summary.thresholds)
+        {
+            Json::Value item;
+            item["threshold_cm"] = 100.0 * stats.threshold_m;
+            item["farther_count"] = static_cast<Json::UInt64>(stats.farther_count);
+            item["farther_ratio"] = stats.farther_ratio;
+            thresholds.append(item);
+        }
+        root["voxel_support_floater_thresholds"] = thresholds;
+    }
     root["align_recon_to_gt_enabled"] = align_recon_to_gt;
     root["align_recon_to_gt_success"] = alignment_ok;
     root["save_aligned_mesh"] = save_aligned_mesh;
@@ -2808,6 +3884,79 @@ int main(int argc, char** argv)
         f << "threshold_m " << tau_m << "\n";
         f << "n_recon_samples " << recon_pts.size() << "\n";
         f << "n_gt_samples " << gt_pts.size() << "\n";
+        f << "floater_evaluation_enabled " << (eval_floaters ? 1 : 0) << "\n";
+        if (eval_floaters)
+        {
+            f << "floater_samples " << floater_samples << "\n";
+            f << "surface_floater_samples " << surface_floater_summary.count << "\n";
+            f << "surface_floater_count " << surface_floater_count_at_tau << "\n";
+            f << "surface_floater_ratio " << surface_floater_ratio_at_tau << "\n";
+            f << "surface_floater_threshold_cm " << tau_cm << "\n";
+            f << "surface_distance_mean_m " << surface_floater_summary.mean_m << "\n";
+            f << "surface_distance_p95_m " << surface_floater_summary.p95_m << "\n";
+            f << "surface_distance_p99_m " << surface_floater_summary.p99_m << "\n";
+            for (const auto& stats : surface_floater_summary.thresholds)
+            {
+                f << "surface_floater_at_cm " << 100.0 * stats.threshold_m
+                  << " count " << stats.farther_count
+                  << " ratio " << stats.farther_ratio << "\n";
+            }
+        }
+        f << "gaussian_support_requested " << (eval_gaussian_support ? 1 : 0) << "\n";
+        f << "gaussian_support_evaluated " << (gaussian_support_evaluated ? 1 : 0) << "\n";
+        if (gaussian_support_evaluated)
+        {
+            f << "gaussian_support_sigma " << gaussian_support_sigma << "\n";
+            f << "gaussian_support_min_opacity " << gaussian_min_opacity << "\n";
+            f << "gaussian_support_eligible_gaussians " << gaussian_support_eligible << "\n";
+            f << "gaussian_support_samples_per_primitive "
+              << support_samples_per_primitive << "\n";
+            f << "gaussian_support_probe_samples "
+              << gaussian_support_eligible * static_cast<size_t>(support_samples_per_primitive)
+              << "\n";
+            f << "gaussian_support_primitive_count " << gaussian_support_summary.count << "\n";
+            f << "gaussian_support_distance_statistic max_boundary_distance\n";
+            f << "gaussian_support_floater_count " << gaussian_support_count_at_tau << "\n";
+            f << "gaussian_support_floater_ratio " << gaussian_support_ratio_at_tau << "\n";
+            f << "gaussian_support_distance_mean_m " << gaussian_support_summary.mean_m << "\n";
+            f << "gaussian_support_distance_p95_m " << gaussian_support_summary.p95_m << "\n";
+            f << "gaussian_support_distance_p99_m " << gaussian_support_summary.p99_m << "\n";
+            for (const auto& stats : gaussian_support_summary.thresholds)
+            {
+                f << "gaussian_support_floater_at_cm " << 100.0 * stats.threshold_m
+                  << " count " << stats.farther_count
+                  << " ratio " << stats.farther_ratio << "\n";
+            }
+        }
+        f << "voxel_support_requested " << (eval_voxel_support ? 1 : 0) << "\n";
+        f << "voxel_support_evaluated " << (voxel_support_evaluated ? 1 : 0) << "\n";
+        if (voxel_support_evaluated)
+        {
+            f << "voxel_support_total_voxels " << voxel_support_total << "\n";
+            f << "voxel_support_eligible_zero_crossing_voxels "
+              << voxel_support_eligible << "\n";
+            f << "voxel_support_scene_extent " << recon_mesh.voxel_scene_extent << "\n";
+            f << "voxel_support_min_edge_m " << voxel_support_min_edge_m << "\n";
+            f << "voxel_support_max_edge_m " << voxel_support_max_edge_m << "\n";
+            f << "voxel_support_samples_per_primitive "
+              << support_samples_per_primitive << "\n";
+            f << "voxel_support_probe_samples "
+              << voxel_support_eligible * static_cast<size_t>(support_samples_per_primitive)
+              << "\n";
+            f << "voxel_support_primitive_count " << voxel_support_summary.count << "\n";
+            f << "voxel_support_distance_statistic max_boundary_distance\n";
+            f << "voxel_support_floater_count " << voxel_support_count_at_tau << "\n";
+            f << "voxel_support_floater_ratio " << voxel_support_ratio_at_tau << "\n";
+            f << "voxel_support_distance_mean_m " << voxel_support_summary.mean_m << "\n";
+            f << "voxel_support_distance_p95_m " << voxel_support_summary.p95_m << "\n";
+            f << "voxel_support_distance_p99_m " << voxel_support_summary.p99_m << "\n";
+            for (const auto& stats : voxel_support_summary.thresholds)
+            {
+                f << "voxel_support_floater_at_cm " << 100.0 * stats.threshold_m
+                  << " count " << stats.farther_count
+                  << " ratio " << stats.farther_ratio << "\n";
+            }
+        }
         f << "align_recon_to_gt_enabled " << (align_recon_to_gt ? 1 : 0) << "\n";
         f << "align_recon_to_gt_success " << (alignment_ok ? 1 : 0) << "\n";
         f << "save_aligned_mesh " << (save_aligned_mesh ? 1 : 0) << "\n";
@@ -2862,6 +4011,45 @@ int main(int argc, char** argv)
     std::cout << "Completion@" << tau_cm << "cm: " << completion
               << " (" << 100.0 * completion << "%)\n";
     std::cout << "F-score@" << tau_cm << "cm: " << fscore << "\n";
+    if (eval_floaters)
+    {
+        std::cout << (recon_has_faces ? "Surface samples" : "Primitive centers")
+                  << " farther than " << tau_cm << "cm: "
+                  << surface_floater_count_at_tau << " / " << surface_floater_summary.count
+                  << " (" << surface_floater_ratio_at_tau << ")\n";
+        std::cout << (recon_has_faces ? "Surface" : "Primitive-center")
+                  << " distance P95/P99: "
+                  << surface_floater_summary.p95_m << " / "
+                  << surface_floater_summary.p99_m << " m\n";
+        std::cout << "Floater count plot: "
+                  << (std::filesystem::path(out_dir) / "surface_floater_count.png") << "\n";
+    }
+    if (gaussian_support_evaluated)
+    {
+        std::cout << "Gaussians whose " << gaussian_support_sigma
+                  << "sigma support extends farther than " << tau_cm << "cm: "
+                  << gaussian_support_count_at_tau << " / " << gaussian_support_summary.count
+                  << " (" << gaussian_support_ratio_at_tau << ")\n";
+        std::cout << "Gaussian support distance P95/P99: "
+                  << gaussian_support_summary.p95_m << " / "
+                  << gaussian_support_summary.p99_m << " m\n";
+        std::cout << "Gaussian support plot: "
+                  << (std::filesystem::path(out_dir) /
+                      "gaussian_support_floater_count.png") << "\n";
+    }
+    if (voxel_support_evaluated)
+    {
+        std::cout << "Zero-crossing voxels whose cube support extends farther than "
+                  << tau_cm << "cm: "
+                  << voxel_support_count_at_tau << " / " << voxel_support_summary.count
+                  << " (" << voxel_support_ratio_at_tau << ")\n";
+        std::cout << "Voxel support distance P95/P99: "
+                  << voxel_support_summary.p95_m << " / "
+                  << voxel_support_summary.p99_m << " m\n";
+        std::cout << "Voxel support plot: "
+                  << (std::filesystem::path(out_dir) /
+                      "voxel_support_floater_count.png") << "\n";
+    }
     if (alignment_ok)
     {
         if (eval_mode == EvalMode::Current)
@@ -2920,9 +4108,9 @@ int main(int argc, char** argv)
 // Replica 
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5881_shutdown/ply/voxel_model/iteration_5881/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/1/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/5881_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/1/mesh_eval_gs_sim3 \
 //   --tau_cm=1.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
@@ -2933,19 +4121,19 @@ int main(int argc, char** argv)
 
 // TUM
 //   ./bin/mesh_eval \
-//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments/5881_shutdown/ply/voxel_model/iteration_5881/voxel_surface_mesh.ply \
+//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/2/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
 //   --gt=results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply \
-//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments/5881_shutdown/mesh_eval_nvblox \
+//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/2/mesh_eval_nvblox \
 //   --tau_cm=5.0 \
 //   --recon_samples=500000 \
 //   --gt_samples=500000
 
-
+// ESLAM culled Replica
 // ./bin/mesh_eval \
 //   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments/sdf_evidence_zero_crossing_refresh/ply/voxel_model/iteration_2896/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/<experiment>/ply/voxel_model/<iteration>/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments/sdf_evidence_zero_crossing_refresh/mesh_eval_gs_table3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/<experiment>/mesh_eval_gs_table3 \
 //   --tau_cm=1.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
@@ -2953,3 +4141,43 @@ int main(int argc, char** argv)
 //   --traj_mode=c2w \
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
+
+// Replica ESLAM culled mesh evaluation example with floaters
+// ./bin/mesh_eval \
+//   --eval_mode=gaussian_slam_sim3 \
+//   --recon=results/replica_rgbd_voxel/office0/4141_shutdown/ply/voxel_model/iteration_4141/voxel_model.ply \
+//   --gt=third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
+//   --out=results/replica_rgbd_voxel/office0/4141_shutdown/voxel_support_eval \
+//   --tau_cm=5.0 \
+//   --align_recon_to_gt=1 \
+//   --traj=scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
+//   --eval_floaters=0 \
+//   --gt_samples=500000 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0 \
+//   --eval_gaussian_support=0 \
+//   --eval_voxel_support=1 \
+//   --support_samples_per_primitive=32
+
+// Original Replica RGBD evaluation with floaters and Gaussian support
+// ./bin/mesh_eval \
+//   --eval_mode=gaussian_slam_sim3 \
+//   --recon=results/replica_rgbd_original/office0/3381_shutdown/ply/point_cloud/iteration_3381/point_cloud.ply \
+//   --gt=third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
+//   --out=results/replica_rgbd_original/office0/3381_shutdown/gaussian_support_eval_equal \
+//   --tau_cm=5.0 \
+//   --align_recon_to_gt=1 \
+//   --traj=scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=results/replica_rgbd_original/office0/CameraTrajectory_TUM.txt \
+//   --eval_floaters=0 \
+//   --gt_samples=500000 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0 \
+//   --eval_gaussian_support=1 \
+//   --gaussian_support_sigma=3.0 \
+//   --gaussian_min_opacity=0.0 \
+//   --eval_voxel_support=0 \
+//   --support_samples_per_primitive=32

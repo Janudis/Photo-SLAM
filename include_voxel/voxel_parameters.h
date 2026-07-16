@@ -62,25 +62,18 @@ public:
         bool  filter_near_voxels_ = true,
         bool  prune_far_voxels_ = true,
         bool  prune_near_voxels_geometric_ = false,
-        bool  prune_recent_unstable_ = false,
-        int   prune_recent_keyframes_ = 3,      // GS-SLAM style: "inserted within last K keyframes"
-        int   prune_recent_min_views_real_ = 0,
-        int   prune_recent_min_views_artificial_ = 0,
-        int   rendered_depth_candidate_promote_min_support_ = 3,
-        int   rendered_depth_candidate_prune_kf_age_ = 3,
         bool  final_special_prune_enable_ = true,
         // Pruning
+        int   prune_from_            = 1000,
         int   prune_until_           = 18000,
         float prune_thres_init_      = 1e-4f,
         float prune_thres_final_     = 5e-2f,
         float prune_thres_final_at_target_ = 5e-2f,
-        float prune_thres_init_artificial_ = 3e-4f,
-        float prune_thres_final_artificial_ = 1e-1f,
         // Subdivision
-        int   subdivide_until_       = 15000,
+        int   subdivide_from_        = 250,
         int   subdivide_all_until_   = 0,
         float subdivide_samp_thres_  = 1.0f,
-        float subdivide_prop_        = 0.05f,        // top 5% by priority
+        float subdivide_prop_        = 0.05f,
         int   subdivide_max_num_     = 10000000,   // hard cap
         float lambda_dssim = 0.2f,
         bool  use_l1 = false,
@@ -103,12 +96,6 @@ public:
         float lambda_ssim = 0.02f,
         float lambda_sparse_depth = 0.0f,
         int   sparse_depth_until = 1000,
-        float lambda_depthanythingv2 = 0.0f,
-        int   depthanythingv2_from = 3000,
-        int   depthanythingv2_end = 20000,
-        float depthanythingv2_end_mult = 0.1f,
-        bool  depthanythingv2_overall = false,
-        bool  depthanythingv2_alpha_adjust = false,
         bool  enable_da2_uncertainty = true,
         int   level_uncertainty_from = 0,
         float power_level_uncertainty = 1.0f,
@@ -127,11 +114,7 @@ public:
         int   multi_view_patch_size = 3,
         int   multi_view_sample_num = 10240000,
         float multi_view_pixel_noise_th = 1.0f,
-        float voxel_dropout_min = 0.5f,
-        float lambda_depthanythingv2_normal = 0.0f,
-        int   depthanythingv2_normal_from = 3000,
-        int   depthanythingv2_normal_end = 20000,
-        float depthanythingv2_normal_end_mult = 0.1f
+        float voxel_dropout_min = 0.5f
     );
 
 public:
@@ -139,6 +122,7 @@ public:
     float geo_lr_;
     float sh0_lr_;
     float shs_lr_;
+    float log_s_lr_ = 0.0f;
     float optim_beta1_;
     float optim_beta2_;
     float optim_eps_;
@@ -151,20 +135,20 @@ public:
     bool filter_near_voxels_;
     bool prune_far_voxels_;
     bool prune_near_voxels_geometric_;
-    bool prune_recent_unstable_;
-    int prune_recent_keyframes_;
-    int prune_recent_min_views_real_;
-    int prune_recent_min_views_artificial_;
-    int rendered_depth_candidate_promote_min_support_;
-    int rendered_depth_candidate_prune_kf_age_;
     bool final_special_prune_enable_;
+    bool prune_surface_views_enable_ = false;
+    bool final_surface_prune_enable_ = false;
+    int final_surface_min_views_ = 1;
+    float final_surface_depth_tolerance_vox_ = 0.5f;
+    float final_surface_min_sdf_span_vox_ = 0.1f;
+    bool final_surface_keep_connected_ = true;
+    int final_surface_connected_hops_ = 2;
+    int prune_from_;
     int prune_until_;
     float prune_thres_init_;
     float prune_thres_final_;
     float prune_thres_final_at_target_;
-    float prune_thres_init_artificial_;
-    float prune_thres_final_artificial_;
-    int subdivide_until_;
+    int subdivide_from_;
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
@@ -176,6 +160,12 @@ public:
     float lambda_tv_density_;
     int   tv_from_;
     int   tv_until_;
+    float lambda_ge_density_ = 0.0f;
+    int   ge_from_ = 0;
+    int   ge_until_ = 0;
+    float lambda_ls_density_ = 0.0f;
+    int   ls_from_ = 0;
+    int   ls_until_ = 0;
     float ss_aug_max_;
     float lambda_R_concen_;
     float lambda_dist_;
@@ -190,16 +180,22 @@ public:
     float lambda_ssim_;
     float lambda_sparse_depth_;
     int   sparse_depth_until_;
-    float lambda_depthanythingv2_;
-    int   depthanythingv2_from_;
-    int   depthanythingv2_end_;
-    float depthanythingv2_end_mult_;
     float lambda_rgbd_depth_ = 0.0f;
     int   rgbd_depth_from_ = 3000;
     int   rgbd_depth_end_ = 20000;
     float rgbd_depth_end_mult_ = 0.1f;
-    bool  depthanythingv2_overall_;
-    bool  depthanythingv2_alpha_adjust_;
+    float lambda_rgbd_sdf_ = 0.0f;
+    int   rgbd_sdf_from_ = 0;
+    int   rgbd_sdf_end_ = 15000;
+    float rgbd_sdf_end_mult_ = 0.1f;
+    float rgbd_sdf_trunc_vox_ = 4.0f;
+    int   rgbd_sdf_max_samples_ = 40000;
+    int   rgbd_sdf_ray_pixels_ = 1024;
+    int   rgbd_sdf_free_samples_ = 4;
+    int   rgbd_sdf_surface_samples_ = 8;
+    float rgbd_sdf_w_fs_ = 5.0f;
+    float rgbd_sdf_w_center_ = 20.0f;
+    float rgbd_sdf_w_tail_ = 1.0f;
     bool  enable_da2_uncertainty_;
     int   level_uncertainty_from_;
     float power_level_uncertainty_;
@@ -219,12 +215,6 @@ public:
     int   multi_view_sample_num_;
     float multi_view_pixel_noise_th_;
     float voxel_dropout_min_;
-    float lambda_depthanythingv2_normal_;
-    int   depthanythingv2_normal_from_;
-    int   depthanythingv2_normal_end_;
-    float depthanythingv2_normal_end_mult_;
-    int   depthanythingv2_normal_ks_ = 3;
-    float depthanythingv2_normal_tol_deg_ = 90.0f;
     float lambda_rgbd_normal_ = 0.0f;
     int   rgbd_normal_from_ = 3000;
     int   rgbd_normal_end_ = 20000;

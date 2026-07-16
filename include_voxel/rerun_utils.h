@@ -71,7 +71,7 @@ public:
         int source_frame_id = -1
     );
 
-    // Log a mesh (e.g. TSDF mesh or voxel mesh) similar to nvblox's visualize_nvblox.
+    // Log a triangle mesh for debug visualization.
     //
     // vertices  : [N,3] float tensor on any device.
     // colors    : [N,3] float or uint8 data in tensor (optional, can be empty).
@@ -96,18 +96,16 @@ public:
         const torch::Tensor& sizes,     // [N] or [N,1] or [N,3] float
         const torch::Tensor& colors,     // [N,3] float or uint8, can be undefined
         int iteration,
-        const std::string& entity_path = "world/voxels",
-        const torch::Tensor& view_counts = torch::Tensor(),
-        const torch::Tensor& birth_kfs = torch::Tensor()
+        const std::string& entity_path = "world/voxels"
     );
 
-    void visualizeNvbloxMesh(
+    void visualizeTriangleMesh(
         const torch::Tensor& vertices,   // [N,3], float32
         const torch::Tensor& colors,     // [N,3], float32 or uint8, or undefined
         const torch::Tensor& triangles,  // [M,3], int32/int64
         int iteration
     );
-    void visualizeDebugNvbloxMesh(
+    void visualizeDebugTriangleMesh(
         const std::string& recording_name,
         const torch::Tensor& vertices,   // [N,3], float32
         const torch::Tensor& colors,     // [N,3], float32 or uint8, or undefined
@@ -116,15 +114,15 @@ public:
         const std::string& entity_path = "world/mesh"
     );
 
-    void visualizeNvbloxPlyMesh(
+    void visualizePlyMesh(
         const std::string& ply_path,
         int iteration,
-        const std::string& entity_path = "world/tsdf_mesh/live");
-    void visualizeDebugNvbloxPlyMesh(
+        const std::string& entity_path = "world/sdf_mesh/live");
+    void visualizeDebugPlyMesh(
         const std::string& recording_name,
         const std::string& ply_path,
         int iteration,
-        const std::string& entity_path = "world/nvblox_mesh/reference");
+        const std::string& entity_path = "world/mesh/reference");
     void visualizeSVRasterMesh(
         const torch::Tensor& centers,   // [N,3] float
         const torch::Tensor& sizes,     // [N] or [N,1] or [N,3] float

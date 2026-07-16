@@ -22,8 +22,6 @@ int frameIdFromIntegerTimestamp(double timestamp);
 void saveKeyframeFrameIdMap(
     const std::map<std::size_t, std::shared_ptr<VoxelKeyframe>>& keyframes,
     const std::filesystem::path& path);
-std::filesystem::path resolveNvbloxMeshPath(const std::string& configured_path);
-
 bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters);
 bool loadReplicaDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_meters);
 bool loadTumDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_meters);

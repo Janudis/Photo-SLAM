@@ -59,38 +59,9 @@ find_package(realsense2)
 
 find_package(glog REQUIRED)
 
-find_package(ompl REQUIRED)
-
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
-
-# ------------------------------------------------------------------
-# nvblox (TSDF/ESDF) – already built in third_party/nvblox/build
-# ------------------------------------------------------------------
-set(NVBLOX_ROOT_DIR  "${PROJECT_SOURCE_DIR}/third_party/nvblox")
-set(NVBLOX_BUILD_DIR "${NVBLOX_ROOT_DIR}/build")
-set(NVBLOX_SRC_DIR   "${NVBLOX_ROOT_DIR}/nvblox")
-
-# Headers: third_party/nvblox/nvblox/include
-set(NVBLOX_INCLUDE_DIR "${NVBLOX_SRC_DIR}/include")
-
-# Library: third_party/nvblox/build/nvblox/libnvblox_lib.so
-set(NVBLOX_LIB_DIR "${NVBLOX_BUILD_DIR}/nvblox")
-
-# Make headers visible to all targets
-include_directories(${NVBLOX_INCLUDE_DIR})
-
-# Locate the core nvblox library built above
-find_library(NVBLOX_LIB
-    NAMES nvblox_lib
-    PATHS "${NVBLOX_LIB_DIR}"
-    NO_DEFAULT_PATH
-)
-
-if(NOT NVBLOX_LIB)
-    message(FATAL_ERROR "Could not find nvblox_lib in ${NVBLOX_LIB_DIR}")
-endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}
@@ -140,25 +111,45 @@ target_link_libraries(cuda_rasterizer
     "${TORCH_LIBRARIES}"
     Eigen3::Eigen)
 
-add_library(svraster_cuda_core STATIC
-    third_party/svraster/cuda/src/raster_state.cu
-    third_party/svraster/cuda/src/preprocess.cu
-    third_party/svraster/cuda/src/forward.cu
-    third_party/svraster/cuda/src/backward.cu
-    third_party/svraster/cuda/src/geo_params_gather.cu
-    third_party/svraster/cuda/src/sh_compute.cu
-    third_party/svraster/cuda/src/tv_compute.cu
-    third_party/svraster/cuda/src/utils.cu
-    third_party/svraster/cuda/src/adam_step.cu)
-set_target_properties(svraster_cuda_core PROPERTIES
+set(SVRECON_NAMESPACE_REMAP
+    PREPROCESS=SVRECON_PREPROCESS
+    FORWARD=SVRECON_FORWARD
+    BACKWARD=SVRECON_BACKWARD
+    RASTER_STATE=SVRECON_RASTER_STATE
+    GEO_PARAMS_GATHER=SVRECON_GEO_PARAMS_GATHER
+    SH_COMPUTE=SVRECON_SH_COMPUTE
+    TV_COMPUTE=SVRECON_TV_COMPUTE
+    VG_COMPUTE=SVRECON_VG_COMPUTE
+    GE_COMPUTE=SVRECON_GE_COMPUTE
+    LS_COMPUTE=SVRECON_LS_COMPUTE
+    PL_COMPUTE=SVRECON_PL_COMPUTE
+    UTILS=SVRECON_UTILS
+    ADAM_STEP=SVRECON_ADAM_STEP)
+
+add_library(svrecon_cuda_core STATIC
+    third_party/SVRecon/cuda/src/raster_state.cu
+    third_party/SVRecon/cuda/src/preprocess.cu
+    third_party/SVRecon/cuda/src/forward.cu
+    third_party/SVRecon/cuda/src/backward.cu
+    third_party/SVRecon/cuda/src/geo_params_gather.cu
+    third_party/SVRecon/cuda/src/sh_compute.cu
+    third_party/SVRecon/cuda/src/tv_compute.cu
+    third_party/SVRecon/cuda/src/vg_compute.cu
+    third_party/SVRecon/cuda/src/ge_compute.cu
+    third_party/SVRecon/cuda/src/ls_compute.cu
+    third_party/SVRecon/cuda/src/pl_compute.cu
+    third_party/SVRecon/cuda/src/utils.cu
+    third_party/SVRecon/cuda/src/adam_step.cu)
+set_target_properties(svrecon_cuda_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CUDA_ARCHITECTURES "75;86")
-target_include_directories(svraster_cuda_core
+target_compile_definitions(svrecon_cuda_core PRIVATE ${SVRECON_NAMESPACE_REMAP})
+target_include_directories(svrecon_cuda_core
     PUBLIC
-        ${PROJECT_SOURCE_DIR}/third_party/svraster/cuda
+        ${PROJECT_SOURCE_DIR}/third_party/SVRecon/cuda
         ${TORCH_INCLUDE_DIRS}
         ${Python3_INCLUDE_DIRS})
-target_link_libraries(svraster_cuda_core
+target_link_libraries(svrecon_cuda_core
     PUBLIC
         "${TORCH_LIBRARIES}")
 
@@ -296,8 +287,6 @@ add_library(voxel_core
         src_voxel/voxel_mapper.cpp
         src_voxel/voxel_mapper_tsdf.cpp
         src_voxel/voxel_mapper_rerun.cpp
-        src_voxel/voxel_mapper_mono_prior.cpp
-        src_voxel/voxel_mapper_planner.cpp
         src_voxel/voxel_mapper_utils.cpp
         src_voxel/voxel_mapper_evaluation.cpp
         evaluation/mesh_extraction.cpp
@@ -306,32 +295,27 @@ add_library(voxel_core
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
         src_voxel/voxel_model_rerun.cpp
-        src_voxel/voxel_svraster_rasterizer.cpp
+        src_voxel/voxel_svrecon_rasterizer.cpp
         src_voxel/rerun_utils.cpp
-        ${NVBLOX_SRC_DIR}/src/io/mesh_io.cpp
         third_party/tinyply/tinyply.h
-        third_party/tinyply/tinyply.cpp
-        src_voxel/voxel_planner.cpp)
+        third_party/tinyply/tinyply.cpp)
         
 target_include_directories(voxel_core
         PUBLIC
             include_voxel
             ${Python3_INCLUDE_DIRS}
             ${OpenCV_INCLUDE_DIRS}
-            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus
-            ${OMPL_INCLUDE_DIRS} )
+            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus )
 target_link_libraries(voxel_core
         PUBLIC
             # voxel_rasterizer           # call kernels directly if needed
-            svraster_cuda_core
+            svrecon_cuda_core
             "${TORCH_LIBRARIES}"
             Python3::Python
             pybind11::embed
             ${OpenCV_LIBRARIES}
             rerun_sdk
-            ${NVBLOX_LIB}
-            glog::glog
-            ${OMPL_LIBRARIES})
+            glog::glog)
 
 add_library(voxel_viewer SHARED
     viewer/drawer_utils.h
@@ -368,29 +352,21 @@ target_include_directories(voxel_viewer
 #     gaussian_mapper
 #     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 
-# # Replica Monocular
-# add_executable(replica_rgbd examples/replica_rgbd.cpp)
-# target_link_libraries(replica_rgbd
-#     gaussian_viewer    
-#     gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-add_executable(replica_mono_voxel examples/replica_mono_voxel.cpp)
-target_include_directories(replica_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel      # <‑‑ header path
-        pybind11::embed
-)
-target_link_libraries(replica_mono_voxel
-        voxel_core          # lib that implements LiveVoxelTrainer
-        voxel_viewer
-        # gaussian_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        torch_python
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-target_link_directories(replica_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+# Replica RGB-D (original Photo-SLAM Gaussian mapper)
+add_executable(replica_rgbd examples/replica_rgbd.cpp)
+target_include_directories(replica_rgbd PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(replica_rgbd
+    gaussian_viewer
+    gaussian_mapper
+    ${OpenCV_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(replica_rgbd PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 add_executable(replica_rgbd_voxel examples/replica_rgbd_voxel.cpp)
 target_include_directories(replica_rgbd_voxel PRIVATE
@@ -434,24 +410,6 @@ target_link_directories(tum_rgbd PRIVATE
     /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 
-add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
-target_include_directories(tum_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel      # <‑‑ header path
-        pybind11::embed
-)
-target_link_libraries(tum_mono_voxel
-        voxel_core          # lib that implements LiveVoxelTrainer
-        voxel_viewer
-        # gaussian_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        torch_python
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-target_link_directories(tum_mono_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
-
-set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -469,24 +427,6 @@ target_link_libraries(tum_rgbd_voxel
 )
 target_link_directories(tum_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# SplatNav / statues monocular (transforms.json -> rgb.txt -> ORB-SLAM3 TrackMonocular)
-add_executable(statues_voxel examples/statues_voxel.cpp)
-target_include_directories(statues_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        ${Python3_INCLUDE_DIRS}
-)
-target_link_libraries(statues_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        torch_python
-        ${Python3_LIBRARIES}
-        jsoncpp_lib
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-target_link_directories(statues_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 # Mesh evaluation utility (reconstruction mesh vs GT mesh)
 add_executable(mesh_eval

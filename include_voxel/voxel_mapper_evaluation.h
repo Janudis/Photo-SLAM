@@ -41,7 +41,6 @@ torch::Tensor depthTensorToEvalMap(const torch::Tensor& depth_tensor);
 torch::Tensor transmittanceTensorToEvalMap(const torch::Tensor& t_tensor);
 bool renderPkgToMetricDepthForEval(const std::unordered_map<std::string, torch::Tensor>& render_pkg, torch::Tensor& metric_depth);
 bool renderPkgToSparseDepthLossMap(const std::unordered_map<std::string, torch::Tensor>& render_pkg, torch::Tensor& depth_loss_map);
-bool renderPkgToMonoPriorDebugMaps(const std::unordered_map<std::string, torch::Tensor>& render_pkg, const torch::Tensor& mono_prior, float z_near, torch::Tensor& mono_prior_resized, torch::Tensor& aligned_target, torch::Tensor& rendered_loss_ref);
 bool computeSharedDepthVizRange(const torch::Tensor& pred_depth, const cv::Mat& gt_depth_meters, float valid_min_depth, float valid_max_depth, float& viz_min, float& viz_max);
 bool computeDepthScaleFitStats(const torch::Tensor& pred_depth, const cv::Mat& gt_depth_meters, float valid_min_depth, float valid_max_depth, DepthScaleFitStats& stats_out);
 bool computeWeightedMedianScale(const std::vector<std::pair<float, double>>& weighted_scales, float& scale_out);
@@ -54,7 +53,7 @@ cv::Mat appendJetLegendBar(const cv::Mat& image_bgr, float viz_min, float viz_ma
 bool renderPkgToNormalForEval(const std::unordered_map<std::string, torch::Tensor>& render_pkg, torch::Tensor& render_normal);
 torch::Tensor depth2normalSVRaster(const sv::MiniCam& cam, const torch::Tensor& depth, int ks, float tol_cos);
 torch::Tensor validDepthSupportMask(const torch::Tensor& valid, int ks);
-torch::Tensor normalDepthConsistencyLossSVRaster(const sv::MiniCam& cam, const std::unordered_map<std::string, torch::Tensor>& render_pkg, int ks, float tol_deg);
+torch::Tensor normalDepthConsistencyLossSvrecon(const sv::MiniCam& cam, const std::unordered_map<std::string, torch::Tensor>& render_pkg, int ks, float tol_deg);
 cv::Mat colorizeNormalMapBgr(const torch::Tensor& normal_tensor);
 torch::Tensor normalWorldToCameraForViz(const sv::MiniCam& cam, const torch::Tensor& normal_world);
 cv::Mat blackRgbImage(int height, int width);

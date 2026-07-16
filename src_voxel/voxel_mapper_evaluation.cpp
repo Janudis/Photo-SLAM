@@ -150,126 +150,6 @@ bool renderPkgToSparseDepthLossMap(
     return pred_depth.defined();
 }
 
-bool renderPkgToMonoPriorDebugMaps(
-    const std::unordered_map<std::string, torch::Tensor>& render_pkg,
-    const torch::Tensor& mono_depth,
-    float cam_near,
-    torch::Tensor& mono_prior_resized,
-    torch::Tensor& aligned_target,
-    torch::Tensor& rendered_loss_ref)
-{
-    mono_prior_resized = torch::Tensor();
-    aligned_target = torch::Tensor();
-    rendered_loss_ref = torch::Tensor();
-
-    if (!mono_depth.defined() || mono_depth.numel() == 0) {
-        return false;
-    }
-
-    auto it_T = render_pkg.find("raw_T");
-    if (it_T == render_pkg.end() || !it_T->second.defined()) {
-        it_T = render_pkg.find("T");
-        if (it_T == render_pkg.end() || !it_T->second.defined()) {
-            return false;
-        }
-    }
-
-    auto it_depth = render_pkg.find("raw_depth");
-    if (it_depth == render_pkg.end() || !it_depth->second.defined()) {
-        it_depth = render_pkg.find("depth");
-        if (it_depth == render_pkg.end() || !it_depth->second.defined()) {
-            return false;
-        }
-    }
-
-    torch::Tensor depth = it_depth->second.detach().to(torch::kFloat32).contiguous();
-    if (depth.dim() == 4 && depth.size(0) == 1) {
-        depth = depth.squeeze(0);
-    }
-    if (depth.dim() == 2) {
-        depth = depth.unsqueeze(0);
-    }
-    if (depth.dim() != 3) {
-        return false;
-    }
-
-    torch::Tensor T = it_T->second.detach().to(depth.device()).to(torch::kFloat32).contiguous();
-    if (T.dim() == 4 && T.size(0) == 1) {
-        T = T.squeeze(0);
-    }
-    if (T.dim() == 2) {
-        T = T.unsqueeze(0);
-    }
-    if (T.dim() != 3) {
-        return false;
-    }
-
-    torch::Tensor Y = mono_depth.detach().to(depth.device()).to(torch::kFloat32).contiguous();
-    if (Y.dim() == 4 && Y.size(0) == 1) {
-        Y = Y.squeeze(0);
-    }
-    if (Y.dim() == 3 && Y.size(0) == 1) {
-        Y = Y.squeeze(0);
-    }
-    if (Y.dim() == 2) {
-        Y = Y.unsqueeze(0).unsqueeze(0);
-    } else if (Y.dim() == 3 && Y.size(0) == 1) {
-        Y = Y.unsqueeze(0);
-    }
-    if (Y.dim() != 4) {
-        return false;
-    }
-
-    torch::Tensor invdepth =
-        1.0f / depth.unsqueeze(1).clamp_min(std::max(1e-6f, cam_near));
-    const int64_t ref_idx = std::min<int64_t>(2, invdepth.size(0) - 1);
-    torch::Tensor X = invdepth.index({0}).unsqueeze(0);
-    torch::Tensor Xref = invdepth.index({ref_idx}).unsqueeze(0);
-    torch::Tensor alpha = 1.0f - T.index({0}).unsqueeze(0).unsqueeze(0);
-
-    if (Y.sizes().slice(2) != X.sizes().slice(2)) {
-        Y = torch::nn::functional::interpolate(
-            Y,
-            torch::nn::functional::InterpolateFuncOptions()
-                .size(std::vector<int64_t>{X.size(2), X.size(3)})
-                .mode(torch::kBilinear)
-                .align_corners(false));
-    }
-
-    torch::Tensor target;
-    {
-        torch::NoGradGuard no_grad;
-        const torch::Tensor Ymed = Y.median();
-        const torch::Tensor Ys = (Y - Ymed).abs().mean().clamp_min(1e-6f);
-        const torch::Tensor Xmed = Xref.median();
-        const torch::Tensor Xs = (Xref - Xmed).abs().mean().clamp_min(1e-6f);
-        target = (Y - Ymed) * (Xs / Ys) + Xmed;
-    }
-
-    torch::Tensor render_ref = X * alpha;
-    torch::Tensor valid_mask = (target > 0.01f) & (alpha > 0.5f);
-    const torch::Tensor nan_like = torch::full_like(render_ref, std::numeric_limits<float>::quiet_NaN());
-
-    mono_prior_resized = Y.squeeze().detach().to(torch::kCPU).contiguous();
-    aligned_target = torch::where(valid_mask, target, nan_like)
-                         .squeeze()
-                         .detach()
-                         .to(torch::kCPU)
-                         .contiguous();
-    rendered_loss_ref = torch::where(valid_mask, render_ref, nan_like)
-                            .squeeze()
-                            .detach()
-                            .to(torch::kCPU)
-                            .contiguous();
-
-    return mono_prior_resized.defined() &&
-           aligned_target.defined() &&
-           rendered_loss_ref.defined() &&
-           mono_prior_resized.dim() == 2 &&
-           aligned_target.dim() == 2 &&
-           rendered_loss_ref.dim() == 2;
-}
-
 bool computeSharedDepthVizRange(
     const torch::Tensor& pred_depth,
     const cv::Mat& gt_depth_meters,
@@ -734,7 +614,7 @@ torch::Tensor validDepthSupportMask(const torch::Tensor& valid, int ks)
     return support;
 }
 
-torch::Tensor normalDepthConsistencyLossSVRaster(
+torch::Tensor normalDepthConsistencyLossSvrecon(
     const sv::MiniCam& cam,
     const std::unordered_map<std::string, torch::Tensor>& render_pkg,
     int ks,
@@ -1691,6 +1571,276 @@ torch::Tensor VoxelMapper::computeRgbdDepthLoss(
         0.0f,
         1.0f);
     const float mult = std::pow(opt_params_.rgbd_depth_end_mult_, ratio);
+    return loss * mult;
+}
+
+torch::Tensor VoxelMapper::computeRgbdSdfLoss(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const sv::MiniCam& cam,
+    int iteration)
+{
+    using torch::indexing::Slice;
+
+    auto zero = torch::zeros(
+        {1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(mDevice));
+
+    if (sensor_type_ != RGBD ||
+        opt_params_.lambda_rgbd_sdf_ <= 0.0f ||
+        iteration < opt_params_.rgbd_sdf_from_ ||
+        iteration > opt_params_.rgbd_sdf_end_ ||
+        !kf ||
+        kf->img_auxiliary_undist_.empty() ||
+        !voxel_model_) {
+        return zero;
+    }
+
+    if (!voxel_model_->geoGridPts().defined() ||
+        voxel_model_->geoGridPts().numel() == 0) {
+        return zero;
+    }
+
+    cv::Mat depth_meters;
+    if (!voxel_utils::depthMatToMeters(kf->img_auxiliary_undist_, depth_meters) ||
+        depth_meters.empty()) {
+        return zero;
+    }
+    if (depth_meters.type() != CV_32FC1) {
+        depth_meters.convertTo(depth_meters, CV_32FC1);
+    }
+
+    torch::Tensor rgbd_depth =
+        torch::from_blob(
+            depth_meters.data,
+            {depth_meters.rows, depth_meters.cols},
+            torch::TensorOptions().dtype(torch::kFloat32))
+            .clone()
+            .to(mDevice, torch::kFloat32)
+            .contiguous();
+
+    const int H = cam.height;
+    const int W = cam.width;
+    if (H <= 0 || W <= 0) {
+        return zero;
+    }
+    if (rgbd_depth.size(0) != H || rgbd_depth.size(1) != W) {
+        rgbd_depth = torch::nn::functional::interpolate(
+            rgbd_depth.unsqueeze(0).unsqueeze(0),
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{H, W})
+                .mode(torch::kNearest)).squeeze();
+    }
+
+    const float near_depth = std::max(1e-6f, cam.near);
+    const float min_depth = std::max(RGBD_min_depth_, near_depth);
+    const float tau = std::max(
+        1.0e-4f,
+        opt_params_.rgbd_sdf_trunc_vox_ * voxel_model_->fixedVoxSize());
+    const float center_band = 0.4f * tau;
+
+    torch::Tensor valid_depth =
+        torch::isfinite(rgbd_depth) &
+        (rgbd_depth > min_depth) &
+        (rgbd_depth < RGBD_max_depth_);
+    if (!valid_depth.any().item<bool>()) {
+        return zero;
+    }
+
+    const int free_samples = std::max(0, opt_params_.rgbd_sdf_free_samples_);
+    const int surface_samples = std::max(0, opt_params_.rgbd_sdf_surface_samples_);
+    const int samples_per_ray = free_samples + surface_samples;
+    const int64_t requested_pixels =
+        std::max<int64_t>(0, static_cast<int64_t>(opt_params_.rgbd_sdf_ray_pixels_));
+    if (samples_per_ray <= 0 || requested_pixels <= 0 ||
+        !std::isfinite(cam.fx) || !std::isfinite(cam.fy) ||
+        std::abs(cam.fx) < 1.0e-6f || std::abs(cam.fy) < 1.0e-6f) {
+        return zero;
+    }
+
+    torch::Tensor valid_uv =
+        torch::nonzero(valid_depth).to(mDevice).to(torch::kLong).contiguous();
+    if (!valid_uv.defined() || valid_uv.dim() != 2 || valid_uv.size(0) == 0) {
+        return zero;
+    }
+    const int64_t valid_pixel_count = valid_uv.size(0);
+    int64_t capped_pixels = requested_pixels;
+    if (opt_params_.rgbd_sdf_max_samples_ > 0) {
+        capped_pixels = std::min<int64_t>(
+            capped_pixels,
+            std::max<int64_t>(1, opt_params_.rgbd_sdf_max_samples_ / samples_per_ray));
+    }
+    const int64_t pixel_count =
+        std::min<int64_t>(valid_pixel_count, capped_pixels);
+    if (pixel_count <= 0) {
+        return zero;
+    }
+
+    torch::Tensor pixel_row_idx;
+    if (pixel_count < valid_pixel_count) {
+        pixel_row_idx =
+            torch::linspace(
+                0.0,
+                static_cast<double>(valid_pixel_count - 1),
+                pixel_count,
+                torch::TensorOptions().dtype(torch::kFloat32).device(mDevice))
+                .round()
+                .to(torch::kLong)
+                .clamp(0, valid_pixel_count - 1)
+                .contiguous();
+    } else {
+        pixel_row_idx =
+            torch::arange(
+                valid_pixel_count,
+                torch::TensorOptions().dtype(torch::kLong).device(mDevice));
+    }
+
+    torch::Tensor uv = valid_uv.index_select(0, pixel_row_idx);
+    torch::Tensor v_idx = uv.index({Slice(), 0});
+    torch::Tensor u_idx = uv.index({Slice(), 1});
+    torch::Tensor sampled_depth =
+        rgbd_depth.view({H * W}).index_select(0, v_idx * W + u_idx).contiguous();
+
+    std::vector<torch::Tensor> z_vec;
+    std::vector<torch::Tensor> valid_vec;
+    if (free_samples > 0) {
+        torch::Tensor free_t =
+            (torch::arange(
+                 free_samples,
+                 torch::TensorOptions().dtype(torch::kFloat32).device(mDevice)) +
+             0.5f) /
+            static_cast<float>(free_samples);
+        torch::Tensor free_end =
+            (sampled_depth - tau).clamp_min(min_depth);
+        torch::Tensor free_span =
+            (free_end - min_depth).clamp_min(0.0f);
+        torch::Tensor z_free =
+            min_depth + free_span.view({pixel_count, 1}) * free_t.view({1, free_samples});
+        torch::Tensor valid_free =
+            (free_span.view({pixel_count, 1}) > 1.0e-6f)
+                .expand({pixel_count, free_samples});
+        z_vec.push_back(z_free);
+        valid_vec.push_back(valid_free);
+    }
+    if (surface_samples > 0) {
+        torch::Tensor surface_t =
+            (torch::arange(
+                 surface_samples,
+                 torch::TensorOptions().dtype(torch::kFloat32).device(mDevice)) +
+             0.5f) /
+            static_cast<float>(surface_samples);
+        torch::Tensor z_surface =
+            sampled_depth.view({pixel_count, 1}) - 1.5f * tau +
+            (3.0f * tau) * surface_t.view({1, surface_samples});
+        torch::Tensor valid_surface =
+            (z_surface > min_depth) & (z_surface < RGBD_max_depth_);
+        z_vec.push_back(z_surface);
+        valid_vec.push_back(valid_surface);
+    }
+
+    torch::Tensor z_mat = torch::cat(z_vec, /*dim=*/1).contiguous();
+    torch::Tensor sample_valid = torch::cat(valid_vec, /*dim=*/1).to(torch::kBool).contiguous();
+    torch::Tensor depth_mat =
+        sampled_depth.view({pixel_count, 1}).expand_as(z_mat).contiguous();
+    torch::Tensor u_float =
+        u_idx.to(torch::kFloat32).view({pixel_count, 1}).expand_as(z_mat);
+    torch::Tensor v_float =
+        v_idx.to(torch::kFloat32).view({pixel_count, 1}).expand_as(z_mat);
+    torch::Tensor ray_x = (u_float - cam.cx) / cam.fx;
+    torch::Tensor ray_y = (v_float - cam.cy) / cam.fy;
+
+    torch::Tensor sample_mask =
+        sample_valid &
+        torch::isfinite(z_mat) &
+        torch::isfinite(depth_mat) &
+        torch::isfinite(ray_x) &
+        torch::isfinite(ray_y);
+    if (!sample_mask.any().item<bool>()) {
+        return zero;
+    }
+
+    torch::Tensor z =
+        z_mat.reshape({-1}).index({sample_mask.reshape({-1})}).contiguous();
+    sampled_depth =
+        depth_mat.reshape({-1}).index({sample_mask.reshape({-1})}).contiguous();
+    torch::Tensor x =
+        (ray_x.reshape({-1}).index({sample_mask.reshape({-1})}) * z).contiguous();
+    torch::Tensor y =
+        (ray_y.reshape({-1}).index({sample_mask.reshape({-1})}) * z).contiguous();
+    torch::Tensor pts_cam = torch::stack({x, y, z}, /*dim=*/1).contiguous();
+
+    torch::Tensor c2w = cam.c2w.to(mDevice, torch::kFloat32).contiguous();
+    if (c2w.dim() != 2 || c2w.size(0) < 3 || c2w.size(1) < 4) {
+        return zero;
+    }
+    torch::Tensor R = c2w.index({Slice(0, 3), Slice(0, 3)});
+    torch::Tensor t = c2w.index({Slice(0, 3), 3}).view({1, 3});
+    torch::Tensor pts_world = torch::matmul(pts_cam, R.t()) + t;
+
+    torch::Tensor sdf_pred;
+    torch::Tensor query_valid;
+    try {
+        std::tie(sdf_pred, query_valid) = voxel_model_->querySdfTrilinear(pts_world);
+    } catch (const c10::Error&) {
+        return zero;
+    }
+    if (!sdf_pred.defined() || !query_valid.defined() ||
+        sdf_pred.numel() != z.numel() || query_valid.numel() != z.numel()) {
+        return zero;
+    }
+    query_valid = query_valid.to(mDevice).to(torch::kBool).contiguous();
+    if (!query_valid.any().item<bool>()) {
+        return zero;
+    }
+
+    sdf_pred = sdf_pred.to(mDevice, torch::kFloat32).index({query_valid}).contiguous();
+    z = z.index({query_valid}).contiguous();
+    sampled_depth = sampled_depth.index({query_valid}).contiguous();
+
+    torch::Tensor signed_dist =
+        (sampled_depth - z).clamp(-tau, tau);
+    torch::Tensor target_norm = signed_dist / tau;
+    torch::Tensor pred_norm = sdf_pred / tau;
+
+    torch::Tensor front = z < (sampled_depth - tau);
+    torch::Tensor back = z > (sampled_depth + tau);
+    torch::Tensor center =
+        (z > (sampled_depth - center_band)) &
+        (z < (sampled_depth + center_band));
+    torch::Tensor excluded = torch::logical_or(torch::logical_or(front, back), center);
+    torch::Tensor tail = torch::logical_not(excluded);
+
+    auto masked_mse = [&](const torch::Tensor& values,
+                          const torch::Tensor& mask) -> torch::Tensor {
+        if (!mask.any().item<bool>()) {
+            return zero;
+        }
+        return values.index({mask}).pow(2).mean();
+    };
+
+    torch::Tensor fs_loss =
+        masked_mse(pred_norm - 1.0f, front);
+    torch::Tensor center_loss =
+        masked_mse(pred_norm - target_norm, center);
+    torch::Tensor tail_loss =
+        masked_mse(pred_norm - target_norm, tail);
+
+    torch::Tensor loss =
+        opt_params_.rgbd_sdf_w_fs_ * fs_loss +
+        opt_params_.rgbd_sdf_w_center_ * center_loss +
+        opt_params_.rgbd_sdf_w_tail_ * tail_loss;
+
+    if (opt_params_.rgbd_sdf_end_ <= opt_params_.rgbd_sdf_from_ ||
+        opt_params_.rgbd_sdf_end_mult_ == 1.0f) {
+        return loss;
+    }
+
+    const float ratio = std::clamp(
+        static_cast<float>(iteration - opt_params_.rgbd_sdf_from_) /
+            static_cast<float>(opt_params_.rgbd_sdf_end_ -
+                               opt_params_.rgbd_sdf_from_),
+        0.0f,
+        1.0f);
+    const float mult = std::pow(opt_params_.rgbd_sdf_end_mult_, ratio);
     return loss * mult;
 }
 

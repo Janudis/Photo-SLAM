@@ -466,9 +466,7 @@ void RerunVisualizerBridge::visualizeDebugVoxelBoxes(
     const torch::Tensor& sizes,
     const torch::Tensor& colors,
     int iteration,
-    const std::string& entity_path,
-    const torch::Tensor& view_counts,
-    const torch::Tensor& birth_kfs
+    const std::string& entity_path
 ) {
     ensureInitialized();
     if (!impl_) return;
@@ -557,63 +555,6 @@ void RerunVisualizerBridge::visualizeDebugVoxelBoxes(
         colors_np = tmp;
     }
 
-    py::object metadata = py::none();
-    torch::Tensor view_counts_cpu;
-    torch::Tensor birth_kfs_cpu;
-    py::dict meta;
-    bool has_metadata = false;
-    if (view_counts.defined() &&
-        view_counts.numel() == c_cpu.size(0)) {
-        view_counts_cpu =
-            view_counts.contiguous()
-                .to(torch::kCPU)
-                .to(torch::kFloat32)
-                .round()
-                .to(torch::kInt32)
-                .view({c_cpu.size(0)});
-        auto vc_sizes = view_counts_cpu.sizes();
-        std::vector<ssize_t> vc_shape{vc_sizes[0]};
-        std::vector<ssize_t> vc_strides{
-            static_cast<ssize_t>(sizeof(int32_t))
-        };
-        py::array view_counts_np(py::buffer_info(
-            view_counts_cpu.data_ptr<int32_t>(),
-            sizeof(int32_t),
-            py::format_descriptor<int32_t>::format(),
-            1,
-            vc_shape,
-            vc_strides
-        ));
-        meta["view_cnt"] = view_counts_np;
-        has_metadata = true;
-    }
-    if (birth_kfs.defined() &&
-        birth_kfs.numel() == c_cpu.size(0)) {
-        birth_kfs_cpu =
-            birth_kfs.contiguous()
-                .to(torch::kCPU)
-                .to(torch::kInt32)
-                .view({c_cpu.size(0)});
-        auto bk_sizes = birth_kfs_cpu.sizes();
-        std::vector<ssize_t> bk_shape{bk_sizes[0]};
-        std::vector<ssize_t> bk_strides{
-            static_cast<ssize_t>(sizeof(int32_t))
-        };
-        py::array birth_kfs_np(py::buffer_info(
-            birth_kfs_cpu.data_ptr<int32_t>(),
-            sizeof(int32_t),
-            py::format_descriptor<int32_t>::format(),
-            1,
-            bk_shape,
-            bk_strides
-        ));
-        meta["birth_kf"] = birth_kfs_np;
-        has_metadata = true;
-    }
-    if (has_metadata) {
-        metadata = meta;
-    }
-
     try {
         impl_->visualizer.attr("visualize_voxels_boxes_recording")(
             py::str(recording_name),
@@ -623,14 +564,14 @@ void RerunVisualizerBridge::visualizeDebugVoxelBoxes(
             py::str(entity_path),
             1000000,
             iteration,
-            metadata);
+            py::none());
     } catch (const py::error_already_set& e) {
         std::cerr << "[RERUN] Python error in visualizeDebugVoxelBoxes: "
                   << e.what() << std::endl;
     }
 }
 
-void RerunVisualizerBridge::visualizeNvbloxMesh(
+void RerunVisualizerBridge::visualizeTriangleMesh(
     const torch::Tensor& vertices,
     const torch::Tensor& colors,
     const torch::Tensor& triangles,
@@ -728,19 +669,19 @@ void RerunVisualizerBridge::visualizeNvbloxMesh(
 
     // ---- call Python ----
     try {
-        impl_->visualizer.attr("visualize_nvblox")(
+        impl_->visualizer.attr("visualize_triangle_mesh")(
             vertices_np,
             colors_np,
             triangles_np,
             iteration
         );
     } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeNvbloxMesh: "
+        std::cerr << "[RERUN] Python error in visualizeTriangleMesh: "
                   << e.what() << std::endl;
     }
 }
 
-void RerunVisualizerBridge::visualizeDebugNvbloxMesh(
+void RerunVisualizerBridge::visualizeDebugTriangleMesh(
     const std::string& recording_name,
     const torch::Tensor& vertices,
     const torch::Tensor& colors,
@@ -829,7 +770,7 @@ void RerunVisualizerBridge::visualizeDebugNvbloxMesh(
     ));
 
     try {
-        impl_->visualizer.attr("visualize_nvblox_recording")(
+        impl_->visualizer.attr("visualize_triangle_mesh_recording")(
             py::str(recording_name),
             vertices_np,
             colors_np,
@@ -838,12 +779,12 @@ void RerunVisualizerBridge::visualizeDebugNvbloxMesh(
             py::str(entity_path)
         );
     } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeDebugNvbloxMesh: "
+        std::cerr << "[RERUN] Python error in visualizeDebugTriangleMesh: "
                   << e.what() << std::endl;
     }
 }
 
-void RerunVisualizerBridge::visualizeNvbloxPlyMesh(
+void RerunVisualizerBridge::visualizePlyMesh(
     const std::string& ply_path,
     int iteration,
     const std::string& entity_path
@@ -853,18 +794,18 @@ void RerunVisualizerBridge::visualizeNvbloxPlyMesh(
 
     py::gil_scoped_acquire gil;
     try {
-        impl_->visualizer.attr("visualize_nvblox_ply")(
+        impl_->visualizer.attr("visualize_ply_mesh")(
             py::str(ply_path),
             iteration,
             py::str(entity_path)
         );
     } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeNvbloxPlyMesh: "
+        std::cerr << "[RERUN] Python error in visualizePlyMesh: "
                   << e.what() << std::endl;
     }
 }
 
-void RerunVisualizerBridge::visualizeDebugNvbloxPlyMesh(
+void RerunVisualizerBridge::visualizeDebugPlyMesh(
     const std::string& recording_name,
     const std::string& ply_path,
     int iteration,
@@ -875,14 +816,14 @@ void RerunVisualizerBridge::visualizeDebugNvbloxPlyMesh(
 
     py::gil_scoped_acquire gil;
     try {
-        impl_->visualizer.attr("visualize_nvblox_ply_recording")(
+        impl_->visualizer.attr("visualize_ply_mesh_recording")(
             py::str(recording_name),
             py::str(ply_path),
             iteration,
             py::str(entity_path)
         );
     } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeDebugNvbloxPlyMesh: "
+        std::cerr << "[RERUN] Python error in visualizeDebugPlyMesh: "
                   << e.what() << std::endl;
     }
 }

@@ -1574,6 +1574,74 @@ torch::Tensor VoxelMapper::computeRgbdDepthLoss(
     return loss * mult;
 }
 
+torch::Tensor VoxelMapper::computeRgbdMaskLoss(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const sv::MiniCam& cam,
+    const std::unordered_map<std::string, torch::Tensor>& render_pkg)
+{
+    auto zero = torch::zeros(
+        {1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(mDevice));
+
+    if (sensor_type_ != RGBD || !kf || kf->img_auxiliary_undist_.empty()) {
+        return zero;
+    }
+
+    auto it_T = render_pkg.find("raw_T");
+    if (it_T == render_pkg.end()) {
+        it_T = render_pkg.find("T");
+    }
+    if (it_T == render_pkg.end() || !it_T->second.defined()) {
+        return zero;
+    }
+
+    torch::Tensor raw_T =
+        it_T->second.to(mDevice, torch::kFloat32).contiguous();
+    if (raw_T.dim() == 4 && raw_T.size(0) == 1) {
+        raw_T = raw_T.squeeze(0);
+    }
+    if (raw_T.dim() == 3 && raw_T.size(0) >= 1) {
+        raw_T = raw_T.index({0});
+    }
+    if (raw_T.dim() != 2) {
+        return zero;
+    }
+
+    cv::cuda::GpuMat depth_gpu;
+    depth_gpu.upload(kf->img_auxiliary_undist_);
+    torch::Tensor rgbd_depth =
+        tensor_utils::cvGpuMat2TorchTensor_Float32(depth_gpu)
+            .to(mDevice, torch::kFloat32)
+            .contiguous();
+    if (rgbd_depth.dim() == 3 && rgbd_depth.size(0) == 1) {
+        rgbd_depth = rgbd_depth.squeeze(0);
+    }
+    if (rgbd_depth.dim() != 2) {
+        return zero;
+    }
+    if (rgbd_depth.sizes() != raw_T.sizes()) {
+        rgbd_depth = torch::nn::functional::interpolate(
+            rgbd_depth.unsqueeze(0).unsqueeze(0),
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{raw_T.size(0), raw_T.size(1)})
+                .mode(torch::kNearest)).squeeze();
+    }
+
+    const float min_depth = std::max(
+        RGBD_min_depth_, std::max(1.0e-6f, cam.near));
+    torch::Tensor valid =
+        torch::isfinite(rgbd_depth) &
+        (rgbd_depth > min_depth) &
+        (rgbd_depth < RGBD_max_depth_);
+    if (!valid.any().item<bool>()) {
+        return zero;
+    }
+
+    // Equivalent to SVRecon's foreground-mask objective
+    // ||T - (1-mask)||^2. Valid RGB-D samples have mask=1, hence target T=0.
+    return raw_T.index({valid}).square().mean();
+}
+
 torch::Tensor VoxelMapper::computeRgbdSdfLoss(
     const std::shared_ptr<VoxelKeyframe>& kf,
     const sv::MiniCam& cam,

@@ -1227,33 +1227,17 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
         torch::Tensor sh0 = voxel_model_->sh0();
         if (sh0.defined() && sh0.dim() == 2 && sh0.size(0) == N) {
             live_colors = (sh0 * sh_utils::C0 + 0.5f).clamp(0.0f, 1.0f).contiguous();
-
-            torch::Tensor density = voxel_model_->voxelDensityMean();
-            if (density.defined() && density.numel() == N) {
-                torch::Tensor d_cpu = density.view({-1}).to(torch::kCPU);
-                const float d_min = d_cpu.min().item().toFloat();
-                const float d_max = d_cpu.max().item().toFloat();
-                const float range = d_max - d_min;
-                torch::Tensor alpha_cpu;
-                if (range < 1e-6f) {
-                    alpha_cpu = torch::full_like(d_cpu, 0.8f);
-                } else {
-                    alpha_cpu = ((d_cpu - d_min) / range).clamp(0.05f, 1.0f);
-                }
-
-                torch::Tensor col_cpu = live_colors.to(torch::kCPU);
-                if (col_cpu.dim() == 2 && col_cpu.size(0) == N && col_cpu.size(1) == 3) {
-                    torch::Tensor col_rgba = torch::zeros({N, 4}, col_cpu.options());
-                    col_rgba.index_put_(
-                        {torch::indexing::Slice(), torch::indexing::Slice(0, 3)},
-                        col_cpu);
-                    col_rgba.index_put_({torch::indexing::Slice(), 3}, alpha_cpu);
-                    live_colors = col_rgba.to(live_colors.device());
-                } else if (col_cpu.dim() == 2 && col_cpu.size(0) == N && col_cpu.size(1) == 4) {
-                    col_cpu.index_put_({torch::indexing::Slice(), 3}, alpha_cpu);
-                    live_colors = col_cpu.to(live_colors.device());
-                }
-            }
+            // An SVRecon cell has no independent per-voxel opacity. Its rendered
+            // alpha depends on ordered SDF samples along a camera ray, so the SDF
+            // corner mean is not a meaningful box alpha. Use a fixed display alpha
+            // to keep an existing cell visually stable when topology/SDF ranges grow.
+            torch::Tensor col_rgba = torch::zeros(
+                {N, 4}, live_colors.options());
+            col_rgba.index_put_(
+                {torch::indexing::Slice(), torch::indexing::Slice(0, 3)},
+                live_colors);
+            col_rgba.index_put_({torch::indexing::Slice(), 3}, 0.8f);
+            live_colors = col_rgba.contiguous();
         }
     }
     torch::Tensor sizes = sizes_in;
@@ -1385,6 +1369,97 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
         "world/voxels/source/svrecon_ray_support",
         {0.2f, 0.9f, 0.35f, 0.7f},
         svrecon_ray_support_);
+
+    if (rerun_params_.rerun_svrecon_debug_) {
+        torch::Tensor active_idx = active_mask.nonzero().squeeze(1);
+        torch::Tensor centers_live;
+        torch::Tensor sizes_live;
+        torch::Tensor colors_live;
+        if (active_idx.defined() && active_idx.numel() > 0) {
+            torch::Tensor idx_dev = active_idx.to(dev).to(torch::kLong);
+            centers_live = centers_in.index_select(0, idx_dev).contiguous();
+            sizes_live = sizes.index_select(0, idx_dev).contiguous();
+            colors_live = colors_for_indices(
+                idx_dev, {0.75f, 0.75f, 0.75f, 0.45f});
+        } else {
+            centers_live = torch::empty(
+                {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+            sizes_live = torch::empty(
+                {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+            colors_live = torch::empty(
+                {0, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+        }
+        sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
+            "svrecon_debug",
+            centers_live,
+            sizes_live,
+            colors_live,
+            iteration,
+            "world/svrecon/live");
+    }
+}
+
+void VoxelMapper::logSvreconDebugVoxelMaskToRerun(
+    int iteration,
+    const torch::Tensor& mask_in,
+    const std::string& entity_path,
+    const std::array<float, 4>& rgba)
+{
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.rerun_svrecon_debug_ || !voxel_model_) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor centers = voxel_model_->voxCenter();
+    torch::Tensor sizes = voxel_model_->voxSize();
+    if (!centers.defined() || !sizes.defined() ||
+        centers.dim() != 2 || centers.size(1) != 3) {
+        return;
+    }
+
+    const int64_t N = centers.size(0);
+    const torch::Device dev = centers.device();
+    torch::Tensor mask = normalizeBoolMaskOrZeros(mask_in, N, dev);
+    torch::Tensor idx = mask.nonzero().squeeze(1);
+    const int64_t K = idx.defined() ? idx.numel() : 0;
+
+    torch::Tensor selected_centers;
+    torch::Tensor selected_sizes;
+    torch::Tensor selected_colors;
+    if (K > 0) {
+        torch::Tensor idx_dev = idx.to(dev).to(torch::kLong);
+        selected_centers = centers.index_select(0, idx_dev).contiguous();
+        if (sizes.dim() == 1) {
+            sizes = sizes.view({N, 1});
+        } else if (sizes.dim() != 2 || sizes.size(1) != 1) {
+            sizes = sizes.reshape({N, 1});
+        }
+        selected_sizes = sizes.index_select(0, idx_dev).contiguous();
+        selected_colors = torch::zeros(
+            {K, 4},
+            torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+        for (int channel = 0; channel < 4; ++channel) {
+            selected_colors.index_put_(
+                {torch::indexing::Slice(), channel}, rgba[channel]);
+        }
+    } else {
+        selected_centers = torch::empty(
+            {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+        selected_sizes = torch::empty(
+            {0, 1}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+        selected_colors = torch::empty(
+            {0, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+    }
+
+    auto& bridge = sv::RerunVisualizerBridge::instance();
+    bridge.visualizeDebugVoxelBoxes(
+        "svrecon_debug",
+        selected_centers,
+        selected_sizes,
+        selected_colors,
+        iteration,
+        entity_path);
 }
 
 void VoxelMapper::appendWholeRunPrunedVoxels(
@@ -1506,15 +1581,13 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
             colors_accum = torch::cat({colors_accum, colors_sel}, 0).contiguous();
         }
 
-        for (const std::string& recording : recordings) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
-                recording,
-                centers_accum,
-                sizes_accum,
-                colors_accum,
-                iteration,
-                entity_path);
-        }
+        sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
+            "whole_run",
+            centers_accum,
+            sizes_accum,
+            colors_accum,
+            iteration,
+            entity_path);
     };
 
     if (!rerun_state_.whole_run_pruned_centers_accum_.defined()) {
@@ -1540,34 +1613,36 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
             "world/pruned");
     }
 
-    append_source(
-        sdf_mask,
-        rerun_state_.whole_run_pruned_sdf_centers_accum_,
-        rerun_state_.whole_run_pruned_sdf_sizes_accum_,
-        rerun_state_.whole_run_pruned_sdf_colors_accum_,
-        {1.0f, 0.1f, 0.1f, 0.85f},
-        "world/pruned/source/sdf");
-    append_source(
-        base_mask,
-        rerun_state_.whole_run_pruned_svraster_centers_accum_,
-        rerun_state_.whole_run_pruned_svraster_sizes_accum_,
-        rerun_state_.whole_run_pruned_svraster_colors_accum_,
-        {0.2f, 0.55f, 1.0f, 0.85f},
-        "world/pruned/source/base");
-    append_source(
-        near_mask,
-        rerun_state_.whole_run_pruned_near_centers_accum_,
-        rerun_state_.whole_run_pruned_near_sizes_accum_,
-        rerun_state_.whole_run_pruned_near_colors_accum_,
-        {1.0f, 0.85f, 0.05f, 0.85f},
-        "world/pruned/source/near_voxels");
-    append_source(
-        final_special_mask,
-        rerun_state_.whole_run_pruned_final_special_centers_accum_,
-        rerun_state_.whole_run_pruned_final_special_sizes_accum_,
-        rerun_state_.whole_run_pruned_final_special_colors_accum_,
-        {1.0f, 0.45f, 0.0f, 0.85f},
-        "world/pruned/source/final_special_prune_enable");
+    if (rerun_params_.run_whole_run_) {
+        append_source(
+            sdf_mask,
+            rerun_state_.whole_run_pruned_sdf_centers_accum_,
+            rerun_state_.whole_run_pruned_sdf_sizes_accum_,
+            rerun_state_.whole_run_pruned_sdf_colors_accum_,
+            {1.0f, 0.1f, 0.1f, 0.85f},
+            "world/pruned/source/sdf");
+        append_source(
+            base_mask,
+            rerun_state_.whole_run_pruned_svraster_centers_accum_,
+            rerun_state_.whole_run_pruned_svraster_sizes_accum_,
+            rerun_state_.whole_run_pruned_svraster_colors_accum_,
+            {0.2f, 0.55f, 1.0f, 0.85f},
+            "world/pruned/source/base");
+        append_source(
+            near_mask,
+            rerun_state_.whole_run_pruned_near_centers_accum_,
+            rerun_state_.whole_run_pruned_near_sizes_accum_,
+            rerun_state_.whole_run_pruned_near_colors_accum_,
+            {1.0f, 0.85f, 0.05f, 0.85f},
+            "world/pruned/source/near_voxels");
+        append_source(
+            final_special_mask,
+            rerun_state_.whole_run_pruned_final_special_centers_accum_,
+            rerun_state_.whole_run_pruned_final_special_sizes_accum_,
+            rerun_state_.whole_run_pruned_final_special_colors_accum_,
+            {1.0f, 0.45f, 0.0f, 0.85f},
+            "world/pruned/source/final_special_prune_enable");
+    }
 }
 
 void VoxelMapper::appendAndLogOrbRawMapPcdToRerun(

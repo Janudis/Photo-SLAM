@@ -25,6 +25,7 @@
 #include <optional>
 #include <regex>
 #include <iomanip>
+#include <array>
 #include <unordered_set>
 
 #include "include_voxel/voxel_parameters.h"
@@ -163,7 +164,21 @@ protected:
 
     void increasePcdByKeyframeInactiveGeoDensify(
         std::shared_ptr<VoxelKeyframe> pkf,
-        bool include_inactive_geo = true);
+        bool include_inactive_geo = true,
+        bool include_rgbd_hole_fill = true);
+    torch::Tensor detectRgbdRenderHolePixels(
+        const std::shared_ptr<VoxelKeyframe>& pkf,
+        const torch::Tensor& depth,
+        int pixel_stride,
+        int64_t& valid_depth_pixels,
+        int64_t& hole_pixels,
+        torch::Tensor& full_hole_mask);
+    void fillRgbdRenderHolesSdf(
+        const std::shared_ptr<VoxelKeyframe>& pkf,
+        const torch::Tensor& depth,
+        const torch::Tensor& rgb,
+        const torch::Tensor& points3D_camera,
+        const Sophus::SE3f& Twc);
     void increasePcdByKeyframeSvreconRaySupport(std::shared_ptr<VoxelKeyframe> pkf);
     void flushSvreconRaySupportBatch();
 
@@ -213,6 +228,7 @@ protected:
     void runFinalSpecialPrune();
     torch::Tensor computeFinalSurfaceConfidenceKeepMask(
         bool retain_connected = true);
+    torch::Tensor computeSvreconSdfPruneMask(float* sdf_threshold_out = nullptr);
 
     void ensureEmbeddedPythonRuntime(bool import_torch_cuda = false);
 
@@ -241,6 +257,11 @@ protected:
         const torch::Tensor& pruned_by_sdf,
         const torch::Tensor& pruned_by_near,
         const torch::Tensor& pruned_by_final_special = torch::Tensor());
+    void logSvreconDebugVoxelMaskToRerun(
+        int iteration,
+        const torch::Tensor& mask,
+        const std::string& entity_path,
+        const std::array<float, 4>& rgba);
     void logReconstructionMeshToRerun(int iteration);
 
     // evaluation/debugging ----------------------------------------------------
@@ -262,6 +283,10 @@ protected:
         const sv::MiniCam& cam,
         const std::unordered_map<std::string, torch::Tensor>& render_pkg,
         int iteration);
+    torch::Tensor computeRgbdMaskLoss(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const sv::MiniCam& cam,
+        const std::unordered_map<std::string, torch::Tensor>& render_pkg);
     torch::Tensor computeRgbdSdfLoss(
         const std::shared_ptr<VoxelKeyframe>& kf,
         const sv::MiniCam& cam,
@@ -334,6 +359,7 @@ protected:
     bool loop_closure_iteration_;
     bool keep_training_ = false;
     bool disable_topology_changes_ = false;
+    bool tail_refinement_active_ = false;
     int default_sh_ = 0;
     int svrecon_outside_level_ = 5;
     bool svrecon_uniform_support_ = true;
@@ -378,8 +404,6 @@ protected:
     torch::Tensor depth_cache_colors_;
 
     // RGBD fill holes
-    torch::Tensor rgbd_fill_render_holes_cache_points_;
-    torch::Tensor rgbd_fill_render_holes_cache_colors_;
     bool rgbd_fill_render_holes_ = false;
     int rgbd_fill_render_holes_stride_ = 2;
     int rgbd_fill_render_holes_max_points_per_kf_ = 20000;

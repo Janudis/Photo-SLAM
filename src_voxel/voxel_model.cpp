@@ -1930,6 +1930,190 @@ void VoxelModel::applyGeoGridRawInit(
     _geo_grid_pts_.copy_(updated);
 }
 
+std::pair<torch::Tensor, torch::Tensor> VoxelModel::rgbdHoleSupportCellCenters(
+    const torch::Tensor& surface_points_world) const
+{
+    if (!surface_points_world.defined() || surface_points_world.numel() == 0 ||
+        !scene_min_t_.defined() || !vox_eff_.defined()) {
+        return {torch::Tensor(), torch::Tensor()};
+    }
+
+    auto dev = scene_min_t_.device();
+    torch::Tensor surface =
+        surface_points_world.to(dev).to(torch::kFloat32).reshape({-1, 3}).contiguous();
+    const float cell_size = vox_eff_.reshape({-1})[0].item<float>();
+    if (surface.size(0) == 0 || !std::isfinite(cell_size) || cell_size <= 0.0f) {
+        return {torch::Tensor(), torch::Tensor()};
+    }
+
+    torch::Tensor scene_min =
+        scene_min_t_.to(dev).to(torch::kFloat32).reshape({1, 3}).contiguous();
+    torch::Tensor surface_ijk =
+        ((surface - scene_min) / cell_size).floor().to(torch::kLong).contiguous();
+    // RGB-D render-hole filling allocates only the cell containing the measured
+    // surface. Neighboring cells are not required merely to close a 2-D hole and
+    // previously produced front/back layers of free-space candidates.
+    torch::Tensor support_ijk = surface_ijk.contiguous();
+    torch::Tensor source_idx =
+        torch::arange(
+            surface.size(0),
+            torch::TensorOptions().dtype(torch::kLong).device(dev))
+            .contiguous();
+    const int64_t limit = 1LL << static_cast<int>(octlevel_);
+    torch::Tensor valid =
+        ((support_ijk >= 0) & (support_ijk < limit)).all(/*dim=*/1);
+    support_ijk = support_ijk.index({valid}).contiguous();
+    source_idx = source_idx.index({valid}).contiguous();
+    if (support_ijk.size(0) == 0) {
+        return {torch::Tensor(), torch::Tensor()};
+    }
+    return {
+        (scene_min +
+         (support_ijk.to(torch::kFloat32) + 0.5f) * cell_size)
+            .contiguous(),
+        source_idx};
+}
+
+int64_t VoxelModel::applyRgbdHoleSdfEvidence(
+    const sv::MiniCam& cam,
+    const torch::Tensor& depth_meters,
+    const torch::Tensor& hole_mask,
+    const float truncation_m)
+{
+    if (!_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0 ||
+        !grid_pts_key_.defined() || grid_pts_key_.size(0) != _geo_grid_pts_.size(0) ||
+        !depth_meters.defined() || !hole_mask.defined() ||
+        cam.width <= 0 || cam.height <= 0 ||
+        cam.fx <= 1.0e-6f || cam.fy <= 1.0e-6f ||
+        !cam.w2c.defined() || cam.w2c.numel() < 16) {
+        return 0;
+    }
+
+    const int64_t expected_pixels =
+        static_cast<int64_t>(cam.width) * static_cast<int64_t>(cam.height);
+    if (depth_meters.numel() != expected_pixels || hole_mask.numel() != expected_pixels) {
+        return 0;
+    }
+
+    auto dev = _geo_grid_pts_.device();
+    torch::Tensor depth =
+        depth_meters.to(dev).to(torch::kFloat32).reshape({-1}).contiguous();
+    torch::Tensor holes =
+        hole_mask.to(dev).to(torch::kBool).reshape({-1}).contiguous();
+    // Grid corners around a selected surface cell project a few pixels away
+    // from the original hole ray. Include that local image neighborhood when
+    // assigning the shared corner SDF values.
+    torch::Tensor hole_image = holes.view({cam.height, cam.width});
+    torch::Tensor dilated_holes = hole_image.clone();
+    constexpr int kHoleDilationRadius = 4;
+    for (int dy = -kHoleDilationRadius; dy <= kHoleDilationRadius; ++dy) {
+        const int dst_y0 = std::max(0, dy);
+        const int dst_y1 = std::min(cam.height, cam.height + dy);
+        const int src_y0 = std::max(0, -dy);
+        const int src_y1 = std::min(cam.height, cam.height - dy);
+        for (int dx = -kHoleDilationRadius; dx <= kHoleDilationRadius; ++dx) {
+            const int dst_x0 = std::max(0, dx);
+            const int dst_x1 = std::min(cam.width, cam.width + dx);
+            const int src_x0 = std::max(0, -dx);
+            const int src_x1 = std::min(cam.width, cam.width - dx);
+            if (dst_y0 >= dst_y1 || dst_x0 >= dst_x1) {
+                continue;
+            }
+            using torch::indexing::Slice;
+            torch::Tensor dst = dilated_holes.index(
+                {Slice(dst_y0, dst_y1), Slice(dst_x0, dst_x1)});
+            torch::Tensor src = hole_image.index(
+                {Slice(src_y0, src_y1), Slice(src_x0, src_x1)});
+            dilated_holes.index_put_(
+                {Slice(dst_y0, dst_y1), Slice(dst_x0, dst_x1)},
+                dst | src);
+        }
+    }
+    holes = dilated_holes.reshape({-1}).contiguous();
+
+    torch::Tensor scene_min =
+        scene_center_.to(dev).to(torch::kFloat32).reshape({3}) -
+        0.5f * scene_extent_.to(dev).to(torch::kFloat32).reshape({1});
+    const float finest_vox =
+        scene_extent_.reshape({-1})[0].item<float>() *
+        std::ldexp(1.0f, -max_num_levels_);
+    torch::Tensor grid_xyz =
+        scene_min.view({1, 3}) +
+        grid_pts_key_.to(dev).to(torch::kFloat32) * finest_vox;
+
+    torch::Tensor w2c = cam.w2c.to(dev).to(torch::kFloat32).contiguous();
+    torch::Tensor R = w2c.index({torch::indexing::Slice(0, 3),
+                                 torch::indexing::Slice(0, 3)});
+    torch::Tensor t = w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
+    torch::Tensor camera_xyz = torch::matmul(grid_xyz, R.transpose(0, 1)) + t;
+    torch::Tensor z = camera_xyz.index({torch::indexing::Slice(), 2});
+    torch::Tensor z_safe = z.clamp_min(1.0e-6f);
+    torch::Tensor u =
+        (cam.fx * camera_xyz.index({torch::indexing::Slice(), 0}) / z_safe + cam.cx)
+            .round().to(torch::kLong);
+    torch::Tensor v =
+        (cam.fy * camera_xyz.index({torch::indexing::Slice(), 1}) / z_safe + cam.cy)
+            .round().to(torch::kLong);
+    torch::Tensor in_image =
+        (z > 1.0e-6f) &
+        (u >= 0) & (u < cam.width) &
+        (v >= 0) & (v < cam.height);
+    torch::Tensor pixel =
+        (v.clamp(0, cam.height - 1) * cam.width +
+         u.clamp(0, cam.width - 1)).to(torch::kLong);
+    torch::Tensor measured_depth = depth.index_select(0, pixel);
+    torch::Tensor projected_hole = holes.index_select(0, pixel);
+    torch::Tensor measured_sdf = measured_depth - z;
+    const float trunc = std::max(1.0e-4f, truncation_m);
+    torch::Tensor valid =
+        in_image & projected_hole &
+        torch::isfinite(measured_depth) &
+        (measured_depth > 0.0f) &
+        torch::isfinite(measured_sdf) &
+        (measured_sdf.abs() <= trunc);
+    torch::Tensor update_idx =
+        torch::nonzero(valid).view({-1}).to(torch::kLong).contiguous();
+    if (update_idx.numel() == 0) {
+        return 0;
+    }
+
+    torch::Tensor sample =
+        measured_sdf.index_select(0, update_idx)
+            .clamp(-trunc, trunc).view({-1, 1}).contiguous();
+    ensureSvrasterSdfField();
+    torch::NoGradGuard no_grad;
+    torch::Tensor old_w =
+        svraster_sdf_weights_.index_select(0, update_idx)
+            .to(torch::kFloat32).contiguous();
+    torch::Tensor old_evidence =
+        svraster_sdf_grid_pts_.index_select(0, update_idx)
+            .to(torch::kFloat32).contiguous();
+    torch::Tensor new_w = (old_w + 1.0f).clamp_max(100.0f);
+    torch::Tensor fused =
+        torch::where(
+            old_w > 0.0f,
+            (old_evidence * old_w + sample) / (old_w + 1.0f),
+            sample)
+            .contiguous();
+
+    // Hole closure is an initialization/update of the learnable SDF from the
+    // current valid RGB-D observation. Do not average the learnable geometry
+    // against stale pre-loop or pre-subdivision evidence; retain the weighted
+    // average only in the auxiliary evidence buffers.
+    _geo_grid_pts_.index_put_({update_idx}, sample);
+    svraster_sdf_grid_pts_.index_put_({update_idx}, fused);
+    svraster_sdf_weights_.index_put_({update_idx}, new_w);
+    if (adam_geo_.exp_avg.defined() &&
+        adam_geo_.exp_avg.size(0) == _geo_grid_pts_.size(0)) {
+        adam_geo_.exp_avg.index_put_({update_idx}, 0.0f);
+    }
+    if (adam_geo_.exp_avg_sq.defined() &&
+        adam_geo_.exp_avg_sq.size(0) == _geo_grid_pts_.size(0)) {
+        adam_geo_.exp_avg_sq.index_put_({update_idx}, 0.0f);
+    }
+    return update_idx.numel();
+}
+
 void VoxelModel::refreshSvreconLogSTargetFromVoxelSize(const bool initialize_current)
 {
     if (!size_.defined() || size_.numel() == 0) {

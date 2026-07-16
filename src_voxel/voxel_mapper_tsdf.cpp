@@ -234,6 +234,69 @@ torch::Tensor VoxelMapper::computeSdfInitForGridPoints(
     return sdf_init;
 }
 
+torch::Tensor VoxelMapper::computeSvreconSdfPruneMask(float* sdf_threshold_out)
+{
+    if (sdf_threshold_out) {
+        *sdf_threshold_out = 0.0f;
+    }
+
+    torch::Device device = mDevice;
+    if (voxel_model_ && voxel_model_->voxCenter().defined()) {
+        device = voxel_model_->voxCenter().device();
+    }
+    auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device);
+    const int64_t N = voxel_model_ ? voxel_model_->numVoxels() : 0;
+    if (!voxel_model_ || N <= 0) {
+        return torch::empty({0}, bool_opts);
+    }
+
+    torch::Tensor sdf8 =
+        voxel_model_->voxelGeoCorners().to(device).to(torch::kFloat32).contiguous();
+    torch::Tensor leaf =
+        voxel_model_->isLeaf().to(device).to(torch::kBool).reshape({-1});
+    if (sdf8.dim() != 2 || sdf8.size(0) != N || sdf8.size(1) != 8 ||
+        leaf.numel() != N) {
+        return torch::zeros({N}, bool_opts);
+    }
+
+    torch::Tensor corner_valid = torch::isfinite(sdf8).to(torch::kBool);
+    torch::Tensor valid_count =
+        corner_valid.to(torch::kInt32).sum(/*dim=*/1);
+    torch::Tensor has_pos = ((sdf8 > 0.0f) & corner_valid).any(/*dim=*/1);
+    torch::Tensor has_neg = ((sdf8 < 0.0f) & corner_valid).any(/*dim=*/1);
+    torch::Tensor has_surface =
+        (valid_count == sdf8.size(1)) & has_pos & has_neg;
+
+    torch::Tensor inf_like = torch::full_like(
+        sdf8, std::numeric_limits<float>::infinity());
+    torch::Tensor min_abs_sdf = std::get<0>(
+        torch::where(corner_valid, sdf8.abs(), inf_like).min(/*dim=*/1));
+
+    torch::Tensor sizes =
+        voxel_model_->voxSize().to(device).to(torch::kFloat32).reshape({-1});
+    float finest_voxel_size = std::max(1.0e-6f, voxel_model_->fixedVoxSize());
+    if (sizes.numel() == N && N > 0) {
+        finest_voxel_size = std::max(1.0e-6f, sizes.min().item<float>());
+    }
+    torch::Tensor log_s =
+        voxel_model_->svreconLogS().to(device).to(torch::kFloat32).reshape({-1});
+    float sdf_threshold = 2.0f * finest_voxel_size;
+    if (log_s.numel() > 0) {
+        const float sharpness_threshold =
+            std::log(199.0f) / std::exp(10.0f * log_s[0].item<float>());
+        sdf_threshold = std::max(sdf_threshold, sharpness_threshold);
+    }
+    if (sdf_threshold_out) {
+        *sdf_threshold_out = sdf_threshold;
+    }
+
+    // This is the scheduled SVRecon SDF pruning rule, restricted to leaf cells:
+    // no strict corner sign variation and outside the current near-surface band.
+    return ((~has_surface) & (min_abs_sdf > sdf_threshold) & leaf)
+        .to(torch::kBool)
+        .contiguous();
+}
+
 torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
     bool retain_connected)
 {

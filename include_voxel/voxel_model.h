@@ -69,6 +69,7 @@ public:
 
     const torch::Tensor& geoGridPts() const;
     const torch::Tensor& svreconLogS() const { return log_s_; }
+    float svreconLogSTarget() const { return svrecon_log_s_target_; }
     void refreshSvreconLogSTargetFromVoxelSize(bool initialize_current);
     void advanceSvreconLogSTowardTarget(float max_delta);
     const torch::Tensor& sh0() const;
@@ -226,6 +227,13 @@ public:
     void applyGeoGridRawInit(
         const torch::Tensor& raw_values,
         const torch::Tensor& valid_mask);
+    std::pair<torch::Tensor, torch::Tensor> rgbdHoleSupportCellCenters(
+        const torch::Tensor& surface_points_world) const;
+    int64_t applyRgbdHoleSdfEvidence(
+        const sv::MiniCam& cam,
+        const torch::Tensor& depth_meters,
+        const torch::Tensor& hole_mask,
+        float truncation_m);
     torch::Tensor makeGeoGridInitRows_(
         const torch::Tensor& grid_pts_key_new,
         int64_t begin,

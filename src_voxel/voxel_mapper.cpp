@@ -1077,8 +1077,9 @@ void VoxelMapper::run()
                 }
                 flushSvreconRaySupportBatch();
             } else if (sensor_type_ == RGBD &&
-                rgbd_fill_render_holes_ &&
-                rgbd_fill_render_holes_initial_backfill_) {
+                (inactive_geo_densify_ ||
+                 (rgbd_fill_render_holes_ &&
+                  rgbd_fill_render_holes_initial_backfill_))) {
                 std::vector<std::shared_ptr<VoxelKeyframe>> initial_rgbd_kfs;
                 initial_rgbd_kfs.reserve(scene_->keyframes().size());
                 for (const auto& kv : scene_->keyframes()) {
@@ -1093,7 +1094,10 @@ void VoxelMapper::run()
                 for (const auto& pkf : initial_rgbd_kfs) {
                     increasePcdByKeyframeInactiveGeoDensify(
                         pkf,
-                        /*include_inactive_geo=*/false);
+                        /*include_inactive_geo=*/inactive_geo_densify_,
+                        /*include_rgbd_hole_fill=*/
+                            rgbd_fill_render_holes_ &&
+                            rgbd_fill_render_holes_initial_backfill_);
                 }
                 max_depth_cached_ = previous_depth_cache_limit;
             }
@@ -1142,7 +1146,14 @@ void VoxelMapper::run()
     int adapt_interval = opt_params_.adapt_every_;          // cfg.procedure.adapt_every
     int n_delay_iters  = adapt_interval * 0.8f;        // same heuristic as GS code
     const bool prev_disable_topology_changes = disable_topology_changes_;
+    const bool prev_tail_refinement_active = tail_refinement_active_;
     disable_topology_changes_ = true;
+    tail_refinement_active_ = true;
+    std::cout << "[TAIL/refine] begin iter=" << getIteration()
+              << " planned_min_iters=" << n_delay_iters
+              << " topology_frozen=1 eikonal=0"
+              << " laplacian=" << (opt_params_.lambda_ls_density_ > 0.0f ? 1 : 0)
+              << "\n";
     while (getIteration() - SLAM_stop_iter <= n_delay_iters
         || (getIteration() % adapt_interval) <= n_delay_iters
         || isKeepingTraining() )
@@ -1152,6 +1163,10 @@ void VoxelMapper::run()
         adapt_interval = opt_params_.adapt_every_;
         n_delay_iters  = adapt_interval * 0.8f;
     }
+    std::cout << "[TAIL/refine] end iter=" << getIteration()
+              << " optimized_iters=" << (getIteration() - SLAM_stop_iter)
+              << "\n";
+    tail_refinement_active_ = prev_tail_refinement_active;
     disable_topology_changes_ = prev_disable_topology_changes;
 
     runFinalSpecialPrune();
@@ -1416,6 +1431,7 @@ void VoxelMapper::trainForOneIteration()
         (opt_params_.lambda_rgbd_sdf_ > 0.0f) &&
         (iter >= opt_params_.rgbd_sdf_from_) &&
         (iter <= opt_params_.rgbd_sdf_end_);
+    const bool need_rgbd_mask = sensor_type_ == RGBD;
     const bool need_rgbd_normal =
         (sensor_type_ == RGBD) &&
         (opt_params_.lambda_rgbd_normal_ > 0.0f) &&
@@ -1429,7 +1445,7 @@ void VoxelMapper::trainForOneIteration()
         (iter <= opt_params_.n_dmean_end_);
     ropts.output_T =
         need_T_concen || need_T_inside || need_sparse_depth || need_normal_dmean ||
-        need_rgbd_depth || need_rgbd_normal;
+        need_rgbd_depth || need_rgbd_normal || need_rgbd_mask;
     ropts.output_depth = need_sparse_depth || need_normal_dmean || need_rgbd_depth;
     ropts.output_normal = need_normal_dmean || need_rgbd_normal;
 
@@ -1534,6 +1550,17 @@ void VoxelMapper::trainForOneIteration()
 
         loss = loss + opt_params_.lambda_rgbd_depth_ * rgbd_depth_loss;
     }
+    torch::Tensor rgbd_mask_loss_for_debug;
+    if (need_rgbd_mask) {
+        // SVRecon's lambda_mask supervises final transmittance using its
+        // foreground mask. For RGB-D SLAM, valid measured depth is the
+        // corresponding foreground observation.
+        constexpr float kRgbdForegroundMaskWeight = 0.1f;
+        torch::Tensor rgbd_mask_loss =
+            computeRgbdMaskLoss(viewpoint_cam, cam, render_pkg);
+        rgbd_mask_loss_for_debug = rgbd_mask_loss.detach();
+        loss = loss + kRgbdForegroundMaskWeight * rgbd_mask_loss;
+    }
     if (need_rgbd_sdf) {
         torch::Tensor rgbd_sdf_loss =
             computeRgbdSdfLoss(viewpoint_cam, cam, iter);
@@ -1581,7 +1608,9 @@ void VoxelMapper::trainForOneIteration()
     // SVRecon applies local Eikonal regularization after the hierarchy reaches
     // inside level 9. The paper uses 1e-11 here versus 1e-8 for the coarse
     // global Eikonal term.
-    if (opt_params_.lambda_ge_density_ > 0.f) {
+    const bool eikonal_enabled =
+        !tail_refinement_active_ && opt_params_.lambda_ge_density_ > 0.f;
+    if (eikonal_enabled) {
         loss = loss + voxel_model_->svreconLocalEikonalLoss(
             opt_params_.lambda_ge_density_ * 1.0e-3f,
             /*min_inside_level=*/9);
@@ -1595,7 +1624,7 @@ void VoxelMapper::trainForOneIteration()
         iter <= opt_params_.tv_until_) {
         voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
     }
-    if (opt_params_.lambda_ge_density_ > 0.f &&
+    if (eikonal_enabled &&
         iter >= opt_params_.ge_from_ &&
         iter <= opt_params_.ge_until_) {
         const float ge_mult = std::pow(0.25f, std::min(iter / 2000, 2));
@@ -1615,6 +1644,19 @@ void VoxelMapper::trainForOneIteration()
     }
 
     voxel_model_->optimizerStep();   // <-- the actual update
+
+    // Snapshot the exact SDF prune candidates after this optimization step but
+    // before scheduled pruning can remove them. This preserves the red state at
+    // pruning iterations instead of replacing it with the post-prune remainder.
+    if (rerun_params_.enable_rerun_ &&
+        rerun_params_.rerun_svrecon_debug_) {
+        torch::NoGradGuard no_grad;
+        logSvreconDebugVoxelMaskToRerun(
+            iter,
+            computeSvreconSdfPruneMask(),
+            "world/svrecon/suspected_floaters",
+            {1.0f, 0.0f, 0.0f, 0.95f});
+    }
 
     if (!disable_topology_changes_) {
         // Densification for increasePcd
@@ -1866,7 +1908,8 @@ void VoxelMapper::trainForOneIteration()
                                     // move or form. Online SLAM has no fixed offline foreground
                                     // extent, so apply the same rule to every allocated cell.
                                     sdf_prune_mask =
-                                        ((~has_surface) & (min_abs_sdf > sdf_thresh))
+                                        computeSvreconSdfPruneMask()
+                                            .to(prune_mask.device())
                                             .to(torch::kBool);
                                 tsdf_surface_protect_mask =
                                     tsdf_surface_mask.to(prune_mask.device()).to(torch::kBool).contiguous();
@@ -2133,14 +2176,13 @@ void VoxelMapper::trainForOneIteration()
                     count_pruned_by_mask(prune_mask_surface_views_extra);
                 std::cout << "[PRUNE/stats] iter=" << iter
                           << " total=" << n_prune_total_selected
-                          << " base=0"
-                          << " sdf="
-                          << n_prune_stats_tsdf
-                          << " visibility=" << n_prune_stats_visibility
-                          << " near=" << n_prune_stats_near
-                          << " far=" << n_prune_stats_far
-                          << " surface_views=" << n_prune_stats_surface_views
+                          << " sdf=" << n_prune_stats_tsdf
                           << " surface_views_extra=" << n_prune_stats_surface_views_extra
+                          << " diagnostic_overlap_visibility=" << n_prune_stats_visibility
+                          << " diagnostic_overlap_near=" << n_prune_stats_near
+                          << " diagnostic_overlap_far=" << n_prune_stats_far
+                          << " diagnostic_overlap_surface_views="
+                          << n_prune_stats_surface_views
                           << "\n";
 
                 if (prune_mask.defined() && prune_mask.numel() == N) {
@@ -2238,7 +2280,8 @@ void VoxelMapper::trainForOneIteration()
                     int64_t n_sdf_subdiv_candidates = 0;
                     int64_t n_subdiv_sdf_selected = 0;
                     int64_t n_sdf_crossing_candidates = 0;
-                    int64_t n_sdf_band_candidates = 0;
+                    int64_t n_sdf_base_scale_candidates = 0;
+                    int64_t n_sdf_refined_candidates = 0;
                     int64_t n_sdf_priority_selected = 0;
 
                     auto compute_max_n_subdiv = [&]() -> int {
@@ -2314,43 +2357,16 @@ void VoxelMapper::trainForOneIteration()
                             torch::Tensor all_finite = finite.all(/*dim=*/1);
                             torch::Tensor has_surface =
                                 (all_finite & has_pos & has_neg).to(torch::kBool);
-                            torch::Tensor abs_sdf = torch::where(
-                                finite,
-                                sdf_corners.abs(),
-                                torch::full_like(
-                                    sdf_corners,
-                                    std::numeric_limits<float>::infinity()));
-                            torch::Tensor min_abs_sdf =
-                                std::get<0>(abs_sdf.min(/*dim=*/1));
-                            torch::Tensor log_s =
-                                voxel_model_->svreconLogS()
-                                    .to(sdf_corners.device()).to(torch::kFloat32);
-                            const float learning_band_m = std::max(
-                                2.0f * std::max(
-                                    1.0e-6f,
-                                    vox_size_1d.min().item<float>()),
-                                (torch::log(torch::tensor(
-                                     199.0f,
-                                     torch::TensorOptions()
-                                         .dtype(torch::kFloat32)
-                                         .device(sdf_corners.device()))) /
-                                 torch::exp(10.0f * log_s))
-                                    .reshape({-1})[0].item<float>());
-                            torch::Tensor in_learning_band =
-                                (all_finite & (min_abs_sdf <= learning_band_m))
-                                    .to(torch::kBool);
-                            // SVRecon: likely-surface cells either contain a
-                            // zero crossing or lie inside the current learning band.
+                            // Subdivision requires an actual zero-level-set crossing.
+                            // Same-sign cells in the near-zero learning band remain
+                            // optimizable, but are not refined as surface geometry.
                             normal_candidate_mask =
-                                ((has_surface | in_learning_band) & valid_mask_svrecon)
+                                (has_surface & valid_mask_svrecon)
                                     .to(torch::kBool);
                             sdf_subdivide_candidate_mask =
                                 normal_candidate_mask.to(torch::kBool);
                             n_sdf_crossing_candidates =
                                 (has_surface & valid_mask_svrecon).sum().item<int64_t>();
-                            n_sdf_band_candidates =
-                                (in_learning_band & valid_mask_svrecon & (~has_surface))
-                                    .sum().item<int64_t>();
                             n_sdf_subdiv_candidates =
                                 sdf_subdivide_candidate_mask.sum().item<int64_t>();
                             n_normal_candidates =
@@ -2377,16 +2393,38 @@ void VoxelMapper::trainForOneIteration()
                         if (n_normal_candidates > 0) {
                             priority = priority * normal_candidate_mask.to(priority.scalar_type());
 
-                            auto coarse_candidates =
-                                (normal_candidate_mask & (inside_level < 9)).to(torch::kBool);
-                            auto fine_candidates =
-                                (normal_candidate_mask & (inside_level >= 9)).to(torch::kBool);
+                            // In the offline SVRecon scene, inside level 9 is a
+                            // stable global transition to priority refinement.
+                            // Our online scene extent changes with the initial
+                            // map, so that absolute level can correspond to a
+                            // much finer physical scale. Establish the configured
+                            // base voxel scale densely, then use accumulated
+                            // SVRecon priority for every further refinement.
+                            const float base_scale_threshold =
+                                0.75f * std::max(
+                                    1.0e-6f,
+                                    voxel_model_->fixedVoxSize());
+                            auto base_scale_candidates =
+                                (normal_candidate_mask &
+                                 (vox_size_1d >= base_scale_threshold))
+                                    .to(torch::kBool);
+                            auto refined_candidates =
+                                (normal_candidate_mask &
+                                 (vox_size_1d < base_scale_threshold))
+                                    .to(torch::kBool);
+                            n_sdf_base_scale_candidates =
+                                base_scale_candidates.sum().item<int64_t>();
+                            n_sdf_refined_candidates =
+                                refined_candidates.sum().item<int64_t>();
 
-                            // SVRecon refines all eligible coarse cells. From
-                            // level 9 to finer levels, retain only the highest
-                            // accumulated rendering-loss fraction.
-                            auto normal_selected_mask = coarse_candidates.clone();
-                            auto fine_idx = torch::nonzero(fine_candidates)
+                            auto normal_selected_mask = base_scale_candidates.clone();
+                            if (opt_params_.subdivide_all_until_ > 0 &&
+                                iter <= opt_params_.subdivide_all_until_) {
+                                normal_selected_mask = normal_candidate_mask.clone();
+                            }
+                            auto fine_idx = torch::nonzero(
+                                                refined_candidates &
+                                                (~normal_selected_mask))
                                                 .reshape({-1}).to(torch::kLong);
                             if (fine_idx.numel() > 0 && opt_params_.subdivide_prop_ > 0.0f) {
                                 const int64_t fine_keep = std::max<int64_t>(
@@ -2426,7 +2464,7 @@ void VoxelMapper::trainForOneIteration()
                             }
 
                             n_sdf_priority_selected =
-                                (normal_selected_mask & fine_candidates)
+                                (normal_selected_mask & refined_candidates)
                                     .sum().item<int64_t>();
                             n_subdiv_normal_selected =
                                 normal_selected_mask.sum().item<int64_t>();
@@ -2469,12 +2507,14 @@ void VoxelMapper::trainForOneIteration()
                                   << (double)after / std::max(1, before) << ")\n";
                         std::cout << "[SUBDIV/sdf] zero_crossing_candidates="
                                   << n_sdf_crossing_candidates
-                                  << " learning_band_candidates="
-                                  << n_sdf_band_candidates
+                                  << " base_scale_candidates="
+                                  << n_sdf_base_scale_candidates
+                                  << " refined_candidates="
+                                  << n_sdf_refined_candidates
                                   << " selected=" << n_subdiv_sdf_selected
                                   << " priority_selected="
                                   << n_sdf_priority_selected
-                                  << " mode=surface_band_then_priority"
+                                  << " mode=base_scale_then_priority"
                                   << "\n";
                     } else {
                         std::cout << "[SUBDIV:skip] selected_total=0\n";
@@ -2511,25 +2551,92 @@ void VoxelMapper::trainForOneIteration()
     // Update learning rate
     voxel_model_->schedulerStep();
 
+    const bool report_sdf_state =
+        training_report_interval_ > 0 &&
+        (iter % training_report_interval_) == 0;
+    torch::Tensor sdf_prune_candidates_for_debug;
+    float sdf_prune_threshold_for_debug = 0.0f;
+    if (report_sdf_state) {
+        torch::NoGradGuard no_grad;
+        sdf_prune_candidates_for_debug =
+            computeSvreconSdfPruneMask(&sdf_prune_threshold_for_debug);
+    }
+    if (report_sdf_state) {
+        torch::NoGradGuard no_grad;
+        try {
+            torch::Tensor sdf8 =
+                voxel_model_->voxelGeoCorners().to(torch::kFloat32).contiguous();
+            torch::Tensor sizes =
+                voxel_model_->voxSize().to(sdf8.device()).to(torch::kFloat32).reshape({-1});
+            torch::Tensor leaf =
+                voxel_model_->isLeaf().to(sdf8.device()).to(torch::kBool).reshape({-1});
+            if (sdf8.dim() == 2 && sdf8.size(1) == 8 &&
+                sizes.numel() == sdf8.size(0) && leaf.numel() == sdf8.size(0)) {
+                torch::Tensor finite = torch::isfinite(sdf8).all(/*dim=*/1);
+                torch::Tensor has_pos = (sdf8 > 0.0f).any(/*dim=*/1);
+                torch::Tensor has_neg = (sdf8 < 0.0f).any(/*dim=*/1);
+                torch::Tensor crossing = finite & has_pos & has_neg & leaf;
+                torch::Tensor min_abs = std::get<0>(sdf8.abs().min(/*dim=*/1));
+                torch::Tensor near_no_crossing =
+                    finite & (~crossing) & leaf & (min_abs <= 2.0f * sizes);
+                torch::Tensor all_positive =
+                    finite & has_pos & (~has_neg) & leaf;
+                torch::Tensor all_negative =
+                    finite & has_neg & (~has_pos) & leaf;
+                torch::Tensor nonfinite = (~finite) & leaf;
+                auto [geo_lr, sh0_lr, shs_lr] = voxel_model_->currentLearningRates();
+                const float log_s = voxel_model_->svreconLogS()
+                    .detach().to(torch::kCPU).reshape({-1})[0].item<float>();
+                const float log_s_target = voxel_model_->svreconLogSTarget();
+                const float global_eikonal_weight =
+                    (eikonal_enabled && iter >= opt_params_.ge_from_ &&
+                     iter <= opt_params_.ge_until_)
+                        ? opt_params_.lambda_ge_density_ *
+                              std::pow(0.25f, std::min(iter / 2000, 2))
+                        : 0.0f;
+                const float rgbd_mask_loss_value =
+                    rgbd_mask_loss_for_debug.defined()
+                        ? rgbd_mask_loss_for_debug.to(torch::kCPU)
+                              .reshape({-1})[0].item<float>()
+                        : 0.0f;
+
+                std::cout << "[SDF/opt] iter=" << iter
+                          << " phase=" << (tail_refinement_active_ ? "tail" : "mapping")
+                          << " eikonal=" << (eikonal_enabled ? 1 : 0)
+                          << " eikonal_w=" << global_eikonal_weight
+                          << " geo_lr=" << geo_lr
+                          << " log_s=" << log_s
+                          << " log_s_target=" << log_s_target
+                          << " leaf=" << leaf.sum().item<int64_t>()
+                          << " crossing=" << crossing.sum().item<int64_t>()
+                          << " near_no_crossing=" << near_no_crossing.sum().item<int64_t>()
+                          << " sdf_prune_candidates="
+                          << (sdf_prune_candidates_for_debug.defined()
+                                  ? sdf_prune_candidates_for_debug.sum().item<int64_t>()
+                                  : 0)
+                          << " sdf_prune_threshold=" << sdf_prune_threshold_for_debug
+                          << " all_positive=" << all_positive.sum().item<int64_t>()
+                          << " all_negative=" << all_negative.sum().item<int64_t>()
+                          << " nonfinite=" << nonfinite.sum().item<int64_t>()
+                          << " vox_min=" << sizes.min().item<float>()
+                          << " vox_max=" << sizes.max().item<float>()
+                          << " rgbd_mask_loss=" << rgbd_mask_loss_value
+                          << "\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SDF/opt] diagnostics failed at iter=" << iter
+                      << ": " << e.what() << "\n";
+        }
+    }
+
     if (rerun_params_.enable_rerun_) {
-        if (rerun_params_.run_whole_run_) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugScalar(
-                "whole_run",
-                static_cast<double>(iter),
-                iter,
-                "world/debug/iteration");
-        }
-        if (rerun_params_.rerun_svrecon_debug_) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugScalar(
-                "svrecon_debug",
-                static_cast<double>(iter),
-                iter,
-                "world/debug/iteration");
-        }
         logReconstructionMeshToRerun(iter);
+        const bool periodic_svrecon_snapshot =
+            rerun_params_.rerun_svrecon_debug_ && report_sdf_state;
         if ((rerun_params_.run_whole_run_ ||
              rerun_params_.rerun_svrecon_debug_) &&
-            rerun_state_.whole_run_live_voxels_dirty_) {
+            (rerun_state_.whole_run_live_voxels_dirty_ ||
+             periodic_svrecon_snapshot)) {
             logWholeRunLiveVoxelsToRerun(
                 iter,
                 voxel_model_->voxCenter(),
@@ -2597,7 +2704,7 @@ void VoxelMapper::combineMappingOperations()
         case ORB_SLAM3::MappingOperation::OprType::LocalMappingBA:
         {
             bool kf_changed = false;
-            std::vector<std::shared_ptr<VoxelKeyframe>> new_ray_support_kfs;
+            std::vector<std::shared_ptr<VoxelKeyframe>> new_densification_kfs;
             // Get new keyframes
             auto& associated_kfs = opr.associatedKeyFrames();
             // Add keyframes to the scene
@@ -2618,12 +2725,10 @@ void VoxelMapper::combineMappingOperations()
                     kf_changed = true;
 	                }
 	                else {
-	                handleNewKeyframe(kf);                   // still void
-                    if (sensor_type_ == RGBD && svrecon_ray_support_) {
-                        std::shared_ptr<VoxelKeyframe> new_pkf = scene_->getKeyframe(kfid);
-                        if (new_pkf) {
-                            new_ray_support_kfs.push_back(new_pkf);
-                        }
+		                handleNewKeyframe(kf);                   // still void
+                    std::shared_ptr<VoxelKeyframe> new_pkf = scene_->getKeyframe(kfid);
+                    if (new_pkf) {
+                        new_densification_kfs.push_back(new_pkf);
                     }
                     kf_changed = true;
 	                }
@@ -2658,12 +2763,17 @@ void VoxelMapper::combineMappingOperations()
 		                }
 	            }
 
-            // ORB topology and its SDF initialization must be available before
-            // deciding which image regions genuinely lack spatial support.
-            if (sensor_type_ == RGBD && svrecon_ray_support_ &&
-                !new_ray_support_kfs.empty()) {
-                for (const auto& pkf : new_ray_support_kfs) {
-                    increasePcdByKeyframeSvreconRaySupport(pkf);
+            // Always complete incremental ORB insertion first. Then add sparse
+            // inactive geometry, re-render, and finally fill only residual RGB-D
+            // holes. This keeps the three sources ordered and prevents hole fill
+            // from claiming cells that ORB/inactive geometry would have supplied.
+            if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
+                for (const auto& pkf : new_densification_kfs) {
+                    if (svrecon_ray_support_) {
+                        increasePcdByKeyframeSvreconRaySupport(pkf);
+                    } else if (isdoingInactiveGeoDensify()) {
+                        increasePcdByKeyframeInactiveGeoDensify(pkf);
+                    }
                 }
             }
 		    }
@@ -2680,7 +2790,7 @@ void VoxelMapper::combineMappingOperations()
 
             // Get new keyframes (scaled transformation applied in ORB-SLAM3)
             auto& associated_kfs = opr.associatedKeyFrames();
-            std::vector<std::shared_ptr<VoxelKeyframe>> new_ray_support_kfs;
+            std::vector<std::shared_ptr<VoxelKeyframe>> new_densification_kfs;
 
             // std::vector<std::shared_ptr<VoxelKeyframe>> kfs_for_bounding;
 
@@ -2741,8 +2851,8 @@ void VoxelMapper::combineMappingOperations()
 	                 else {
 	                     handleNewKeyframe(kf);
 	                     pkf = scene_->getKeyframe(kfid);
-                         if (sensor_type_ == RGBD && svrecon_ray_support_ && pkf) {
-                             new_ray_support_kfs.push_back(pkf);
+                         if (pkf) {
+                             new_densification_kfs.push_back(pkf);
                          }
                          kf_changed = true;
 	                 }
@@ -2784,10 +2894,13 @@ void VoxelMapper::combineMappingOperations()
                 }
 	             }
 
-                if (sensor_type_ == RGBD && svrecon_ray_support_ &&
-                    !new_ray_support_kfs.empty()) {
-                    for (const auto& pkf : new_ray_support_kfs) {
-                        increasePcdByKeyframeSvreconRaySupport(pkf);
+                if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
+                    for (const auto& pkf : new_densification_kfs) {
+                        if (svrecon_ray_support_) {
+                            increasePcdByKeyframeSvreconRaySupport(pkf);
+                        } else if (isdoingInactiveGeoDensify()) {
+                            increasePcdByKeyframeInactiveGeoDensify(pkf);
+                        }
                     }
                 }
 		            // Mark this iteration
@@ -3026,12 +3139,9 @@ void VoxelMapper::handleNewKeyframe(
     pkf->kps_pixel_ = std::move(std::get<6>(kf));
     pkf->kps_point_local_ = std::move(std::get<7>(kf));
 
-    // SVRecon ray support is evaluated by the mapping-operation handler only
-    // after its incremental ORB points have been inserted.
-    if (!(sensor_type_ == RGBD && svrecon_ray_support_) &&
-        isdoingInactiveGeoDensify()) {
-        increasePcdByKeyframeInactiveGeoDensify(pkf);
-    }
+    // Geometry densification is deferred to the mapping-operation handler so
+    // incremental ORB points are inserted before inactive geometry and RGB-D
+    // residual-hole filling.
 
     // Prepare multi resolution images for training
     if (device_type_ == torch::kCUDA) {
@@ -3429,13 +3539,269 @@ void VoxelMapper::flushSvreconRaySupportBatch()
               << "\n";
 }
 
+torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
+    const std::shared_ptr<VoxelKeyframe>& pkf,
+    const torch::Tensor& depth,
+    const int pixel_stride,
+    int64_t& valid_depth_pixels,
+    int64_t& hole_pixels,
+    torch::Tensor& full_hole_mask)
+{
+    valid_depth_pixels = 0;
+    hole_pixels = 0;
+    full_hole_mask = torch::Tensor();
+    if (!pkf || !voxel_model_ || !depth.defined() ||
+        pkf->image_height_ <= 0 || pkf->image_width_ <= 0) {
+        return torch::Tensor();
+    }
+
+    std::unordered_map<std::string, torch::Tensor> render_pkg;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        render_pkg = voxel_model_->render(
+            pkf->toMiniCam(pkf->image_height_, pkf->image_width_),
+            pkf->image_height_,
+            pkf->image_width_,
+            torch::Tensor(),
+            "dontcare",
+            false,
+            std::nullopt,
+            true,
+            false,
+            true,
+            false,
+            false,
+            sv::RenderOpts{});
+    }
+
+    torch::Tensor render_depth_cpu;
+    torch::Tensor render_alpha_cpu;
+    torch::Tensor render_n_contrib_cpu;
+    if (!voxel_utils::renderPkgToDepthAlphaMaps(
+            render_pkg,
+            pkf->image_height_,
+            pkf->image_width_,
+            render_depth_cpu,
+            render_alpha_cpu,
+            render_n_contrib_cpu)) {
+        return torch::Tensor();
+    }
+
+    torch::Tensor depth_cpu =
+        depth.detach().to(torch::kCPU).to(torch::kFloat32)
+            .reshape({pkf->image_height_, pkf->image_width_}).contiguous();
+    std::vector<uint8_t> selected_mask(
+        static_cast<size_t>(pkf->image_height_) *
+        static_cast<size_t>(pkf->image_width_),
+        0);
+    std::vector<uint8_t> all_holes_mask(selected_mask.size(), 0);
+    std::vector<int64_t> selected;
+    const int stride = std::max(1, pixel_stride);
+    auto depth_acc = depth_cpu.accessor<float, 2>();
+    auto render_depth_acc = render_depth_cpu.accessor<float, 2>();
+    auto render_alpha_acc = render_alpha_cpu.accessor<float, 2>();
+    // SVRecon treats rendered geometry as valid at alpha >= 0.5 during
+    // rendered-depth fusion. A merely nonzero SDF contribution can still be
+    // visually indistinguishable from a hole, so use the same confidence
+    // boundary for RGB-D hole closure.
+    constexpr float kStructuralAlphaThreshold = 0.5f;
+    for (int y = 0; y < pkf->image_height_; ++y) {
+        for (int x = 0; x < pkf->image_width_; ++x) {
+            const float z_rgbd = depth_acc[y][x];
+            if (!std::isfinite(z_rgbd) ||
+                z_rgbd <= RGBD_min_depth_ || z_rgbd >= RGBD_max_depth_) {
+                continue;
+            }
+            ++valid_depth_pixels;
+            const float z_render = render_depth_acc[y][x];
+            const float alpha = render_alpha_acc[y][x];
+            const bool no_rendered_depth =
+                !std::isfinite(z_render) || z_render <= 1.0e-6f;
+            const bool structural_hole =
+                no_rendered_depth || !std::isfinite(alpha) ||
+                alpha <= kStructuralAlphaThreshold;
+            if (!structural_hole) {
+                continue;
+            }
+            ++hole_pixels;
+            all_holes_mask[
+                static_cast<size_t>(y) * pkf->image_width_ + x] = 1;
+            if ((x % stride) == 0 && (y % stride) == 0) {
+                selected.push_back(
+                    static_cast<int64_t>(y) * pkf->image_width_ + x);
+            }
+        }
+    }
+
+    if (rgbd_fill_render_holes_max_points_per_kf_ > 0 &&
+        static_cast<int64_t>(selected.size()) >
+            rgbd_fill_render_holes_max_points_per_kf_) {
+        std::vector<int64_t> kept;
+        const int64_t keep_count = rgbd_fill_render_holes_max_points_per_kf_;
+        kept.reserve(static_cast<size_t>(keep_count));
+        for (int64_t i = 0; i < keep_count; ++i) {
+            const size_t src = keep_count <= 1
+                ? selected.size() / 2
+                : static_cast<size_t>(std::llround(
+                    static_cast<double>(i) *
+                    static_cast<double>(selected.size() - 1) /
+                    static_cast<double>(keep_count - 1)));
+            kept.push_back(selected[std::min(src, selected.size() - 1)]);
+        }
+        selected.swap(kept);
+    }
+    for (const int64_t idx : selected) {
+        selected_mask[static_cast<size_t>(idx)] = 1;
+    }
+    full_hole_mask = torch::from_blob(
+                         all_holes_mask.data(),
+                         {static_cast<int64_t>(all_holes_mask.size())},
+                         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                         .clone().to(device_type_).to(torch::kBool).contiguous();
+    return torch::from_blob(
+               selected_mask.data(),
+               {static_cast<int64_t>(selected_mask.size())},
+               torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+        .clone().to(device_type_).to(torch::kBool).contiguous();
+}
+
+void VoxelMapper::fillRgbdRenderHolesSdf(
+    const std::shared_ptr<VoxelKeyframe>& pkf,
+    const torch::Tensor& depth,
+    const torch::Tensor& rgb,
+    const torch::Tensor& points3D_camera,
+    const Sophus::SE3f& Twc)
+{
+    if (!pkf || !voxel_model_ || !rgbd_fill_render_holes_ ||
+        !depth.defined() || !rgb.defined() || !points3D_camera.defined()) {
+        return;
+    }
+
+    const sv::MiniCam cam =
+        pkf->toMiniCam(pkf->image_height_, pkf->image_width_);
+    torch::Tensor Twc_tensor =
+        tensor_utils::EigenMatrix2TorchTensor(
+            Twc.matrix(), device_type_).transpose(0, 1);
+    std::vector<sv::MiniCam> cameras;
+    cameras.reserve(scene_->keyframes().size());
+    for (const auto& item : scene_->keyframes()) {
+        if (item.second) {
+            cameras.push_back(item.second->toMiniCam(
+                item.second->image_height_, item.second->image_width_));
+        }
+    }
+
+    constexpr int kMaxClosurePasses = 3;
+    for (int pass = 0; pass < kMaxClosurePasses; ++pass) {
+        int64_t valid_depth = 0;
+        int64_t holes_before = 0;
+        torch::Tensor full_hole_mask;
+        const int stride = pass == 0
+            ? std::max(1, rgbd_fill_render_holes_stride_)
+            : 1;
+        torch::Tensor hole_mask = detectRgbdRenderHolePixels(
+            pkf, depth, stride, valid_depth, holes_before, full_hole_mask);
+        if (!hole_mask.defined() || hole_mask.numel() == 0) {
+            std::cout << "[RGBD/hole_fill_sdf] kf=" << pkf->fid_
+                      << " pass=" << pass
+                      << " render_maps_unavailable=1\n";
+            return;
+        }
+        const int64_t selected_holes = hole_mask.sum().item<int64_t>();
+        if (selected_holes == 0) {
+            std::cout << "[RGBD/hole_fill_sdf] kf=" << pkf->fid_
+                      << " pass=" << pass
+                      << " valid_depth=" << valid_depth
+                      << " holes_before=" << holes_before
+                      << " selected=0 closed=1\n";
+            return;
+        }
+
+        torch::Tensor surface_camera = points3D_camera.index({hole_mask}).contiguous();
+        torch::Tensor surface_colors = rgb.index({hole_mask}).contiguous();
+        torch::Tensor surface_world = surface_camera.clone().contiguous();
+        voxel_utils::transformPoints(surface_world, Twc_tensor);
+        auto [support_centers, support_source_idx] =
+            voxel_model_->rgbdHoleSupportCellCenters(
+                surface_world);
+        if (!support_centers.defined() || support_centers.numel() == 0) {
+            std::cout << "[RGBD/hole_fill_sdf] kf=" << pkf->fid_
+                      << " pass=" << pass
+                      << " holes_before=" << holes_before
+                      << " selected=" << selected_holes
+                      << " support_cells=0\n";
+            return;
+        }
+        torch::Tensor support_colors =
+            surface_colors.index_select(
+                0, support_source_idx.to(surface_colors.device()))
+                .contiguous();
+
+        sv::VoxelModel::IncreasePcdStats stats;
+        int64_t sdf_updates = 0;
+        {
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            voxel_model_->setNextRealInsertionRerunEntityPath(
+                "world/rgbd_fill_render_holes/created");
+            voxel_model_->setNextSdfInitializationSupportPoints(surface_world);
+            voxel_model_->increasePcd(
+                support_centers,
+                support_colors,
+                getIteration(),
+                cameras);
+            voxel_model_->setNextRealInsertionRerunEntityPath("");
+            stats = voxel_model_->lastIncreasePcdStats();
+            const float base_size =
+                voxel_model_->voxSize().max().item<float>();
+            sdf_updates = voxel_model_->applyRgbdHoleSdfEvidence(
+                cam,
+                depth,
+                full_hole_mask,
+                2.0f * std::max(1.0e-4f, base_size));
+        }
+        if (stats.new_voxels > 0 &&
+            (rerun_params_.run_whole_run_ || rerun_params_.rerun_svrecon_debug_)) {
+            rerun_state_.whole_run_live_voxels_dirty_ = true;
+        }
+        std::cout << "[RGBD/hole_fill_sdf] kf=" << pkf->fid_
+                  << " pass=" << pass
+                  << " stride=" << stride
+                  << " valid_depth=" << valid_depth
+                  << " holes_before=" << holes_before
+                  << " selected=" << selected_holes
+                  << " support_cells=" << support_centers.size(0)
+                  << " new_voxels=" << stats.new_voxels
+                  << " duplicates=" << stats.duplicate_existing_voxels
+                  << " sdf_grid_updates=" << sdf_updates
+                  << "\n";
+    }
+
+    int64_t valid_depth = 0;
+    int64_t residual_holes = 0;
+    torch::Tensor final_full_hole_mask;
+    (void)detectRgbdRenderHolePixels(
+        pkf,
+        depth,
+        /*pixel_stride=*/1,
+        valid_depth,
+        residual_holes,
+        final_full_hole_mask);
+    std::cout << "[RGBD/hole_fill_sdf] kf=" << pkf->fid_
+              << " final_valid_depth=" << valid_depth
+              << " final_holes=" << residual_holes
+              << " max_passes=" << kMaxClosurePasses
+              << "\n";
+}
+
 void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
     std::shared_ptr<VoxelKeyframe> pkf,
-    const bool include_inactive_geo)
+    const bool include_inactive_geo,
+    const bool include_rgbd_hole_fill)
 {
     torch::NoGradGuard no_grad;
 
     const int iter = getIteration();
+    bool rgbd_completed_immediately = false;
 
     // Pose of camera in world frame
     Sophus::SE3f Twc = pkf->getPosef().inverse();
@@ -3621,158 +3987,10 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
             point_valid_flags,
             torch::where(depth < RGBD_max_depth_, true, false));
         
-        torch::Tensor inactive_geo_flags = include_inactive_geo
+        torch::Tensor inactive_geo_flags =
+            (include_inactive_geo && inactive_geo_densify_)
             ? point_valid_flags.clone()
             : torch::zeros_like(point_valid_flags);
-        torch::Tensor rgbd_render_hole_flags = torch::zeros_like(point_valid_flags);
-
-        int64_t rgbd_render_hole_selected = 0;
-        std::vector<int64_t> rgbd_render_hole_selected_idx;
-        if (rgbd_fill_render_holes_ && voxel_model_ &&
-            pkf->image_height_ > 0 && pkf->image_width_ > 0) {
-            std::unordered_map<std::string, torch::Tensor> render_pkg;
-            {
-                std::unique_lock<std::mutex> lock_render(mutex_render_);
-                render_pkg = voxel_model_->render(
-                    pkf->toMiniCam(pkf->image_height_, pkf->image_width_),
-                    pkf->image_height_,
-                    pkf->image_width_,
-                    torch::Tensor(),
-                    "dontcare",
-                    false,
-                    std::nullopt,
-                    true,
-                    false,
-                    true,
-                    false,
-                    false,
-                    sv::RenderOpts{});
-            }
-
-            torch::Tensor render_depth_cpu;
-            torch::Tensor render_alpha_cpu;
-            torch::Tensor render_n_contrib_cpu;
-            if (voxel_utils::renderPkgToDepthAlphaMaps(
-                    render_pkg,
-                    pkf->image_height_,
-                    pkf->image_width_,
-                    render_depth_cpu,
-                    render_alpha_cpu,
-                    render_n_contrib_cpu)) {
-                torch::Tensor depth_cpu =
-                    depth.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-                if (depth_cpu.dim() == 1) {
-                    depth_cpu = depth_cpu.view({pkf->image_height_, pkf->image_width_});
-                }
-
-                std::vector<uint8_t> fill_mask(
-                    static_cast<size_t>(pkf->image_height_) *
-                    static_cast<size_t>(pkf->image_width_),
-                    0);
-                auto depth_acc = depth_cpu.accessor<float, 2>();
-                auto render_depth_acc = render_depth_cpu.accessor<float, 2>();
-                auto render_n_contrib_acc = render_n_contrib_cpu.accessor<int, 2>();
-
-                const int active_hole_max_n_contrib = 0;
-                const int stride = std::max(1, rgbd_fill_render_holes_stride_);
-                rgbd_render_hole_selected_idx.reserve(
-                    static_cast<size_t>((pkf->image_height_ + stride - 1) / stride) *
-                    static_cast<size_t>((pkf->image_width_ + stride - 1) / stride));
-
-                for (int y = 0; y < pkf->image_height_; ++y) {
-                    for (int x = 0; x < pkf->image_width_; ++x) {
-                        const float z_rgbd = depth_acc[y][x];
-                        if (!std::isfinite(z_rgbd) ||
-                            z_rgbd <= RGBD_min_depth_ ||
-                            z_rgbd >= RGBD_max_depth_) {
-                            continue;
-                        }
-
-                        const float z_render = render_depth_acc[y][x];
-                        const int n_contrib = render_n_contrib_acc[y][x];
-                        const bool render_hole =
-                            (n_contrib <= active_hole_max_n_contrib) &&
-                            (!std::isfinite(z_render) ||
-                             z_render <= 1.0e-6f);
-                        if (!render_hole) {
-                            continue;
-                        }
-
-                        if ((x % stride) == 0 && (y % stride) == 0) {
-                            rgbd_render_hole_selected_idx.push_back(
-                                static_cast<int64_t>(y) *
-                                static_cast<int64_t>(pkf->image_width_) +
-                                static_cast<int64_t>(x));
-                        }
-                    }
-                }
-
-                const int samples_per_ray_for_cap = 1;
-                if (rgbd_fill_render_holes_max_points_per_kf_ > 0 &&
-                    static_cast<int64_t>(rgbd_render_hole_selected_idx.size()) *
-                            static_cast<int64_t>(samples_per_ray_for_cap) >
-                        static_cast<int64_t>(rgbd_fill_render_holes_max_points_per_kf_)) {
-                    std::vector<int64_t> keep;
-                    const int max_selected_rays =
-                        std::max(1, rgbd_fill_render_holes_max_points_per_kf_ / samples_per_ray_for_cap);
-                    keep.reserve(static_cast<size_t>(max_selected_rays));
-                    if (max_selected_rays == 1) {
-                        keep.push_back(
-                            rgbd_render_hole_selected_idx[
-                                rgbd_render_hole_selected_idx.size() / 2]);
-                    } else {
-                        const double step =
-                            static_cast<double>(rgbd_render_hole_selected_idx.size() - 1) /
-                            static_cast<double>(max_selected_rays - 1);
-                        for (int i = 0; i < max_selected_rays; ++i) {
-                            const size_t idx = static_cast<size_t>(
-                                std::llround(step * static_cast<double>(i)));
-                            keep.push_back(rgbd_render_hole_selected_idx[
-                                std::min(idx, rgbd_render_hole_selected_idx.size() - 1)]);
-                        }
-                    }
-                    rgbd_render_hole_selected_idx.swap(keep);
-                }
-
-                for (const int64_t idx : rgbd_render_hole_selected_idx) {
-                    fill_mask[static_cast<size_t>(idx)] = 1;
-                }
-                rgbd_render_hole_selected =
-                    static_cast<int64_t>(rgbd_render_hole_selected_idx.size());
-
-                if (rgbd_render_hole_selected > 0) {
-                    torch::Tensor fill_flags =
-                        torch::from_blob(
-                            fill_mask.data(),
-                            {depth.size(0)},
-                            torch::TensorOptions()
-                                .dtype(torch::kUInt8)
-                                .device(torch::kCPU))
-                            .clone()
-                            .to(device_type_)
-                            .to(torch::kBool);
-                    rgbd_render_hole_flags =
-                        (fill_flags & (~inactive_geo_flags)).to(torch::kBool);
-                    point_valid_flags =
-                        (inactive_geo_flags | rgbd_render_hole_flags).to(torch::kBool);
-                    rgbd_render_hole_selected =
-                        rgbd_render_hole_flags.sum().item<int64_t>();
-                    rgbd_render_hole_selected_idx.clear();
-                    torch::Tensor final_idx_cpu =
-                        torch::nonzero(
-                            rgbd_render_hole_flags.to(torch::kCPU).to(torch::kBool))
-                            .view({-1})
-                            .to(torch::kInt64)
-                            .contiguous();
-                    auto final_idx_acc = final_idx_cpu.accessor<int64_t, 1>();
-                    rgbd_render_hole_selected_idx.reserve(
-                        static_cast<size_t>(final_idx_cpu.size(0)));
-                    for (int64_t i = 0; i < final_idx_cpu.size(0); ++i) {
-                        rgbd_render_hole_selected_idx.push_back(final_idx_acc[i]);
-                    }
-                }
-            }
-        }
 
         // Reproject to 3D (camera coordinates)
         torch::Tensor points3D_all;
@@ -3804,31 +4022,54 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
         torch::Tensor points3D_inactive_geo = points3D_all.index({inactive_geo_flags});
         torch::Tensor colors_inactive_geo = rgb.index({inactive_geo_flags});
-        torch::Tensor points3D_rgbd_holes;
-        torch::Tensor colors_rgbd_holes;
-        points3D_rgbd_holes = points3D_all.index({rgbd_render_hole_flags});
-        colors_rgbd_holes = rgb.index({rgbd_render_hole_flags});
         // Transform to world coordinates
         torch::Tensor Twc_tensor =
             tensor_utils::EigenMatrix2TorchTensor(
                 Twc.matrix(), device_type_).transpose(0, 1);
         voxel_utils::transformPoints(points3D_inactive_geo, Twc_tensor);
-        voxel_utils::transformPoints(points3D_rgbd_holes, Twc_tensor);
 
-        // Cache
-        if (depth_cached_ == 0) {
-            depth_cache_points_ = points3D_inactive_geo;
-            depth_cache_colors_ = colors_inactive_geo;
-            rgbd_fill_render_holes_cache_points_ = points3D_rgbd_holes;
-            rgbd_fill_render_holes_cache_colors_ = colors_rgbd_holes;
-        } else {
-            depth_cache_points_ = torch::cat({depth_cache_points_, points3D_inactive_geo}, /*dim=*/0);
-            depth_cache_colors_ = torch::cat({depth_cache_colors_, colors_inactive_geo},   /*dim=*/0);
-            rgbd_fill_render_holes_cache_points_ =
-                torch::cat({rgbd_fill_render_holes_cache_points_, points3D_rgbd_holes}, /*dim=*/0);
-            rgbd_fill_render_holes_cache_colors_ =
-                torch::cat({rgbd_fill_render_holes_cache_colors_, colors_rgbd_holes},   /*dim=*/0);
+        int64_t inactive_new_voxels = 0;
+        if (points3D_inactive_geo.defined() &&
+            points3D_inactive_geo.dim() == 2 &&
+            points3D_inactive_geo.size(0) > 0) {
+            std::vector<sv::MiniCam> tr_cams;
+            tr_cams.reserve(scene_->keyframes().size());
+            for (const auto& kv : scene_->keyframes()) {
+                if (kv.second) {
+                    tr_cams.push_back(kv.second->toMiniCam(
+                        kv.second->image_height_, kv.second->image_width_));
+                }
+            }
+            std::unique_lock<std::mutex> lock_render(mutex_render_);
+            voxel_model_->setNextRealInsertionRerunEntityPath(
+                "world/voxels_inactive_geo_densify/created");
+            voxel_model_->increasePcd(
+                points3D_inactive_geo,
+                colors_inactive_geo,
+                getIteration(),
+                tr_cams);
+            voxel_model_->setNextRealInsertionRerunEntityPath("");
+            inactive_new_voxels = voxel_model_->lastIncreasePcdStats().new_voxels;
+            if (inactive_new_voxels > 0 &&
+                (rerun_params_.run_whole_run_ ||
+                 rerun_params_.rerun_svrecon_debug_)) {
+                rerun_state_.whole_run_live_voxels_dirty_ = true;
+            }
         }
+
+        std::cout << "[DENSIFY/order] kf=" << pkf->fid_
+                  << " inactive_candidates=" << points3D_inactive_geo.size(0)
+                  << " inactive_new_voxels=" << inactive_new_voxels
+                  << " rgbd_hole_fill="
+                  << ((include_rgbd_hole_fill && rgbd_fill_render_holes_) ? 1 : 0)
+                  << "\n";
+
+        // Re-render only after inactive geometry has been inserted, then fill
+        // whatever structural holes remain at the measured RGB-D surface.
+        if (include_rgbd_hole_fill && rgbd_fill_render_holes_) {
+            fillRgbdRenderHolesSdf(pkf, depth, rgb, points3D_all, Twc);
+        }
+        rgbd_completed_immediately = true;
     }
     break;
 
@@ -3837,6 +4078,11 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
         throw std::runtime_error("[VoxelMapper] Unsupported sensor type!");
     }
     break;
+    }
+
+    if (rgbd_completed_immediately) {
+        pkf->done_inactive_geo_densify_ = true;
+        return;
     }
 
     pkf->done_inactive_geo_densify_ = true;
@@ -3878,18 +4124,13 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
             cache_colors = torch::Tensor();
         };
 
-        if ((depth_cache_points_.defined() && depth_cache_points_.dim() == 2 && depth_cache_points_.size(0) > 0) ||
-            (rgbd_fill_render_holes_cache_points_.defined() &&
-             rgbd_fill_render_holes_cache_points_.dim() == 2 &&
-             rgbd_fill_render_holes_cache_points_.size(0) > 0)) {
+        if (depth_cache_points_.defined() &&
+            depth_cache_points_.dim() == 2 &&
+            depth_cache_points_.size(0) > 0) {
             flush_real_cache(
                 depth_cache_points_,
                 depth_cache_colors_,
                 "world/voxels_inactive_geo_densify/created");
-            flush_real_cache(
-                rgbd_fill_render_holes_cache_points_,
-                rgbd_fill_render_holes_cache_colors_,
-                "world/rgbd_fill_render_holes/created");
         }
     }
 }
@@ -4939,7 +5180,8 @@ bool VoxelMapper::isdoingGausPyramidTraining()
 bool VoxelMapper::isdoingInactiveGeoDensify()
 {
     std::unique_lock<std::mutex> lock(mutex_settings_);
-    return inactive_geo_densify_;
+    return inactive_geo_densify_ ||
+           (sensor_type_ == RGBD && rgbd_fill_render_holes_);
 }
 
  void VoxelMapper::setgeoLearningRateInit(const float lr)

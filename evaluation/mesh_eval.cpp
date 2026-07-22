@@ -2195,6 +2195,301 @@ std::vector<float> nearestDistancesL2(
     return dist;
 }
 
+float interpolateColorChannel(
+    float x,
+    const std::vector<std::array<float, 3>>& stops)
+{
+    if (stops.empty()) return 0.0f;
+    if (x <= stops.front()[0]) return stops.front()[1];
+    if (x >= stops.back()[0]) return stops.back()[2];
+    for (size_t i = 1; i < stops.size(); ++i)
+    {
+        if (x > stops[i][0]) continue;
+        const auto& left = stops[i - 1];
+        const auto& right = stops[i];
+        const float width = right[0] - left[0];
+        const float t = width > 0.0f ? (x - left[0]) / width : 0.0f;
+        return left[2] + t * (right[1] - left[2]);
+    }
+    return stops.back()[2];
+}
+
+cv::Vec3b matplotlibHsvColor(float value)
+{
+    // Matplotlib's legacy "hsv" colormap uses a 256-entry lookup table.
+    const float scaled = std::clamp(value, 0.0f, 1.0f) * 256.0f;
+    const int lut_index = std::min(255, static_cast<int>(scaled));
+    const float x = static_cast<float>(lut_index) / 255.0f;
+
+    static const std::vector<std::array<float, 3>> red = {
+        {0.0f, 1.0f, 1.0f}, {0.158730f, 1.0f, 1.0f},
+        {0.174603f, 0.968750f, 0.968750f}, {0.333333f, 0.031250f, 0.031250f},
+        {0.349206f, 0.0f, 0.0f}, {0.666667f, 0.0f, 0.0f},
+        {0.682540f, 0.031250f, 0.031250f}, {0.841270f, 0.968750f, 0.968750f},
+        {0.857143f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};
+    static const std::vector<std::array<float, 3>> green = {
+        {0.0f, 0.0f, 0.0f}, {0.158730f, 0.937500f, 0.937500f},
+        {0.174603f, 1.0f, 1.0f}, {0.507937f, 1.0f, 1.0f},
+        {0.666667f, 0.062500f, 0.062500f}, {0.682540f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f}};
+    static const std::vector<std::array<float, 3>> blue = {
+        {0.0f, 0.0f, 0.0f}, {0.333333f, 0.0f, 0.0f},
+        {0.349206f, 0.062500f, 0.062500f}, {0.507937f, 1.0f, 1.0f},
+        {0.841270f, 1.0f, 1.0f}, {0.857143f, 0.937500f, 0.937500f},
+        {1.0f, 0.093750f, 0.093750f}};
+
+    const auto to_u8 = [](float channel) {
+        return static_cast<uint8_t>(std::lround(std::clamp(channel, 0.0f, 1.0f) * 255.0f));
+    };
+    return cv::Vec3b(
+        to_u8(interpolateColorChannel(x, red)),
+        to_u8(interpolateColorChannel(x, green)),
+        to_u8(interpolateColorChannel(x, blue)));
+}
+
+std::vector<cv::Vec3b> hiSlamDistanceColors(
+    const std::vector<float>& distances,
+    float threshold_m)
+{
+    std::vector<cv::Vec3b> colors;
+    colors.reserve(distances.size());
+    const float max_distance_m = 3.0f * threshold_m;
+    for (const float distance : distances)
+    {
+        float c = max_distance_m > 0.0f ? distance / max_distance_m : 0.0f;
+        c = std::min(c, 0.85f);
+        c += 0.33f;
+        if (c > 1.0f) c -= 1.0f;
+        colors.push_back(matplotlibHsvColor(c));
+    }
+    return colors;
+}
+
+bool saveHiSlamDistanceColorbar(
+    const std::filesystem::path& path,
+    float threshold_m)
+{
+    if (!(threshold_m > 0.0f)) return false;
+
+    constexpr int image_width = 280;
+    constexpr int image_height = 820;
+    constexpr int bar_x0 = 125;
+    constexpr int bar_x1 = 185;
+    constexpr int bar_y0 = 70;
+    constexpr int bar_y1 = 760;
+    const float saturation_distance_m = 2.55f * threshold_m;
+
+    cv::Mat image(
+        image_height,
+        image_width,
+        CV_8UC3,
+        cv::Scalar(255, 255, 255));
+    for (int y = bar_y0; y <= bar_y1; ++y)
+    {
+        const float ratio = 1.0f - static_cast<float>(y - bar_y0) /
+                                       static_cast<float>(bar_y1 - bar_y0);
+        const cv::Vec3b rgb = hiSlamDistanceColors(
+            {ratio * saturation_distance_m}, threshold_m).front();
+        cv::line(
+            image,
+            cv::Point(bar_x0, y),
+            cv::Point(bar_x1, y),
+            cv::Scalar(rgb[2], rgb[1], rgb[0]));
+    }
+    cv::rectangle(
+        image,
+        cv::Point(bar_x0, bar_y0),
+        cv::Point(bar_x1, bar_y1),
+        cv::Scalar(30, 30, 30),
+        1);
+    cv::putText(
+        image,
+        "[m]",
+        cv::Point(bar_x0 + 8, 45),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(20, 20, 20),
+        1,
+        cv::LINE_AA);
+
+    struct Tick
+    {
+        float distance_m;
+        std::string label;
+    };
+    const std::vector<Tick> ticks = {
+        {0.0f, "0.000"},
+        {threshold_m, [&]() {
+             std::ostringstream stream;
+             stream << std::fixed << std::setprecision(3) << threshold_m;
+             return stream.str();
+         }()},
+        {2.0f * threshold_m, [&]() {
+             std::ostringstream stream;
+             stream << std::fixed << std::setprecision(3) << 2.0f * threshold_m;
+             return stream.str();
+         }()},
+        {saturation_distance_m, [&]() {
+             std::ostringstream stream;
+             stream << ">=" << std::fixed << std::setprecision(4)
+                    << saturation_distance_m;
+             return stream.str();
+         }()}};
+
+    for (const Tick& tick : ticks)
+    {
+        const float ratio = std::clamp(
+            tick.distance_m / saturation_distance_m, 0.0f, 1.0f);
+        const int y = bar_y1 - static_cast<int>(
+            std::lround(ratio * static_cast<float>(bar_y1 - bar_y0)));
+        cv::line(
+            image,
+            cv::Point(bar_x0 - 8, y),
+            cv::Point(bar_x1, y),
+            cv::Scalar(20, 20, 20),
+            1,
+            cv::LINE_AA);
+
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(
+            tick.label,
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.58,
+            1,
+            &baseline);
+        const int text_x = bar_x0 - text_size.width - 14;
+        const int text_y = std::clamp(
+            y + text_size.height / 2,
+            text_size.height + 2,
+            image_height - baseline - 2);
+        cv::putText(
+            image,
+            tick.label,
+            cv::Point(text_x, text_y),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.58,
+            cv::Scalar(20, 20, 20),
+            1,
+            cv::LINE_AA);
+    }
+    return cv::imwrite(path.string(), image);
+}
+
+std::string inferEvaluationSceneName(const std::string& gt_path)
+{
+    std::string name = std::filesystem::path(gt_path).stem().string();
+    const std::vector<std::string> suffixes = {
+        "_color_mesh", "_culled", "_mesh", "_gt"};
+    for (const auto& suffix : suffixes)
+    {
+        if (name.size() > suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        {
+            name.resize(name.size() - suffix.size());
+            break;
+        }
+    }
+    return name.empty() ? "scene" : name;
+}
+
+bool saveHiSlamPrecisionRecallMeshes(
+    const MeshData& recon_mesh,
+    const MeshData& gt_mesh,
+    float threshold_m,
+    uint32_t seed,
+    const std::filesystem::path& out_dir,
+    const std::string& scene_name,
+    const std::string& recon_path,
+    const std::string& gt_path,
+    bool alignment_applied,
+    std::filesystem::path& precision_path,
+    std::filesystem::path& recall_path,
+    std::filesystem::path& explanation_path,
+    std::filesystem::path& colorbar_path)
+{
+    if (recon_mesh.vertices.empty() || gt_mesh.vertices.empty() ||
+        recon_mesh.faces.empty() || gt_mesh.faces.empty())
+    {
+        std::cerr << "[mesh_eval] precision/recall mesh export requires two triangle meshes\n";
+        return false;
+    }
+
+    std::vector<cv::Point3f> precision_target;
+    std::vector<cv::Point3f> recall_target;
+    std::string sampling_case;
+    if (gt_mesh.vertices.size() < recon_mesh.vertices.size())
+    {
+        precision_target = sampleMeshPoints(
+            gt_mesh, recon_mesh.vertices.size(), seed + 101U);
+        recall_target = recon_mesh.vertices;
+        sampling_case =
+            "GT surface sampled to reconstruction vertex count; reconstruction vertices used directly.";
+    }
+    else
+    {
+        precision_target = gt_mesh.vertices;
+        recall_target = sampleMeshPoints(
+            recon_mesh, gt_mesh.vertices.size(), seed + 101U);
+        sampling_case =
+            "Reconstruction surface sampled to GT vertex count; GT vertices used directly.";
+    }
+
+    const std::vector<float> precision_distances = nearestDistancesL2(
+        recon_mesh.vertices, precision_target);
+    const std::vector<float> recall_distances = nearestDistancesL2(
+        gt_mesh.vertices, recall_target);
+    if (precision_distances.size() != recon_mesh.vertices.size() ||
+        recall_distances.size() != gt_mesh.vertices.size())
+    {
+        std::cerr << "[mesh_eval] failed to compute precision/recall vertex distances\n";
+        return false;
+    }
+
+    MeshData precision_mesh = recon_mesh;
+    MeshData recall_mesh = gt_mesh;
+    precision_mesh.colors = hiSlamDistanceColors(precision_distances, threshold_m);
+    recall_mesh.colors = hiSlamDistanceColors(recall_distances, threshold_m);
+
+    precision_path = out_dir / (scene_name + ".precision.ply");
+    recall_path = out_dir / (scene_name + ".recall.ply");
+    explanation_path = out_dir / "precision_recall_colors.txt";
+    colorbar_path = out_dir / "precision_recall_colorbar.png";
+    const bool precision_saved = savePlyMesh(precision_path.string(), precision_mesh);
+    const bool recall_saved = savePlyMesh(recall_path.string(), recall_mesh);
+    const bool colorbar_saved = saveHiSlamDistanceColorbar(colorbar_path, threshold_m);
+    if (!precision_saved || !recall_saved || !colorbar_saved) return false;
+
+    std::ofstream text(explanation_path);
+    if (!text)
+    {
+        std::cerr << "[mesh_eval] failed to write " << explanation_path << "\n";
+        return false;
+    }
+    text << "HI-SLAM2-style precision and recall mesh visualization\n\n";
+    text << "Reconstruction input: " << recon_path << "\n";
+    text << "Ground truth input: " << gt_path << "\n";
+    text << "Alignment applied before coloring: " << (alignment_applied ? "yes" : "no") << "\n";
+    text << "Threshold tau: " << std::fixed << std::setprecision(3)
+         << threshold_m << " m\n";
+    text << "Sampling: " << sampling_case << "\n\n";
+    text << precision_path.filename().string() << "\n";
+    text << "  Geometry: evaluated reconstructed mesh, aligned when alignment was enabled.\n";
+    text << "  Color distance: reconstructed vertex to nearest GT support point.\n";
+    text << "  Meaning: precision/accuracy and reconstructed floaters.\n\n";
+    text << recall_path.filename().string() << "\n";
+    text << "  Geometry: ground-truth mesh.\n";
+    text << "  Color distance: GT vertex to nearest reconstructed support point.\n";
+    text << "  Meaning: recall/completeness and missing reconstructed surfaces.\n\n";
+    text << "Color mapping (matching HI-SLAM2 evaluate_3d_reconstruction):\n";
+    text << "  c = min(distance / (3 * tau), 0.85) + 0.33; values above 1 wrap by subtracting 1.\n";
+    text << "  Matplotlib HSV(c) supplies the RGB vertex color.\n";
+    text << "  Near zero: green. Around tau: blue. Around 2*tau: red.\n";
+    text << "  Distances >= 2.55*tau use the same saturated yellow-green color.\n";
+    text << "  Colors are continuous distances, not a binary pass/fail mask.\n";
+    text << "  Color scale image: " << colorbar_path.filename().string() << "\n";
+    return true;
+}
+
 std::vector<cv::Point3f> voxelDownsamplePoints(
     const std::vector<cv::Point3f>& pts,
     float voxel_size)
@@ -3050,6 +3345,8 @@ int main(int argc, char** argv)
         "{align_stride  |1| stride for trajectory pair sampling in Sim(3) fit }"
         "{align_max_pairs|0| max pose pairs for Sim(3) fit (0=all sampled pairs) }"
         "{save_aligned_mesh|0| save the aligned reconstruction mesh to the output directory }"
+        "{save_precision_recall_meshes|0| save HI-SLAM2-style vertex-colored precision and recall meshes }"
+        "{scene_name    | | output prefix for precision/recall meshes; inferred from GT filename when empty }"
         "{gs_unseen_npy | | unseen GT point cloud .npy for gaussian_slam random-view rejection; if empty and --gt ends with _culled.ply, infer _pc_unseen.npy }"
         "{gs_depth_views|1000| number of random views for gaussian_slam depth evaluation }"
         "{gs_depth_w    |500| gaussian_slam depth image width }"
@@ -3103,6 +3400,10 @@ int main(int argc, char** argv)
     const int align_stride = parser.get<int>("align_stride");
     const int align_max_pairs = parser.get<int>("align_max_pairs");
     const bool save_aligned_mesh = parser.get<int>("save_aligned_mesh") != 0;
+    const bool save_precision_recall_meshes =
+        parser.get<int>("save_precision_recall_meshes") != 0;
+    std::string scene_name = parser.get<std::string>("scene_name");
+    if (scene_name.empty()) scene_name = inferEvaluationSceneName(gt_path);
     std::string gs_unseen_npy = parser.get<std::string>("gs_unseen_npy");
 
     std::filesystem::create_directories(out_dir);
@@ -3151,6 +3452,11 @@ int main(int argc, char** argv)
     if (eval_voxel_support && support_samples_per_primitive <= 0)
     {
         std::cerr << "[mesh_eval] support_samples_per_primitive must be positive\n";
+        return 1;
+    }
+    if (save_precision_recall_meshes && !(tau_m > 0.0f))
+    {
+        std::cerr << "[mesh_eval] --tau_cm must be positive for precision/recall mesh export\n";
         return 1;
     }
     if (gs_unseen_npy.empty())
@@ -3682,6 +3988,38 @@ int main(int argc, char** argv)
         }
     }
 
+    std::filesystem::path precision_mesh_path;
+    std::filesystem::path recall_mesh_path;
+    std::filesystem::path precision_recall_explanation_path;
+    std::filesystem::path precision_recall_colorbar_path;
+    bool precision_recall_meshes_saved = false;
+    if (save_precision_recall_meshes)
+    {
+        precision_recall_meshes_saved = saveHiSlamPrecisionRecallMeshes(
+            recon_mesh,
+            gt_mesh,
+            tau_m,
+            static_cast<uint32_t>(seed),
+            out_dir,
+            scene_name,
+            recon_path,
+            gt_path,
+            alignment_ok,
+            precision_mesh_path,
+            recall_mesh_path,
+            precision_recall_explanation_path,
+            precision_recall_colorbar_path);
+        if (precision_recall_meshes_saved)
+        {
+            std::cout << "[mesh_eval] saved precision mesh: " << precision_mesh_path << "\n";
+            std::cout << "[mesh_eval] saved recall mesh: " << recall_mesh_path << "\n";
+            std::cout << "[mesh_eval] saved precision/recall color description: "
+                      << precision_recall_explanation_path << "\n";
+            std::cout << "[mesh_eval] saved precision/recall color bar: "
+                      << precision_recall_colorbar_path << "\n";
+        }
+    }
+
     Json::Value root;
     root["recon_mesh"] = recon_path;
     root["gt_mesh"] = gt_path;
@@ -3701,6 +4039,15 @@ int main(int argc, char** argv)
     root["fscore"] = fscore;
     root["threshold_m"] = tau_m;
     root["threshold_cm"] = tau_cm;
+    root["save_precision_recall_meshes"] = save_precision_recall_meshes;
+    root["precision_recall_meshes_saved"] = precision_recall_meshes_saved;
+    if (precision_recall_meshes_saved)
+    {
+        root["precision_mesh"] = precision_mesh_path.string();
+        root["recall_mesh"] = recall_mesh_path.string();
+        root["precision_recall_colors_txt"] = precision_recall_explanation_path.string();
+        root["precision_recall_colorbar_png"] = precision_recall_colorbar_path.string();
+    }
     root["n_recon_samples"] = static_cast<Json::UInt64>(recon_pts.size());
     root["n_gt_samples"] = static_cast<Json::UInt64>(gt_pts.size());
     root["floater_evaluation_enabled"] = eval_floaters;
@@ -3882,6 +4229,17 @@ int main(int argc, char** argv)
         f << "recon_has_faces " << (recon_has_faces ? 1 : 0) << "\n";
         f << "gt_has_faces " << (gt_has_faces ? 1 : 0) << "\n";
         f << "threshold_m " << tau_m << "\n";
+        f << "save_precision_recall_meshes " << (save_precision_recall_meshes ? 1 : 0) << "\n";
+        f << "precision_recall_meshes_saved " << (precision_recall_meshes_saved ? 1 : 0) << "\n";
+        if (precision_recall_meshes_saved)
+        {
+            f << "precision_mesh " << precision_mesh_path.string() << "\n";
+            f << "recall_mesh " << recall_mesh_path.string() << "\n";
+            f << "precision_recall_colors_txt "
+              << precision_recall_explanation_path.string() << "\n";
+            f << "precision_recall_colorbar_png "
+              << precision_recall_colorbar_path.string() << "\n";
+        }
         f << "n_recon_samples " << recon_pts.size() << "\n";
         f << "n_gt_samples " << gt_pts.size() << "\n";
         f << "floater_evaluation_enabled " << (eval_floaters ? 1 : 0) << "\n";
@@ -4105,36 +4463,45 @@ int main(int argc, char** argv)
     return 0;
 }
 
+// SVRecon
 // Replica 
 // ./bin/mesh_eval \
-//   --eval_mode=gaussian_slam_sim3 \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/1/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
+//   --eval_mode=current \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/ply/voxel_model/iteration_4641/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/1/mesh_eval_gs_sim3 \
-//   --tau_cm=1.0 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_eval_gs_sim3 \
+//   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
 //   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
-//   --save_aligned_mesh=1
+//   --save_aligned_mesh=1 \
+//   --recon_samples=500000 \
+//   --gt_samples=500000 \
+//   --eval_floaters=1 \
+//   --floater_samples=500000 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0 \
+//   --eval_gaussian_support=0 \
+//   --eval_voxel_support=0
 
 // TUM
 //   ./bin/mesh_eval \
-//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/2/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
+//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/11_shutdown/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
 //   --gt=results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply \
-//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/2/mesh_eval_nvblox \
+//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/11_shutdown/mesh_eval_nvblox \
 //   --tau_cm=5.0 \
 //   --recon_samples=500000 \
 //   --gt_samples=500000
 
-// ESLAM culled Replica
+// Replica ESLAM culled mesh evaluation example
 // ./bin/mesh_eval \
-//   --eval_mode=gaussian_slam_sim3 \
+//   --eval_mode=current \
 //   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/<experiment>/ply/voxel_model/<iteration>/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
 //   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/<experiment>/mesh_eval_gs_table3 \
-//   --tau_cm=1.0 \
+//   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
 //   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
@@ -4142,42 +4509,144 @@ int main(int argc, char** argv)
 //   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
 //   --save_aligned_mesh=1
 
-// Replica ESLAM culled mesh evaluation example with floaters
+// Original Photo-SLAM 
+// Replica
 // ./bin/mesh_eval \
-//   --eval_mode=gaussian_slam_sim3 \
-//   --recon=results/replica_rgbd_voxel/office0/4141_shutdown/ply/voxel_model/iteration_4141/voxel_model.ply \
-//   --gt=third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
-//   --out=results/replica_rgbd_voxel/office0/4141_shutdown/voxel_support_eval \
+//   --eval_mode=current \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/3581_shutdown/ply/point_cloud/iteration_3581/gaussian_surface_mesh.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/3581_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
+//   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
-//   --traj=scripts/data/Replica/office0/traj.txt \
+//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
-//   --recon_traj_tum=results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
-//   --eval_floaters=0 \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/CameraTrajectory_TUM.txt \
+//   --save_aligned_mesh=1 \
+//   --recon_samples=500000 \
 //   --gt_samples=500000 \
+//   --eval_floaters=1 \
+//   --floater_samples=500000 \
 //   --floater_bin_cm=1.0 \
 //   --floater_max_cm=50.0 \
 //   --eval_gaussian_support=0 \
-//   --eval_voxel_support=1 \
-//   --support_samples_per_primitive=32
+//   --eval_voxel_support=0
 
-// Original Replica RGBD evaluation with floaters and Gaussian support
+// HI-SLAM2
 // ./bin/mesh_eval \
-//   --eval_mode=gaussian_slam_sim3 \
-//   --recon=results/replica_rgbd_original/office0/3381_shutdown/ply/point_cloud/iteration_3381/point_cloud.ply \
-//   --gt=third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
-//   --out=results/replica_rgbd_original/office0/3381_shutdown/gaussian_support_eval_equal \
+//   --eval_mode=current \
+//   --recon=third_party/HI-SLAM2/outputs/replica/office0/tsdf_mesh_after_opt_w2.0.ply \
+//   --gt=scripts/data/Replica/office0_mesh.ply \
+//   --out=third_party/HI-SLAM2/outputs/replica/office0/mesh_eval_gs_sim3_after_opt \
 //   --tau_cm=5.0 \
+//   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
 //   --traj=scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
-//   --recon_traj_tum=results/replica_rgbd_original/office0/CameraTrajectory_TUM.txt \
-//   --eval_floaters=0 \
+//   --recon_traj_tum=third_party/HI-SLAM2/outputs/replica/office0/traj_full.txt \
+//   --save_aligned_mesh=1 \
+//   --recon_samples=500000 \
 //   --gt_samples=500000 \
+//   --eval_floaters=1 \
+//   --floater_samples=500000 \
 //   --floater_bin_cm=1.0 \
 //   --floater_max_cm=50.0 \
+//   --eval_gaussian_support=0 \
+//   --eval_voxel_support=0
+
+// FLOATER EVALUATION ///////
+// SVRecon
+// ./bin/mesh_eval \
+//   --eval_mode=current \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/ply/voxel_model/iteration_4641/voxel_model.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/voxel_support_eval \
+//   --tau_cm=5.0 \
+//   --align_recon_to_gt=1 \
+//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/CameraTrajectory_TUM.txt \
+//   --gt_samples=500000 \
+//   --eval_floaters=0 \
+//   --eval_gaussian_support=0 \
+//   --eval_voxel_support=1 \
+//   --support_samples_per_primitive=32 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0
+
+// Original Photo-SLAM 3σ
+// ./bin/mesh_eval \
+//   --eval_mode=current \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/3581_shutdown/ply/point_cloud/iteration_3581/point_cloud.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/3581_shutdown/gaussian_support_eval_equal \
+//   --tau_cm=5.0 \
+//   --align_recon_to_gt=1 \
+//   --traj=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/CameraTrajectory_TUM.txt \
+//   --gt_samples=500000 \
+//   --eval_floaters=0 \
 //   --eval_gaussian_support=1 \
 //   --gaussian_support_sigma=3.0 \
 //   --gaussian_min_opacity=0.0 \
 //   --eval_voxel_support=0 \
-//   --support_samples_per_primitive=32
+//   --support_samples_per_primitive=32 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0
+
+// HI-SLAM2 3σ
+// ./bin/mesh_eval \
+//   --eval_mode=current \
+//   --recon=third_party/HI-SLAM2/outputs/replica/office0/3dgs_before_opt.ply \
+//   --gt=scripts/data/Replica/office0_mesh.ply \
+//   --out=third_party/HI-SLAM2/outputs/replica/office0/gaussian_support_eval_before_opt \
+//   --tau_cm=5.0 \
+//   --align_recon_to_gt=1 \
+//   --traj=scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=third_party/HI-SLAM2/outputs/replica/office0/traj_full_before_opt.txt \
+//   --gt_samples=500000 \
+//   --eval_floaters=0 \
+//   --eval_gaussian_support=1 \
+//   --gaussian_support_sigma=3.0 \
+//   --gaussian_min_opacity=0.0 \
+//   --eval_voxel_support=0 \
+//   --support_samples_per_primitive=32 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0
+
+// NVBLOX
+// ./bin/mesh_eval \
+//   --eval_mode=current \
+//   --recon=results/replica_rgbd_nvblox/office0/online_orb/nvblox_color_mesh.ply \
+//   --gt=scripts/data/Replica/office0_mesh.ply \
+//   --out=results/replica_rgbd_nvblox/office0/online_orb/mesh_eval_gs_sim3 \
+//   --tau_cm=5.0 \
+//   --recon_samples=500000 \
+//   --gt_samples=500000 \
+//   --seed=0 \
+//   --eval_floaters=1 \
+//   --floater_samples=500000 \
+//   --floater_bin_cm=1.0 \
+//   --floater_max_cm=50.0 \
+//   --eval_depth_mesh=1 \
+//   --align_recon_to_gt=1 \
+//   --traj=scripts/data/Replica/office0/traj.txt \
+//   --traj_mode=c2w \
+//   --recon_traj_tum=results/replica_rgbd_nvblox/office0/online_orb/CameraTrajectory_TUM.txt \
+//   --save_aligned_mesh=1
+
+// Combined Line Plot
+// python3 evaluation/plot_support_floater_comparison.py \
+//   --voxel-csv=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/voxel_support_eval/voxel_support_floater_count.csv \
+//   --gaussian-csv=/home/dimitris/Photo-SLAM/results/replica_rgbd_original/office0/3581_shutdown/gaussian_support_eval_equal/gaussian_support_floater_count.csv \
+//   --hislam2-csv=/home/dimitris/Photo-SLAM/third_party/HI-SLAM2/outputs/replica/office0/gaussian_support_eval_after_opt/gaussian_support_floater_count.csv \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/primitive_support_floater_comparison.png
+
+// python3 evaluation/plot_mesh_floater_comparison.py \
+//   --ours-csv=results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_eval_gs_sim3/surface_floater_count.csv \
+//   --photoslam-csv=results/replica_rgbd_original/office0/3581_shutdown/mesh_eval_gs_sim3/surface_floater_count.csv \
+//   --hislam2-csv=third_party/HI-SLAM2/outputs/replica/office0/mesh_eval_gs_sim3_after_opt/surface_floater_count.csv \
+//   --nvblox-csv=results/replica_rgbd_nvblox/office0/online_orb/mesh_eval_gs_sim3/surface_floater_count.csv \
+//   --out=results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_surface_floater_comparison.png

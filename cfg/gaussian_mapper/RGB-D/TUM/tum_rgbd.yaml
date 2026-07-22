@@ -44,6 +44,12 @@ Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
 Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 0 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
+Record.save_rendered_mesh_eval: 1 # final Gaussian rendered-depth TSDF mesh
+Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2/default voxel size
+Record.rendered_mesh_eval_min_weight: 1.0 # independent keyframe support
+Record.rendered_mesh_eval_trunc_vox: 8.0 # TSDF truncation in voxels
+Record.rendered_mesh_eval_depth_max_m: 5.0
+Record.rendered_mesh_eval_alpha_thres: 0.5 # reject weak Gaussian depth pixels
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 

@@ -131,7 +131,7 @@ protected:
     float geo_lr_;
     float sh0_lr_;
     float shs_lr_;
-    float lambda_dssim_;
+    float lambda_ssim_;
     int densify_interval_;
     int new_kf_times_of_use_;
     int stable_num_iter_existence_; ///< loop closure correction

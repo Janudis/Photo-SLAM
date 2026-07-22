@@ -465,18 +465,71 @@ class RerunVisualizer:
                     image_mode="child",
                 )
 
-            t_W_C_np = np.asarray(t_W_C, dtype=np.float32).reshape(3)
-            hist = self._debug_trajectory_history.setdefault(
-                str(recording_name),
-                deque(maxlen=self.trajectory_length),
+            self._update_debug_trajectory(
+                str(recording_name), keyframe_id, iteration, t_W_C)
+
+    def _update_debug_trajectory(
+        self,
+        recording_name: str,
+        keyframe_id: Optional[int],
+        iteration: Optional[int],
+        t_W_C: npt.NDArray,
+    ) -> None:
+        t_W_C_np = np.asarray(t_W_C, dtype=np.float32).reshape(3)
+        poses_by_keyframe = self._debug_trajectory_history.setdefault(
+            str(recording_name),
+            {},
+        )
+        trajectory_key = (
+            int(keyframe_id)
+            if keyframe_id is not None
+            else int(iteration) if iteration is not None else len(poses_by_keyframe)
+        )
+        poses_by_keyframe[trajectory_key] = t_W_C_np.copy()
+        ordered_ids = sorted(poses_by_keyframe)
+        if self.trajectory_length > 0:
+            ordered_ids = ordered_ids[-self.trajectory_length :]
+        if ordered_ids:
+            trajectory = np.stack(
+                [poses_by_keyframe[kf_id] for kf_id in ordered_ids],
+                axis=0,
             )
-            hist.append(t_W_C_np)
-            if len(hist) > 0:
+            rr.log(
+                "world/trajectory",
+                rr.LineStrips3D([trajectory]),
+            )
+
+    def visualize_camera_pose_recording(
+        self,
+        recording_name: str,
+        t_W_C: npt.NDArray,
+        q_W_C_xyzw: npt.NDArray,
+        iteration: Optional[int],
+        keyframe_id: int,
+    ) -> None:
+        rec = self._ensure_debug_recording(str(recording_name))
+        if rec is None:
+            return
+
+        with rec:
+            self._set_iter_time(iteration)
+            kf_name = f"kf_{int(keyframe_id):06d}"
+            translation = np.asarray(t_W_C, dtype=np.float32).reshape(3)
+            quaternion = np.asarray(q_W_C_xyzw, dtype=np.float32).reshape(4)
+            for entity_path in (
+                f"world/keyframes/{kf_name}",
+                f"world/keyframes_with_images/{kf_name}",
+            ):
                 rr.log(
-                    "world/trajectory",
-                    rr.LineStrips3D([np.stack(hist, axis=0)]),
-                    static=True,
+                    entity_path,
+                    rr.Transform3D(
+                        translation=translation,
+                        quaternion=quaternion,
+                        relation=rr.TransformRelation.ParentFromChild,
+                    ),
                 )
+            self._update_debug_trajectory(
+                str(recording_name), keyframe_id, iteration, t_W_C)
 
     def visualize_gt_sdf_mesh_recording(
         self,

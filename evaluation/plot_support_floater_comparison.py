@@ -72,13 +72,29 @@ def main():
     parser = argparse.ArgumentParser(description="Plot voxel/Gaussian primitive floater curves")
     parser.add_argument("--voxel-csv", required=True, type=Path)
     parser.add_argument("--gaussian-csv", required=True, type=Path)
+    parser.add_argument(
+        "--hislam2-csv",
+        type=Path,
+        help="optional HI-SLAM2 Gaussian support floater CSV",
+    )
+    parser.add_argument(
+        "--hislam2-label",
+        default="HI-SLAM2 3-sigma Gaussians",
+        help="legend label for the optional HI-SLAM2 curve",
+    )
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
     vx, vc, vf = read_curve(args.voxel_csv)
     gx, gc, gf = read_curve(args.gaussian_csv)
+    hislam2_curve = read_curve(args.hislam2_csv) if args.hislam2_csv else None
     voxel_total = infer_total(vc, vf)
     gaussian_total = infer_total(gc, gf)
+    hislam2_total = (
+        infer_total(hislam2_curve[1], hislam2_curve[2])
+        if hislam2_curve is not None
+        else 0
+    )
 
     min_x = 5.0
     voxel_keep = vx >= min_x
@@ -87,21 +103,32 @@ def main():
     gx, gc = gx[gaussian_keep], gc[gaussian_keep]
     if vx.size == 0 or gx.size == 0:
         raise ValueError("floater curves do not contain the 5 cm evaluation range")
-    max_x = float(max(vx.max(), gx.max()))
+    curves = [(vx, vc), (gx, gc)]
+    if hislam2_curve is not None:
+        hx, hc, _ = hislam2_curve
+        hislam2_keep = hx >= min_x
+        hx, hc = hx[hislam2_keep], hc[hislam2_keep]
+        if hx.size == 0:
+            raise ValueError("HI-SLAM2 floater curve does not contain the 5 cm evaluation range")
+        curves.append((hx, hc))
+    max_x = float(max(xs.max() for xs, _ in curves))
 
-    curve_max = int(max(vc.max(), gc.max()))
+    curve_max = int(max(counts.max() for _, counts in curves))
     y_step = nice_axis_step(curve_max / 9.0)
     y_max = int(math.ceil(curve_max / y_step) * y_step)
 
-    width, height = 1400, 850
+    width = 1400
+    height = 900 if hislam2_curve is not None else 850
     left, right = 115, width - 55
-    top, bottom = 145, height - 155
+    top = 180 if hislam2_curve is not None else 145
+    bottom = height - 155
     image = np.full((height, width, 3), 250, dtype=np.uint8)
 
     grid = (224, 224, 224)
     axis = (70, 70, 70)
     voxel_color = (125, 125, 25)
     gaussian_color = (55, 95, 215)
+    hislam2_color = (190, 105, 35)
 
     for value in range(0, y_max + 1, y_step):
         y = int(round(bottom - (bottom - top) * value / y_max))
@@ -133,6 +160,15 @@ def main():
 
     cv2.polylines(image, [cropped_curve_points(vx, vc)], False, voxel_color, 4, cv2.LINE_AA)
     cv2.polylines(image, [cropped_curve_points(gx, gc)], False, gaussian_color, 4, cv2.LINE_AA)
+    if hislam2_curve is not None:
+        cv2.polylines(
+            image,
+            [cropped_curve_points(hx, hc)],
+            False,
+            hislam2_color,
+            4,
+            cv2.LINE_AA,
+        )
 
     draw_text(image, "Primitive Support Floater Comparison", (left, 48), 0.9, (35, 35, 35), 2)
     draw_text(
@@ -152,12 +188,38 @@ def main():
     legend_x = left + 410
     cv2.line(image, (legend_x, legend_y), (legend_x + 45, legend_y), gaussian_color, 5, cv2.LINE_AA)
     draw_text(image, "Original Photo-SLAM 3-sigma Gaussians", (legend_x + 58, legend_y + 6), 0.55)
+    if hislam2_curve is not None:
+        hislam2_legend_y = 148
+        cv2.line(
+            image,
+            (left, hislam2_legend_y),
+            (left + 45, hislam2_legend_y),
+            hislam2_color,
+            5,
+            cv2.LINE_AA,
+        )
+        draw_text(
+            image,
+            args.hislam2_label,
+            (left + 58, hislam2_legend_y + 6),
+            0.55,
+        )
 
-    footer = (
+    totals_footer = (
         f"Final scene totals: {voxel_total:,} zero-crossing voxels  |  "
-        f"{gaussian_total:,} Gaussians  |  32 support probes per primitive"
+        f"{gaussian_total:,} Photo-SLAM Gaussians"
     )
-    draw_text(image, footer, (left, height - 42), 0.58, (55, 55, 55), 1)
+    if hislam2_curve is not None:
+        totals_footer += f"  |  {hislam2_total:,} HI-SLAM2 Gaussians"
+    draw_text(image, totals_footer, (left, height - 62), 0.54, (55, 55, 55), 1)
+    draw_text(
+        image,
+        "Finite support: voxel boundary / Gaussian 3-sigma ellipsoid; 32 probes per primitive",
+        (left, height - 34),
+        0.52,
+        (70, 70, 70),
+        1,
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(args.out), image):

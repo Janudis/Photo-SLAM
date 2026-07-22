@@ -329,6 +329,37 @@ cv::Mat depthTensorToCvMatFloat(const torch::Tensor& depth_tensor)
     return depth_view.clone();
 }
 
+bool saveMetricDepthPngMillimeters(
+    const torch::Tensor& depth_meters,
+    const std::filesystem::path& output_path,
+    float valid_min_depth,
+    float valid_max_depth)
+{
+    const cv::Mat depth = depthTensorToCvMatFloat(depth_meters);
+    if (depth.empty()) {
+        return false;
+    }
+
+    cv::Mat depth_mm(depth.rows, depth.cols, CV_16UC1, cv::Scalar(0));
+    for (int y = 0; y < depth.rows; ++y) {
+        const float* src = depth.ptr<float>(y);
+        uint16_t* dst = depth_mm.ptr<uint16_t>(y);
+        for (int x = 0; x < depth.cols; ++x) {
+            const float z = src[x];
+            if (!std::isfinite(z) || z <= valid_min_depth || z >= valid_max_depth) {
+                continue;
+            }
+            dst[x] = static_cast<uint16_t>(std::clamp(
+                std::lround(z * 1000.0f),
+                1L,
+                static_cast<long>(std::numeric_limits<uint16_t>::max())));
+        }
+    }
+
+    std::filesystem::create_directories(output_path.parent_path());
+    return cv::imwrite(output_path.string(), depth_mm);
+}
+
 cv::Mat colorizeDepthMatJet(
     const cv::Mat& depth_meters,
     float valid_min_depth,

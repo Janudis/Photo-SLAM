@@ -268,6 +268,11 @@ int main(int argc, char **argv)
         if (pSLAM->isShutDown())
             break;
 
+        // HI-SLAM2 bounds its producer/consumer queue to eight entries. The
+        // ScanNet mapper enables an equivalent keyframe-level backpressure
+        // limit so asynchronous ORB local mapping cannot outrun voxel mapping.
+        pVoxelMapper->waitForInputQueueSlot();
+
         // load RGB + depth
         cv::Mat imRGB = cv::imread(std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni],
                                    cv::IMREAD_UNCHANGED);

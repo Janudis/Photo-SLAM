@@ -23,6 +23,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include "ORB-SLAM3/include/Atlas.h"
+#include "ORB-SLAM3/include/KeyFrame.h"
 #include "ORB-SLAM3/include/MapPoint.h"
 
 void VoxelMapper::logKeyframeCameraToRerunRecordings(
@@ -50,18 +51,10 @@ void VoxelMapper::logKeyframeCameraToRerunRecordings(
     }
 
     try {
-        sv::MiniCam cam = pkf->toMiniCam(pkf->image_height_, pkf->image_width_);
-        torch::Tensor c2w_cpu = cam.c2w.to(torch::kCPU).contiguous();
-        TORCH_CHECK(c2w_cpu.sizes() == torch::IntArrayRef({4, 4}),
-                    "MiniCam.c2w must be 4x4");
-
-        Eigen::Matrix4f T_W_C;
-        {
-            float* data = c2w_cpu.data_ptr<float>();
-            Eigen::Map<const Eigen::Matrix<float, 4, 4, Eigen::RowMajor>>
-                T_row_major(data);
-            T_W_C = T_row_major;
-        }
+        // ORB-SLAM stores Tcw. Use its inverse directly so cameras, ORB
+        // MapPoints, and reconstructed geometry stay in the same world frame.
+        const Eigen::Matrix4f T_W_C =
+            pkf->getPosef().inverse().matrix();
 
         const sv::Camera& camera = scene_->cameras_.at(pkf->camera_id_);
         const float fx = static_cast<float>(camera.fx());
@@ -377,14 +370,7 @@ static void capTriangleMeshForExport(
     }
 
     if (!capped.vertices.empty() && !capped.faces.empty()) {
-        std::cout << "[TriangleMesh] capped mesh "
-                  << " verts " << mesh.vertices.size() << " -> " << capped.vertices.size()
-                  << " faces " << mesh.faces.size() << " -> " << capped.faces.size()
-                  << " limits=(" << max_vertices << " verts, " << max_faces << " faces)"
-                  << "\n";
         mesh = std::move(capped);
-    } else {
-        std::cout << "[TriangleMesh] mesh cap produced empty mesh; keeping full mesh.\n";
     }
 }
 
@@ -1645,102 +1631,120 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
     }
 }
 
-void VoxelMapper::appendAndLogOrbRawMapPcdToRerun(
-    const std::map<point3D_id_t, Point3D>& pcd,
-    int iteration)
+void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)
 {
-    if (pcd.empty()) {
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.rerun_reconstruction_mesh_ ||
+        !mpSLAM || !mpSLAM->getAtlas()) {
+        return;
+    }
+
+    auto* pMap = mpSLAM->getAtlas()->GetCurrentMap();
+    if (!pMap) {
         return;
     }
 
     std::vector<float> pts;
     std::vector<float> cols;
-    pts.reserve(pcd.size() * 3);
-    cols.reserve(pcd.size() * 3);
-    for (const auto& kv : pcd) {
-        const auto& P = kv.second;
-        pts.push_back(static_cast<float>(P.xyz_(0)));
-        pts.push_back(static_cast<float>(P.xyz_(1)));
-        pts.push_back(static_cast<float>(P.xyz_(2)));
-        cols.push_back(static_cast<float>(P.color_(0)));
-        cols.push_back(static_cast<float>(P.color_(1)));
-        cols.push_back(static_cast<float>(P.color_(2)));
+    {
+        std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
+        const std::vector<ORB_SLAM3::MapPoint*> map_points = pMap->GetAllMapPoints();
+        pts.reserve(map_points.size() * 3);
+        cols.reserve(map_points.size() * 3);
+        for (auto* pMP : map_points) {
+            if (!pMP || pMP->isBad()) {
+                continue;
+            }
+            const Eigen::Vector3f pos = pMP->GetWorldPos();
+            const Eigen::Vector3f color = pMP->GetColorRGB();
+            if (!pos.allFinite() || !color.allFinite()) {
+                continue;
+            }
+            pts.push_back(pos.x());
+            pts.push_back(pos.y());
+            pts.push_back(pos.z());
+            cols.push_back(color.x());
+            cols.push_back(color.y());
+            cols.push_back(color.z());
+        }
     }
 
+    const int64_t n_points = static_cast<int64_t>(pts.size() / 3);
+    if (n_points == 0) {
+        return;
+    }
     auto points = torch::from_blob(
         pts.data(),
-        {static_cast<int64_t>(pcd.size()), 3},
+        {n_points, 3},
         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
     auto colors = torch::from_blob(
         cols.data(),
-        {static_cast<int64_t>(pcd.size()), 3},
+        {n_points, 3},
         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
     colors = normalizeRerunPointColors(colors);
 
-    if (!orb_raw_pcd_points_accum_cpu_.defined() || orb_raw_pcd_points_accum_cpu_.numel() == 0) {
-        orb_raw_pcd_points_accum_cpu_ = points.contiguous();
-        orb_raw_pcd_colors_accum_cpu_ = colors.contiguous();
-    } else {
-        orb_raw_pcd_points_accum_cpu_ =
-            torch::cat({orb_raw_pcd_points_accum_cpu_, points.contiguous()}, 0).contiguous();
-        orb_raw_pcd_colors_accum_cpu_ =
-            torch::cat({orb_raw_pcd_colors_accum_cpu_, colors.contiguous()}, 0).contiguous();
-    }
-
-    sv::RerunVisualizerBridge::instance().visualizePoints3D(
-        orb_raw_pcd_points_accum_cpu_,
-        orb_raw_pcd_colors_accum_cpu_,
+    sv::RerunVisualizerBridge::instance().visualizeDebugPoints3D(
+        "reconstruction_mesh",
+        points,
+        colors,
         iteration,
-        "world/orb/raw_pcd",
+        "world/orb/map_points",
         0.015f);
-    // std::cout << "[rerun/orb] appended_raw_pcd_points=" << pcd.size()
-    //           << " total_raw_pcd_points=" << orb_raw_pcd_points_accum_cpu_.size(0)
-    //           << " entity=world/orb/raw_pcd"
-    //           << " iter=" << iteration
-    //           << std::endl;
 }
 
-void VoxelMapper::appendAndLogOrbRawPointBatchToRerun(
-    const std::vector<float>& points_flat,
-    const std::vector<float>& colors_flat,
-    int iteration)
+void VoxelMapper::logCurrentOrbKeyframePosesToReconstructionRerun(int iteration)
 {
-    const int64_t n_points = static_cast<int64_t>(points_flat.size() / 3);
-    if (n_points <= 0 || colors_flat.size() < static_cast<size_t>(3 * n_points)) {
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.rerun_reconstruction_mesh_ ||
+        !mpSLAM || !mpSLAM->getAtlas()) {
         return;
     }
 
-    auto points = torch::from_blob(
-        const_cast<float*>(points_flat.data()),
-        {n_points, 3},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-    auto colors = torch::from_blob(
-        const_cast<float*>(colors_flat.data()),
-        {n_points, 3},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-    colors = normalizeRerunPointColors(colors);
-
-    if (!orb_raw_pcd_points_accum_cpu_.defined() || orb_raw_pcd_points_accum_cpu_.numel() == 0) {
-        orb_raw_pcd_points_accum_cpu_ = points.contiguous();
-        orb_raw_pcd_colors_accum_cpu_ = colors.contiguous();
-    } else {
-        orb_raw_pcd_points_accum_cpu_ =
-            torch::cat({orb_raw_pcd_points_accum_cpu_, points.contiguous()}, 0).contiguous();
-        orb_raw_pcd_colors_accum_cpu_ =
-            torch::cat({orb_raw_pcd_colors_accum_cpu_, colors.contiguous()}, 0).contiguous();
+    auto* pMap = mpSLAM->getAtlas()->GetCurrentMap();
+    if (!pMap) {
+        return;
     }
 
-    sv::RerunVisualizerBridge::instance().visualizePoints3D(
-        orb_raw_pcd_points_accum_cpu_,
-        orb_raw_pcd_colors_accum_cpu_,
-        iteration,
-        "world/orb/raw_pcd",
-        0.015f);
-    // std::cout << "[rerun/orb] appended_raw_pcd_points=" << n_points
-    //           << " total_raw_pcd_points=" << orb_raw_pcd_points_accum_cpu_.size(0)
-    //           << " entity=world/orb/raw_pcd"
-    //           << " iter=" << iteration
-    //           << std::endl;
+    std::vector<std::pair<unsigned long, Eigen::Matrix4f>> poses;
+    {
+        std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
+        const std::vector<ORB_SLAM3::KeyFrame*> keyframes = pMap->GetAllKeyFrames();
+        poses.reserve(keyframes.size());
+        for (auto* pKF : keyframes) {
+            if (!pKF || pKF->isBad()) {
+                continue;
+            }
+            poses.emplace_back(pKF->mnId, pKF->GetPoseInverse().matrix());
+        }
+    }
+
+    std::sort(
+        poses.begin(),
+        poses.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    const unsigned long begin =
+        static_cast<unsigned long>(std::max(0, rerun_params_.rerun_keyframe_start_));
+    const unsigned long end = rerun_params_.rerun_max_keyframes_ > 0
+        ? begin + static_cast<unsigned long>(rerun_params_.rerun_max_keyframes_)
+        : std::numeric_limits<unsigned long>::max();
+
+    for (const auto& [kf_id, T_W_C] : poses) {
+        if (kf_id < begin || kf_id >= end) {
+            continue;
+        }
+        const auto previous = rerun_reconstruction_last_orb_poses_.find(kf_id);
+        if (previous != rerun_reconstruction_last_orb_poses_.end() &&
+            previous->second.isApprox(T_W_C, 1.0e-6f)) {
+            continue;
+        }
+        sv::RerunVisualizerBridge::instance().visualizeDebugCameraPose(
+            "reconstruction_mesh",
+            T_W_C,
+            iteration,
+            static_cast<int>(kf_id));
+        rerun_reconstruction_last_orb_poses_[kf_id] = T_W_C;
+    }
 }
 
 void VoxelMapper::logReconstructionMeshToRerun(int iteration)
@@ -1783,11 +1787,9 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
     };
     try
     {
-        c10::cuda::CUDACachingAllocator::emptyCache();
         voxel_model_->freezeVoxGeo();
         froze_geo = true;
 
-        std::size_t frame_idx = 0;
         for (const auto& [kfid, pkf] : keyframes)
         {
             if (!pkf) continue;
@@ -1896,15 +1898,37 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
             cv::Mat depth_mat(
                 image_height, image_width, CV_32FC1, depth_cpu.data_ptr<float>());
 
-            cv::Mat depth_for_fusion = depth_mat.clone();
+            // The live Rerun mesh is a preview. Downsample before CPU TSDF
+            // fusion; the shutdown evaluation mesh keeps its full-resolution
+            // extraction path.
+            constexpr int kLivePreviewDownsample = 2;
+            const int fusion_width = std::max(1, image_width / kLivePreviewDownsample);
+            const int fusion_height = std::max(1, image_height / kLivePreviewDownsample);
+            cv::Mat color_for_fusion;
+            cv::Mat depth_for_fusion;
+            cv::resize(
+                color_mat,
+                color_for_fusion,
+                cv::Size(fusion_width, fusion_height),
+                0.0,
+                0.0,
+                cv::INTER_AREA);
+            cv::resize(
+                depth_mat,
+                depth_for_fusion,
+                cv::Size(fusion_width, fusion_height),
+                0.0,
+                0.0,
+                cv::INTER_NEAREST);
             cv::Mat gt_depth_meters;
-            if (getKeyframeDepthMetersForEval(pkf, image_height, image_width, gt_depth_meters))
+            if (getKeyframeDepthMetersForEval(
+                    pkf, fusion_height, fusion_width, gt_depth_meters))
             {
-                for (int y = 0; y < image_height; ++y)
+                for (int y = 0; y < fusion_height; ++y)
                 {
                     const float* gt_ptr = gt_depth_meters.ptr<float>(y);
                     float* depth_ptr = depth_for_fusion.ptr<float>(y);
-                    for (int x = 0; x < image_width; ++x)
+                    for (int x = 0; x < fusion_width; ++x)
                     {
                         const float gt_depth = gt_ptr[x];
                         if (!std::isfinite(gt_depth) || gt_depth <= 0.0f) {
@@ -1915,22 +1939,28 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
             }
 
             cv::Mat filtered_depth = filterDepthOutliersLikeGaussianSlam(depth_for_fusion);
+            std::vector<float> fusion_intr = pkf->intr_;
+            const float scale_x =
+                static_cast<float>(fusion_width) / static_cast<float>(image_width);
+            const float scale_y =
+                static_cast<float>(fusion_height) / static_cast<float>(image_height);
+            fusion_intr[0] *= scale_x;
+            fusion_intr[1] *= scale_y;
+            fusion_intr[2] *= scale_x;
+            fusion_intr[3] *= scale_y;
             volume.integrate(
-                color_mat.clone(),
+                color_for_fusion,
                 filtered_depth,
-                pkf->intr_,
+                fusion_intr,
                 pkf->getPosef(),
                 depth_trunc);
 
-            ++frame_idx;
         }
 
         TriangleMeshRgb mesh = volume.extractMesh(rerun_params_.rerun_reconstruction_mesh_min_weight_);
         if (mesh.vertices.empty() || mesh.faces.empty())
         {
             unfreeze_geo();
-            std::cout << "[RERUN/reconstruction_mesh] iter=" << iteration
-                      << " empty mesh after fusing " << frame_idx << " keyframes.\n";
             return;
         }
 
@@ -1946,17 +1976,6 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
             mesh.faces.size() > rerun_params_.rerun_reconstruction_mesh_max_faces_;
         if (over_vertex_budget || over_face_budget) {
             unfreeze_geo();
-            std::cout << "[RERUN/reconstruction_mesh] iter=" << iteration
-                      << " skipped over-budget full-scene mesh"
-                      << " verts=" << mesh.vertices.size()
-                      << " faces=" << mesh.faces.size()
-                      << " max_vertices=" << rerun_params_.rerun_reconstruction_mesh_max_vertices_
-                      << " max_faces=" << rerun_params_.rerun_reconstruction_mesh_max_faces_
-                      << " voxel_length=" << voxel_length
-                      << " current_voxel=" << current_sdf_voxel
-                      << " configured_sdf_voxel=" << sdf_params_.sdf_voxel_size_m_
-                      << ". Increase Mapper.sdf_voxel_size_m for a coarser debug mesh, "
-                      << "or set the run_reconstruction_mesh max limits to 0 to disable this guard.\n";
             return;
         }
 
@@ -1973,27 +1992,12 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
             colors,
             triangles,
             iteration,
-            "world/mesh");
+            "world/mesh/live");
 
-        std::cout << "[RERUN/reconstruction_mesh] iter=" << iteration
-                  << " kfs=" << frame_idx
-                  << " verts=" << mesh.vertices.size()
-                  << " faces=" << mesh.faces.size()
-                  << " voxel_length=" << voxel_length
-                  << " current_voxel=" << current_sdf_voxel
-                  << " configured_sdf_voxel=" << sdf_params_.sdf_voxel_size_m_
-                  << " sdf_trunc=" << sdf_trunc
-                  << " depth_trunc=" << depth_trunc
-                  << " min_weight=" << rerun_params_.rerun_reconstruction_mesh_min_weight_
-                  << " weld=" << static_cast<int>(rerun_params_.rerun_reconstruction_mesh_weld_vertices_)
-                  << " max_vertices=" << rerun_params_.rerun_reconstruction_mesh_max_vertices_
-                  << " max_faces=" << rerun_params_.rerun_reconstruction_mesh_max_faces_
-                  << "\n";
     }
     catch (const std::exception& e)
     {
         unfreeze_geo();
-        c10::cuda::CUDACachingAllocator::emptyCache();
         std::cerr << "[RERUN/reconstruction_mesh] failed: " << e.what() << "\n";
     }
 }

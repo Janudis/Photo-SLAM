@@ -1,0 +1,39 @@
+%YAML:1.0
+
+File.version: "1.0"
+
+# Waymo Open Dataset v2 FRONT camera (camera_name=1) for the selected segment.
+Camera.type: "PinHole"
+Camera1.fx: 2059.047144
+Camera1.fy: 2059.047144
+Camera1.cx: 935.124808
+Camera1.cy: 635.052475
+Camera1.k1: 0.042396
+Camera1.k2: -0.341657
+Camera1.p1: 0.001806
+Camera1.p2: -0.000055
+Camera1.k3: 0.0
+
+Camera.width: 1920
+Camera.height: 1280
+Camera.newWidth: 960
+Camera.newHeight: 640
+Camera.fps: 10
+Camera.RGB: 1
+
+ORBextractor.nFeatures: 2500
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.5
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.8
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -10.0
+Viewer.ViewpointZ: -20.0
+Viewer.ViewpointF: 500.0

@@ -234,6 +234,98 @@ torch::Tensor VoxelMapper::computeSdfInitForGridPoints(
     return sdf_init;
 }
 
+int64_t VoxelMapper::fuseProjectiveSdfInitFromKeyframe(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const torch::Tensor& pixel_mask)
+{
+    const bool targeted_hole_update =
+        pixel_mask.defined() && pixel_mask.numel() > 0;
+    if ((!sdf_initialization_rgbd_projective_ && !targeted_hole_update) ||
+        sensor_type_ != RGBD ||
+        !voxel_model_ ||
+        !prepareProjectiveSdfInitContext(kf)) {
+        return 0;
+    }
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor grid_points = voxel_model_->gridPointsWorld();
+    if (!grid_points.defined() || grid_points.numel() == 0) {
+        clearProjectiveSdfInitContext();
+        return 0;
+    }
+
+    torch::Tensor measured_sdf =
+        computeProjectiveSdfInitForGridPoints(grid_points, sdfMetricVoxelSize());
+    clearProjectiveSdfInitContext();
+    torch::Tensor valid = torch::isfinite(measured_sdf).reshape({-1, 1});
+    if (targeted_hole_update && valid.any().item<bool>()) {
+        const float trunc_m = std::max(
+            1.0e-6f,
+            sdf_params_.sdf_init_trunc_vox_ * sdfMetricVoxelSize());
+        // Hole densification supplies local surface support, not a full-ray
+        // TSDF rewrite of the ORB field. Values clamped to +/-trunc_m lie
+        // outside the measured surface band and are excluded here.
+        valid = valid & (measured_sdf.abs() < trunc_m - 1.0e-6f);
+        const sv::MiniCam camera =
+            kf->toMiniCam(kf->image_height_, kf->image_width_);
+        torch::Tensor w2c =
+            camera.w2c.to(grid_points.device()).to(torch::kFloat32).contiguous();
+        torch::Tensor points_cam =
+            torch::matmul(
+                grid_points.to(torch::kFloat32),
+                w2c.index({torch::indexing::Slice(0, 3),
+                           torch::indexing::Slice(0, 3)}).transpose(0, 1)) +
+            w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
+        torch::Tensor z = points_cam.index({torch::indexing::Slice(), 2});
+        torch::Tensor z_safe = z.clamp_min(1.0e-6f);
+        torch::Tensor u =
+            camera.fx * points_cam.index({torch::indexing::Slice(), 0}) / z_safe +
+            camera.cx;
+        torch::Tensor v =
+            camera.fy * points_cam.index({torch::indexing::Slice(), 1}) / z_safe +
+            camera.cy;
+        torch::Tensor in_image =
+            torch::isfinite(z) & (z > 0.0f) &
+            (u >= 0.0f) & (u < static_cast<float>(camera.width)) &
+            (v >= 0.0f) & (v < static_cast<float>(camera.height));
+        torch::Tensor u_idx =
+            torch::where(torch::isfinite(u), u, torch::zeros_like(u))
+                .floor()
+                .clamp(0.0f, static_cast<float>(camera.width - 1))
+                .to(torch::kLong);
+        torch::Tensor v_idx =
+            torch::where(torch::isfinite(v), v, torch::zeros_like(v))
+                .floor()
+                .clamp(0.0f, static_cast<float>(camera.height - 1))
+                .to(torch::kLong);
+        torch::Tensor mask_flat =
+            pixel_mask.to(grid_points.device()).to(torch::kBool).reshape({-1});
+        TORCH_CHECK(
+            mask_flat.numel() ==
+                static_cast<int64_t>(camera.width) * camera.height,
+            "fuseProjectiveSdfInitFromKeyframe: pixel mask size mismatch");
+        torch::Tensor selected_pixel = mask_flat.index_select(
+            0, (v_idx * camera.width + u_idx).to(torch::kLong));
+        valid = valid & in_image.view({-1, 1}) & selected_pixel.view({-1, 1});
+    }
+    const int64_t observed = valid.sum().item<int64_t>();
+    if (observed == 0) {
+        return 0;
+    }
+
+    torch::Tensor weights = valid.to(torch::kFloat32);
+    voxel_model_->fuseSvrasterSdfGridSamples(
+        measured_sdf,
+        weights,
+        valid,
+        /*max_weight=*/100.0f);
+    torch::Tensor fused_weight = voxel_model_->svrasterSdfWeights();
+    voxel_model_->applyGeoGridRawInit(
+        voxel_model_->svrasterSdfGridPts(),
+        targeted_hole_update ? valid : (fused_weight > 0.0f));
+    return observed;
+}
+
 torch::Tensor VoxelMapper::computeSvreconSdfPruneMask(float* sdf_threshold_out)
 {
     if (sdf_threshold_out) {
@@ -391,8 +483,31 @@ torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
         const torch::Tensor depth_tolerance =
             opt_params_.final_surface_depth_tolerance_vox_ * sizes;
 
-        for (const auto& item : scene_->keyframes()) {
-            const auto& kf = item.second;
+        std::vector<std::shared_ptr<VoxelKeyframe>> evidence_keyframes;
+        const auto& scene_keyframes = scene_->keyframes();
+        if (!retain_connected && incremental_mapping_window_size_ > 0) {
+            evidence_keyframes.reserve(std::min<std::size_t>(
+                static_cast<std::size_t>(incremental_mapping_window_size_),
+                scene_keyframes.size()));
+            for (auto it = scene_keyframes.rbegin();
+                 it != scene_keyframes.rend() &&
+                 evidence_keyframes.size() <
+                     static_cast<std::size_t>(incremental_mapping_window_size_);
+                 ++it) {
+                if (it->second) {
+                    evidence_keyframes.push_back(it->second);
+                }
+            }
+        } else {
+            evidence_keyframes.reserve(scene_keyframes.size());
+            for (const auto& item : scene_keyframes) {
+                if (item.second) {
+                    evidence_keyframes.push_back(item.second);
+                }
+            }
+        }
+
+        for (const auto& kf : evidence_keyframes) {
             if (!kf || kf->img_auxiliary_undist_.empty()) {
                 continue;
             }
@@ -483,11 +598,15 @@ torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
         connected_candidate = zero_crossing.clone();
     } else {
         std::vector<sv::MiniCam> cameras;
-        cameras.reserve(scene_->keyframes().size());
-        for (const auto& item : scene_->keyframes()) {
-            if (item.second) {
-                cameras.push_back(item.second->toMiniCam(
-                    item.second->image_height_, item.second->image_width_));
+        if (!retain_connected && incremental_mapping_window_size_ > 0) {
+            cameras = incrementalMappingCameras();
+        } else {
+            cameras.reserve(scene_->keyframes().size());
+            for (const auto& item : scene_->keyframes()) {
+                if (item.second) {
+                    cameras.push_back(item.second->toMiniCam(
+                        item.second->image_height_, item.second->image_width_));
+                }
             }
         }
         if (cameras.empty()) {
@@ -530,6 +649,11 @@ torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
     }
 
     torch::Tensor keep = strong_seed.clone();
+    if (!retain_connected && incremental_mapping_window_size_ > 0) {
+        // Online windowed pruning may reject only cells observed by the current
+        // window. Historical cells outside that window remain unchanged.
+        keep = keep | (observed_views <= 0);
+    }
     if (retain_connected &&
         opt_params_.final_surface_keep_connected_ &&
         candidate_count > strong_count) {
@@ -597,6 +721,10 @@ torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
     }
 
     const int64_t keep_count = keep.sum().item<int64_t>();
+    const int64_t preserved_unobserved_count =
+        (!retain_connected && incremental_mapping_window_size_ > 0)
+            ? ((observed_views <= 0) & (~strong_seed)).sum().item<int64_t>()
+            : 0;
     std::cout << log_tag << " total=" << voxel_count
               << " depth_keyframes=" << depth_keyframes
               << " observed=" << (observed_views > 0).sum().item<int64_t>()
@@ -607,7 +735,11 @@ torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
               << " below_min_views=" << below_min_views_count
               << " candidates=" << candidate_count
               << " strong=" << strong_count
-              << " connected_saved=" << std::max<int64_t>(0, keep_count - strong_count)
+              << " connected_saved="
+              << std::max<int64_t>(
+                     0,
+                     keep_count - strong_count - preserved_unobserved_count)
+              << " preserved_unobserved=" << preserved_unobserved_count
               << " keep=" << keep_count
               << " prune=" << (voxel_count - keep_count)
               << "\n";

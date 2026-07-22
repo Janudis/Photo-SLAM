@@ -110,7 +110,7 @@ void ImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
     geo_lr_ = pVoxelMapper_->geoLearningRateInit();
     sh0_lr_ = pVoxelMapper_->sh0LearningRate();
     shs_lr_ = pVoxelMapper_->shsLearningRate();
-    lambda_dssim_ = pVoxelMapper_->lambdaDssim();
+    lambda_ssim_ = pVoxelMapper_->lambdaSsim();
     densify_interval_ = pVoxelMapper_->densifyInterval();
     new_kf_times_of_use_ = pVoxelMapper_->newKeyframeTimesOfUse();
     stable_num_iter_existence_ = pVoxelMapper_->stableNumIterExistence();
@@ -361,7 +361,7 @@ void ImGuiViewer::run()
         geo_lr_ = params_in.geo_lr;
         sh0_lr_ = params_in.sh0_lr;
         shs_lr_ = params_in.shs_lr;
-        lambda_dssim_ = params_in.lambda_dssim;
+        lambda_ssim_ = params_in.lambda_ssim;
         densify_interval_ = params_in.densify_interval;
         new_kf_times_of_use_ = params_in.new_kf_times_of_use;
         stable_num_iter_existence_ = params_in.stable_num_iter_existence;
@@ -402,7 +402,7 @@ void ImGuiViewer::run()
                 ImGui::SliderFloat("Geo l.r.", &geo_lr_, 0.00001f, 0.00100f, "%.5f");
                 ImGui::SliderFloat("Sh0 l.r.", &sh0_lr_, 0.0001f, 0.0050f, "%.5f");
                 ImGui::SliderFloat("Shs l.r.", &shs_lr_, 0.01f, 0.10f, "%.5f");
-                ImGui::SliderFloat("Lambda dssim", &lambda_dssim_, 0.01f, 0.40f, "%.2f");
+                ImGui::SliderFloat("Lambda SSIM", &lambda_ssim_, 0.0f, 0.10f, "%.2f");
                 ImGui::SliderInt("Densify int.", &densify_interval_, 1, 400);
                 ImGui::SliderInt("New kf. using", &new_kf_times_of_use_, 0, 10);
                 ImGui::SliderInt("Stable iter.", &stable_num_iter_existence_, 0, 100);
@@ -414,7 +414,7 @@ void ImGuiViewer::run()
         params_out.geo_lr = geo_lr_;
         params_out.sh0_lr = sh0_lr_;
         params_out.shs_lr = shs_lr_;
-        params_out.lambda_dssim = lambda_dssim_;
+        params_out.lambda_ssim = lambda_ssim_;
         params_out.densify_interval = densify_interval_;
         params_out.new_kf_times_of_use = new_kf_times_of_use_;
         params_out.stable_num_iter_existence = stable_num_iter_existence_;

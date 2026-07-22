@@ -45,6 +45,11 @@ bool computeSharedDepthVizRange(const torch::Tensor& pred_depth, const cv::Mat& 
 bool computeDepthScaleFitStats(const torch::Tensor& pred_depth, const cv::Mat& gt_depth_meters, float valid_min_depth, float valid_max_depth, DepthScaleFitStats& stats_out);
 bool computeWeightedMedianScale(const std::vector<std::pair<float, double>>& weighted_scales, float& scale_out);
 cv::Mat depthTensorToCvMatFloat(const torch::Tensor& depth_tensor);
+bool saveMetricDepthPngMillimeters(
+    const torch::Tensor& depth_meters,
+    const std::filesystem::path& output_path,
+    float valid_min_depth,
+    float valid_max_depth);
 cv::Mat colorizeDepthMatJet(const cv::Mat& depth_meters, float valid_min_depth, float valid_max_depth, float viz_min, float viz_max);
 cv::Mat colorizeFiniteScalarMat(const cv::Mat& values, float viz_min, float viz_max, int colormap);
 cv::Mat colorizeFiniteScalarMatJet(const cv::Mat& values, float viz_min, float viz_max);

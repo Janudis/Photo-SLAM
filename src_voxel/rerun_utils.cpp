@@ -199,17 +199,8 @@ void RerunVisualizerBridge::visualizeCamera(
 
     py::gil_scoped_acquire gil;
 
-    py::array_t<float> t_np({3});
-    py::array_t<float> q_np({4});
-    {
-        auto bt = t_np.mutable_unchecked<1>();
-        auto bq = q_np.mutable_unchecked<1>();
-        for (int i = 0; i < 3; ++i) bt(i) = t(i);
-        bq(0) = q.x();
-        bq(1) = q.y();
-        bq(2) = q.z();
-        bq(3) = q.w();
-    }
+    const py::tuple t_py = py::make_tuple(t.x(), t.y(), t.z());
+    const py::tuple q_py = py::make_tuple(q.x(), q.y(), q.z(), q.w());
 
     // 4) Image → numpy using explicit strides (H, W, C) in bytes
     std::vector<ssize_t> shape   = { H, W, C };
@@ -232,8 +223,8 @@ void RerunVisualizerBridge::visualizeCamera(
 
     try {
         impl_->visualizer.attr("visualize_cuvslam")(
-            t_np,
-            q_np,
+            t_py,
+            q_py,
             img_np,
             py::none(),  // points_uv
             py::none(),   // track_ids
@@ -308,17 +299,8 @@ void RerunVisualizerBridge::visualizeDebugCamera(
 
     py::gil_scoped_acquire gil;
 
-    py::array_t<float> t_np({3});
-    py::array_t<float> q_np({4});
-    {
-        auto bt = t_np.mutable_unchecked<1>();
-        auto bq = q_np.mutable_unchecked<1>();
-        for (int i = 0; i < 3; ++i) bt(i) = t(i);
-        bq(0) = q.x();
-        bq(1) = q.y();
-        bq(2) = q.z();
-        bq(3) = q.w();
-    }
+    const py::tuple t_py = py::make_tuple(t.x(), t.y(), t.z());
+    const py::tuple q_py = py::make_tuple(q.x(), q.y(), q.z(), q.w());
 
     std::vector<ssize_t> shape = {H, W, C};
     std::vector<ssize_t> strides = {
@@ -338,8 +320,8 @@ void RerunVisualizerBridge::visualizeDebugCamera(
     try {
         impl_->visualizer.attr("visualize_cuvslam_recording")(
             py::str(recording_name),
-            t_np,
-            q_np,
+            t_py,
+            q_py,
             img_np,
             py::none(),
             py::none(),
@@ -352,6 +334,35 @@ void RerunVisualizerBridge::visualizeDebugCamera(
             source_frame_id);
     } catch (const py::error_already_set& e) {
         std::cerr << "[RERUN] Python error in visualizeDebugCamera: "
+                  << e.what() << std::endl;
+    }
+}
+
+void RerunVisualizerBridge::visualizeDebugCameraPose(
+    const std::string& recording_name,
+    const Eigen::Matrix4f& T_W_C,
+    int iteration,
+    int keyframe_id
+) {
+    ensureInitialized();
+    if (!impl_) return;
+
+    const Eigen::Vector3f t = T_W_C.block<3, 1>(0, 3);
+    const Eigen::Quaternionf q(T_W_C.block<3, 3>(0, 0));
+
+    py::gil_scoped_acquire gil;
+    const py::tuple t_py = py::make_tuple(t.x(), t.y(), t.z());
+    const py::tuple q_py = py::make_tuple(q.x(), q.y(), q.z(), q.w());
+
+    try {
+        impl_->visualizer.attr("visualize_camera_pose_recording")(
+            py::str(recording_name),
+            t_py,
+            q_py,
+            iteration,
+            keyframe_id);
+    } catch (const py::error_already_set& e) {
+        std::cerr << "[RERUN] Python error in visualizeDebugCameraPose: "
                   << e.what() << std::endl;
     }
 }
@@ -1150,7 +1161,7 @@ void RerunVisualizerBridge::visualizeLineStrip3D(
         auto c = color_rgb.contiguous().to(torch::kCPU).view({-1});
         TORCH_CHECK(c.numel() >= 3, "color_rgb must have at least 3 values");
         // pass as numpy [3]
-        py::array_t<uint8_t> cu8({3});
+        py::array_t<uint8_t> cu8(static_cast<py::ssize_t>(3));
         if (c.dtype() == torch::kUInt8) {
             auto cptr = c.data_ptr<uint8_t>();
             auto b = cu8.mutable_unchecked<1>();

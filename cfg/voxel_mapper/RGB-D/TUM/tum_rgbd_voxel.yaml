@@ -9,6 +9,7 @@ Model.resolution: -1.0
 Model.white_background: 0  # 0:false, 1 or other integer:true
 Model.eval: 0  # 0:false, 1 or other integer:true
 Model.outside_level: 5 # SVRecon default: scene_extent = inside_extent * 2^outside_level
+Model.global_scene_extent: 0.0 # <=0: current automatic root; set 2048.0 for a fixed 2048 m outdoor root
 
 ##############################################################################
 # Pipeline-level parameters (only the ones VoxelMapper uses)
@@ -20,24 +21,28 @@ RGBD.max_depth: 40.0
 
 Mapper.geometry_mode: "svrecon_sdf"
 Mapper.svrecon_uniform_support: 0
-Mapper.svrecon_uniform_initial_max_voxels: 500000
-Mapper.svrecon_uniform_growth_max_voxels: 40000
 Mapper.svrecon_uniform_growth_margin_vox: 4.0
 Mapper.svrecon_ray_support: 0 # allocate SVRecon topology around RGB-D depth for structural holes
 Mapper.svrecon_ray_support_pixel_stride: 8
 Mapper.svrecon_ray_support_surface_spacing_vox: 1.0
 Mapper.svrecon_ray_support_trunc_vox: 3.0
-Mapper.svrecon_ray_support_max_points_per_kf: 0 # 0 disables the optional deterministic safety cap
 Mapper.svrecon_ray_support_batch_keyframes: 8 # batch exact ray samples to avoid rebuilding the full octree for every keyframe
-Mapper.sdf_initialization_mode: "weak_surface_prior" # ORB keeps the signed SVRecon prior; RGB-D topology gets a weak positive trainable surface ramp
+# Paper-inspired alternative topology allocator. Structural RGB-D holes reserve
+# lightweight B^3 block metadata over [D-mu,D+mu], while only the measured-depth
+# cell becomes a weak renderable SVRecon candidate.
+Mapper.octree_block_support: 1
+Mapper.octree_block_support_initial_backfill: 0
+Mapper.octree_block_support_block_size_vox: 8
+Mapper.octree_block_support_pixel_stride: 2
+Mapper.octree_block_support_trunc_vox: 3.0
+Mapper.sdf_initialization_mode: "orb_prior" # nearby ORB corners use metric SDF; unsupported corners use a weak ORB-directed signed ramp
 Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance for signed nearest-point initialization
 Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
-Mapper.depth_cache: 10 # batches inactive-geometry points only; RGB-D render-hole closure is immediate
-Mapper.rgbd_fill_render_holes: 1 # RGB-D densification prior: insert depth samples where the current SVRecon render has no contribution
+Mapper.depth_cache: 10 # batch keyframes; insert inactive geometry first, then run residual RGB-D hole filling
+Mapper.rgbd_fill_render_holes: 0 # after ORB/inactive insertion, fill strict holes with one measured-surface voxel cell
 Mapper.rgbd_fill_render_holes_initial_backfill: 0 # run only RGB-D render-hole fill for initial keyframes after createFromPcd
-Mapper.rgbd_fill_render_holes_stride: 2 # first closure pass; residual verification/fill passes use stride 1
-Mapper.rgbd_fill_render_holes_max_points_per_kf: 0 # 0 disables cap
+Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for the single residual-hole detection pass
 Mapper.sdf_voxel_size_m: 0.05
 Mapper.sdf_init_trunc_vox: 4.0
 Mapper.sdf_init_max_depth_m: 4.0
@@ -62,13 +67,13 @@ Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
-Record.enable_rerun: 1  # enable the focused SVRecon optimization debug recording below
+Record.enable_rerun: 0  # enable the reconstruction timeline below
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
 Record.run_whole_run: 0 # svrecon_debug already contains the keyframes and live/pruned voxel timeline
-Record.rerun_svrecon_debug: 1 # keyframes, nvblox mesh, live voxels, per-iteration red SDF-prune candidates, and accumulated pruned voxels
-Record.run_reconstruction_mesh: 0 # write run_reconstruction_mesh.rrd with GT mesh and voxel mesh
-Record.run_reconstruction_mesh_interval: 200 # mapper-iteration interval for voxel mesh updates
+Record.rerun_svrecon_debug: 0 # separate optimization-debug recording; disabled for reconstruction capture
+Record.run_reconstruction_mesh: 1 # keyframes, ORB points, live preview mesh, and exact final mesh
+Record.run_reconstruction_mesh_interval: 200 # live preview interval; final mesh remains full-resolution
 Record.run_reconstruction_mesh_min_weight: 1e-4
 Record.run_reconstruction_mesh_weld_vertices: 1
 Record.run_reconstruction_mesh_max_vertices: 0 # 0:disable guard; >0:skip oversized Rerun snapshots instead of logging partial meshes
@@ -78,7 +83,6 @@ Record.run_maps_stride: 1 # log every Nth keyframe into maps.rrd
 
 Record.rerun_rendered_mesh_eval: 0 # log the SVRecon progressive rendered-TSDF mesh to world/voxel_model_mesh/final
 Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
-Record.rerun_gt_mesh_path: "/home/dimitris/Photo-SLAM/results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply"
 
 Record.save_rendered_mesh_eval: 1 # save common fixed-TSDF, SVRecon progressive-TSDF, and direct-SDF meshes
 Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
@@ -100,7 +104,7 @@ Record.svrecon_mesh_use_vert_color: 1 # SVRecon extract_mesh.py --use_vert_color
 ##############################################################################
 Optimization.max_num_iterations: 30100
 # SparseAdam param groups
-Optimization.geo_lr: 0.025 # closes weak SDF candidates within the online optimization budget
+Optimization.geo_lr: 0.025 #0.1 # closes weak SDF candidates within the online optimization budget
 Optimization.sh0_lr: 0.01 #0.04 #0.01 # very important
 Optimization.shs_lr: 0.00025 #0.00025 #important
 
@@ -118,12 +122,12 @@ Optimization.lr_decay_mult: 0.1
 # Adaptive prune/subdivide
 # --------------------------------------------------------------------------------------------
 # Optimization.adapt_from: 600
-Optimization.adapt_every: 600
-Optimization.prune_every: 600
-Optimization.subdivide_every: 600
+Optimization.adapt_every: 800
+Optimization.prune_every: 800
+Optimization.subdivide_every: 800
 
 # Pruning
-Optimization.prune_from: 600
+Optimization.prune_from: 800
 Optimization.prune_until: 15000
 Optimization.prune_thres_init: 0.001 
 Optimization.prune_thres_final: 0.1 #0.05
@@ -131,7 +135,7 @@ Optimization.prune_thres_final_at_target: 0.1
 Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
-Optimization.prune_surface_views_enable: 0 # pure SVRecon SDF pruning; optional multi-view refinement disabled
+Optimization.prune_surface_views_enable: 1 # pure SVRecon SDF pruning; optional multi-view refinement disabled
 Optimization.final_surface_prune_enable: 1
 Optimization.final_surface_min_views: 2
 Optimization.final_surface_depth_tolerance_vox: 1.0  # relax it if it prunes too much.
@@ -139,11 +143,10 @@ Optimization.final_surface_min_sdf_span_vox: 0.05
 Optimization.final_surface_keep_connected: 1
 Optimization.final_surface_connected_hops: 2 # retain unsupported crossing cells only this many shared-corner hops from support
 # Subdivision
-Optimization.subdivide_from: 600
+Optimization.subdivide_from: 800
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
 Optimization.subdivide_samp_thres: 0.5 # retained for file compatibility; SVRecon SDF uses its learning band
 Optimization.subdivide_prop: 0.1 # top-priority fraction after the configured base voxel scale has been reached
-Optimization.subdivide_max_num: 10000000
 
 # SVRecon SDF regularizers
 Optimization.lambda_tv_density: 0 #1e-10
@@ -172,8 +175,7 @@ Optimization.lambda_T_concen: 0.0
 Optimization.lambda_T_inside: 0.0
 
 # SSIM loss
-Optimization.lambda_ssim : 0.0
-Optimization.lambda_dssim: 0.02
+Optimization.lambda_ssim: 0.02
 Optimization.use_l1: 0
 Optimization.use_huber: 0
 Optimization.huber_thres: 0.03

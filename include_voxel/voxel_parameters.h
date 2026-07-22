@@ -74,8 +74,6 @@ public:
         int   subdivide_all_until_   = 0,
         float subdivide_samp_thres_  = 1.0f,
         float subdivide_prop_        = 0.05f,
-        int   subdivide_max_num_     = 10000000,   // hard cap
-        float lambda_dssim = 0.2f,
         bool  use_l1 = false,
         bool  use_huber = false,
         float huber_thres = 0.03f,
@@ -152,8 +150,6 @@ public:
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
-    int subdivide_max_num_;
-    float lambda_dssim_;
     bool use_l1_;
     bool use_huber_;
     float huber_thres_;

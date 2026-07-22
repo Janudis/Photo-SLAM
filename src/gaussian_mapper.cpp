@@ -213,6 +213,34 @@ cv::Mat depthTensorToCvMatGaussian(const torch::Tensor& depth_tensor)
     return depth_view.clone();
 }
 
+bool saveMetricDepthPngGaussian(
+    const cv::Mat& depth_meters,
+    const std::filesystem::path& output_path,
+    float valid_min_depth,
+    float valid_max_depth)
+{
+    if (depth_meters.empty() || depth_meters.type() != CV_32FC1)
+        return false;
+
+    cv::Mat depth_mm(depth_meters.rows, depth_meters.cols, CV_16UC1, cv::Scalar(0));
+    for (int y = 0; y < depth_meters.rows; ++y) {
+        const float* src = depth_meters.ptr<float>(y);
+        uint16_t* dst = depth_mm.ptr<uint16_t>(y);
+        for (int x = 0; x < depth_meters.cols; ++x) {
+            const float z = src[x];
+            if (!std::isfinite(z) || z <= valid_min_depth || z >= valid_max_depth)
+                continue;
+            dst[x] = static_cast<uint16_t>(std::clamp(
+                std::lround(z * 1000.0f),
+                1L,
+                static_cast<long>(std::numeric_limits<uint16_t>::max())));
+        }
+    }
+
+    std::filesystem::create_directories(output_path.parent_path());
+    return cv::imwrite(output_path.string(), depth_mm);
+}
+
 void saveGaussianDepthAndNormalMaps(
     const std::shared_ptr<GaussianKeyframe>& pkf,
     const torch::Tensor& rendered_depth,
@@ -230,6 +258,11 @@ void saveGaussianDepthAndNormalMaps(
     const cv::Mat depth = depthTensorToCvMatGaussian(rendered_depth);
     if (depth.empty())
         return;
+    saveMetricDepthPngGaussian(
+        depth,
+        depth_dir.parent_path() / "depth_metric" / (stem + ".png"),
+        min_depth,
+        max_depth);
     const cv::Mat depth_bgr = colorizeDepthJetGaussian(depth, min_depth, std::min(max_depth, 6.0f));
     cv::imwrite((depth_dir / (stem + ".png")).string(), depth_bgr);
 
@@ -563,10 +596,44 @@ void saveGaussianDepthAndNormalMaps(
          (settings_file["Record.record_rendered_image"].operator int()) != 0;
      record_ground_truth_image_ = 
          (settings_file["Record.record_ground_truth_image"].operator int()) != 0;
-     record_loss_image_ = 
-         (settings_file["Record.record_loss_image"].operator int()) != 0;
-     training_report_interval_ = 
-         settings_file["Record.training_report_interval"].operator int();
+    record_loss_image_ =
+        (settings_file["Record.record_loss_image"].operator int()) != 0;
+    save_rendered_mesh_eval_ =
+        !settings_file["Record.save_rendered_mesh_eval"].empty() &&
+        (settings_file["Record.save_rendered_mesh_eval"].operator int()) != 0;
+    rendered_mesh_eval_voxel_size_m_ =
+        settings_file["Record.rendered_mesh_eval_voxel_size_m"].empty()
+            ? 0.05f
+            : std::max(
+                  1.0e-4f,
+                  settings_file["Record.rendered_mesh_eval_voxel_size_m"].operator float());
+    rendered_mesh_eval_min_weight_ =
+        settings_file["Record.rendered_mesh_eval_min_weight"].empty()
+            ? 2.0f
+            : std::max(
+                  0.0f,
+                  settings_file["Record.rendered_mesh_eval_min_weight"].operator float());
+    rendered_mesh_eval_trunc_vox_ =
+        settings_file["Record.rendered_mesh_eval_trunc_vox"].empty()
+            ? 8.0f
+            : std::max(
+                  1.0f,
+                  settings_file["Record.rendered_mesh_eval_trunc_vox"].operator float());
+    rendered_mesh_eval_depth_max_m_ =
+        settings_file["Record.rendered_mesh_eval_depth_max_m"].empty()
+            ? 5.0f
+            : std::max(
+                  1.0e-3f,
+                  settings_file["Record.rendered_mesh_eval_depth_max_m"].operator float());
+    rendered_mesh_eval_alpha_thres_ =
+        settings_file["Record.rendered_mesh_eval_alpha_thres"].empty()
+            ? 0.5f
+            : std::clamp(
+                  settings_file["Record.rendered_mesh_eval_alpha_thres"].operator float(),
+                  0.0f,
+                  1.0f);
+    training_report_interval_ =
+        settings_file["Record.training_report_interval"].operator int();
      record_loop_ply_ =
          (settings_file["Record.record_loop_ply"].operator int()) != 0;
  
@@ -790,6 +857,18 @@ void GaussianMapper::run()
         result_dir_ / (std::to_string(final_iteration) + "_shutdown");
     renderAndRecordAllKeyframes("_shutdown");
     savePly(shutdown_dir / "ply");
+    if (save_rendered_mesh_eval_) {
+        const std::filesystem::path mesh_path =
+            shutdown_dir / "ply" / "point_cloud" /
+            ("iteration_" + std::to_string(final_iteration)) /
+            "gaussian_surface_mesh.ply";
+        try {
+            saveRenderedTsdfMeshPly(mesh_path);
+        } catch (const std::exception& e) {
+            std::cerr << "[Gaussian mesh/rendered-TSDF] shutdown export failed: "
+                      << e.what() << "\n";
+        }
+    }
     const std::filesystem::path final_map_path =
         shutdown_dir / "ply" / "point_cloud" /
         ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";
@@ -876,6 +955,18 @@ void GaussianMapper::trainColmap()
         result_dir_ / (std::to_string(final_iteration) + "_shutdown");
     renderAndRecordAllKeyframes("_shutdown");
     savePly(shutdown_dir / "ply");
+    if (save_rendered_mesh_eval_) {
+        const std::filesystem::path mesh_path =
+            shutdown_dir / "ply" / "point_cloud" /
+            ("iteration_" + std::to_string(final_iteration)) /
+            "gaussian_surface_mesh.ply";
+        try {
+            saveRenderedTsdfMeshPly(mesh_path);
+        } catch (const std::exception& e) {
+            std::cerr << "[Gaussian mesh/rendered-TSDF] shutdown export failed: "
+                      << e.what() << "\n";
+        }
+    }
     const std::filesystem::path final_map_path =
         shutdown_dir / "ply" / "point_cloud" /
         ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";

@@ -71,6 +71,13 @@ public:
         int source_frame_id = -1
     );
 
+    void visualizeDebugCameraPose(
+        const std::string& recording_name,
+        const Eigen::Matrix4f& T_W_C,
+        int iteration,
+        int keyframe_id
+    );
+
     // Log a triangle mesh for debug visualization.
     //
     // vertices  : [N,3] float tensor on any device.

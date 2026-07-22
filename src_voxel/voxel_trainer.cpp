@@ -71,8 +71,7 @@ sv::VoxelTrainer::VoxelTrainer()
 //         // 2.6) Photometric + SSIM loss
 //         auto gt = vf->original_image_.unsqueeze(0).to(device_type); // (1,3,H,W)
 //         auto Ll1 = loss_utils::l1_loss(image, gt);
-//         auto loss = (1.0f - optParams.lambda_dssim_) * Ll1
-//                   +  optParams.lambda_dssim_ * (1.0f - loss_utils::ssim(image, gt));
+//         auto loss = Ll1;
 //         loss.backward();
 
 //         // 2.7) Sync + timing
@@ -132,10 +131,10 @@ sv::VoxelTrainer::VoxelTrainer()
 void sv::VoxelTrainer::trainingReport(
     int iteration,
     int num_iterations,
-    torch::Tensor& Ll1,
-    torch::Tensor& loss,
-    float ema_loss_for_log,
-    torch::Tensor& mse,
+    const torch::Tensor& photo_loss,
+    const char* photo_loss_name,
+    const torch::Tensor& ssim_loss,
+    float ema_total_loss,
     int64_t elapsed_time,
     sv::VoxelModel& voxels,
     sv::VoxelScene& scene,
@@ -145,9 +144,10 @@ void sv::VoxelTrainer::trainingReport(
     std::cout << std::fixed << std::setprecision(8)
               << "Training iteration " << iteration << "/" << num_iterations
               << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
-              << ", ema_loss: " << ema_loss_for_log
-              << ", L1: " << Ll1.item<float>()
-              << ", MSE: " << mse.item<float>()
-              << ", num_voxels: " << voxels.numVoxels()
-              << std::endl;
+              << ", ema_total_loss: " << ema_total_loss
+              << ", photo_" << photo_loss_name << ": " << photo_loss.item<float>();
+    if (ssim_loss.defined()) {
+        std::cout << ", one_minus_SSIM: " << ssim_loss.item<float>();
+    }
+    std::cout << ", num_voxels: " << voxels.numVoxels() << std::endl;
 }

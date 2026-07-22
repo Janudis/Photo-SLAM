@@ -26,6 +26,9 @@
 #include <regex>
 #include <iomanip>
 #include <array>
+#include <atomic>
+#include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "include_voxel/voxel_parameters.h"
@@ -81,7 +84,7 @@ enum SystemSensorType {
      float geo_lr;
      float sh0_lr;
      float shs_lr;
-     float lambda_dssim;
+     float lambda_ssim;
      int densify_interval;
      int new_kf_times_of_use;
      int stable_num_iter_existence; ///< loop closure correction
@@ -116,11 +119,12 @@ public:
 
     int  getIteration();
     void increaseIteration(const int inc=1);
+    void waitForInputQueueSlot();
     
     float geoLearningRateInit();
     float sh0LearningRate();
     float shsLearningRate();
-    float lambdaDssim();
+    float lambdaSsim();
     int densifyInterval();
     int newKeyframeTimesOfUse();
     bool isKeepingTraining();
@@ -131,7 +135,7 @@ public:
     void setgeoLearningRateInit(const float lr);
     void setsh0LearningRate(const float lr);
     void setshsLearningRate(const float lr);
-    void setLambdaDssim(const float lambda_dssim);
+    void setLambdaSsim(const float lambda_ssim);
     void setDensifyInterval(const int interval);
     void setNewKeyframeTimesOfUse(const int times);
     void setKeepTraining(const bool keep);
@@ -166,6 +170,7 @@ protected:
         std::shared_ptr<VoxelKeyframe> pkf,
         bool include_inactive_geo = true,
         bool include_rgbd_hole_fill = true);
+    void flushInactiveGeoAndRgbdClosure();
     torch::Tensor detectRgbdRenderHolePixels(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         const torch::Tensor& depth,
@@ -174,13 +179,13 @@ protected:
         int64_t& hole_pixels,
         torch::Tensor& full_hole_mask);
     void fillRgbdRenderHolesSdf(
-        const std::shared_ptr<VoxelKeyframe>& pkf,
-        const torch::Tensor& depth,
-        const torch::Tensor& rgb,
-        const torch::Tensor& points3D_camera,
-        const Sophus::SE3f& Twc);
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void allocateOctreeBlocksForRgbdHoles(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
     void increasePcdByKeyframeSvreconRaySupport(std::shared_ptr<VoxelKeyframe> pkf);
     void flushSvreconRaySupportBatch();
+    std::vector<sv::MiniCam> incrementalMappingCameras() const;
+    std::map<point3D_id_t, Point3D> buildInitialRgbdPointCloud() const;
 
     void recordKeyframeRendered(
         torch::Tensor &rendered,
@@ -225,6 +230,9 @@ protected:
     torch::Tensor computeSdfInitForGridPoints(
         const torch::Tensor& grid_points_world,
         float ray_interval_m);
+    int64_t fuseProjectiveSdfInitFromKeyframe(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const torch::Tensor& pixel_mask = torch::Tensor());
     void runFinalSpecialPrune();
     torch::Tensor computeFinalSurfaceConfidenceKeepMask(
         bool retain_connected = true);
@@ -238,13 +246,8 @@ protected:
         unsigned long kf_id,
         bool log_reconstruction_mesh);
     void saveRerunRecordingsAtShutdown();
-    void appendAndLogOrbRawMapPcdToRerun(
-        const std::map<point3D_id_t, Point3D>& pcd,
-        int iteration);
-    void appendAndLogOrbRawPointBatchToRerun(
-        const std::vector<float>& points_flat,
-        const std::vector<float>& colors_flat,
-        int iteration);
+    void logCurrentOrbMapPointsToReconstructionRerun(int iteration);
+    void logCurrentOrbKeyframePosesToReconstructionRerun(int iteration);
     void logWholeRunLiveVoxelsToRerun(
         int iteration,
         const torch::Tensor& centers,
@@ -341,8 +344,8 @@ protected:
     // Rerun debugging
     VoxelRerunParameters rerun_params_;
     VoxelRerunState rerun_state_;
-    torch::Tensor orb_raw_pcd_points_accum_cpu_;
-    torch::Tensor orb_raw_pcd_colors_accum_cpu_;
+    std::unordered_map<unsigned long, Eigen::Matrix4f>
+        rerun_reconstruction_last_orb_poses_;
 
     // Data
     std::vector<std::size_t> kfid_shuffle_;
@@ -360,18 +363,25 @@ protected:
     bool keep_training_ = false;
     bool disable_topology_changes_ = false;
     bool tail_refinement_active_ = false;
+    int input_queue_max_keyframes_ = 0;
+    int incremental_mapping_window_size_ = 0;
+    bool loop_closure_reinsert_points_ = true;
+    std::atomic<long long> latest_consumed_keyframe_id_{-1};
+    std::atomic<bool> input_backpressure_ready_{false};
     int default_sh_ = 0;
     int svrecon_outside_level_ = 5;
+    float global_scene_extent_m_ = 0.0f;
+    bool robust_scene_bounds_ = false;
     bool svrecon_uniform_support_ = true;
-    int64_t svrecon_uniform_initial_max_voxels_ = 500000;
-    int64_t svrecon_uniform_growth_max_voxels_ = 40000;
     float svrecon_uniform_growth_margin_vox_ = 4.0f;
+    bool sdf_initialization_rgbd_projective_ = false;
+    bool allocate_orb_voxels_ = true;
+    bool rgbd_surface_point_allocation_ = false;
     bool svrecon_ray_support_ = false;
     int svrecon_ray_support_pixel_stride_ = 8;
     float svrecon_ray_support_surface_spacing_vox_ = 1.0f;
     float svrecon_ray_support_trunc_vox_ = 4.0f;
     float sdf_initialization_orb_radius_vox_ = 2.0f;
-    int svrecon_ray_support_max_points_per_kf_ = 0;
     int svrecon_ray_support_batch_keyframes_ = 8;
     std::string sdf_initialization_mode_ = "orb_prior";
     std::vector<float> svrecon_ray_support_pending_points_;
@@ -383,6 +393,20 @@ protected:
     int64_t svrecon_ray_support_pending_existing_support_holes_ = 0;
     camera_id_t svrecon_ray_support_pending_first_kf_ = 0;
     camera_id_t svrecon_ray_support_pending_last_kf_ = 0;
+    bool octree_block_support_ = false;
+    bool octree_block_support_initial_backfill_ = false;
+    int octree_block_support_block_size_vox_ = 8;
+    int octree_block_support_pixel_stride_ = 2;
+    float octree_block_support_trunc_vox_ = 3.0f;
+    struct OctreeBlockRecord {
+        int observation_count = 0;
+        camera_id_t last_keyframe = 0;
+        // Blocks reserve addressable support cheaply. Only cells promoted to
+        // the VoxelModel carry SH/SDF/optimizer state.
+        std::vector<std::uint16_t> band_observations;
+        std::vector<std::uint16_t> surface_observations;
+    };
+    std::unordered_map<std::uint64_t, OctreeBlockRecord> octree_block_records_;
 
     // Settings
     SystemSensorType sensor_type_;
@@ -402,11 +426,12 @@ protected:
     int max_depth_cached_ = 1;
     torch::Tensor depth_cache_points_;
     torch::Tensor depth_cache_colors_;
+    std::vector<std::shared_ptr<VoxelKeyframe>> rgbd_hole_fill_keyframe_cache_;
 
     // RGBD fill holes
     bool rgbd_fill_render_holes_ = false;
+    bool rgbd_fill_render_holes_projective_sdf_ = false;
     int rgbd_fill_render_holes_stride_ = 2;
-    int rgbd_fill_render_holes_max_points_per_kf_ = 20000;
 
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;

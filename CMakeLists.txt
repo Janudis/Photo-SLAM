@@ -47,6 +47,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -pthread")
 # set(ENV{TORCH_USE_CUDA_DSA} 1)
 
 find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV 4 REQUIRED)
 find_package(jsoncpp REQUIRED)
@@ -58,6 +59,22 @@ find_package(glfw3 REQUIRED)
 find_package(realsense2)
 
 find_package(glog REQUIRED)
+
+option(BUILD_NVBLOX_EXPERIMENT "Build the separate ORB-SLAM + nvblox RGB-D experiment" ON)
+if(BUILD_NVBLOX_EXPERIMENT)
+    set(NVBLOX_ROOT_DIR "${PROJECT_SOURCE_DIR}/third_party/nvblox")
+    set(NVBLOX_INCLUDE_DIR "${NVBLOX_ROOT_DIR}/nvblox/include")
+    set(NVBLOX_STDGPU_INCLUDE_DIR
+        "${NVBLOX_ROOT_DIR}/build/_deps/ext_stdgpu-src/src")
+    find_library(NVBLOX_LIB
+        NAMES nvblox_lib
+        PATHS "${NVBLOX_ROOT_DIR}/build/nvblox"
+        NO_DEFAULT_PATH)
+    if(NOT NVBLOX_LIB)
+        message(FATAL_ERROR
+            "BUILD_NVBLOX_EXPERIMENT=ON but third_party/nvblox/build/nvblox/libnvblox_lib.so was not found")
+    endif()
+endif()
 
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
@@ -208,7 +225,8 @@ add_library(gaussian_mapper SHARED
     src/gaussian_renderer.cpp
     src/gaussian_scene.cpp
     src/gaussian_trainer.cpp
-    src/gaussian_mapper.cpp)
+    src/gaussian_mapper.cpp
+    evaluation/gaussian_mesh_extraction.cpp)
 target_link_libraries(gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
     ${OpenCV_LIBRARIES}
@@ -283,6 +301,7 @@ target_include_directories(gaussian_mapper
 ### 3.2  C++ core / optimiser  ---------------------------------------
 add_library(voxel_core
         src/stereo_vision.cu
+        src_voxel/mapper_depth_registry.cpp
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
         src_voxel/voxel_mapper_tsdf.cpp
@@ -341,6 +360,32 @@ target_include_directories(voxel_viewer
     ${Python3_INCLUDE_DIRS}  # <-- Keep this if needed for Python integration
 )
 
+if(BUILD_NVBLOX_EXPERIMENT)
+    add_library(photoslam_nvblox STATIC
+        include_nvblox/nvblox_mapper.h
+        include_nvblox/nvblox_runner.h
+        src_nvblox/nvblox_mapper.cpp
+        src_nvblox/nvblox_runner.cpp)
+    target_include_directories(photoslam_nvblox
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}
+            ${NVBLOX_INCLUDE_DIR}
+            ${NVBLOX_STDGPU_INCLUDE_DIR}
+            ${OpenCV_INCLUDE_DIRS}
+            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
+    target_link_libraries(photoslam_nvblox
+        PUBLIC
+            ${NVBLOX_LIB}
+            ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+            ${OpenCV_LIBRARIES}
+            Eigen3::Eigen
+            CUDA::cudart
+            glog::glog)
+    set_target_properties(photoslam_nvblox PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        BUILD_RPATH "${NVBLOX_ROOT_DIR}/build/nvblox")
+endif()
+
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
@@ -384,6 +429,41 @@ target_link_libraries(replica_rgbd_voxel
 )
 target_link_directories(replica_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
+add_executable(waymo_mono_voxel examples/waymo_mono_voxel.cpp)
+target_include_directories(waymo_mono_voxel PRIVATE
+    ${CMAKE_SOURCE_DIR}/include_voxel
+    pybind11::embed)
+target_link_libraries(waymo_mono_voxel
+    voxel_core
+    voxel_viewer
+    ${OpenCV_LIBS}
+    ${TORCH_LIBRARIES}
+    torch_python
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(waymo_mono_voxel PRIVATE
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+add_executable(waymo_rgbd_voxel examples/waymo_rgbd_voxel.cpp)
+target_include_directories(waymo_rgbd_voxel PRIVATE
+    ${CMAKE_SOURCE_DIR}/include_voxel
+    pybind11::embed)
+target_link_libraries(waymo_rgbd_voxel
+    voxel_core
+    voxel_viewer
+    ${OpenCV_LIBS}
+    ${TORCH_LIBRARIES}
+    torch_python
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(waymo_rgbd_voxel PRIVATE
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+if(BUILD_NVBLOX_EXPERIMENT)
+    add_executable(replica_rgbd_nvblox examples/replica_rgbd_nvblox.cpp)
+    target_link_libraries(replica_rgbd_nvblox PRIVATE photoslam_nvblox)
+endif()
+
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # # TUM Monocular
@@ -426,7 +506,27 @@ target_link_libraries(tum_rgbd_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 target_link_directories(tum_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+# ScanNet uses the same generic timestamp/RGB/depth association runner as TUM,
+# but has a separate executable, generated camera calibration, and mapper YAML.
+add_executable(scannet_rgbd_voxel examples/tum_rgbd_voxel.cpp)
+target_link_libraries(scannet_rgbd_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(scannet_rgbd_voxel PRIVATE
+        /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(BUILD_NVBLOX_EXPERIMENT)
+    add_executable(tum_rgbd_nvblox examples/tum_rgbd_nvblox.cpp)
+    target_link_libraries(tum_rgbd_nvblox PRIVATE photoslam_nvblox)
+endif()
 
 # Mesh evaluation utility (reconstruction mesh vs GT mesh)
 add_executable(mesh_eval

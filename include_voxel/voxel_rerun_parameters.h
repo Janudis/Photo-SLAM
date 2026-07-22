@@ -17,8 +17,8 @@ struct VoxelRerunParameters
     std::string rerun_gt_mesh_path_;
     bool save_rendered_mesh_eval_ = true;
     bool rerun_rendered_mesh_eval_ = false;
-    float rendered_mesh_eval_voxel_size_m_ = 0.03f;
-    float rendered_mesh_eval_min_weight_ = 1.0f;
+    float rendered_mesh_eval_voxel_size_m_ = 0.05f;
+    float rendered_mesh_eval_min_weight_ = 2.0f;
     float rendered_mesh_eval_trunc_vox_ = 8.0f;
     float rendered_mesh_eval_depth_max_m_ = 5.0f;
     int svrecon_mesh_init_lv_ = 7;

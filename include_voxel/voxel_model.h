@@ -18,6 +18,9 @@
 #include <cmath>
 #include <tuple>
 #include <optional>
+#include <array>
+#include <cstdint>
+#include <unordered_map>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 #include "third_party/simple-knn/spatial.h"
@@ -122,6 +125,8 @@ public:
     torch::Tensor SceneExtent() const;
     torch::Tensor InsideExtent() const;
     float         fixedVoxSize() const { return fixed_vox_size_; }
+    float         insertionVoxSize() const;
+    int           insertionOctreeLevel() const { return static_cast<int>(octlevel_); }
     
     // svraster SDF helpers
     const torch::Tensor& svrasterSdfGridPts() const;
@@ -261,18 +266,25 @@ public:
     void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
     void setSvreconUniformSupport(
         const bool enable,
-        const int64_t initial_max_voxels,
-        const int64_t growth_max_voxels,
         const float growth_margin_vox)
     {
         svrecon_uniform_support_ = enable;
-        svrecon_uniform_initial_max_voxels_ = std::max<int64_t>(0, initial_max_voxels);
-        svrecon_uniform_growth_max_voxels_ = std::max<int64_t>(0, growth_max_voxels);
         svrecon_uniform_growth_margin_vox_ = std::max(0.0f, growth_margin_vox);
     }
     void setOutsideLevel(const int level) {
         outside_level_ = std::clamp(level, 0, max_num_levels_);
     }
+    void setFixedGlobalSceneExtent(const float extent_m) {
+        configured_global_scene_extent_ = std::max(0.0f, extent_m);
+        fixed_global_scene_layout_ = configured_global_scene_extent_ > 0.0f;
+    }
+    void setFixedVoxSize(const float voxel_size_m) {
+        fixed_vox_size_ = std::max(1.0e-4f, voxel_size_m);
+    }
+    void setRobustSceneBounds(const bool enable) {
+        robust_scene_bounds_ = enable;
+    }
+    bool hasFixedGlobalSceneLayout() const { return fixed_global_scene_layout_; }
     void setSdfInitializationOrbRadiusVox(const float radius_vox) {
         sdf_initialization_orb_radius_vox_ = std::max(0.0f, radius_vox);
     }
@@ -311,7 +323,12 @@ private:
     void updateExistingUniformSupportSdfFromPoints_(
         const torch::Tensor& support_xyz,
         const torch::Tensor& support_rgb,
-        const std::vector<sv::MiniCam>& cams);
+        const std::vector<sv::MiniCam>& cams,
+        bool initialize_all_visible_corners);
+    void registerSparseVoxelBlocks_(
+        const torch::Tensor& octpath,
+        const torch::Tensor& octlevel,
+        int iteration);
     torch::Tensor visibilitySignedPointPriorSdf_(
         const torch::Tensor& grid_xyz,
         const torch::Tensor& dist,
@@ -372,7 +389,8 @@ public:
         SignedPointPrior,
         WeakSurfacePrior,
         OrbPriorOnly,
-        WeakPositive
+        WeakPositive,
+        OrbPriorWeakCandidate
     };
     SdfInitMode pending_sdf_init_mode_ = SdfInitMode::SignedPointPrior;
     SdfInitMode topology_sdf_init_mode_ = SdfInitMode::OrbPriorOnly;
@@ -390,8 +408,21 @@ public:
     float global_scene_extent_ = 200.0f;  // example: 100 m cube
     std::array<float,3> global_scene_center_{0.f, 0.f, 0.f};
     float fixed_vox_size_ = 0.05f;     
+    bool fixed_global_scene_layout_ = false;
+    float configured_global_scene_extent_ = 0.0f;
+    bool robust_scene_bounds_ = false;
 
-    int64_t max_real_pcd_points_ = 800000;      // cap accumulated real PCD points
+    // Supereight-style sparse map-management blocks. Each key is the global
+    // octree ancestor of an 8^3 group of insertion-level cells. The block is
+    // an allocation/management unit; only observed cells carry SVRecon state.
+    static constexpr int sparse_block_side_vox_ = 8;
+    struct SparseVoxelBlockRecord {
+        std::array<std::uint64_t, 8> observed_cells{}; // 8 * 64 = 512 cells
+        std::uint32_t observation_count = 0;
+        int32_t last_observed_iteration = -1;
+    };
+    std::unordered_map<std::int64_t, SparseVoxelBlockRecord> sparse_voxel_blocks_;
+
     float dense_core_pcd_density_rate_ = 0.005f;
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
@@ -409,8 +440,6 @@ public:
     bool has_dense_core_bb_ = false;
     bool filter_near_voxels_ = true;
     bool svrecon_uniform_support_ = true;
-    int64_t svrecon_uniform_initial_max_voxels_ = 500000;
-    int64_t svrecon_uniform_growth_max_voxels_ = 40000;
     float svrecon_uniform_growth_margin_vox_ = 4.0f;
     std::string pending_real_insert_rr_entity_path_;
     GeoGridInitCallback geo_grid_init_callback_;

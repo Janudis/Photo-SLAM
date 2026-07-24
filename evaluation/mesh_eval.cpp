@@ -4467,9 +4467,9 @@ int main(int argc, char** argv)
 // Replica 
 // ./bin/mesh_eval \
 //   --eval_mode=current \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/ply/voxel_model/iteration_4641/voxel_surface_mesh.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2362_shutdown/ply/voxel_model/iteration_2362/voxel_surface_mesh.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
-//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_eval_gs_sim3 \
+//   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2362_shutdown/mesh_eval_gs_sim3 \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
 //   --align_recon_to_gt=1 \
@@ -4536,7 +4536,7 @@ int main(int argc, char** argv)
 // ./bin/mesh_eval \
 //   --eval_mode=current \
 //   --recon=third_party/HI-SLAM2/outputs/replica/office0/tsdf_mesh_after_opt_w2.0.ply \
-//   --gt=scripts/data/Replica/office0_mesh.ply \
+//   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
 //   --out=third_party/HI-SLAM2/outputs/replica/office0/mesh_eval_gs_sim3_after_opt \
 //   --tau_cm=5.0 \
 //   --eval_depth_mesh=1 \
@@ -4558,7 +4558,7 @@ int main(int argc, char** argv)
 // SVRecon
 // ./bin/mesh_eval \
 //   --eval_mode=current \
-//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/ply/voxel_model/iteration_4641/voxel_model.ply \
+//   --recon=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/ply/voxel_model/iteration_2362/voxel_model.ply \
 //   --gt=/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply \
 //   --out=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/voxel_support_eval \
 //   --tau_cm=5.0 \
@@ -4598,14 +4598,14 @@ int main(int argc, char** argv)
 // HI-SLAM2 3σ
 // ./bin/mesh_eval \
 //   --eval_mode=current \
-//   --recon=third_party/HI-SLAM2/outputs/replica/office0/3dgs_before_opt.ply \
-//   --gt=scripts/data/Replica/office0_mesh.ply \
-//   --out=third_party/HI-SLAM2/outputs/replica/office0/gaussian_support_eval_before_opt \
+//   --recon=third_party/HI-SLAM2/outputs/replica/office0/3dgs_final.ply \
+//   --gt=third_party/ESLAM/cull_replica_mesh/office0_culled.ply \
+//   --out=third_party/HI-SLAM2/outputs/replica/office0/gaussian_support_eval_after_opt \
 //   --tau_cm=5.0 \
 //   --align_recon_to_gt=1 \
 //   --traj=scripts/data/Replica/office0/traj.txt \
 //   --traj_mode=c2w \
-//   --recon_traj_tum=third_party/HI-SLAM2/outputs/replica/office0/traj_full_before_opt.txt \
+//   --recon_traj_tum=third_party/HI-SLAM2/outputs/replica/office0/traj_full.txt \
 //   --gt_samples=500000 \
 //   --eval_floaters=0 \
 //   --eval_gaussian_support=1 \

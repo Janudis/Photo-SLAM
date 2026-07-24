@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_keyframe.h"
@@ -44,6 +45,7 @@
 #include "include_voxel/render_opts.h"  
 #include "include_voxel/voxel_rerun_parameters.h"
 #include "include_voxel/voxel_sdf_parameters.h"
+#include "include_voxel/rgbd_tsdf_evidence.h"
 // #include "include/stereo_vision.h"
 // #include "include/operate_points.h"
 
@@ -170,20 +172,32 @@ protected:
         std::shared_ptr<VoxelKeyframe> pkf,
         bool include_inactive_geo = true,
         bool include_rgbd_hole_fill = true);
-    void flushInactiveGeoAndRgbdClosure();
+    void flushInactiveGeoCache();
+    void processRgbdClosureCache();
     torch::Tensor detectRgbdRenderHolePixels(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         const torch::Tensor& depth,
         int pixel_stride,
+        bool render_on_stride_grid,
         int64_t& valid_depth_pixels,
         int64_t& hole_pixels,
         torch::Tensor& full_hole_mask);
     void fillRgbdRenderHolesSdf(
         const std::shared_ptr<VoxelKeyframe>& pkf);
-    void allocateOctreeBlocksForRgbdHoles(
-        const std::shared_ptr<VoxelKeyframe>& pkf);
-    void increasePcdByKeyframeSvreconRaySupport(std::shared_ptr<VoxelKeyframe> pkf);
-    void flushSvreconRaySupportBatch();
+    void integrateRgbdTsdfEvidenceForRenderHoles(
+        const std::shared_ptr<VoxelKeyframe>& pkf,
+        std::unordered_set<
+            sv::RgbdTsdfGridKey,
+            sv::RgbdTsdfGridKeyHash>& affected_cells);
+    void promoteRgbdTsdfEvidenceCells(
+        const std::unordered_set<
+            sv::RgbdTsdfGridKey,
+            sv::RgbdTsdfGridKeyHash>& affected_cells);
+    void resetRgbdTsdfEvidenceIfLayoutChanged();
+    void logRgbdTsdfEvidenceCellsToRerun(
+        int iteration,
+        const std::vector<sv::RgbdTsdfGridKey>& cells,
+        const std::string& entity_path);
     std::vector<sv::MiniCam> incrementalMappingCameras() const;
     std::map<point3D_id_t, Point3D> buildInitialRgbdPointCloud() const;
 
@@ -252,19 +266,22 @@ protected:
         int iteration,
         const torch::Tensor& centers,
         const torch::Tensor& sizes,
-        const torch::Tensor& colors);
+        const torch::Tensor& colors,
+        bool log_whole_run = true,
+        bool log_svrecon_debug = true);
     void appendWholeRunPrunedVoxels(
         int iteration,
         const torch::Tensor& centers,
         const torch::Tensor& sizes,
+        const torch::Tensor& levels,
+        const torch::Tensor& colors,
         const torch::Tensor& pruned_by_sdf,
-        const torch::Tensor& pruned_by_near,
-        const torch::Tensor& pruned_by_final_special = torch::Tensor());
+        const torch::Tensor& pruned_by_surface_views,
+        const torch::Tensor& pruned_by_final_surface = torch::Tensor());
     void logSvreconDebugVoxelMaskToRerun(
         int iteration,
         const torch::Tensor& mask,
-        const std::string& entity_path,
-        const std::array<float, 4>& rgba);
+        const std::string& entity_path);
     void logReconstructionMeshToRerun(int iteration);
 
     // evaluation/debugging ----------------------------------------------------
@@ -372,41 +389,11 @@ protected:
     int svrecon_outside_level_ = 5;
     float global_scene_extent_m_ = 0.0f;
     bool robust_scene_bounds_ = false;
-    bool svrecon_uniform_support_ = true;
-    float svrecon_uniform_growth_margin_vox_ = 4.0f;
     bool sdf_initialization_rgbd_projective_ = false;
     bool allocate_orb_voxels_ = true;
     bool rgbd_surface_point_allocation_ = false;
-    bool svrecon_ray_support_ = false;
-    int svrecon_ray_support_pixel_stride_ = 8;
-    float svrecon_ray_support_surface_spacing_vox_ = 1.0f;
-    float svrecon_ray_support_trunc_vox_ = 4.0f;
     float sdf_initialization_orb_radius_vox_ = 2.0f;
-    int svrecon_ray_support_batch_keyframes_ = 8;
     std::string sdf_initialization_mode_ = "orb_prior";
-    std::vector<float> svrecon_ray_support_pending_points_;
-    std::vector<float> svrecon_ray_support_pending_colors_;
-    std::vector<float> svrecon_ray_support_pending_surface_points_;
-    int svrecon_ray_support_pending_keyframes_ = 0;
-    int64_t svrecon_ray_support_pending_rays_ = 0;
-    int64_t svrecon_ray_support_pending_structural_holes_ = 0;
-    int64_t svrecon_ray_support_pending_existing_support_holes_ = 0;
-    camera_id_t svrecon_ray_support_pending_first_kf_ = 0;
-    camera_id_t svrecon_ray_support_pending_last_kf_ = 0;
-    bool octree_block_support_ = false;
-    bool octree_block_support_initial_backfill_ = false;
-    int octree_block_support_block_size_vox_ = 8;
-    int octree_block_support_pixel_stride_ = 2;
-    float octree_block_support_trunc_vox_ = 3.0f;
-    struct OctreeBlockRecord {
-        int observation_count = 0;
-        camera_id_t last_keyframe = 0;
-        // Blocks reserve addressable support cheaply. Only cells promoted to
-        // the VoxelModel carry SH/SDF/optimizer state.
-        std::vector<std::uint16_t> band_observations;
-        std::vector<std::uint16_t> surface_observations;
-    };
-    std::unordered_map<std::uint64_t, OctreeBlockRecord> octree_block_records_;
 
     // Settings
     SystemSensorType sensor_type_;
@@ -426,13 +413,37 @@ protected:
     int max_depth_cached_ = 1;
     torch::Tensor depth_cache_points_;
     torch::Tensor depth_cache_colors_;
+    torch::Tensor rgbd_fill_render_holes_cache_points_;
+    torch::Tensor rgbd_fill_render_holes_cache_colors_;
+    std::vector<std::pair<std::shared_ptr<VoxelKeyframe>, torch::Tensor>>
+        rgbd_fill_render_holes_projective_cache_;
     std::vector<std::shared_ptr<VoxelKeyframe>> rgbd_hole_fill_keyframe_cache_;
+    std::vector<std::shared_ptr<VoxelKeyframe>> rgbd_hole_fill_ready_keyframes_;
 
     // RGBD fill holes
     bool rgbd_fill_render_holes_ = false;
     bool rgbd_fill_render_holes_projective_sdf_ = false;
     int rgbd_fill_render_holes_stride_ = 2;
 
+    // Non-renderable RGB-D TSDF evidence used only to promote confirmed
+    // residual-hole cells into the active SVRecon octree.
+    bool rgbd_tsdf_evidence_ = false;
+    bool rgbd_tsdf_evidence_initial_backfill_ = true;
+    int rgbd_tsdf_evidence_pixel_stride_ = 4;
+    float rgbd_tsdf_evidence_trunc_vox_ = 4.0f;
+    float rgbd_tsdf_evidence_max_weight_ = 5.0f;
+    int rgbd_tsdf_evidence_promote_min_views_ = 2;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCornerEvidence,
+        sv::RgbdTsdfGridKeyHash> rgbd_tsdf_corner_evidence_;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCellEvidence,
+        sv::RgbdTsdfGridKeyHash> rgbd_tsdf_cell_evidence_;
+    Eigen::Vector3f rgbd_tsdf_layout_scene_min_ = Eigen::Vector3f::Zero();
+    float rgbd_tsdf_layout_cell_size_ = 0.0f;
+    int rgbd_tsdf_layout_grid_dim_ = 0;
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;
     float large_rot_th_;

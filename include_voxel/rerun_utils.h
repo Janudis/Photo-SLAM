@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -104,6 +107,36 @@ public:
         const torch::Tensor& colors,     // [N,3] float or uint8, can be undefined
         int iteration,
         const std::string& entity_path = "world/voxels"
+    );
+
+    // Log sparse, axis-aligned octree leaves using Rerun's VoxelGridMap.
+    // Each octree level is emitted under entity_path/level_<L>, since one
+    // VoxelGridMap entity has a single voxel size.
+    void visualizeDebugVoxelGridMap(
+        const std::string& recording_name,
+        const torch::Tensor& centers,    // [N,3] float world centers
+        const torch::Tensor& sizes,      // [N] or [N,1] float edge lengths
+        const torch::Tensor& levels,     // [N] or [N,1] integer octree levels
+        const torch::Tensor& colors,     // [N,3]/[N,4] optimized/fused colors
+        const torch::Tensor& grid_origin,// [3] world-space minimum corner
+        int iteration,
+        const std::string& entity_path = "world/voxels",
+        float opacity = 0.8f
+    );
+
+    // Deferred-friendly fixed-level VoxelGridMap input. Integer grid indices
+    // and optional RGB/RGBA colors are retained during mapping; tensor and
+    // Rerun conversion happens only when the recording is flushed.
+    void visualizeDebugVoxelGridIndices(
+        const std::string& recording_name,
+        const std::vector<std::int32_t>& indices_xyz, // flat [N*3]
+        const std::vector<float>& colors,             // flat [N*3] or [N*4]
+        const Eigen::Vector3f& grid_origin,
+        float voxel_size,
+        std::int32_t level,
+        int iteration,
+        const std::string& entity_path = "world/voxels",
+        float opacity = 0.8f
     );
 
     void visualizeTriangleMesh(
@@ -254,9 +287,14 @@ public:
 private:
     RerunVisualizerBridge();
     void ensureInitialized();
+    bool deferDebugCall(std::function<void()> call);
+    void flushDeferredDebugCalls();
 
     bool enabled_ = true;
     bool initialized_ = false;
+    bool flushing_deferred_debug_calls_ = false;
+    std::mutex deferred_debug_mutex_;
+    std::vector<std::function<void()>> deferred_debug_calls_;
 
     // Python object: instance of python_rerun_bridge.visualizer_wrapper.RerunVisualizer
     struct PyImpl;

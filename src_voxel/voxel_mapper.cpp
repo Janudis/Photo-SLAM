@@ -59,12 +59,27 @@ void ensurePythonRuntimeInitialized(bool import_torch_cuda)
 {
     static bool initialized_by_mapper = false;
     static PyThreadState* released_main_thread_state = nullptr;
+    const auto configure_python_paths = []() {
+        py::exec(R"PY(
+import os
+import site
+import sys
+
+_user_site = site.getusersitepackages()
+site.addsitedir(_user_site)
+for _path in (os.path.join(_user_site, "rerun_sdk"), _user_site):
+    if _path in sys.path:
+        sys.path.remove(_path)
+    sys.path.insert(0, _path)
+)PY");
+        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
+        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+    };
 
     if (!initialized_by_mapper && Py_IsInitialized() == 0) {
         py::initialize_interpreter(false);
         initialized_by_mapper = true;
-        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
-        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+        configure_python_paths();
         if (import_torch_cuda) {
             py::module_::import("torch.cuda");
         }
@@ -74,8 +89,7 @@ void ensurePythonRuntimeInitialized(bool import_torch_cuda)
 
     {
         py::gil_scoped_acquire gil;
-        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
-        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+        configure_python_paths();
         if (import_torch_cuda) {
             py::module_::import("torch.cuda");
         }
@@ -144,9 +158,6 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         sdf_initialization_orb_radius_vox_);
     voxel_model_->setTopologySdfInitializationMode(sdf_initialization_mode_);
     voxel_model_->setFilterNearVoxels(opt_params_.filter_near_voxels_);
-    voxel_model_->setSvreconUniformSupport(
-        svrecon_uniform_support_,
-        svrecon_uniform_growth_margin_vox_);
 
     switch (pSLAM->getSensorType()) {
     case ORB_SLAM3::System::MONOCULAR:
@@ -285,6 +296,21 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         }
         this->scene_->addCamera(camera);
     }
+
+    // Debug snapshots are queued natively and Rerun is initialized only when
+    // the recording is saved, so instrumentation cannot alter online cadence.
+    auto& rerun_bridge = sv::RerunVisualizerBridge::instance();
+    rerun_bridge.setEnabled(rerun_params_.enable_rerun_);
+    const bool requires_live_rerun =
+        rerun_params_.run_whole_run_ ||
+        rerun_params_.rerun_reconstruction_mesh_ ||
+        rerun_params_.rerun_maps_ ||
+        rerun_params_.rerun_gt_mesh_ ||
+        rerun_params_.rerun_rendered_mesh_eval_;
+    if (rerun_params_.enable_rerun_ && requires_live_rerun) {
+        ensureEmbeddedPythonRuntime(/*import_torch_cuda=*/false);
+        rerun_bridge.init("PhotoSLAM-SVRecon", /*spawn_viewer=*/false);
+    }
 }
 
 void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
@@ -382,71 +408,14 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         robust_scene_bounds_ =
             (settings_file["Model.robust_scene_bounds"].operator int()) != 0;
     }
-    if (!settings_file["Mapper.svrecon_uniform_support"].empty()) {
-        svrecon_uniform_support_ =
-            (settings_file["Mapper.svrecon_uniform_support"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.svrecon_uniform_growth_margin_vox"].empty()) {
-        svrecon_uniform_growth_margin_vox_ =
-            std::max(
-                0.0f,
-                settings_file["Mapper.svrecon_uniform_growth_margin_vox"].operator float());
-    }
     if (!settings_file["Mapper.sdf_initialization_rgbd_projective"].empty()) {
         sdf_initialization_rgbd_projective_ =
             (settings_file["Mapper.sdf_initialization_rgbd_projective"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.svrecon_ray_support"].empty()) {
-        svrecon_ray_support_ =
-            (settings_file["Mapper.svrecon_ray_support"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.svrecon_ray_support_pixel_stride"].empty()) {
-        svrecon_ray_support_pixel_stride_ = std::max(
-            1,
-            settings_file["Mapper.svrecon_ray_support_pixel_stride"].operator int());
-    }
-    if (!settings_file["Mapper.svrecon_ray_support_surface_spacing_vox"].empty()) {
-        svrecon_ray_support_surface_spacing_vox_ = std::max(
-            0.25f,
-            settings_file["Mapper.svrecon_ray_support_surface_spacing_vox"].operator float());
-    }
-    if (!settings_file["Mapper.svrecon_ray_support_trunc_vox"].empty()) {
-        svrecon_ray_support_trunc_vox_ = std::max(
-            0.5f,
-            settings_file["Mapper.svrecon_ray_support_trunc_vox"].operator float());
     }
     if (!settings_file["Mapper.sdf_initialization_orb_radius_vox"].empty()) {
         sdf_initialization_orb_radius_vox_ = std::max(
             0.0f,
             settings_file["Mapper.sdf_initialization_orb_radius_vox"].operator float());
-    }
-    if (!settings_file["Mapper.svrecon_ray_support_batch_keyframes"].empty()) {
-        svrecon_ray_support_batch_keyframes_ = std::max(
-            1,
-            settings_file["Mapper.svrecon_ray_support_batch_keyframes"].operator int());
-    }
-    if (!settings_file["Mapper.octree_block_support"].empty()) {
-        octree_block_support_ =
-            (settings_file["Mapper.octree_block_support"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.octree_block_support_initial_backfill"].empty()) {
-        octree_block_support_initial_backfill_ =
-            (settings_file["Mapper.octree_block_support_initial_backfill"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.octree_block_support_block_size_vox"].empty()) {
-        octree_block_support_block_size_vox_ = std::max(
-            1,
-            settings_file["Mapper.octree_block_support_block_size_vox"].operator int());
-    }
-    if (!settings_file["Mapper.octree_block_support_pixel_stride"].empty()) {
-        octree_block_support_pixel_stride_ = std::max(
-            1,
-            settings_file["Mapper.octree_block_support_pixel_stride"].operator int());
-    }
-    if (!settings_file["Mapper.octree_block_support_trunc_vox"].empty()) {
-        octree_block_support_trunc_vox_ = std::max(
-            0.5f,
-            settings_file["Mapper.octree_block_support_trunc_vox"].operator float());
     }
     if (!settings_file["Mapper.sdf_initialization_mode"].empty()) {
         sdf_initialization_mode_ = voxel_utils::toLowerCopy(
@@ -478,23 +447,45 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rgbd_fill_render_holes_stride_ =
             std::max(1, settings_file["Mapper.rgbd_fill_render_holes_stride"].operator int());
     }
-    if (octree_block_support_) {
-        if (svrecon_uniform_support_ || svrecon_ray_support_ || rgbd_fill_render_holes_) {
-            std::cout << "[VoxelMapper] Mapper.octree_block_support replaces uniform, "
-                         "ray-support, and single-cell render-hole allocation; "
-                         "inactive geometry remains an optional earlier source.\n";
+    if (!settings_file["Mapper.rgbd_tsdf_evidence"].empty()) {
+        rgbd_tsdf_evidence_ =
+            (settings_file["Mapper.rgbd_tsdf_evidence"].operator int()) != 0;
+    }
+    if (!settings_file["Mapper.rgbd_tsdf_evidence_initial_backfill"].empty()) {
+        rgbd_tsdf_evidence_initial_backfill_ =
+            (settings_file["Mapper.rgbd_tsdf_evidence_initial_backfill"].operator int()) != 0;
+    }
+    if (!settings_file["Mapper.rgbd_tsdf_evidence_pixel_stride"].empty()) {
+        rgbd_tsdf_evidence_pixel_stride_ = std::max(
+            1,
+            settings_file["Mapper.rgbd_tsdf_evidence_pixel_stride"].operator int());
+    }
+    if (!settings_file["Mapper.rgbd_tsdf_evidence_trunc_vox"].empty()) {
+        rgbd_tsdf_evidence_trunc_vox_ = std::max(
+            0.5f,
+            settings_file["Mapper.rgbd_tsdf_evidence_trunc_vox"].operator float());
+    }
+    if (!settings_file["Mapper.rgbd_tsdf_evidence_max_weight"].empty()) {
+        rgbd_tsdf_evidence_max_weight_ = std::max(
+            1.0e-4f,
+            settings_file["Mapper.rgbd_tsdf_evidence_max_weight"].operator float());
+    }
+    if (!settings_file["Mapper.rgbd_tsdf_evidence_promote_min_views"].empty()) {
+        rgbd_tsdf_evidence_promote_min_views_ = std::max(
+            1,
+            settings_file["Mapper.rgbd_tsdf_evidence_promote_min_views"].operator int());
+    }
+    if (rgbd_tsdf_evidence_) {
+        if (rgbd_fill_render_holes_ ||
+            rgbd_surface_point_allocation_ || sdf_initialization_rgbd_projective_) {
+            std::cout
+                << "[VoxelMapper] Mapper.rgbd_tsdf_evidence uses ORB, optional "
+                   "inactive geometry, and evidence-only residual-hole fusion; "
+                   "disabling other RGB-D topology/SDF paths.\n";
         }
-        svrecon_uniform_support_ = false;
-        svrecon_ray_support_ = false;
         rgbd_fill_render_holes_ = false;
-    } else if (svrecon_ray_support_) {
-        if (svrecon_uniform_support_ || inactive_geo_densify_ || rgbd_fill_render_holes_) {
-            std::cout << "[VoxelMapper] Mapper.svrecon_ray_support replaces uniform, "
-                         "inactive-geo, and render-hole topology allocation.\n";
-        }
-        svrecon_uniform_support_ = false;
-        inactive_geo_densify_ = false;
-        rgbd_fill_render_holes_ = false;
+        rgbd_surface_point_allocation_ = false;
+        sdf_initialization_rgbd_projective_ = false;
     }
     if (!settings_file["Mapper.sdf_voxel_size_m"].empty()) {
         sdf_params_.sdf_voxel_size_m_ =
@@ -651,6 +642,11 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             settings_file["Optimization.subdivide_prop"].operator float(),
             0.0f,
             1.0f);
+    }
+    if (!settings_file["Optimization.subdivide_max_num"].empty()) {
+        opt_params_.subdivide_max_num_ = std::max(
+            1,
+            settings_file["Optimization.subdivide_max_num"].operator int());
     }
     opt_params_.use_l1_ =
         (settings_file["Optimization.use_l1"].operator int()) != 0;
@@ -933,14 +929,6 @@ void VoxelMapper::ensureEmbeddedPythonRuntime(bool import_torch_cuda)
 void VoxelMapper::run()
 {
     sv::RerunVisualizerBridge::instance().setEnabled(rerun_params_.enable_rerun_);
-    if (rerun_params_.enable_rerun_) {
-        ensureEmbeddedPythonRuntime(/*import_torch_cuda=*/false);
-        // Initialize Rerun in "headless" mode (no viewer window).
-        sv::RerunVisualizerBridge::instance().init(
-            "PhotoSLAM-SVRecon",
-            /*spawn_viewer=*/false
-        );
-    }
 
     if (rerun_params_.enable_rerun_ && rerun_params_.rerun_gt_mesh_) {
         if (!rerun_params_.rerun_gt_mesh_path_.empty() &&
@@ -951,20 +939,6 @@ void VoxelMapper::run()
                 "world/gt/mesh");
         } else {
             std::cerr << "[RERUN] GT mesh not found: "
-                      << rerun_params_.rerun_gt_mesh_path_ << "\n";
-        }
-    }
-
-    if (rerun_params_.enable_rerun_ && rerun_params_.rerun_svrecon_debug_) {
-        if (!rerun_params_.rerun_gt_mesh_path_.empty() &&
-            std::filesystem::exists(rerun_params_.rerun_gt_mesh_path_)) {
-            sv::RerunVisualizerBridge::instance().visualizeDebugPlyMesh(
-                "svrecon_debug",
-                rerun_params_.rerun_gt_mesh_path_,
-                0,
-                "world/nvblox/mesh");
-        } else if (!rerun_params_.rerun_gt_mesh_path_.empty()) {
-            std::cerr << "[RERUN/svrecon_debug] reference mesh not found: "
                       << rerun_params_.rerun_gt_mesh_path_ << "\n";
         }
     }
@@ -1147,17 +1121,6 @@ void VoxelMapper::run()
                 } else {
                     voxel_model_->createFromPcd(scene_->cached_point_cloud_, tr_cams);
                 }
-                // Uniform support defines the initial ORB-driven layout. Sparse
-                // RGB-D/LiDAR methods must still be able to restore cells that
-                // were pruned and later observed as residual render holes.
-                if (svrecon_uniform_support_ &&
-                    (rgbd_surface_point_allocation_ ||
-                     (rgbd_fill_render_holes_ &&
-                      rgbd_fill_render_holes_projective_sdf_))) {
-                    voxel_model_->setSvreconUniformSupport(
-                        false,
-                        svrecon_uniform_growth_margin_vox_);
-                }
                 if (rerun_params_.run_whole_run_ ||
                     rerun_params_.rerun_svrecon_debug_) {
                     rerun_state_.whole_run_live_voxels_dirty_ = true;
@@ -1178,20 +1141,13 @@ void VoxelMapper::run()
             logCurrentOrbMapPointsToReconstructionRerun(getIteration());
             logCurrentOrbKeyframePosesToReconstructionRerun(getIteration());
 
-            if (sensor_type_ == RGBD && svrecon_ray_support_) {
-                for (const auto& kv : scene_->keyframes()) {
-                    if (kv.second) {
-                        increasePcdByKeyframeSvreconRaySupport(kv.second);
-                    }
-                }
-                flushSvreconRaySupportBatch();
-            } else if (sensor_type_ == RGBD &&
+            if (sensor_type_ == RGBD &&
                 (inactive_geo_densify_ ||
                  rgbd_surface_point_allocation_ ||
+                 (rgbd_tsdf_evidence_ &&
+                  rgbd_tsdf_evidence_initial_backfill_) ||
                  (rgbd_fill_render_holes_ &&
-                  rgbd_fill_render_holes_initial_backfill_) ||
-                 (octree_block_support_ &&
-                  octree_block_support_initial_backfill_))) {
+                  rgbd_fill_render_holes_initial_backfill_))) {
                 std::vector<std::shared_ptr<VoxelKeyframe>> initial_rgbd_kfs;
                 initial_rgbd_kfs.reserve(scene_->keyframes().size());
                 for (const auto& kv : scene_->keyframes()) {
@@ -1208,11 +1164,13 @@ void VoxelMapper::run()
                         pkf,
                         /*include_inactive_geo=*/inactive_geo_densify_,
                         /*include_rgbd_hole_fill=*/
+                            (rgbd_tsdf_evidence_ &&
+                             rgbd_tsdf_evidence_initial_backfill_) ||
                             (rgbd_fill_render_holes_ &&
-                             rgbd_fill_render_holes_initial_backfill_) ||
-                            (octree_block_support_ &&
-                             octree_block_support_initial_backfill_));
+                             rgbd_fill_render_holes_initial_backfill_));
                 }
+                flushInactiveGeoCache();
+                processRgbdClosureCache();
                 max_depth_cached_ = previous_depth_cache_limit;
             }
             if (sensor_type_ == RGBD &&
@@ -1276,15 +1234,13 @@ void VoxelMapper::run()
             break;
     }
     
-    // Third loop: Tail optimization. Keep optimizing the existing voxel
-    // parameters after SLAM stops, but freeze topology in this final stage.
-    flushSvreconRaySupportBatch();
-    flushInactiveGeoAndRgbdClosure();
+    // Third loop: Tail optimization. Match GaussianMapper: scheduled topology
+    // adaptation remains active while the post-SLAM optimization finishes.
+    flushInactiveGeoCache();
+    processRgbdClosureCache();
     int adapt_interval = opt_params_.adapt_every_;          // cfg.procedure.adapt_every
     int n_delay_iters  = adapt_interval * 0.8f;        // same heuristic as GS code
-    const bool prev_disable_topology_changes = disable_topology_changes_;
     const bool prev_tail_refinement_active = tail_refinement_active_;
-    disable_topology_changes_ = true;
     tail_refinement_active_ = true;
     while (getIteration() - SLAM_stop_iter <= n_delay_iters
         || (getIteration() % adapt_interval) <= n_delay_iters
@@ -1296,7 +1252,6 @@ void VoxelMapper::run()
         n_delay_iters  = adapt_interval * 0.8f;
     }
     tail_refinement_active_ = prev_tail_refinement_active;
-    disable_topology_changes_ = prev_disable_topology_changes;
 
     runFinalSpecialPrune();
 
@@ -1691,17 +1646,16 @@ void VoxelMapper::trainForOneIteration()
 
     voxel_model_->optimizerStep();   // <-- the actual update
 
-    // Snapshot the exact SDF prune candidates after this optimization step but
-    // before scheduled pruning can remove them. This preserves the red state at
-    // pruning iterations instead of replacing it with the post-prune remainder.
+    // This is a live diagnostic of the learned SDF, independent of the pruning
+    // schedule. Recompute it after every optimizer step so its Rerun timeline
+    // shows cells entering and leaving the current SVRecon prune set.
     if (rerun_params_.enable_rerun_ &&
         rerun_params_.rerun_svrecon_debug_) {
         torch::NoGradGuard no_grad;
         logSvreconDebugVoxelMaskToRerun(
             iter,
             computeSvreconSdfPruneMask(),
-            "world/svrecon/suspected_floaters",
-            {1.0f, 0.0f, 0.0f, 0.95f});
+            "world/svrecon/sdf_prune_candidates");
     }
 
     if (!disable_topology_changes_) {
@@ -1836,9 +1790,7 @@ void VoxelMapper::trainForOneIteration()
                                 torch::Tensor tsdf_surface_mask;
 
                                 // Keep only an actual learned-SDF surface: the voxel must
-                                // have finite corners on both strict sides of zero. Only
-                                // uniform support protects unseen/unknown cells; sparse
-                                // and ray support have no preallocated future-space cells.
+                                // have finite corners on both strict sides of zero.
                                 corner_valid = torch::isfinite(tsdf8).to(torch::kBool);
                                 torch::Tensor valid_count =
                                     corner_valid.to(torch::kInt32).sum(/*dim=*/1);
@@ -2237,6 +2189,30 @@ void VoxelMapper::trainForOneIteration()
 	                        {
 	                            torch::Tensor pruned_centers = centers_world.index({prune_idx}).clone();
 	                            torch::Tensor pruned_sizes = sizes_world.index({prune_idx}).clone();
+                                torch::Tensor pruned_levels;
+                                torch::Tensor oct_levels = voxel_model_->octLevel();
+                                if (oct_levels.defined() &&
+                                    oct_levels.numel() == N) {
+                                    pruned_levels =
+                                        oct_levels.reshape({N, 1})
+                                            .index_select(
+                                                0,
+                                                prune_idx.to(oct_levels.device()).to(torch::kLong))
+                                            .contiguous();
+                                }
+                                torch::Tensor pruned_colors;
+                                torch::Tensor sh0 = voxel_model_->sh0();
+                                if (sh0.defined() && sh0.dim() == 2 &&
+                                    sh0.size(0) == N) {
+                                    pruned_colors =
+                                        (sh0.index_select(
+                                             0,
+                                             prune_idx.to(sh0.device()).to(torch::kLong)) *
+                                             sh_utils::C0 +
+                                         0.5f)
+                                            .clamp(0.0f, 1.0f)
+                                            .contiguous();
+                                }
 	                            torch::Tensor whole_run_pruned_by_tsdf;
                             if (sdf_prune_mask.defined() &&
                                 sdf_prune_mask.numel() == N) {
@@ -2248,11 +2224,11 @@ void VoxelMapper::trainForOneIteration()
                                         .index_select(0, prune_idx.to(torch::kLong))
                                         .contiguous();
                             }
-                            torch::Tensor whole_run_pruned_by_near;
-                            if (prune_mask_near.defined() &&
-                                prune_mask_near.numel() == N) {
-                                whole_run_pruned_by_near =
-                                    prune_mask_near
+                            torch::Tensor whole_run_pruned_by_surface_views;
+                            if (prune_mask_surface_views_extra.defined() &&
+                                prune_mask_surface_views_extra.numel() == N) {
+                                whole_run_pruned_by_surface_views =
+                                    prune_mask_surface_views_extra
                                         .to(prune_idx.device())
                                         .to(torch::kBool)
                                         .contiguous()
@@ -2263,8 +2239,10 @@ void VoxelMapper::trainForOneIteration()
 	                                iter,
 	                                pruned_centers,
 	                                pruned_sizes,
+	                                pruned_levels,
+                                    pruned_colors,
 	                                whole_run_pruned_by_tsdf,
-	                                whole_run_pruned_by_near);
+	                                whole_run_pruned_by_surface_views);
 
 	                        }
 	                    }
@@ -2419,6 +2397,8 @@ void VoxelMapper::trainForOneIteration()
                             priority = priority.reshape({M});
                         }
 
+                        auto normal_selected_mask =
+                            torch::zeros_like(normal_candidate_mask, torch::kBool);
                         if (n_normal_candidates > 0) {
                             priority = priority * normal_candidate_mask.to(priority.scalar_type());
 
@@ -2446,7 +2426,7 @@ void VoxelMapper::trainForOneIteration()
                             n_sdf_refined_candidates =
                                 refined_candidates.sum().item<int64_t>();
 
-                            auto normal_selected_mask = base_scale_candidates.clone();
+                            normal_selected_mask = base_scale_candidates.clone();
                             if (opt_params_.subdivide_all_until_ > 0 &&
                                 iter <= opt_params_.subdivide_all_until_) {
                                 normal_selected_mask = normal_candidate_mask.clone();
@@ -2471,6 +2451,59 @@ void VoxelMapper::trainForOneIteration()
                                 normal_selected_mask.index_put_({chosen}, true);
                                 n_sdf_priority_selected = chosen.numel();
                             }
+                            // Match SVRecon's hard topology cap. Subdividing one
+                            // parent replaces it with eight children, adding
+                            // seven active voxels to the map.
+                            const int64_t max_n_subdiv = std::max<int64_t>(
+                                0,
+                                (static_cast<int64_t>(opt_params_.subdivide_max_num_) -
+                                 static_cast<int64_t>(M)) /
+                                    7);
+                            const int64_t selected_before_cap =
+                                normal_selected_mask.sum().item<int64_t>();
+                            if (selected_before_cap > max_n_subdiv) {
+                                if (max_n_subdiv == 0) {
+                                    normal_selected_mask =
+                                        torch::zeros_like(
+                                            normal_candidate_mask,
+                                            torch::kBool);
+                                } else {
+                                    auto selected_idx =
+                                        torch::nonzero(normal_selected_mask)
+                                            .reshape({-1})
+                                            .to(torch::kLong);
+                                    auto selected_priority =
+                                        priority.index_select(0, selected_idx);
+                                    auto order = std::get<1>(
+                                        selected_priority.sort(
+                                            /*dim=*/0,
+                                            /*descending=*/true));
+                                    auto keep_idx = selected_idx.index_select(
+                                        0,
+                                        order.index({
+                                            torch::indexing::Slice(
+                                                0,
+                                                max_n_subdiv)})
+                                            .to(torch::kLong));
+                                    normal_selected_mask =
+                                        torch::zeros_like(
+                                            normal_candidate_mask,
+                                            torch::kBool);
+                                    normal_selected_mask.index_put_(
+                                        {keep_idx},
+                                        true);
+                                }
+                                std::cout
+                                    << "[SUBDIV/cap] max_voxels="
+                                    << opt_params_.subdivide_max_num_
+                                    << " current=" << M
+                                    << " selected_before="
+                                    << selected_before_cap
+                                    << " selected_after="
+                                    << normal_selected_mask.sum().item<int64_t>()
+                                    << "\n";
+                            }
+
                             n_sdf_priority_selected =
                                 (normal_selected_mask & refined_candidates)
                                     .sum().item<int64_t>();
@@ -2485,13 +2518,24 @@ void VoxelMapper::trainForOneIteration()
                                         .item<int64_t>();
                             }
                             if (n_subdiv_normal_selected > 0) {
-	                                voxel_model_->subdividing(normal_selected_mask);
+		                                voxel_model_->subdividing(normal_selected_mask);
                                     if (rerun_params_.run_whole_run_ ||
                                         rerun_params_.rerun_svrecon_debug_) {
                                         rerun_state_.whole_run_live_voxels_dirty_ = true;
                                     }
                                 did_subdivide = true;
                             }
+                        }
+                        if (rerun_params_.enable_rerun_ &&
+                            rerun_params_.rerun_svrecon_debug_) {
+                            logSvreconDebugVoxelMaskToRerun(
+                                iter,
+                                sdf_subdivide_candidate_mask,
+                                "world/svrecon/subdivide_candidates");
+                            logSvreconDebugVoxelMaskToRerun(
+                                iter,
+                                normal_selected_mask,
+                                "world/svrecon/subdivide_selected");
                         }
                     }
 
@@ -2561,19 +2605,31 @@ void VoxelMapper::trainForOneIteration()
 
     if (rerun_params_.enable_rerun_) {
         logReconstructionMeshToRerun(iter);
+        const int svrecon_grid_snapshot_interval = std::max(
+            1,
+            std::max(training_report_interval_, opt_params_.adapt_every_));
         const bool periodic_svrecon_snapshot =
             rerun_params_.rerun_svrecon_debug_ &&
-            training_report_interval_ > 0 &&
-            (iter % training_report_interval_) == 0;
-        if ((rerun_params_.run_whole_run_ ||
-             rerun_params_.rerun_svrecon_debug_) &&
-            (rerun_state_.whole_run_live_voxels_dirty_ ||
-             periodic_svrecon_snapshot)) {
+            (iter % svrecon_grid_snapshot_interval) == 0;
+        const bool log_whole_run_live =
+            rerun_params_.run_whole_run_ &&
+            rerun_state_.whole_run_live_voxels_dirty_;
+        const bool log_svrecon_debug_live =
+            rerun_params_.rerun_svrecon_debug_ &&
+            (!rerun_state_.svrecon_debug_has_source_snapshot_ ||
+             rerun_state_.whole_run_live_voxels_dirty_ ||
+             periodic_svrecon_snapshot);
+        if (log_whole_run_live || log_svrecon_debug_live) {
             logWholeRunLiveVoxelsToRerun(
                 iter,
                 voxel_model_->voxCenter(),
                 voxel_model_->voxSize(),
-                torch::Tensor());
+                torch::Tensor(),
+                log_whole_run_live,
+                log_svrecon_debug_live);
+            if (log_svrecon_debug_live) {
+                rerun_state_.svrecon_debug_has_source_snapshot_ = true;
+            }
             rerun_state_.whole_run_live_voxels_dirty_ = false;
         }
     }
@@ -2655,20 +2711,16 @@ void VoxelMapper::combineMappingOperations()
                     // Give local BA keyframes times of use
                     increaseKeyframeTimesOfUse(pkf, local_BA_increased_times_of_use_);
                     kf_changed = true;
-
-                    logKeyframeCameraToRerunRecordings(
-                        pkf,
-                        kfid,
-                        /*log_reconstruction_mesh=*/true);
 		                }
-	                else {
-		                handleNewKeyframe(kf);                   // still void
-                    std::shared_ptr<VoxelKeyframe> new_pkf = scene_->getKeyframe(kfid);
+			        else {
+				        handleNewKeyframe(kf);                   // still void
+                    std::shared_ptr<VoxelKeyframe> new_pkf =
+                        scene_->getKeyframe(kfid);
                     if (new_pkf) {
                         new_densification_kfs.push_back(new_pkf);
                     }
                     kf_changed = true;
-	                }
+			        }
 	            }
             // Get new points
             auto& associated_points = opr.associatedMapPoints();
@@ -2690,24 +2742,27 @@ void VoxelMapper::combineMappingOperations()
                         getIteration(),
                         tr_cams);
                     voxel_model_->setNextRealInsertionRerunEntityPath("");
+                    if (voxel_model_->lastIncreasePcdStats().new_voxels > 0 &&
+                        (rerun_params_.run_whole_run_ ||
+                         rerun_params_.rerun_svrecon_debug_)) {
+                        rerun_state_.whole_run_live_voxels_dirty_ = true;
+                    }
 		                }
-	            }
+			        }
 
-            // Always complete incremental ORB insertion first. Then add sparse
-            // inactive geometry, re-render, and finally fill only residual RGB-D
-            // holes. This keeps the three sources ordered and prevents hole fill
-            // from claiming cells that ORB/inactive geometry would have supplied.
+            // Preserve the scheduling used by the established SVRecon runs:
+            // ORB topology first, then inactive geometry, then residual RGB-D.
             if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
                 for (const auto& pkf : new_densification_kfs) {
-                    if (svrecon_ray_support_) {
-                        increasePcdByKeyframeSvreconRaySupport(pkf);
-                    } else if (isdoingInactiveGeoDensify()) {
-                        increasePcdByKeyframeInactiveGeoDensify(pkf);
+                    increasePcdByKeyframeInactiveGeoDensify(
+                        pkf,
+                        /*include_inactive_geo=*/inactive_geo_densify_,
+                        /*include_rgbd_hole_fill=*/
+                            rgbd_fill_render_holes_ || rgbd_tsdf_evidence_);
                 }
             }
-
-			    }
-		    }
+            processRgbdClosureCache();
+        }
         break;
 
         case ORB_SLAM3::MappingOperation::OprType::LoopClosingBA:
@@ -2722,7 +2777,6 @@ void VoxelMapper::combineMappingOperations()
             // Get new keyframes (scaled transformation applied in ORB-SLAM3)
             auto& associated_kfs = opr.associatedKeyFrames();
             std::vector<std::shared_ptr<VoxelKeyframe>> new_densification_kfs;
-
             // std::vector<std::shared_ptr<VoxelKeyframe>> kfs_for_bounding;
 
              // Mark the transformed points to avoid transforming more than once
@@ -2777,21 +2831,16 @@ void VoxelMapper::combineMappingOperations()
 	                         pose.unit_quaternion().cast<double>(),
 	                         pose.translation().cast<double>());
 
-                         logKeyframeCameraToRerunRecordings(
-                             pkf,
-                             kfid,
-                             /*log_reconstruction_mesh=*/true);
-
 		                    kf_changed = true;
 	                 }
-	                 else if (loop_closure_reinsert_points_) {
-	                     handleNewKeyframe(kf);
-	                     pkf = scene_->getKeyframe(kfid);
+			                 else if (loop_closure_reinsert_points_) {
+			                     handleNewKeyframe(kf);
+			                     pkf = scene_->getKeyframe(kfid);
                          if (pkf) {
                              new_densification_kfs.push_back(pkf);
                          }
-                         kf_changed = true;
-	                 }
+		                         kf_changed = true;
+			                 }
 	             }
              if (record_loop_ply_)
                  savePly(result_dir_ / (std::to_string(getIteration()) + "_1_after_loop_correction"));
@@ -2820,19 +2869,26 @@ void VoxelMapper::combineMappingOperations()
                         iter,
                         tr_cams);
                     voxel_model_->setNextRealInsertionRerunEntityPath("");
+                    if (voxel_model_->lastIncreasePcdStats().new_voxels > 0 &&
+                        (rerun_params_.run_whole_run_ ||
+                         rerun_params_.rerun_svrecon_debug_)) {
+                        rerun_state_.whole_run_live_voxels_dirty_ = true;
+                    }
                 }
-	             }
+		             }
 
                 if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
                     for (const auto& pkf : new_densification_kfs) {
-                        if (svrecon_ray_support_) {
-                            increasePcdByKeyframeSvreconRaySupport(pkf);
-                        } else if (isdoingInactiveGeoDensify()) {
-                            increasePcdByKeyframeInactiveGeoDensify(pkf);
-                        }
+                        increasePcdByKeyframeInactiveGeoDensify(
+                            pkf,
+                            /*include_inactive_geo=*/inactive_geo_densify_,
+                            /*include_rgbd_hole_fill=*/
+                                rgbd_fill_render_holes_ ||
+                                rgbd_tsdf_evidence_);
                     }
                 }
-		            // Mark this iteration
+                processRgbdClosureCache();
+			            // Mark this iteration
 	            loop_closure_iteration_ = true;
          }
 
@@ -2865,13 +2921,9 @@ void VoxelMapper::combineMappingOperations()
                      std::shared_ptr<VoxelKeyframe> pkf = kfit.second;
                      Sophus::SE3f Twc = pkf->getPosef().inverse();
                      Twc.translation() *= s;
-                     Sophus::SE3f Tyc = T * Twc;
-                     Sophus::SE3f Tcy = Tyc.inverse();
+	                     Sophus::SE3f Tyc = T * Twc;
+	                     Sophus::SE3f Tcy = Tyc.inverse();
 	                     pkf->setPose(Tcy.unit_quaternion().cast<double>(), Tcy.translation().cast<double>());
-	                     logKeyframeCameraToRerunRecordings(
-	                         pkf,
-	                         kfit.first,
-	                         /*log_reconstruction_mesh=*/true);
                     //  pkf->computeTransformTensors();
                  }
              }
@@ -3082,10 +3134,6 @@ void VoxelMapper::handleNewKeyframe(
     pkf->kps_pixel_ = std::move(std::get<6>(kf));
     pkf->kps_point_local_ = std::move(std::get<7>(kf));
 
-    // Geometry densification is deferred to the mapping-operation handler so
-    // incremental ORB points are inserted before inactive geometry and RGB-D
-    // residual-hole filling.
-
     // Prepare multi resolution images for training
     if (device_type_ == torch::kCUDA) {
         cv::cuda::GpuMat img_gpu;
@@ -3127,331 +3175,12 @@ void VoxelMapper::handleNewKeyframe(
     }
 }
 
-void VoxelMapper::increasePcdByKeyframeSvreconRaySupport(
-    std::shared_ptr<VoxelKeyframe> pkf)
-{
-    if (!pkf || sensor_type_ != RGBD || !voxel_model_ ||
-        pkf->img_auxiliary_undist_.empty() || pkf->img_undist_.empty()) {
-        return;
-    }
-
-    cv::Mat depth_meters;
-    if (!voxel_utils::depthMatToMeters(pkf->img_auxiliary_undist_, depth_meters) ||
-        depth_meters.empty()) {
-        return;
-    }
-    if (depth_meters.channels() > 1) {
-        cv::extractChannel(depth_meters, depth_meters, 0);
-    }
-    if (depth_meters.type() != CV_32FC1) {
-        depth_meters.convertTo(depth_meters, CV_32FC1);
-    }
-
-    cv::Mat rgb_float;
-    if (pkf->img_undist_.channels() == 3) {
-        pkf->img_undist_.convertTo(rgb_float, CV_32FC3);
-    } else if (pkf->img_undist_.channels() == 1) {
-        cv::Mat gray_float;
-        pkf->img_undist_.convertTo(gray_float, CV_32FC1);
-        cv::cvtColor(gray_float, rgb_float, cv::COLOR_GRAY2RGB);
-    } else {
-        return;
-    }
-    double color_min = 0.0;
-    double color_max = 0.0;
-    cv::minMaxLoc(rgb_float.reshape(1), &color_min, &color_max);
-    if (color_max > 1.5) {
-        rgb_float *= (1.0f / 255.0f);
-    }
-
-    const int height = std::min(depth_meters.rows, rgb_float.rows);
-    const int width = std::min(depth_meters.cols, rgb_float.cols);
-    if (height <= 0 || width <= 0) {
-        return;
-    }
-    const sv::MiniCam cam = pkf->toMiniCam(height, width);
-    if (cam.fx <= 1.0e-6f || cam.fy <= 1.0e-6f) {
-        return;
-    }
-
-    std::unordered_map<std::string, torch::Tensor> render_pkg;
-    {
-        torch::NoGradGuard no_grad;
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        render_pkg = voxel_model_->render(
-            cam,
-            height,
-            width,
-            torch::Tensor(),
-            "dontcare",
-            false,
-            std::nullopt,
-            true,
-            false,
-            true,
-            false,
-            false,
-            sv::RenderOpts{});
-    }
-
-    torch::Tensor render_depth_cpu;
-    torch::Tensor render_alpha_cpu;
-    torch::Tensor render_n_contrib_cpu;
-    if (!voxel_utils::renderPkgToDepthAlphaMaps(
-            render_pkg,
-            height,
-            width,
-            render_depth_cpu,
-            render_alpha_cpu,
-            render_n_contrib_cpu)) {
-        std::cerr << "[SVRECON/ray_support] failed to read render maps for kf="
-                  << pkf->fid_ << "\n";
-        return;
-    }
-
-    const float vox_size = std::max(1.0e-4f, voxel_model_->fixedVoxSize());
-    const float surface_spacing =
-        std::max(0.25f * vox_size, svrecon_ray_support_surface_spacing_vox_ * vox_size);
-    const float truncation =
-        std::max(0.5f * vox_size, svrecon_ray_support_trunc_vox_ * vox_size);
-    const float max_depth =
-        sdf_params_.sdf_init_max_depth_m_ > 0.0f
-            ? std::min(RGBD_max_depth_, sdf_params_.sdf_init_max_depth_m_)
-            : RGBD_max_depth_;
-    const float start_depth = std::max(z_near_, 0.5f * surface_spacing);
-    const int stride = std::max(1, svrecon_ray_support_pixel_stride_);
-
-    const torch::Tensor scene_center_cpu =
-        voxel_model_->SceneCenter().detach().to(torch::kCPU).to(torch::kFloat32).view({3});
-    const float scene_extent =
-        voxel_model_->SceneExtent().detach().to(torch::kCPU).to(torch::kFloat32).item<float>();
-    const float scene_half = 0.5f * scene_extent;
-    const Eigen::Vector3f scene_center(
-        scene_center_cpu[0].item<float>(),
-        scene_center_cpu[1].item<float>(),
-        scene_center_cpu[2].item<float>());
-    const Sophus::SE3f Twc = pkf->getPosef().inverse();
-
-    struct HoleRay {
-        float depth;
-        float x_norm;
-        float y_norm;
-        cv::Vec3f color;
-        Eigen::Vector3f surface_world;
-    };
-
-    const int64_t ray_estimate =
-        static_cast<int64_t>((height + stride - 1) / stride) *
-        static_cast<int64_t>((width + stride - 1) / stride);
-    std::vector<HoleRay> structural_holes;
-    structural_holes.reserve(static_cast<size_t>(ray_estimate));
-
-    auto render_depth_acc = render_depth_cpu.accessor<float, 2>();
-    auto render_n_contrib_acc = render_n_contrib_cpu.accessor<int, 2>();
-    for (int y = 0; y < height; y += stride) {
-        const float y_norm = (static_cast<float>(y) - cam.cy) / cam.fy;
-        for (int x = 0; x < width; x += stride) {
-            const float depth = depth_meters.at<float>(y, x);
-            if (!std::isfinite(depth) || depth <= RGBD_min_depth_ || depth >= max_depth) {
-                continue;
-            }
-
-            const float rendered_depth = render_depth_acc[y][x];
-            const int n_contrib = render_n_contrib_acc[y][x];
-            const bool no_rendered_depth =
-                !std::isfinite(rendered_depth) || rendered_depth <= 1.0e-6f;
-            if (n_contrib > 0 && !no_rendered_depth) {
-                continue;
-            }
-
-            const float x_norm = (static_cast<float>(x) - cam.cx) / cam.fx;
-            const Eigen::Vector3f surface_world =
-                Twc * Eigen::Vector3f(x_norm * depth, y_norm * depth, depth);
-            structural_holes.push_back(
-                HoleRay{depth, x_norm, y_norm, rgb_float.at<cv::Vec3f>(y, x), surface_world});
-        }
-    }
-
-    std::vector<uint8_t> has_existing_support(structural_holes.size(), 0);
-    if (!structural_holes.empty()) {
-        std::vector<float> surface_points_flat;
-        surface_points_flat.reserve(structural_holes.size() * 3);
-        for (const HoleRay& ray : structural_holes) {
-            surface_points_flat.push_back(ray.surface_world.x());
-            surface_points_flat.push_back(ray.surface_world.y());
-            surface_points_flat.push_back(ray.surface_world.z());
-        }
-
-        torch::Tensor surface_points =
-            torch::from_blob(
-                surface_points_flat.data(),
-                {static_cast<int64_t>(structural_holes.size()), 3},
-                torch::TensorOptions().dtype(torch::kFloat32))
-                .clone()
-                .to(mDevice)
-                .contiguous();
-        torch::Tensor support_valid;
-        {
-            torch::NoGradGuard no_grad;
-            std::unique_lock<std::mutex> lock_render(mutex_render_);
-            support_valid = std::get<1>(voxel_model_->querySdfTrilinear(surface_points))
-                                .detach()
-                                .to(torch::kCPU)
-                                .to(torch::kBool)
-                                .contiguous();
-        }
-        const bool* support_ptr = support_valid.data_ptr<bool>();
-        for (size_t i = 0; i < structural_holes.size(); ++i) {
-            has_existing_support[i] = support_ptr[i] ? 1 : 0;
-        }
-    }
-
-    std::vector<float> points;
-    std::vector<float> colors;
-    std::vector<float> surface_points;
-    points.reserve(structural_holes.size() * 12 * 3);
-    colors.reserve(structural_holes.size() * 12 * 3);
-    surface_points.reserve(structural_holes.size() * 3);
-    int64_t holes_with_existing_support = 0;
-    int64_t holes_without_support = 0;
-
-    auto append_sample = [&](const float x_norm,
-                             const float y_norm,
-                             const float z,
-                             const cv::Vec3f& color) {
-        const Eigen::Vector3f world = Twc * Eigen::Vector3f(x_norm * z, y_norm * z, z);
-        const Eigen::Vector3f delta = (world - scene_center).cwiseAbs();
-        if ((delta.array() >= scene_half).any()) {
-            return;
-        }
-        points.push_back(world.x());
-        points.push_back(world.y());
-        points.push_back(world.z());
-        colors.push_back(std::clamp(color[0], 0.0f, 1.0f));
-        colors.push_back(std::clamp(color[1], 0.0f, 1.0f));
-        colors.push_back(std::clamp(color[2], 0.0f, 1.0f));
-    };
-
-    const int surface_steps =
-        std::max(1, static_cast<int>(std::ceil(truncation / surface_spacing)));
-    for (size_t ray_idx = 0; ray_idx < structural_holes.size(); ++ray_idx) {
-        if (has_existing_support[ray_idx]) {
-            ++holes_with_existing_support;
-            continue;
-        }
-
-        ++holes_without_support;
-        const HoleRay& ray = structural_holes[ray_idx];
-        const size_t points_before = points.size();
-        for (int step = -surface_steps; step <= surface_steps; ++step) {
-            const float z = ray.depth + static_cast<float>(step) * surface_spacing;
-            if (z >= start_depth && z <= max_depth &&
-                std::abs(z - ray.depth) <= truncation + 1.0e-6f) {
-                append_sample(ray.x_norm, ray.y_norm, z, ray.color);
-            }
-        }
-        if (points.size() > points_before) {
-            surface_points.push_back(ray.surface_world.x());
-            surface_points.push_back(ray.surface_world.y());
-            surface_points.push_back(ray.surface_world.z());
-        }
-    }
-
-    int64_t sampled_points = static_cast<int64_t>(points.size() / 3);
-    const camera_id_t pending_kfid = static_cast<camera_id_t>(pkf->fid_);
-    if (svrecon_ray_support_pending_keyframes_ == 0) {
-        svrecon_ray_support_pending_first_kf_ = pending_kfid;
-        svrecon_ray_support_pending_last_kf_ = pending_kfid;
-    } else {
-        svrecon_ray_support_pending_first_kf_ = std::min(
-            svrecon_ray_support_pending_first_kf_, pending_kfid);
-        svrecon_ray_support_pending_last_kf_ = std::max(
-            svrecon_ray_support_pending_last_kf_, pending_kfid);
-    }
-    ++svrecon_ray_support_pending_keyframes_;
-    svrecon_ray_support_pending_rays_ += holes_without_support;
-    svrecon_ray_support_pending_structural_holes_ +=
-        static_cast<int64_t>(structural_holes.size());
-    svrecon_ray_support_pending_existing_support_holes_ +=
-        holes_with_existing_support;
-    svrecon_ray_support_pending_points_.insert(
-        svrecon_ray_support_pending_points_.end(), points.begin(), points.end());
-    svrecon_ray_support_pending_colors_.insert(
-        svrecon_ray_support_pending_colors_.end(), colors.begin(), colors.end());
-    svrecon_ray_support_pending_surface_points_.insert(
-        svrecon_ray_support_pending_surface_points_.end(),
-        surface_points.begin(),
-        surface_points.end());
-
-    if (svrecon_ray_support_pending_keyframes_ >=
-        svrecon_ray_support_batch_keyframes_) {
-        flushSvreconRaySupportBatch();
-    }
-}
-
-void VoxelMapper::flushSvreconRaySupportBatch()
-{
-    if (!svrecon_ray_support_ || !voxel_model_ ||
-        svrecon_ray_support_pending_keyframes_ <= 0) {
-        return;
-    }
-
-    std::vector<sv::MiniCam> cameras = incrementalMappingCameras();
-
-    const int batch_keyframes = svrecon_ray_support_pending_keyframes_;
-    const int64_t batch_missing_support_holes = svrecon_ray_support_pending_rays_;
-    const int64_t batch_structural_holes =
-        svrecon_ray_support_pending_structural_holes_;
-    const int64_t batch_existing_support_holes =
-        svrecon_ray_support_pending_existing_support_holes_;
-    const int64_t batch_samples = static_cast<int64_t>(
-        svrecon_ray_support_pending_points_.size() / 3);
-    const camera_id_t first_kf = svrecon_ray_support_pending_first_kf_;
-    const camera_id_t last_kf = svrecon_ray_support_pending_last_kf_;
-
-    sv::VoxelModel::IncreasePcdStats stats;
-    if (!svrecon_ray_support_pending_points_.empty()) {
-        torch::NoGradGuard no_grad;
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        voxel_model_->setNextRealInsertionRerunEntityPath(
-            "world/svrecon_ray_support/created");
-        if (!svrecon_ray_support_pending_surface_points_.empty()) {
-            torch::Tensor surface_support = torch::from_blob(
-                svrecon_ray_support_pending_surface_points_.data(),
-                {static_cast<int64_t>(
-                     svrecon_ray_support_pending_surface_points_.size() / 3),
-                 3},
-                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-                .clone();
-            voxel_model_->setNextSdfInitializationSupportPoints(surface_support);
-        }
-        voxel_model_->increasePcd(
-            svrecon_ray_support_pending_points_,
-            svrecon_ray_support_pending_colors_,
-            getIteration(),
-            cameras);
-        voxel_model_->setNextRealInsertionRerunEntityPath("");
-        stats = voxel_model_->lastIncreasePcdStats();
-    }
-
-    svrecon_ray_support_pending_points_.clear();
-    svrecon_ray_support_pending_colors_.clear();
-    svrecon_ray_support_pending_surface_points_.clear();
-    svrecon_ray_support_pending_keyframes_ = 0;
-    svrecon_ray_support_pending_rays_ = 0;
-    svrecon_ray_support_pending_structural_holes_ = 0;
-    svrecon_ray_support_pending_existing_support_holes_ = 0;
-    if (stats.new_voxels > 0 &&
-        (rerun_params_.run_whole_run_ || rerun_params_.rerun_svrecon_debug_)) {
-        rerun_state_.whole_run_live_voxels_dirty_ = true;
-    }
-
-}
 
 torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
     const std::shared_ptr<VoxelKeyframe>& pkf,
     const torch::Tensor& depth,
     const int pixel_stride,
+    const bool render_on_stride_grid,
     int64_t& valid_depth_pixels,
     int64_t& hole_pixels,
     torch::Tensor& full_hole_mask)
@@ -3464,13 +3193,40 @@ torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
         return torch::Tensor();
     }
 
+    const int stride = std::max(1, pixel_stride);
+    const int render_scale = render_on_stride_grid ? stride : 1;
+    const int render_height =
+        (pkf->image_height_ + render_scale - 1) / render_scale;
+    const int render_width =
+        (pkf->image_width_ + render_scale - 1) / render_scale;
+    sv::MiniCam render_camera =
+        pkf->toMiniCam(pkf->image_height_, pkf->image_width_);
+    if (render_scale > 1) {
+        const float scale = static_cast<float>(render_scale);
+        render_camera.width = render_width;
+        render_camera.height = render_height;
+        render_camera.fx /= scale;
+        render_camera.fy /= scale;
+        render_camera.cx /= scale;
+        render_camera.cy /= scale;
+        const float fovx = graphics_utils::focal2fov(
+            render_camera.fx, render_width);
+        const float fovy = graphics_utils::focal2fov(
+            render_camera.fy, render_height);
+        render_camera.tanfovx = std::tan(0.5f * fovx);
+        render_camera.tanfovy = std::tan(0.5f * fovy);
+        render_camera.pix_size =
+            2.0f * render_camera.tanfovx /
+            static_cast<float>(render_width);
+    }
+
     std::unordered_map<std::string, torch::Tensor> render_pkg;
     {
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         render_pkg = voxel_model_->render(
-            pkf->toMiniCam(pkf->image_height_, pkf->image_width_),
-            pkf->image_height_,
-            pkf->image_width_,
+            render_camera,
+            render_height,
+            render_width,
             torch::Tensor(),
             "dontcare",
             false,
@@ -3488,8 +3244,8 @@ torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
     torch::Tensor render_n_contrib_cpu;
     if (!voxel_utils::renderPkgToDepthAlphaMaps(
             render_pkg,
-            pkf->image_height_,
-            pkf->image_width_,
+            render_height,
+            render_width,
             render_depth_cpu,
             render_alpha_cpu,
             render_n_contrib_cpu)) {
@@ -3505,20 +3261,22 @@ torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
         0);
     std::vector<uint8_t> all_holes_mask(selected_mask.size(), 0);
     std::vector<int64_t> selected;
-    const int stride = std::max(1, pixel_stride);
     auto depth_acc = depth_cpu.accessor<float, 2>();
     auto render_depth_acc = render_depth_cpu.accessor<float, 2>();
     auto render_n_contrib_acc = render_n_contrib_cpu.accessor<int, 2>();
-    for (int y = 0; y < pkf->image_height_; ++y) {
-        for (int x = 0; x < pkf->image_width_; ++x) {
+    for (int render_y = 0; render_y < render_height; ++render_y) {
+        const int y = render_y * render_scale;
+        for (int render_x = 0; render_x < render_width; ++render_x) {
+            const int x = render_x * render_scale;
             const float z_rgbd = depth_acc[y][x];
             if (!std::isfinite(z_rgbd) ||
                 z_rgbd <= RGBD_min_depth_ || z_rgbd >= RGBD_max_depth_) {
                 continue;
             }
             ++valid_depth_pixels;
-            const float z_render = render_depth_acc[y][x];
-            const int n_contrib = render_n_contrib_acc[y][x];
+            const float z_render = render_depth_acc[render_y][render_x];
+            const int n_contrib =
+                render_n_contrib_acc[render_y][render_x];
             const bool no_rendered_depth =
                 !std::isfinite(z_render) || z_render <= 1.0e-6f;
             const bool structural_hole =
@@ -3529,7 +3287,8 @@ torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
             ++hole_pixels;
             all_holes_mask[
                 static_cast<size_t>(y) * pkf->image_width_ + x] = 1;
-            if ((x % stride) == 0 && (y % stride) == 0) {
+            if (render_on_stride_grid ||
+                ((x % stride) == 0 && (y % stride) == 0)) {
                 selected.push_back(
                     static_cast<int64_t>(y) * pkf->image_width_ + x);
             }
@@ -3562,10 +3321,11 @@ void VoxelMapper::fillRgbdRenderHolesSdf(
     cv::cuda::GpuMat img_rgb_gpu, img_depth_gpu;
     img_rgb_gpu.upload(pkf->img_undist_);
     img_depth_gpu.upload(pkf->img_auxiliary_undist_);
-    torch::Tensor rgb = tensor_utils::cvGpuMat2TorchTensor_Float32(img_rgb_gpu)
-                            .permute({1, 2, 0})
-                            .flatten(0, 1)
-                            .contiguous();
+    torch::Tensor rgb =
+        tensor_utils::cvGpuMat2TorchTensor_Float32(img_rgb_gpu)
+            .permute({1, 2, 0})
+            .flatten(0, 1)
+            .contiguous();
     torch::Tensor depth =
         tensor_utils::cvGpuMat2TorchTensor_Float32(img_depth_gpu)
             .flatten(0, 1)
@@ -3576,351 +3336,52 @@ void VoxelMapper::fillRgbdRenderHolesSdf(
         throw std::runtime_error(
             "[VoxelMapper] RGB-D render-hole filling supports pinhole cameras only.");
     }
-    torch::Tensor points3D_camera = voxel_utils::reprojectDepthPinholeVoxel(
-        depth,
-        pkf->intr_,
-        pkf->image_width_);
-    const Sophus::SE3f Twc = pkf->getPosef().inverse();
 
-    torch::Tensor Twc_tensor =
-        tensor_utils::EigenMatrix2TorchTensor(
-            Twc.matrix(), device_type_).transpose(0, 1);
-    std::vector<sv::MiniCam> cameras = incrementalMappingCameras();
-
-    int64_t valid_depth = 0;
-    int64_t holes_before = 0;
-    torch::Tensor full_hole_mask;
-    const int stride = std::max(1, rgbd_fill_render_holes_stride_);
-    torch::Tensor hole_mask = detectRgbdRenderHolePixels(
-        pkf, depth, stride, valid_depth, holes_before, full_hole_mask);
-    if (!hole_mask.defined() || hole_mask.numel() == 0) {
-        return;
-    }
-    const int64_t selected_holes = hole_mask.sum().item<int64_t>();
-    if (selected_holes == 0) {
-        return;
-    }
-
-    torch::Tensor surface_camera = points3D_camera.index({hole_mask}).contiguous();
-    torch::Tensor surface_colors = rgb.index({hole_mask}).contiguous();
-    torch::Tensor surface_world = surface_camera.clone().contiguous();
-    voxel_utils::transformPoints(surface_world, Twc_tensor);
-
-    sv::VoxelModel::IncreasePcdStats stats;
-    {
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        voxel_model_->setNextRealInsertionRerunEntityPath(
-            "world/rgbd_fill_render_holes/created");
-        voxel_model_->increasePcd(
-            surface_world,
-            surface_colors,
-            getIteration(),
-            cameras);
-        voxel_model_->setNextRealInsertionRerunEntityPath("");
-        stats = voxel_model_->lastIncreasePcdStats();
-        // LiDAR is only a residual-hole cue in this path. Update both newly
-        // allocated cells and already-existing uniform cells, but only at the
-        // pixels where the ORB-driven map failed to render a surface.
-        if (rgbd_fill_render_holes_projective_sdf_) {
-            fuseProjectiveSdfInitFromKeyframe(pkf, hole_mask);
-        }
-    }
-    if (stats.new_voxels > 0 &&
-        (rerun_params_.run_whole_run_ || rerun_params_.rerun_svrecon_debug_)) {
-        rerun_state_.whole_run_live_voxels_dirty_ = true;
-    }
-}
-
-void VoxelMapper::allocateOctreeBlocksForRgbdHoles(
-    const std::shared_ptr<VoxelKeyframe>& pkf)
-{
-    if (!pkf || !voxel_model_ || !octree_block_support_ ||
-        pkf->img_undist_.empty() || pkf->img_auxiliary_undist_.empty()) {
-        return;
-    }
-
-    cv::cuda::GpuMat img_rgb_gpu, img_depth_gpu;
-    img_rgb_gpu.upload(pkf->img_undist_);
-    img_depth_gpu.upload(pkf->img_auxiliary_undist_);
-    torch::Tensor rgb = tensor_utils::cvGpuMat2TorchTensor_Float32(img_rgb_gpu)
-                            .permute({1, 2, 0})
-                            .flatten(0, 1)
-                            .contiguous();
-    torch::Tensor depth =
-        tensor_utils::cvGpuMat2TorchTensor_Float32(img_depth_gpu)
-            .flatten(0, 1)
-            .contiguous();
-
-    const sv::Camera& camera = scene_->cameras_.at(pkf->camera_id_);
-    if (camera.model_id_ != Camera::PINHOLE) {
-        throw std::runtime_error(
-            "[VoxelMapper] Octree block support currently requires a pinhole RGB-D camera.");
-    }
-
-    int64_t valid_depth = 0;
-    int64_t holes_before = 0;
+    int64_t valid_depth_pixels = 0;
+    int64_t hole_pixels = 0;
     torch::Tensor full_hole_mask;
     torch::Tensor hole_mask = detectRgbdRenderHolePixels(
         pkf,
         depth,
-        octree_block_support_pixel_stride_,
-        valid_depth,
-        holes_before,
+        rgbd_fill_render_holes_stride_,
+        /*render_on_stride_grid=*/false,
+        valid_depth_pixels,
+        hole_pixels,
         full_hole_mask);
-    if (!hole_mask.defined() || hole_mask.numel() == 0) {
+    if (!hole_mask.defined() || hole_mask.numel() == 0 ||
+        !hole_mask.any().item<bool>()) {
         return;
     }
 
-    const int64_t selected_holes = hole_mask.sum().item<int64_t>();
-    if (selected_holes == 0) {
-        return;
-    }
-
-    torch::Tensor points3D_camera = voxel_utils::reprojectDepthPinholeVoxel(
-        depth,
-        pkf->intr_,
-        pkf->image_width_);
-    torch::Tensor surface_camera =
-        points3D_camera.index({hole_mask}).detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-    torch::Tensor surface_colors =
-        rgb.index({hole_mask}).detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
-
-    const float cell_size = std::max(1.0e-6f, voxel_model_->insertionVoxSize());
-    const int insertion_level = voxel_model_->insertionOctreeLevel();
-    if (insertion_level <= 0 || insertion_level >= 21) {
-        throw std::runtime_error(
-            "[VoxelMapper] Octree block support requires insertion octree level in [1,20].");
-    }
-    const int64_t cell_limit = int64_t{1} << insertion_level;
-    const int block_size = std::max(1, octree_block_support_block_size_vox_);
-    const float truncation =
-        std::max(0.5f * cell_size, octree_block_support_trunc_vox_ * cell_size);
-
-    torch::Tensor scene_center_cpu =
-        voxel_model_->SceneCenter().detach().to(torch::kCPU).to(torch::kFloat32).reshape({3});
-    const float scene_extent =
-        voxel_model_->SceneExtent().detach().to(torch::kCPU).to(torch::kFloat32).item<float>();
-    const Eigen::Vector3f scene_min(
-        scene_center_cpu[0].item<float>() - 0.5f * scene_extent,
-        scene_center_cpu[1].item<float>() - 0.5f * scene_extent,
-        scene_center_cpu[2].item<float>() - 0.5f * scene_extent);
+    torch::Tensor points3D_camera =
+        voxel_utils::reprojectDepthPinholeVoxel(
+            depth, pkf->intr_, pkf->image_width_);
+    torch::Tensor surface_world =
+        points3D_camera.index({hole_mask}).contiguous();
+    torch::Tensor surface_colors = rgb.index({hole_mask}).contiguous();
     const Sophus::SE3f Twc = pkf->getPosef().inverse();
+    torch::Tensor Twc_tensor =
+        tensor_utils::EigenMatrix2TorchTensor(
+            Twc.matrix(), device_type_).transpose(0, 1);
+    voxel_utils::transformPoints(surface_world, Twc_tensor);
 
-    const size_t cells_per_block =
-        static_cast<size_t>(block_size) * static_cast<size_t>(block_size) *
-        static_cast<size_t>(block_size);
-    struct BlockRequest {
-        std::vector<std::uint8_t> band_touched;
-        std::vector<std::uint8_t> surface_touched;
-    };
-    struct SurfaceCandidate {
-        double color_sum[3] = {0.0, 0.0, 0.0};
-        int64_t observations = 0;
-    };
-    std::unordered_map<std::uint64_t, BlockRequest> requests;
-    requests.reserve(static_cast<size_t>(selected_holes));
-    std::unordered_map<std::uint64_t, SurfaceCandidate> surface_candidates;
-    surface_candidates.reserve(static_cast<size_t>(selected_holes));
-
-    constexpr int kBlockCoordBits = 21;
-    auto pack_block = [](const int64_t bx, const int64_t by, const int64_t bz) {
-        return static_cast<std::uint64_t>(bx) |
-               (static_cast<std::uint64_t>(by) << kBlockCoordBits) |
-               (static_cast<std::uint64_t>(bz) << (2 * kBlockCoordBits));
-    };
-    constexpr int kCellCoordBits = 20;
-    constexpr std::uint64_t kCellCoordMask =
-        (std::uint64_t{1} << kCellCoordBits) - 1;
-    auto pack_cell = [](const int64_t ix, const int64_t iy, const int64_t iz) {
-        return static_cast<std::uint64_t>(ix) |
-               (static_cast<std::uint64_t>(iy) << kCellCoordBits) |
-               (static_cast<std::uint64_t>(iz) << (2 * kCellCoordBits));
-    };
-    auto ensure_request = [&](const std::uint64_t key) -> BlockRequest& {
-        BlockRequest& request = requests[key];
-        if (request.band_touched.empty()) {
-            request.band_touched.assign(cells_per_block, 0);
-            request.surface_touched.assign(cells_per_block, 0);
-        }
-        return request;
-    };
-    auto local_cell_index = [block_size](
-                                const int64_t ix,
-                                const int64_t iy,
-                                const int64_t iz) -> size_t {
-        const int64_t lx = ix % block_size;
-        const int64_t ly = iy % block_size;
-        const int64_t lz = iz % block_size;
-        return static_cast<size_t>(lx + block_size * (ly + block_size * lz));
-    };
-
-    auto surface_acc = surface_camera.accessor<float, 2>();
-    auto color_acc = surface_colors.accessor<float, 2>();
-    int64_t out_of_bounds_samples = 0;
-    int64_t out_of_bounds_surfaces = 0;
-    for (int64_t i = 0; i < surface_camera.size(0); ++i) {
-        const float measured_depth = surface_acc[i][2];
-        if (!std::isfinite(measured_depth) || measured_depth <= 1.0e-6f) {
-            continue;
-        }
-        const float x_norm = surface_acc[i][0] / measured_depth;
-        const float y_norm = surface_acc[i][1] / measured_depth;
-        const Eigen::Vector3f ray_camera(x_norm, y_norm, 1.0f);
-        const float z_step = cell_size / std::max(1.0f, ray_camera.norm());
-        const float z_min = std::max(RGBD_min_depth_, measured_depth - truncation);
-        const float z_max = std::min(RGBD_max_depth_, measured_depth + truncation);
-        const int steps = std::max(
-            1,
-            static_cast<int>(std::ceil((z_max - z_min) / std::max(1.0e-6f, z_step))));
-
-        for (int step = 0; step <= steps; ++step) {
-            const float t = static_cast<float>(step) / static_cast<float>(steps);
-            const float z = z_min + t * (z_max - z_min);
-            const Eigen::Vector3f world = Twc * (ray_camera * z);
-            const Eigen::Array3f grid = (world - scene_min).array() / cell_size;
-            const int64_t ix = static_cast<int64_t>(std::floor(grid.x()));
-            const int64_t iy = static_cast<int64_t>(std::floor(grid.y()));
-            const int64_t iz = static_cast<int64_t>(std::floor(grid.z()));
-            if (ix < 0 || iy < 0 || iz < 0 ||
-                ix >= cell_limit || iy >= cell_limit || iz >= cell_limit) {
-                ++out_of_bounds_samples;
-                continue;
-            }
-
-            const std::uint64_t key = pack_block(
-                ix / block_size,
-                iy / block_size,
-                iz / block_size);
-            BlockRequest& request = ensure_request(key);
-            request.band_touched[local_cell_index(ix, iy, iz)] = 1;
-        }
-
-        // The complete block above is metadata only. Materialize just the cell
-        // containing the measured surface as a weak renderable candidate.
-        const Eigen::Vector3f surface_world = Twc * Eigen::Vector3f(
-            surface_acc[i][0], surface_acc[i][1], surface_acc[i][2]);
-        const Eigen::Array3f surface_grid =
-            (surface_world - scene_min).array() / cell_size;
-        const int64_t six = static_cast<int64_t>(std::floor(surface_grid.x()));
-        const int64_t siy = static_cast<int64_t>(std::floor(surface_grid.y()));
-        const int64_t siz = static_cast<int64_t>(std::floor(surface_grid.z()));
-        if (six < 0 || siy < 0 || siz < 0 ||
-            six >= cell_limit || siy >= cell_limit || siz >= cell_limit) {
-            ++out_of_bounds_surfaces;
-            continue;
-        }
-        const std::uint64_t surface_block_key = pack_block(
-            six / block_size,
-            siy / block_size,
-            siz / block_size);
-        BlockRequest& surface_request = ensure_request(surface_block_key);
-        surface_request.surface_touched[local_cell_index(six, siy, siz)] = 1;
-        SurfaceCandidate& candidate = surface_candidates[pack_cell(six, siy, siz)];
-        candidate.color_sum[0] += std::clamp(color_acc[i][0], 0.0f, 1.0f);
-        candidate.color_sum[1] += std::clamp(color_acc[i][1], 0.0f, 1.0f);
-        candidate.color_sum[2] += std::clamp(color_acc[i][2], 0.0f, 1.0f);
-        ++candidate.observations;
+    // Match the established SVRaster densification flow: collect all hole
+    // samples from the cached keyframes and perform one topology update.
+    if (!rgbd_fill_render_holes_cache_points_.defined() ||
+        rgbd_fill_render_holes_cache_points_.dim() != 2 ||
+        rgbd_fill_render_holes_cache_points_.size(0) == 0) {
+        rgbd_fill_render_holes_cache_points_ = surface_world;
+        rgbd_fill_render_holes_cache_colors_ = surface_colors;
+    } else {
+        rgbd_fill_render_holes_cache_points_ = torch::cat(
+            {rgbd_fill_render_holes_cache_points_, surface_world}, 0);
+        rgbd_fill_render_holes_cache_colors_ = torch::cat(
+            {rgbd_fill_render_holes_cache_colors_, surface_colors}, 0);
     }
-
-    std::vector<std::uint64_t> block_keys;
-    block_keys.reserve(requests.size());
-    for (const auto& item : requests) {
-        block_keys.push_back(item.first);
+    if (rgbd_fill_render_holes_projective_sdf_) {
+        rgbd_fill_render_holes_projective_cache_.emplace_back(
+            pkf, hole_mask);
     }
-    std::sort(block_keys.begin(), block_keys.end());
-
-    int64_t known_blocks = 0;
-    int64_t unique_band_cells = 0;
-    int64_t newly_observed_band_cells = 0;
-    int64_t newly_observed_surface_cells = 0;
-    auto increment_saturating = [](std::uint16_t& value) {
-        if (value != std::numeric_limits<std::uint16_t>::max()) {
-            ++value;
-        }
-    };
-
-    for (const std::uint64_t key : block_keys) {
-        auto record_it = octree_block_records_.find(key);
-        if (record_it != octree_block_records_.end()) {
-            ++known_blocks;
-        }
-        OctreeBlockRecord& record = octree_block_records_[key];
-        ++record.observation_count;
-        record.last_keyframe = static_cast<camera_id_t>(pkf->fid_);
-        const BlockRequest& request = requests.at(key);
-        if (record.band_observations.empty()) {
-            record.band_observations.assign(cells_per_block, 0);
-            record.surface_observations.assign(cells_per_block, 0);
-        }
-        for (size_t cell = 0; cell < cells_per_block; ++cell) {
-            if (request.band_touched[cell]) {
-                ++unique_band_cells;
-                if (record.band_observations[cell] == 0) {
-                    ++newly_observed_band_cells;
-                }
-                increment_saturating(record.band_observations[cell]);
-            }
-            if (request.surface_touched[cell]) {
-                if (record.surface_observations[cell] == 0) {
-                    ++newly_observed_surface_cells;
-                }
-                increment_saturating(record.surface_observations[cell]);
-            }
-        }
-    }
-
-    std::vector<std::uint64_t> candidate_keys;
-    candidate_keys.reserve(surface_candidates.size());
-    for (const auto& item : surface_candidates) {
-        candidate_keys.push_back(item.first);
-    }
-    std::sort(candidate_keys.begin(), candidate_keys.end());
-    std::vector<float> allocation_points;
-    std::vector<float> allocation_colors;
-    allocation_points.reserve(candidate_keys.size() * 3);
-    allocation_colors.reserve(candidate_keys.size() * 3);
-    for (const std::uint64_t key : candidate_keys) {
-        const int64_t ix = static_cast<int64_t>(key & kCellCoordMask);
-        const int64_t iy = static_cast<int64_t>((key >> kCellCoordBits) & kCellCoordMask);
-        const int64_t iz = static_cast<int64_t>((key >> (2 * kCellCoordBits)) & kCellCoordMask);
-        const SurfaceCandidate& candidate = surface_candidates.at(key);
-        const float inv_observations = candidate.observations > 0
-            ? 1.0f / static_cast<float>(candidate.observations)
-            : 0.0f;
-        allocation_points.push_back(
-            scene_min.x() + (static_cast<float>(ix) + 0.5f) * cell_size);
-        allocation_points.push_back(
-            scene_min.y() + (static_cast<float>(iy) + 0.5f) * cell_size);
-        allocation_points.push_back(
-            scene_min.z() + (static_cast<float>(iz) + 0.5f) * cell_size);
-        allocation_colors.push_back(
-            static_cast<float>(candidate.color_sum[0]) * inv_observations);
-        allocation_colors.push_back(
-            static_cast<float>(candidate.color_sum[1]) * inv_observations);
-        allocation_colors.push_back(
-            static_cast<float>(candidate.color_sum[2]) * inv_observations);
-    }
-
-    std::vector<sv::MiniCam> cameras = incrementalMappingCameras();
-
-    sv::VoxelModel::IncreasePcdStats stats;
-    if (!allocation_points.empty()) {
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        voxel_model_->setNextRealInsertionRerunEntityPath(
-            "world/octree_block_support/created");
-        voxel_model_->increasePcd(
-            allocation_points,
-            allocation_colors,
-            getIteration(),
-            cameras);
-        voxel_model_->setNextRealInsertionRerunEntityPath("");
-        stats = voxel_model_->lastIncreasePcdStats();
-    }
-    if (stats.new_voxels > 0 &&
-        (rerun_params_.run_whole_run_ || rerun_params_.rerun_svrecon_debug_)) {
-        rerun_state_.whole_run_live_voxels_dirty_ = true;
-    }
-
 }
 
 std::map<point3D_id_t, Point3D> VoxelMapper::buildInitialRgbdPointCloud() const
@@ -4165,10 +3626,24 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
         int nkps_twice = pkf->kps_pixel_.size();
         int width      = pkf->image_width_;
+        std::vector<int64_t> keypoint_indices;
+        keypoint_indices.reserve(static_cast<size_t>(nkps_twice / 2));
         for (int kpidx = 0; kpidx < nkps_twice; kpidx += 2) {
-            int idx = static_cast<int>(pkf->kps_pixel_[kpidx]) +
-                      static_cast<int>(pkf->kps_pixel_[kpidx + 1]) * width;
-            point_valid_flags[idx] = true;
+            const int x = static_cast<int>(pkf->kps_pixel_[kpidx]);
+            const int y = static_cast<int>(pkf->kps_pixel_[kpidx + 1]);
+            if (x >= 0 && x < width && y >= 0 && y < pkf->image_height_) {
+                keypoint_indices.push_back(
+                    static_cast<int64_t>(y) * width + x);
+            }
+        }
+        if (!keypoint_indices.empty()) {
+            torch::Tensor keypoint_idx = torch::from_blob(
+                keypoint_indices.data(),
+                {static_cast<int64_t>(keypoint_indices.size())},
+                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
+                .clone()
+                .to(device_type_);
+            point_valid_flags.index_fill_(0, keypoint_idx, true);
         }
 
         torch::Tensor valid_depth =
@@ -4241,7 +3716,7 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
         if (rgbd_surface_point_allocation_ ||
             (include_rgbd_hole_fill &&
-             (rgbd_fill_render_holes_ || octree_block_support_))) {
+             (rgbd_fill_render_holes_ || rgbd_tsdf_evidence_))) {
             rgbd_hole_fill_keyframe_cache_.push_back(pkf);
         }
 
@@ -4259,11 +3734,11 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
     ++depth_cached_;
 
     if (depth_cached_ >= max_depth_cached_) {
-        flushInactiveGeoAndRgbdClosure();
+        flushInactiveGeoCache();
     }
 }
 
-void VoxelMapper::flushInactiveGeoAndRgbdClosure()
+void VoxelMapper::flushInactiveGeoCache()
 {
     const bool have_inactive_points =
         depth_cache_points_.defined() &&
@@ -4278,14 +3753,21 @@ void VoxelMapper::flushInactiveGeoAndRgbdClosure()
     {
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         std::vector<sv::MiniCam> tr_cams = incrementalMappingCameras();
-        if (have_inactive_points) {
-            voxel_model_->setNextRealInsertionRerunEntityPath(
-                rgbd_surface_point_allocation_
-                    ? "world/rgbd_surface_points/created"
-                    : "world/voxels_inactive_geo_densify/created");
+
+        auto flush_points =
+            [&](torch::Tensor& points,
+                torch::Tensor& colors,
+                const std::string& entity_path)
+        {
+            if (!points.defined() || points.dim() != 2 || points.size(0) <= 0) {
+                points = torch::Tensor();
+                colors = torch::Tensor();
+                return;
+            }
+            voxel_model_->setNextRealInsertionRerunEntityPath(entity_path);
             voxel_model_->increasePcd(
-                depth_cache_points_,
-                depth_cache_colors_,
+                points,
+                colors,
                 getIteration(),
                 tr_cams);
             voxel_model_->setNextRealInsertionRerunEntityPath("");
@@ -4294,26 +3776,87 @@ void VoxelMapper::flushInactiveGeoAndRgbdClosure()
                  rerun_params_.rerun_svrecon_debug_)) {
                 rerun_state_.whole_run_live_voxels_dirty_ = true;
             }
-        }
-        depth_cache_points_ = torch::Tensor();
-        depth_cache_colors_ = torch::Tensor();
+            points = torch::Tensor();
+            colors = torch::Tensor();
+        };
+
+        // Commit inactive geometry before residual-hole detection.
+        flush_points(
+            depth_cache_points_,
+            depth_cache_colors_,
+            rgbd_surface_point_allocation_
+                ? "world/rgbd_surface_points/created"
+                : "world/voxels_inactive_geo_densify/created");
     }
 
-    // ORB insertion precedes this call. Insert inactive geometry first, then
-    // render each cached keyframe and allocate one cell at each residual
-    // measured RGB-D/LiDAR surface hole.
+    // Detect residual holes only after ORB and inactive topology are present.
+    rgbd_hole_fill_ready_keyframes_.insert(
+        rgbd_hole_fill_ready_keyframes_.end(),
+        rgbd_hole_fill_keyframe_cache_.begin(),
+        rgbd_hole_fill_keyframe_cache_.end());
+    rgbd_hole_fill_keyframe_cache_.clear();
+}
+
+void VoxelMapper::processRgbdClosureCache()
+{
     std::vector<std::shared_ptr<VoxelKeyframe>> rgbd_closure_kfs;
-    rgbd_closure_kfs.swap(rgbd_hole_fill_keyframe_cache_);
+    rgbd_closure_kfs.swap(rgbd_hole_fill_ready_keyframes_);
+    std::unordered_set<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfGridKeyHash> affected_evidence_cells;
     for (const auto& closure_kf : rgbd_closure_kfs) {
-        if (octree_block_support_) {
-            allocateOctreeBlocksForRgbdHoles(closure_kf);
-        } else {
+        if (rgbd_fill_render_holes_) {
             fillRgbdRenderHolesSdf(closure_kf);
         }
-        // handleNewKeyframe() fuses before deferred allocation. Fuse once more
-        // so new cells immediately receive projective D-z corner values.
-        if (initial_mapped_ && sdf_initialization_rgbd_projective_) {
+        if (rgbd_tsdf_evidence_) {
+            integrateRgbdTsdfEvidenceForRenderHoles(
+                closure_kf,
+                affected_evidence_cells);
+        }
+    }
+
+    const bool have_direct_fill =
+        rgbd_fill_render_holes_cache_points_.defined() &&
+        rgbd_fill_render_holes_cache_points_.dim() == 2 &&
+        rgbd_fill_render_holes_cache_points_.size(0) > 0;
+    if (have_direct_fill) {
+        sv::VoxelModel::IncreasePcdStats stats;
+        {
             std::unique_lock<std::mutex> lock_render(mutex_render_);
+            voxel_model_->setNextRealInsertionRerunEntityPath(
+                "world/rgbd_fill_render_holes/created");
+            voxel_model_->increasePcd(
+                rgbd_fill_render_holes_cache_points_,
+                rgbd_fill_render_holes_cache_colors_,
+                getIteration(),
+                incrementalMappingCameras());
+            voxel_model_->setNextRealInsertionRerunEntityPath("");
+            stats = voxel_model_->lastIncreasePcdStats();
+
+            for (const auto& item :
+                 rgbd_fill_render_holes_projective_cache_) {
+                fuseProjectiveSdfInitFromKeyframe(item.first, item.second);
+            }
+        }
+        if (stats.new_voxels > 0 &&
+            (rerun_params_.run_whole_run_ ||
+             rerun_params_.rerun_svrecon_debug_)) {
+            rerun_state_.whole_run_live_voxels_dirty_ = true;
+        }
+    }
+    rgbd_fill_render_holes_cache_points_ = torch::Tensor();
+    rgbd_fill_render_holes_cache_colors_ = torch::Tensor();
+    rgbd_fill_render_holes_projective_cache_.clear();
+
+    if (rgbd_tsdf_evidence_ && !affected_evidence_cells.empty()) {
+        promoteRgbdTsdfEvidenceCells(affected_evidence_cells);
+    }
+
+    // Re-fuse after deferred evidence promotion or direct batched insertion so
+    // newly allocated cells receive projective D-z corner values.
+    if (initial_mapped_ && sdf_initialization_rgbd_projective_) {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        for (const auto& closure_kf : rgbd_closure_kfs) {
             fuseProjectiveSdfInitFromKeyframe(closure_kf);
         }
     }
@@ -5425,7 +4968,7 @@ bool VoxelMapper::isdoingInactiveGeoDensify()
     return inactive_geo_densify_ ||
            rgbd_surface_point_allocation_ ||
            (sensor_type_ == RGBD &&
-            (rgbd_fill_render_holes_ || octree_block_support_));
+            (rgbd_fill_render_holes_ || rgbd_tsdf_evidence_));
 }
 
  void VoxelMapper::setgeoLearningRateInit(const float lr)

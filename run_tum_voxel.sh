@@ -27,12 +27,12 @@ export PYTHONPATH="$root_dir/third_party/simple-knn:$PYTHONPATH"
 # SEQ=$root_dir/scripts/data/Replica/office0
 # OUT=$root_dir/results/replica_voxel/office0
 
-# BIN="$root_dir/bin/replica_rgbd_voxel"
-# VOC="$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt"
-# ORB_CFG="$root_dir/cfg/ORB_SLAM3/RGB-D/Replica/office0.yaml"
-# VOX_CFG="$root_dir/cfg/voxel_mapper/RGB-D/Replica/replica_rgbd_voxel.yaml"
-# SEQ="$root_dir/scripts/data/Replica/office0"
-# OUT="$root_dir/results/replica_rgbd_voxel/office0"
+BIN="$root_dir/bin/replica_rgbd_voxel"
+VOC="$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt"
+ORB_CFG="$root_dir/cfg/ORB_SLAM3/RGB-D/Replica/office0.yaml"
+VOX_CFG="$root_dir/cfg/voxel_mapper/RGB-D/Replica/replica_rgbd_voxel.yaml"
+SEQ="$root_dir/scripts/data/Replica/office0"
+OUT="$root_dir/results/replica_rgbd_voxel/office0"
 
 # BIN=$root_dir/bin/statues_voxel
 # VOC=$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt

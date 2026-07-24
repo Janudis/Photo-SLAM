@@ -1,5 +1,7 @@
 #include "include_voxel/rerun_utils.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include <Eigen/Geometry>          // for Eigen::Quaternionf
@@ -54,6 +56,9 @@ void RerunVisualizerBridge::init(const std::string& app_id, bool spawn_viewer) {
     if (initialized_) {
         return;
     }
+    if (!Py_IsInitialized()) {
+        return;
+    }
 
     py::gil_scoped_acquire gil;
 
@@ -79,6 +84,31 @@ void RerunVisualizerBridge::ensureInitialized() {
     }
 }
 
+bool RerunVisualizerBridge::deferDebugCall(std::function<void()> call) {
+    std::lock_guard<std::mutex> lock(deferred_debug_mutex_);
+    if (initialized_ || flushing_deferred_debug_calls_) {
+        return false;
+    }
+    deferred_debug_calls_.push_back(std::move(call));
+    return true;
+}
+
+void RerunVisualizerBridge::flushDeferredDebugCalls() {
+    std::vector<std::function<void()>> calls;
+    {
+        std::lock_guard<std::mutex> lock(deferred_debug_mutex_);
+        flushing_deferred_debug_calls_ = true;
+        calls.swap(deferred_debug_calls_);
+    }
+    for (auto& call : calls) {
+        call();
+    }
+    {
+        std::lock_guard<std::mutex> lock(deferred_debug_mutex_);
+        flushing_deferred_debug_calls_ = false;
+    }
+}
+
 void RerunVisualizerBridge::saveRecording(const std::string& path) {
     ensureInitialized();
     if (!impl_) return;
@@ -98,6 +128,7 @@ void RerunVisualizerBridge::saveDebugRecording(
 {
     ensureInitialized();
     if (!impl_) return;
+    flushDeferredDebugCalls();
 
     py::gil_scoped_acquire gil;
     try {
@@ -254,6 +285,36 @@ void RerunVisualizerBridge::visualizeDebugCamera(
     float cx, float cy,
     int source_frame_id
 ) {
+    if (!enabled_) return;
+    cv::Mat image_copy = img_rgb_or_gray.clone();
+    if (deferDebugCall(
+            [this,
+             recording_name,
+             T_W_C,
+             image_copy,
+             iteration,
+             keyframe_id,
+             fx,
+             fy,
+             cx,
+             cy,
+             source_frame_id]() {
+                this->visualizeDebugCamera(
+                    recording_name,
+                    T_W_C,
+                    image_copy,
+                    {},
+                    {},
+                    iteration,
+                    keyframe_id,
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    source_frame_id);
+            })) {
+        return;
+    }
     ensureInitialized();
     if (!impl_) return;
     if (img_rgb_or_gray.empty()) {
@@ -344,6 +405,14 @@ void RerunVisualizerBridge::visualizeDebugCameraPose(
     int iteration,
     int keyframe_id
 ) {
+    if (!enabled_) return;
+    if (deferDebugCall(
+            [this, recording_name, T_W_C, iteration, keyframe_id]() {
+                this->visualizeDebugCameraPose(
+                    recording_name, T_W_C, iteration, keyframe_id);
+            })) {
+        return;
+    }
     ensureInitialized();
     if (!impl_) return;
 
@@ -580,6 +649,265 @@ void RerunVisualizerBridge::visualizeDebugVoxelBoxes(
         std::cerr << "[RERUN] Python error in visualizeDebugVoxelBoxes: "
                   << e.what() << std::endl;
     }
+}
+
+void RerunVisualizerBridge::visualizeDebugVoxelGridMap(
+    const std::string& recording_name,
+    const torch::Tensor& centers,
+    const torch::Tensor& sizes,
+    const torch::Tensor& levels,
+    const torch::Tensor& colors,
+    const torch::Tensor& grid_origin,
+    int iteration,
+    const std::string& entity_path,
+    float opacity
+) {
+    if (!enabled_) return;
+    if (!centers.defined() || !sizes.defined() ||
+        !levels.defined() || !grid_origin.defined()) {
+        return;
+    }
+    auto centers_copy =
+        centers.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto sizes_copy =
+        sizes.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto levels_copy =
+        levels.detach().to(torch::kCPU).to(torch::kInt32).contiguous();
+    auto colors_copy = colors.defined()
+        ? colors.detach().to(torch::kCPU).contiguous()
+        : torch::Tensor();
+    auto origin_copy =
+        grid_origin.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    if (deferDebugCall(
+            [this,
+             recording_name,
+             centers_copy,
+             sizes_copy,
+             levels_copy,
+             colors_copy,
+             origin_copy,
+             iteration,
+             entity_path,
+             opacity]() {
+                this->visualizeDebugVoxelGridMap(
+                    recording_name,
+                    centers_copy,
+                    sizes_copy,
+                    levels_copy,
+                    colors_copy,
+                    origin_copy,
+                    iteration,
+                    entity_path,
+                    opacity);
+            })) {
+        return;
+    }
+    ensureInitialized();
+    if (!impl_ || !centers.defined() || !sizes.defined() ||
+        !levels.defined() || !grid_origin.defined()) {
+        return;
+    }
+
+    py::gil_scoped_acquire gil;
+
+    auto centers_cpu =
+        centers.detach().to(torch::kCPU).to(torch::kFloat32).reshape({-1, 3}).contiguous();
+    const int64_t num_voxels = centers_cpu.size(0);
+    auto sizes_cpu =
+        sizes.detach().to(torch::kCPU).to(torch::kFloat32).reshape({-1}).contiguous();
+    auto levels_cpu =
+        levels.detach().to(torch::kCPU).to(torch::kInt32).reshape({-1}).contiguous();
+    auto origin_cpu =
+        grid_origin.detach().to(torch::kCPU).to(torch::kFloat32).reshape({3}).contiguous();
+
+    TORCH_CHECK(
+        sizes_cpu.numel() == num_voxels,
+        "VoxelGridMap sizes must have one value per center");
+    TORCH_CHECK(
+        levels_cpu.numel() == num_voxels,
+        "VoxelGridMap levels must have one value per center");
+
+    auto tensor_to_numpy_2d = [](torch::Tensor tensor) {
+        const auto tensor_sizes = tensor.sizes();
+        return py::array(py::buffer_info(
+            tensor.data_ptr(),
+            tensor.element_size(),
+            tensor.scalar_type() == torch::kInt32
+                ? py::format_descriptor<int32_t>::format()
+                : py::format_descriptor<float>::format(),
+            2,
+            {
+                static_cast<ssize_t>(tensor_sizes[0]),
+                static_cast<ssize_t>(tensor_sizes[1])
+            },
+            {
+                static_cast<ssize_t>(tensor.element_size() * tensor_sizes[1]),
+                static_cast<ssize_t>(tensor.element_size())
+            }
+        ));
+    };
+    auto tensor_to_numpy_1d = [](torch::Tensor tensor) {
+        return py::array(py::buffer_info(
+            tensor.data_ptr(),
+            tensor.element_size(),
+            tensor.scalar_type() == torch::kInt32
+                ? py::format_descriptor<int32_t>::format()
+                : py::format_descriptor<float>::format(),
+            1,
+            {static_cast<ssize_t>(tensor.numel())},
+            {static_cast<ssize_t>(tensor.element_size())}
+        ));
+    };
+
+    py::array centers_np = tensor_to_numpy_2d(centers_cpu);
+    py::array sizes_np = tensor_to_numpy_1d(sizes_cpu);
+    py::array levels_np = tensor_to_numpy_1d(levels_cpu);
+    py::array origin_np = tensor_to_numpy_1d(origin_cpu);
+
+    py::object colors_np = py::none();
+    torch::Tensor colors_cpu;
+    if (colors.defined() && colors.numel() > 0) {
+        colors_cpu = colors.detach().to(torch::kCPU).contiguous();
+        TORCH_CHECK(
+            colors_cpu.dim() == 2 &&
+                colors_cpu.size(0) == num_voxels &&
+                (colors_cpu.size(1) == 3 || colors_cpu.size(1) == 4),
+            "VoxelGridMap colors must be [N,3] or [N,4]");
+        if (colors_cpu.scalar_type() != torch::kUInt8) {
+            colors_cpu = colors_cpu.to(torch::kFloat32).contiguous();
+        }
+        const auto color_sizes = colors_cpu.sizes();
+        py::array colors_array(py::buffer_info(
+            colors_cpu.data_ptr(),
+            colors_cpu.element_size(),
+            colors_cpu.scalar_type() == torch::kUInt8
+                ? py::format_descriptor<uint8_t>::format()
+                : py::format_descriptor<float>::format(),
+            2,
+            {
+                static_cast<ssize_t>(color_sizes[0]),
+                static_cast<ssize_t>(color_sizes[1])
+            },
+            {
+                static_cast<ssize_t>(
+                    colors_cpu.element_size() * color_sizes[1]),
+                static_cast<ssize_t>(colors_cpu.element_size())
+            }
+        ));
+        colors_np = colors_array;
+    }
+
+    try {
+        impl_->visualizer.attr("visualize_voxel_grid_map_recording")(
+            py::str(recording_name),
+            centers_np,
+            sizes_np,
+            levels_np,
+            colors_np,
+            origin_np,
+            py::str(entity_path),
+            iteration,
+            opacity);
+    } catch (const py::error_already_set& e) {
+        std::cerr << "[RERUN] Python error in visualizeDebugVoxelGridMap: "
+                  << e.what() << std::endl;
+    }
+}
+
+void RerunVisualizerBridge::visualizeDebugVoxelGridIndices(
+    const std::string& recording_name,
+    const std::vector<std::int32_t>& indices_xyz,
+    const std::vector<float>& colors,
+    const Eigen::Vector3f& grid_origin,
+    float voxel_size,
+    std::int32_t level,
+    int iteration,
+    const std::string& entity_path,
+    float opacity
+) {
+    if (!enabled_ || indices_xyz.size() % 3 != 0 ||
+        !std::isfinite(voxel_size) || voxel_size <= 0.0f) {
+        return;
+    }
+    const std::size_t num_voxels = indices_xyz.size() / 3;
+    const std::size_t color_channels = num_voxels > 0
+        ? colors.size() / num_voxels
+        : 0;
+    if (!colors.empty() &&
+        (colors.size() % std::max<std::size_t>(1, num_voxels) != 0 ||
+         (color_channels != 3 && color_channels != 4))) {
+        return;
+    }
+
+    if (deferDebugCall(
+            [this,
+             recording_name,
+             indices_xyz,
+             colors,
+             grid_origin,
+             voxel_size,
+             level,
+             iteration,
+             entity_path,
+             opacity]() {
+                this->visualizeDebugVoxelGridIndices(
+                    recording_name,
+                    indices_xyz,
+                    colors,
+                    grid_origin,
+                    voxel_size,
+                    level,
+                    iteration,
+                    entity_path,
+                    opacity);
+            })) {
+        return;
+    }
+
+    auto int_options =
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto float_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    torch::Tensor indices = num_voxels == 0
+        ? torch::empty({0, 3}, int_options)
+        : torch::from_blob(
+              const_cast<std::int32_t*>(indices_xyz.data()),
+              {static_cast<int64_t>(num_voxels), 3},
+              int_options).clone();
+    torch::Tensor origin = torch::tensor(
+        {grid_origin.x(), grid_origin.y(), grid_origin.z()},
+        float_options);
+    torch::Tensor centers =
+        origin.view({1, 3}) +
+        (indices.to(torch::kFloat32) + 0.5f) * voxel_size;
+    torch::Tensor sizes = torch::full(
+        {static_cast<int64_t>(num_voxels), 1},
+        voxel_size,
+        float_options);
+    torch::Tensor levels = torch::full(
+        {static_cast<int64_t>(num_voxels), 1},
+        level,
+        int_options);
+    torch::Tensor color_tensor;
+    if (!colors.empty()) {
+        color_tensor = torch::from_blob(
+            const_cast<float*>(colors.data()),
+            {
+                static_cast<int64_t>(num_voxels),
+                static_cast<int64_t>(color_channels)
+            },
+            float_options).clone();
+    }
+    visualizeDebugVoxelGridMap(
+        recording_name,
+        centers,
+        sizes,
+        levels,
+        color_tensor,
+        origin,
+        iteration,
+        entity_path,
+        opacity);
 }
 
 void RerunVisualizerBridge::visualizeTriangleMesh(
@@ -1039,6 +1367,33 @@ void RerunVisualizerBridge::visualizeDebugPoints3D(
     float radius,
     const std::vector<std::string>& labels
 ) {
+    if (!enabled_) return;
+    if (!points_xyz.defined()) return;
+    auto points_copy =
+        points_xyz.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto colors_copy = colors.defined()
+        ? colors.detach().to(torch::kCPU).contiguous()
+        : torch::Tensor();
+    if (deferDebugCall(
+            [this,
+             recording_name,
+             points_copy,
+             colors_copy,
+             iteration,
+             entity_path,
+             radius,
+             labels]() {
+                this->visualizeDebugPoints3D(
+                    recording_name,
+                    points_copy,
+                    colors_copy,
+                    iteration,
+                    entity_path,
+                    radius,
+                    labels);
+            })) {
+        return;
+    }
     ensureInitialized();
     if (!impl_) return;
     if (!points_xyz.defined()) return;

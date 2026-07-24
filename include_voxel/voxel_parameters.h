@@ -150,6 +150,7 @@ public:
     int subdivide_all_until_;
     float subdivide_samp_thres_;
     float subdivide_prop_;
+    int subdivide_max_num_ = 1500000;
     bool use_l1_;
     bool use_huber_;
     float huber_thres_;

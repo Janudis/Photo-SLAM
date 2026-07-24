@@ -2,15 +2,13 @@
 
 from typing import Dict, Deque, Optional
 from collections import deque
+import queue
 
 import numpy as np
 import numpy.typing as npt
 import rerun as rr
 import rerun.blueprint as rrb
-import open3d as o3d
-import torch
 import os
-import cv2
 import struct
 
 class RerunVisualizer:
@@ -43,9 +41,33 @@ class RerunVisualizer:
         self._debug_binary_streams = {}
         self._debug_trajectory_history = {}
         self._debug_gt_mesh_logged = set()
+        self._voxel_grid_levels = {}
+        self._debug_job_queue = queue.Queue()
         self._main_binary_stream = None
         self._main_recording_bytes_cache = None
-        self._start_rerun_visualizer(app_id, spawn)
+        self._app_id = str(app_id)
+        self._spawn = bool(spawn)
+        self._main_recording_started = False
+
+    def _ensure_main_recording(self) -> None:
+        if self._main_recording_started:
+            return
+        self._start_rerun_visualizer(self._app_id, self._spawn)
+        self._main_recording_started = True
+
+    def _drain_debug_jobs(self) -> None:
+        while not self._debug_job_queue.empty():
+            job = self._debug_job_queue.get()
+            try:
+                callback, args = job
+                callback(*args)
+            except Exception as error:
+                print(f"[RERUN] Background debug logging failed: {error}")
+            finally:
+                self._debug_job_queue.task_done()
+
+    def _submit_debug_job(self, callback, *args) -> None:
+        self._debug_job_queue.put((callback, args))
 
     def _set_iter_time(self, iteration: Optional[int]) -> None:
         if iteration is None:
@@ -158,6 +180,7 @@ class RerunVisualizer:
         # Make sure directory exists
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
+            self._ensure_main_recording()
             if self._main_binary_stream is not None:
                 if self._main_recording_bytes_cache is None:
                     data = self._main_binary_stream.read(flush=True)
@@ -172,12 +195,16 @@ class RerunVisualizer:
 
     def save_debug_recording(self, name: str, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        rec = self._ensure_debug_recording(name)
-        stream = self._debug_binary_streams.get(name)
-        if rec is None or stream is None:
-            print(f"[RERUN] Debug recording unsupported, skipping: {name}")
-            return
         try:
+            # Debug recordings are consumed after the run. Deferring Rerun
+            # serialization keeps its CPU work from changing online SLAM/mapping
+            # cadence while preserving the exact ordered event timeline.
+            self._drain_debug_jobs()
+            rec = self._debug_recordings.get(name)
+            stream = self._debug_binary_streams.get(name)
+            if rec is None or stream is None:
+                print(f"[RERUN] Debug recording unsupported, skipping: {name}")
+                return
             data = stream.read(flush=True)
             if data is None:
                 data = b""
@@ -421,10 +448,55 @@ class RerunVisualizer:
         cy: Optional[float] = None,
         source_frame_id: Optional[int] = None,
     ) -> None:
-        rec = self._ensure_debug_recording(str(recording_name))
+        t_W_C = np.asarray(t_W_C, dtype=np.float32).reshape(3).copy()
+        q_W_C_xyzw = np.asarray(q_W_C_xyzw, dtype=np.float32).reshape(4).copy()
+        image = np.asarray(image).copy()
+        points_uv = (
+            None
+            if points_uv is None
+            else np.asarray(points_uv, dtype=np.float32).copy()
+        )
+        track_ids = (
+            None
+            if track_ids is None
+            else np.asarray(track_ids).copy()
+        )
+        self._submit_debug_job(
+            self._visualize_cuvslam_recording_now,
+            str(recording_name),
+            t_W_C,
+            q_W_C_xyzw,
+            image,
+            points_uv,
+            track_ids,
+            iteration,
+            keyframe_id,
+            fx,
+            fy,
+            cx,
+            cy,
+            source_frame_id,
+        )
+
+    def _visualize_cuvslam_recording_now(
+        self,
+        recording_name: str,
+        t_W_C: npt.NDArray,
+        q_W_C_xyzw: npt.NDArray,
+        image: npt.NDArray,
+        points_uv: Optional[npt.NDArray],
+        track_ids: Optional[npt.NDArray],
+        iteration: Optional[int],
+        keyframe_id: Optional[int],
+        fx: Optional[float],
+        fy: Optional[float],
+        cx: Optional[float],
+        cy: Optional[float],
+        source_frame_id: Optional[int],
+    ) -> None:
+        rec = self._ensure_debug_recording(recording_name)
         if rec is None:
             return
-
         with rec:
             self._set_iter_time(iteration)
             if keyframe_id is not None:
@@ -466,7 +538,7 @@ class RerunVisualizer:
                 )
 
             self._update_debug_trajectory(
-                str(recording_name), keyframe_id, iteration, t_W_C)
+                recording_name, keyframe_id, iteration, t_W_C)
 
     def _update_debug_trajectory(
         self,
@@ -507,10 +579,26 @@ class RerunVisualizer:
         iteration: Optional[int],
         keyframe_id: int,
     ) -> None:
-        rec = self._ensure_debug_recording(str(recording_name))
+        self._submit_debug_job(
+            self._visualize_camera_pose_recording_now,
+            str(recording_name),
+            np.asarray(t_W_C, dtype=np.float32).reshape(3).copy(),
+            np.asarray(q_W_C_xyzw, dtype=np.float32).reshape(4).copy(),
+            iteration,
+            int(keyframe_id),
+        )
+
+    def _visualize_camera_pose_recording_now(
+        self,
+        recording_name: str,
+        t_W_C: npt.NDArray,
+        q_W_C_xyzw: npt.NDArray,
+        iteration: Optional[int],
+        keyframe_id: int,
+    ) -> None:
+        rec = self._ensure_debug_recording(recording_name)
         if rec is None:
             return
-
         with rec:
             self._set_iter_time(iteration)
             kf_name = f"kf_{int(keyframe_id):06d}"
@@ -529,7 +617,7 @@ class RerunVisualizer:
                     ),
                 )
             self._update_debug_trajectory(
-                str(recording_name), keyframe_id, iteration, t_W_C)
+                recording_name, keyframe_id, iteration, t_W_C)
 
     def visualize_gt_sdf_mesh_recording(
         self,
@@ -589,6 +677,8 @@ class RerunVisualizer:
             return
 
         # 1) Load mesh using Open3D
+        import open3d as o3d
+
         mesh = o3d.io.read_triangle_mesh(ply_path)
         if mesh.is_empty():
             print("[RERUN] visualize_ply_mesh: loaded mesh is EMPTY")
@@ -666,6 +756,8 @@ class RerunVisualizer:
         """
 
         # Ensure CPU numpy arrays:
+        import torch
+
         if isinstance(vertices, torch.Tensor):
             vertices = vertices.detach().cpu().numpy()
         else:
@@ -1083,7 +1175,31 @@ class RerunVisualizer:
         iteration: Optional[int] = None,
         labels: Optional[list[str]] = None,
     ) -> None:
-        rec = self._ensure_debug_recording(str(recording_name))
+        points_copy = np.asarray(points_xyz, dtype=np.float32).copy()
+        colors_copy = None if colors is None else np.asarray(colors).copy()
+        labels_copy = None if labels is None else list(labels)
+        self._submit_debug_job(
+            self._visualize_points3d_recording_now,
+            str(recording_name),
+            points_copy,
+            colors_copy,
+            float(radii),
+            str(entity_path),
+            iteration,
+            labels_copy,
+        )
+
+    def _visualize_points3d_recording_now(
+        self,
+        recording_name: str,
+        points_xyz: npt.NDArray,
+        colors: Optional[npt.NDArray],
+        radii: float,
+        entity_path: str,
+        iteration: Optional[int],
+        labels: Optional[list[str]],
+    ) -> None:
+        rec = self._ensure_debug_recording(recording_name)
         if rec is None:
             return
         with rec:
@@ -1231,6 +1347,127 @@ class RerunVisualizer:
                 iteration=iteration,
                 metadata=metadata,
             )
+
+    def visualize_voxel_grid_map_recording(
+        self,
+        recording_name: str,
+        centers: npt.NDArray,
+        sizes: npt.NDArray,
+        levels: npt.NDArray,
+        colors: Optional[npt.NDArray],
+        grid_origin: npt.NDArray,
+        entity_path: str,
+        iteration: Optional[int],
+        opacity: float = 0.8,
+    ) -> None:
+        if not hasattr(rr, "VoxelGridMap"):
+            raise RuntimeError(
+                "rerun-sdk with VoxelGridMap support is required "
+                "(Photo-SLAM pins version 0.34.1)"
+            )
+
+        centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3).copy()
+        sizes = np.asarray(sizes, dtype=np.float32).reshape(-1).copy()
+        levels = np.asarray(levels, dtype=np.int32).reshape(-1).copy()
+        origin = np.asarray(grid_origin, dtype=np.float32).reshape(3).copy()
+        if sizes.shape[0] != centers.shape[0] or levels.shape[0] != centers.shape[0]:
+            raise ValueError("VoxelGridMap centers, sizes, and levels must have equal length")
+
+        rgba = None
+        if colors is not None:
+            rgba = np.asarray(colors)
+            if rgba.dtype != np.uint8:
+                rgba = (np.clip(rgba, 0.0, 1.0) * 255.0).astype(np.uint8)
+            rgba = rgba.reshape(centers.shape[0], -1)
+            if rgba.shape[1] not in (3, 4):
+                raise ValueError("VoxelGridMap colors must have three or four channels")
+            if rgba.shape[1] == 4:
+                # VoxelGridMap opacity is set explicitly below. Keep learned/fused
+                # RGB here so per-color alpha is not multiplied into it a second time.
+                rgba = rgba[:, :3]
+            rgba = rgba.copy()
+
+        self._submit_debug_job(
+            self._visualize_voxel_grid_map_recording_now,
+            str(recording_name),
+            centers,
+            sizes,
+            levels,
+            rgba,
+            origin,
+            str(entity_path),
+            iteration,
+            float(opacity),
+        )
+
+    def _visualize_voxel_grid_map_recording_now(
+        self,
+        recording_name: str,
+        centers: npt.NDArray,
+        sizes: npt.NDArray,
+        levels: npt.NDArray,
+        rgba: Optional[npt.NDArray],
+        origin: npt.NDArray,
+        entity_path: str,
+        iteration: Optional[int],
+        opacity: float,
+    ) -> None:
+        rec = self._ensure_debug_recording(recording_name)
+        if rec is None:
+            return
+        state_key = (recording_name, entity_path)
+        previous_levels = self._voxel_grid_levels.get(state_key, set())
+        current_levels = set(int(level) for level in np.unique(levels))
+
+        with rec:
+            self._set_iter_time(iteration)
+            for stale_level in sorted(previous_levels - current_levels):
+                rr.log(
+                    f"{entity_path}/level_{stale_level}",
+                    rr.VoxelGridMap.cleared(),
+                )
+
+            for level in sorted(current_levels):
+                mask = levels == level
+                level_centers = centers[mask]
+                level_sizes = sizes[mask]
+                voxel_size = float(np.median(level_sizes))
+                if not np.isfinite(voxel_size) or voxel_size <= 0.0:
+                    raise ValueError(f"Invalid voxel size at octree level {level}")
+                tolerance = max(1.0e-6, 1.0e-4 * voxel_size)
+                if np.max(np.abs(level_sizes - voxel_size), initial=0.0) > tolerance:
+                    raise ValueError(
+                        f"Octree level {level} contains inconsistent voxel sizes"
+                    )
+
+                grid_coords = (level_centers - origin[None, :]) / voxel_size - 0.5
+                voxel_indices = np.rint(grid_coords).astype(np.int32)
+                reconstructed = (
+                    origin[None, :] +
+                    (voxel_indices.astype(np.float32) + 0.5) * voxel_size
+                )
+                max_error = float(
+                    np.max(np.abs(reconstructed - level_centers), initial=0.0)
+                )
+                if max_error > tolerance:
+                    raise ValueError(
+                        f"Voxel centers at level {level} are not aligned to the "
+                        f"scene grid (max error {max_error:g} m)"
+                    )
+
+                level_colors = rgba[mask] if rgba is not None else None
+                rr.log(
+                    f"{entity_path}/level_{level}",
+                    rr.VoxelGridMap(
+                        voxel_indices,
+                        voxel_size=[voxel_size, voxel_size, voxel_size],
+                        colors=level_colors,
+                        translation=origin,
+                        opacity=float(np.clip(opacity, 0.0, 1.0)),
+                    ),
+                )
+
+        self._voxel_grid_levels[state_key] = current_levels
 
     def visualize_sdf_voxels_recording(
         self,
@@ -1814,6 +2051,8 @@ class RerunVisualizer:
         vertices, faces, _ = mesh_data
         vertices_sdf = self._transform_vertices(vertices, transform)
 
+        import open3d as o3d
+
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(vertices_sdf.astype(np.float64, copy=False))
         mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32, copy=False))
@@ -1943,6 +2182,8 @@ class RerunVisualizer:
                 vertices, faces, _ = mesh_data
                 return mesh_data
 
+        import open3d as o3d
+
         mesh = o3d.io.read_triangle_mesh(mesh_path)
         if mesh.is_empty() or len(mesh.triangles) == 0:
             return None
@@ -1970,6 +2211,8 @@ class RerunVisualizer:
         if scene is None:
             return None
 
+        import open3d as o3d
+
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         out = np.empty((pts.shape[0],), dtype=np.float32)
         chunk = 500_000
@@ -1995,6 +2238,8 @@ class RerunVisualizer:
         )
         if scene is None:
             return None
+
+        import open3d as o3d
 
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         out = np.empty((pts.shape[0],), dtype=np.float32)
@@ -2060,6 +2305,8 @@ class RerunVisualizer:
         )
         if scene is None:
             return None
+
+        import open3d as o3d
 
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         Tcw_np = np.asarray(Tcw, dtype=np.float32).reshape(4, 4)

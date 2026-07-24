@@ -94,18 +94,4 @@ void VoxelModel::logLiveRgbdFillRenderHolesVoxels(const int iteration, const tor
         {0.95f, 0.25f, 0.85f, 0.75f});
 }
 
-void VoxelModel::logLiveSvreconRaySupportVoxels(
-    const int iteration,
-    const torch::Tensor& live_colors)
-{
-    logLiveMaskedVoxels(
-        this->center_,
-        this->size_,
-        this->is_svrecon_ray_support_voxel_,
-        live_colors,
-        iteration,
-        "world/svrecon_ray_support/created",
-        {0.2f, 0.9f, 0.35f, 0.75f});
-}
-
 } // namespace sv

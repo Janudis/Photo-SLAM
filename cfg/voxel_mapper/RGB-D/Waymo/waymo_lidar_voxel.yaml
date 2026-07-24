@@ -10,7 +10,7 @@ Model.eval: 0
 Model.outside_level: 5
 Model.global_scene_extent: 0
 # RGB-D ORB points are metric and include distant depth outliers; estimate the
-# automatic ORB scene bound robustly before constructing the uniform support.
+# automatic ORB scene bound robustly before constructing sparse topology.
 Model.robust_scene_bounds: 1
 
 Pipeline.convert_SHs: 0
@@ -19,28 +19,18 @@ RGBD.min_depth: 1.0
 RGBD.max_depth: 75.0
 
 Mapper.geometry_mode: "svrecon_sdf"
-# Match the successful monocular topology: the initial ORB MapPoints define the
-# automatic scene layout and initialize the uniform SVRecon support.
-Mapper.svrecon_uniform_support: 1
-Mapper.svrecon_uniform_growth_margin_vox: 0.0
 Mapper.allocate_orb_voxels: 1
 # Do not replace the ORB field with a global LiDAR prior or allocate every return.
 Mapper.rgbd_surface_point_allocation: 0
 Mapper.sdf_initialization_rgbd_projective: 0
-Mapper.svrecon_ray_support: 0
-Mapper.octree_block_support: 0
-Mapper.octree_block_support_initial_backfill: 0
-Mapper.octree_block_support_block_size_vox: 8
-Mapper.octree_block_support_pixel_stride: 2
-Mapper.octree_block_support_trunc_vox: 3.0
 Mapper.sdf_initialization_mode: "orb_prior"
 # Initial and incremental ORB points initialize corners within this radius.
 # LiDAR does not enter the global nearest-point prior.
 Mapper.sdf_initialization_orb_radius_vox: 1.0
 Mapper.inactive_geo_densify: 0
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0
-Mapper.depth_cache: 10
-# Render ORB first, then use valid LiDAR depth only at residual hole pixels.
+Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched LiDAR/RGB-D insertion
+# Render the current ORB/SVRecon map, then use valid LiDAR depth only at residual hole pixels.
 Mapper.rgbd_fill_render_holes: 1
 Mapper.rgbd_fill_render_holes_initial_backfill: 1
 Mapper.rgbd_fill_render_holes_stride: 1
@@ -122,8 +112,8 @@ Optimization.prune_thres_final_at_target: 0.1
 Optimization.filter_near_voxels: 0
 Optimization.prune_far_voxels: 0
 Optimization.prune_near_voxels_geometric: 0
-# Keep SVRecon's SDF pruning for uniform support. Depth-view pruning would
-# collapse the volumetric support back to only the sparse LiDAR returns.
+# Keep SVRecon's SDF pruning. Depth-view pruning can remove weakly observed
+# outdoor cells.
 Optimization.prune_surface_views_enable: 0
 Optimization.final_surface_prune_enable: 0
 Optimization.final_surface_min_views: 1

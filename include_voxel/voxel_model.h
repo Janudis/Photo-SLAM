@@ -247,6 +247,9 @@ public:
     torch::Tensor makePointPriorSdfInitRowsForKeys_(
         const torch::Tensor& grid_pts_key_rows,
         float fallback_value);
+    torch::Tensor applyPendingSdfGridInitialization_(
+        const torch::Tensor& grid_pts_key_rows,
+        const torch::Tensor& initial_values) const;
     void rebuildGeoGridForNewGridKeys_(
         const torch::Tensor& grid_pts_key_new,
         float default_value);
@@ -254,7 +257,6 @@ public:
     torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
     torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
     torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
-    torch::Tensor svreconRaySupportVoxelMask() const { return this->is_svrecon_ray_support_voxel_; } // [N] bool
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
     torch::Tensor activeRenderableMask() const;
@@ -264,13 +266,6 @@ public:
     torch::Tensor denseCoreBBMax() const { return dense_core_bb_max_; } // [3]
     bool refreshDenseCoreBBFromCurrentVoxels();
     void setFilterNearVoxels(const bool enable) { filter_near_voxels_ = enable; }
-    void setSvreconUniformSupport(
-        const bool enable,
-        const float growth_margin_vox)
-    {
-        svrecon_uniform_support_ = enable;
-        svrecon_uniform_growth_margin_vox_ = std::max(0.0f, growth_margin_vox);
-    }
     void setOutsideLevel(const int level) {
         outside_level_ = std::clamp(level, 0, max_num_levels_);
     }
@@ -295,6 +290,9 @@ public:
                 ? points.detach().to(torch::kFloat32).reshape({-1, 3}).contiguous()
                 : torch::Tensor();
     }
+    void setNextSdfInitializationGridSamples(
+        const torch::Tensor& grid_points_world,
+        const torch::Tensor& sdf_values);
     int outsideLevel() const { return outside_level_; }
     void setGeoGridInitCallback(GeoGridInitCallback callback) {
         geo_grid_init_callback_ = std::move(callback);
@@ -310,7 +308,6 @@ public:
     void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
     void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveSvreconRaySupportVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
 private:
     IncreasePcdStats last_increase_pcd_stats_;
     void appendGroup_(int group_idx, const torch::Tensor& add_rows, torch::Tensor* out_member_param);
@@ -320,26 +317,15 @@ private:
         const torch::Tensor& voxel_sdf_values,
         const torch::Tensor& voxel_sdf_weights);
     void appendSparseSupportPoints_(const torch::Tensor& points);
-    void updateExistingUniformSupportSdfFromPoints_(
+    void updateExistingSupportSdfFromPoints_(
         const torch::Tensor& support_xyz,
         const torch::Tensor& support_rgb,
-        const std::vector<sv::MiniCam>& cams,
-        bool initialize_all_visible_corners);
-    void registerSparseVoxelBlocks_(
-        const torch::Tensor& octpath,
-        const torch::Tensor& octlevel,
-        int iteration);
+        const std::vector<sv::MiniCam>& cams);
     torch::Tensor visibilitySignedPointPriorSdf_(
         const torch::Tensor& grid_xyz,
         const torch::Tensor& dist,
         const torch::Tensor& points,
         float surface_band) const;
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-    buildSvreconUniformSupportCandidates_(
-        const torch::Tensor& support_xyz,
-        const torch::Tensor& support_rgb,
-        const std::vector<sv::MiniCam>& cams,
-        bool initial_layout) const;
     // Helper math
     static torch::Tensor camPosition_(const MiniCam& cam, torch::Device d);
     static torch::Tensor camForward_(const MiniCam& cam, torch::Device d);
@@ -384,6 +370,8 @@ public:
     torch::Tensor sparse_points_color_;
     torch::Tensor sdf_init_local_support_points_;
     torch::Tensor next_sdf_init_support_points_;
+    torch::Tensor next_sdf_init_grid_keys_;
+    torch::Tensor next_sdf_init_grid_values_;
     std::vector<MiniCam> sdf_init_cams_;
     enum class SdfInitMode {
         SignedPointPrior,
@@ -412,23 +400,11 @@ public:
     float configured_global_scene_extent_ = 0.0f;
     bool robust_scene_bounds_ = false;
 
-    // Supereight-style sparse map-management blocks. Each key is the global
-    // octree ancestor of an 8^3 group of insertion-level cells. The block is
-    // an allocation/management unit; only observed cells carry SVRecon state.
-    static constexpr int sparse_block_side_vox_ = 8;
-    struct SparseVoxelBlockRecord {
-        std::array<std::uint64_t, 8> observed_cells{}; // 8 * 64 = 512 cells
-        std::uint32_t observation_count = 0;
-        int32_t last_observed_iteration = -1;
-    };
-    std::unordered_map<std::int64_t, SparseVoxelBlockRecord> sparse_voxel_blocks_;
-
     float dense_core_pcd_density_rate_ = 0.005f;
     torch::Tensor real_pcd_points_accum_cpu_;  // [K,3] accumulated real PCD points (CPU)
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
     torch::Tensor is_inactive_geo_voxel_;        // [N] bool provenance: true=created by inactive-geo densification
     torch::Tensor is_rgbd_fill_render_holes_voxel_; // [N] bool provenance: true=created by RGB-D render-hole fill
-    torch::Tensor is_svrecon_ray_support_voxel_; // [N] bool provenance: topology sampled along RGB-D rays
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
@@ -439,8 +415,6 @@ public:
     bool has_global_pcd_bb_ = false;
     bool has_dense_core_bb_ = false;
     bool filter_near_voxels_ = true;
-    bool svrecon_uniform_support_ = true;
-    float svrecon_uniform_growth_margin_vox_ = 4.0f;
     std::string pending_real_insert_rr_entity_path_;
     GeoGridInitCallback geo_grid_init_callback_;
     int32_t topology_birth_iter_ = -1;

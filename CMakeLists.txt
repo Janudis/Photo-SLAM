@@ -9,7 +9,7 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include(FetchContent)
 FetchContent_Declare(rerun_sdk URL
-https://github.com/rerun-io/rerun/releases/latest/download/rerun_cpp_sdk.zip)
+https://github.com/rerun-io/rerun/releases/download/0.34.1/rerun_cpp_sdk.zip)
 FetchContent_MakeAvailable(rerun_sdk)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -304,6 +304,7 @@ add_library(voxel_core
         src_voxel/mapper_depth_registry.cpp
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
+        src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
         src_voxel/voxel_mapper_tsdf.cpp
         src_voxel/voxel_mapper_rerun.cpp
         src_voxel/voxel_mapper_utils.cpp

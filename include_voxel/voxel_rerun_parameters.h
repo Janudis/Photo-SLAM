@@ -43,22 +43,24 @@ struct VoxelRerunParameters
 struct VoxelRerunState
 {
     bool whole_run_live_voxels_dirty_ = true;
+    bool svrecon_debug_has_source_snapshot_ = false;
 
     torch::Tensor whole_run_pruned_centers_accum_;
     torch::Tensor whole_run_pruned_sizes_accum_;
+    torch::Tensor whole_run_pruned_levels_accum_;
     torch::Tensor whole_run_pruned_colors_accum_;
     torch::Tensor whole_run_pruned_sdf_centers_accum_;
     torch::Tensor whole_run_pruned_sdf_sizes_accum_;
+    torch::Tensor whole_run_pruned_sdf_levels_accum_;
     torch::Tensor whole_run_pruned_sdf_colors_accum_;
-    torch::Tensor whole_run_pruned_svraster_centers_accum_;
-    torch::Tensor whole_run_pruned_svraster_sizes_accum_;
-    torch::Tensor whole_run_pruned_svraster_colors_accum_;
-    torch::Tensor whole_run_pruned_near_centers_accum_;
-    torch::Tensor whole_run_pruned_near_sizes_accum_;
-    torch::Tensor whole_run_pruned_near_colors_accum_;
-    torch::Tensor whole_run_pruned_final_special_centers_accum_;
-    torch::Tensor whole_run_pruned_final_special_sizes_accum_;
-    torch::Tensor whole_run_pruned_final_special_colors_accum_;
+    torch::Tensor whole_run_pruned_surface_views_centers_accum_;
+    torch::Tensor whole_run_pruned_surface_views_sizes_accum_;
+    torch::Tensor whole_run_pruned_surface_views_levels_accum_;
+    torch::Tensor whole_run_pruned_surface_views_colors_accum_;
+    torch::Tensor whole_run_pruned_final_surface_centers_accum_;
+    torch::Tensor whole_run_pruned_final_surface_sizes_accum_;
+    torch::Tensor whole_run_pruned_final_surface_levels_accum_;
+    torch::Tensor whole_run_pruned_final_surface_colors_accum_;
 
     torch::Tensor rerun_gt_sdf_grid_keys_cpu_;
     torch::Tensor rerun_gt_sdf_grid_pts_cpu_;

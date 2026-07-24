@@ -769,6 +769,10 @@ void VoxelMapper::runFinalSpecialPrune()
     auto prune_mask_final_special = torch::zeros(
         {before_final_special},
         torch::TensorOptions().dtype(torch::kBool).device(centers.device()));
+    auto prune_mask_near_final_special = torch::zeros_like(
+        prune_mask_final_special);
+    auto prune_mask_final_surface = torch::zeros_like(
+        prune_mask_final_special);
 
     int64_t n_near_final_special = 0;
     int64_t n_near_geom_final_special = 0;
@@ -851,9 +855,13 @@ void VoxelMapper::runFinalSpecialPrune()
                 n_near_final_special = is_near.sum().item<int64_t>();
                 n_near_geom_final_special = is_near_geom.sum().item<int64_t>();
                 auto near_union = (is_near | is_near_geom).to(torch::kBool);
+                prune_mask_near_final_special =
+                    near_union.to(prune_mask_final_special.device())
+                        .to(torch::kBool)
+                        .contiguous();
                 prune_mask_final_special =
                     (prune_mask_final_special |
-                     near_union.to(prune_mask_final_special.device()).to(torch::kBool)).to(torch::kBool);
+                     prune_mask_near_final_special).to(torch::kBool);
                 near_valid_final_special = true;
             } catch (const std::exception& e) {
                 std::cerr << "[FINAL/special_prune] failed to compute near voxels: "
@@ -869,6 +877,7 @@ void VoxelMapper::runFinalSpecialPrune()
             torch::Tensor surface_prune =
                 (~surface_keep.to(prune_mask_final_special.device()).to(torch::kBool))
                     .contiguous();
+            prune_mask_final_surface = surface_prune;
             n_selected_surface_confidence = surface_prune.sum().item<int64_t>();
             prune_mask_final_special =
                 (prune_mask_final_special | surface_prune).to(torch::kBool);
@@ -896,16 +905,48 @@ void VoxelMapper::runFinalSpecialPrune()
             }
             torch::Tensor final_sizes =
                 sizes_for_log.index_select(0, final_idx.to(sizes_for_log.device()).to(torch::kLong)).contiguous();
-            torch::Tensor final_special_mask = torch::ones(
-                {final_idx.numel()},
-                torch::TensorOptions().dtype(torch::kBool).device(final_centers.device()));
+            torch::Tensor final_levels;
+            torch::Tensor oct_levels = voxel_model_->octLevel();
+            if (oct_levels.defined() &&
+                oct_levels.numel() == before_final_special) {
+                final_levels =
+                    oct_levels.reshape({before_final_special, 1})
+                        .index_select(
+                            0,
+                            final_idx.to(oct_levels.device()).to(torch::kLong))
+                        .contiguous();
+            }
+            torch::Tensor final_colors;
+            torch::Tensor sh0 = voxel_model_->sh0();
+            if (sh0.defined() && sh0.dim() == 2 &&
+                sh0.size(0) == before_final_special) {
+                final_colors =
+                    (sh0.index_select(
+                         0,
+                         final_idx.to(sh0.device()).to(torch::kLong)) *
+                         sh_utils::C0 +
+                     0.5f)
+                        .clamp(0.0f, 1.0f)
+                        .contiguous();
+            }
+            torch::Tensor final_surface_mask =
+                prune_mask_final_surface
+                    .index_select(
+                        0,
+                        final_idx.to(prune_mask_final_surface.device())
+                            .to(torch::kLong))
+                    .to(final_centers.device())
+                    .to(torch::kBool)
+                    .contiguous();
             appendWholeRunPrunedVoxels(
                 getIteration(),
                 final_centers,
                 final_sizes,
+                final_levels,
+                final_colors,
                 torch::Tensor(),
                 torch::Tensor(),
-                final_special_mask);
+                final_surface_mask);
         }
     }
 

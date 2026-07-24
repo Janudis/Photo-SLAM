@@ -18,30 +18,26 @@ Camera.z_near: 0.01
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
+Mapper.inactive_geo_densify: 1 # optional Photo-SLAM inactive-geometry densification
+Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
+Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
+Mapper.rgbd_fill_render_holes: 1 # direct SVRaster-style alternative to TSDF-evidence completion
+Mapper.rgbd_fill_render_holes_initial_backfill: 0
+Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for each keyframe's pre-insertion hole detection
+
 Mapper.geometry_mode: "svrecon_sdf"
-Mapper.svrecon_uniform_support: 0
-Mapper.svrecon_uniform_growth_margin_vox: 4.0
-Mapper.svrecon_ray_support: 0 # allocate SVRecon topology around RGB-D depth for structural holes
-Mapper.svrecon_ray_support_pixel_stride: 8 # synthetic depth is dense; avoid oversampling each projected voxel
-Mapper.svrecon_ray_support_surface_spacing_vox: 1.0
-Mapper.svrecon_ray_support_trunc_vox: 1.0 # surface cell plus one cell in front/behind
-Mapper.svrecon_ray_support_batch_keyframes: 8 # batch exact ray samples to avoid rebuilding the full octree for every keyframe
-# Paper-inspired alternative topology allocator. Structural RGB-D holes reserve
-# lightweight B^3 block metadata over [D-mu,D+mu], while only the measured-depth
-# cell becomes a weak renderable SVRecon candidate.
-Mapper.octree_block_support: 1
-Mapper.octree_block_support_initial_backfill: 0
-Mapper.octree_block_support_block_size_vox: 8
-Mapper.octree_block_support_pixel_stride: 2
-Mapper.octree_block_support_trunc_vox: 3.0
 Mapper.sdf_initialization_mode: "orb_prior" # nearby ORB corners use metric SDF; unsupported corners use a weak ORB-directed signed ramp
 Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance for signed nearest-point initialization
-Mapper.inactive_geo_densify: 1 # disabled while svrecon_ray_support is enabled
-Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
-Mapper.depth_cache: 10 # batch keyframes; insert inactive geometry first, then run residual RGB-D hole filling
-Mapper.rgbd_fill_render_holes: 0 # disabled while svrecon_ray_support is enabled
-Mapper.rgbd_fill_render_holes_initial_backfill: 0 # disabled while svrecon_ray_support is enabled
-Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for the single residual-hole detection pass
+
+# Hybrid RGB-D completion: residual holes update non-renderable nvblox-style
+# TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
+# promoted into the active SVRecon map.
+Mapper.rgbd_tsdf_evidence: 0
+Mapper.rgbd_tsdf_evidence_initial_backfill: 0
+Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # nvblox raycast_subsampling_factor default
+Mapper.rgbd_tsdf_evidence_trunc_vox: 4.0 # nvblox TSDF truncation default
+Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # nvblox TSDF maximum weight default
+Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
 Mapper.sdf_voxel_size_m: 0.05
 Mapper.sdf_init_trunc_vox: 4.0
 Mapper.sdf_init_max_depth_m: 4.0
@@ -133,6 +129,7 @@ Optimization.prune_thres_final_at_target: 0.05
 Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
+Optimization.final_special_prune_enable: 1 # legacy shutdown near/geometry cleanup; set 0 to disable
 Optimization.prune_surface_views_enable: 1 # apply surface-view confidence during scheduled pruning
 # Destructive shutdown refinement for voxel_model.ply. Interpolated RGB-D-supported
 # zero crossings seed components; unsupported crossing cells are kept only as bridges.

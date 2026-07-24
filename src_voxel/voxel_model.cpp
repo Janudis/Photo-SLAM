@@ -490,68 +490,6 @@ VoxelModel::VoxelModel(const VoxelModelParams& model_params)
     VOXEL_MODEL_INIT_TENSORS(this->device_type_);
 }
 
-void VoxelModel::registerSparseVoxelBlocks_(
-    const torch::Tensor& octpath,
-    const torch::Tensor& octlevel,
-    const int iteration)
-{
-    if (!fixed_global_scene_layout_ || !octpath.defined() || octpath.numel() == 0 ||
-        !octlevel.defined() || octpath.size(0) != octlevel.size(0) || octlevel_ < 3) {
-        return;
-    }
-
-    // Supereight stores 8^3 voxels in each sparse leaf block. In the SVRecon
-    // global Morton layout, the equivalent block is the ancestor three levels
-    // above the insertion-level cell.
-    const int base_level = static_cast<int>(octlevel_);
-    const int block_level = base_level - 3;
-    auto path = octpath.reshape({-1, 1}).to(torch::kInt64).contiguous();
-    auto level = octlevel.reshape({-1, 1}).to(torch::kInt8).contiguous();
-    auto ijk = SVRECON_UTILS::octpath_2_ijk(path, level)
-                   .detach().to(torch::kCPU).to(torch::kInt64).contiguous();
-    auto level_cpu = level.detach().to(torch::kCPU).to(torch::kInt64).contiguous();
-
-    constexpr std::uint64_t kCoordMask = (std::uint64_t{1} << 20) - 1;
-    auto ijk_acc = ijk.accessor<std::int64_t, 2>();
-    auto level_acc = level_cpu.accessor<std::int64_t, 2>();
-    for (std::int64_t row = 0; row < ijk.size(0); ++row) {
-        const int cell_level = static_cast<int>(level_acc[row][0]);
-        if (cell_level < block_level) {
-            continue;
-        }
-
-        const int shift_to_base = std::max(0, cell_level - base_level);
-        const std::int64_t ix = ijk_acc[row][0] >> shift_to_base;
-        const std::int64_t iy = ijk_acc[row][1] >> shift_to_base;
-        const std::int64_t iz = ijk_acc[row][2] >> shift_to_base;
-        if (ix < 0 || iy < 0 || iz < 0) {
-            continue;
-        }
-
-        const std::uint64_t bx = static_cast<std::uint64_t>(ix / sparse_block_side_vox_);
-        const std::uint64_t by = static_cast<std::uint64_t>(iy / sparse_block_side_vox_);
-        const std::uint64_t bz = static_cast<std::uint64_t>(iz / sparse_block_side_vox_);
-        if (bx > kCoordMask || by > kCoordMask || bz > kCoordMask) {
-            continue;
-        }
-        const std::int64_t block_key = static_cast<std::int64_t>(
-            bx | (by << 20) | (bz << 40));
-
-        const int lx = static_cast<int>(ix % sparse_block_side_vox_);
-        const int ly = static_cast<int>(iy % sparse_block_side_vox_);
-        const int lz = static_cast<int>(iz % sparse_block_side_vox_);
-        const int local_index = lx + sparse_block_side_vox_ *
-            (ly + sparse_block_side_vox_ * lz);
-
-        SparseVoxelBlockRecord& block = sparse_voxel_blocks_[block_key];
-        block.observed_cells[static_cast<std::size_t>(local_index / 64)] |=
-            std::uint64_t{1} << (local_index % 64);
-        if (block.observation_count != std::numeric_limits<std::uint32_t>::max()) {
-            ++block.observation_count;
-        }
-        block.last_observed_iteration = iteration;
-    }
-}
 
 const torch::Tensor& sv::VoxelModel::geoGridPts() const { return _geo_grid_pts_; }
 const torch::Tensor& sv::VoxelModel::sh0()        const { return sh0_; }
@@ -1240,11 +1178,10 @@ void VoxelModel::appendSparseSupportPoints_(const torch::Tensor& points)
 
 }
 
-void VoxelModel::updateExistingUniformSupportSdfFromPoints_(
+void VoxelModel::updateExistingSupportSdfFromPoints_(
     const torch::Tensor& support_xyz,
     const torch::Tensor& support_rgb,
-    const std::vector<sv::MiniCam>& cams,
-    bool initialize_all_visible_corners)
+    const std::vector<sv::MiniCam>& cams)
 {
     if (!support_xyz.defined() ||
         support_xyz.numel() == 0 ||
@@ -1262,6 +1199,14 @@ void VoxelModel::updateExistingUniformSupportSdfFromPoints_(
     if (pts.size(0) == 0) {
         return;
     }
+    torch::Tensor finite_pts =
+        torch::isfinite(pts).all(/*dim=*/1).to(torch::kBool);
+    torch::Tensor finite_idx =
+        torch::nonzero(finite_pts).view({-1}).to(torch::kLong);
+    if (finite_idx.numel() == 0) {
+        return;
+    }
+    pts = pts.index_select(0, finite_idx).contiguous();
     (void)support_rgb;
 
     torch::Tensor scene_min =
@@ -1275,18 +1220,37 @@ void VoxelModel::updateExistingUniformSupportSdfFromPoints_(
         grid_pts_key_.to(dev).to(torch::kFloat32) * finest_vox.view({1, 1});
     grid_xyz = grid_xyz.contiguous();
 
+    const float radius_m =
+        std::max(0.0f, sdf_initialization_orb_radius_vox_) * fixed_vox_size_;
+    if (radius_m <= 0.0f) {
+        return;
+    }
+
+    // This is an exact spatial rejection, not an approximation: no grid
+    // corner outside the point-batch bounds expanded by the support radius can
+    // pass the nearest-distance test below.
+    torch::Tensor support_min =
+        std::get<0>(pts.min(/*dim=*/0, /*keepdim=*/false)) - radius_m;
+    torch::Tensor support_max =
+        std::get<0>(pts.max(/*dim=*/0, /*keepdim=*/false)) + radius_m;
+    torch::Tensor in_support_bounds =
+        (grid_xyz >= support_min.view({1, 3})).all(/*dim=*/1) &
+        (grid_xyz <= support_max.view({1, 3})).all(/*dim=*/1);
     torch::Tensor update_idx =
-        torch::arange(
-            grid_xyz.size(0),
-            torch::TensorOptions().dtype(torch::kLong).device(dev));
+        torch::nonzero(in_support_bounds)
+            .view({-1}).to(torch::kLong).contiguous();
     if (update_idx.numel() == 0) {
         return;
     }
 
+    // Restore the visibility-first SVRecon path used by the archived fast
+    // experiments. Keep projection on the tensor device and transfer only
+    // visible corners to the CPU nearest-neighbor query.
     if (!cams.empty()) {
-        torch::Tensor query_xyz = grid_xyz.index_select(0, update_idx).contiguous();
+        torch::Tensor candidate_xyz =
+            grid_xyz.index_select(0, update_idx).contiguous();
         torch::Tensor visible = torch::zeros(
-            {query_xyz.size(0)},
+            {candidate_xyz.size(0)},
             torch::TensorOptions().dtype(torch::kBool).device(dev));
         for (const auto& cam : cams) {
             if (cam.width <= 0 || cam.height <= 0 ||
@@ -1296,37 +1260,45 @@ void VoxelModel::updateExistingUniformSupportSdfFromPoints_(
             }
             torch::Tensor w2c =
                 cam.w2c.to(dev).to(torch::kFloat32).contiguous();
-            torch::Tensor R = w2c.index({torch::indexing::Slice(0, 3),
-                                         torch::indexing::Slice(0, 3)});
-            torch::Tensor t = w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
-            torch::Tensor xc = torch::matmul(query_xyz, R.transpose(0, 1)) + t;
+            torch::Tensor R = w2c.index({
+                torch::indexing::Slice(0, 3),
+                torch::indexing::Slice(0, 3)});
+            torch::Tensor t =
+                w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
+            torch::Tensor xc =
+                torch::matmul(candidate_xyz, R.transpose(0, 1)) + t;
             torch::Tensor z = xc.index({torch::indexing::Slice(), 2});
             torch::Tensor z_safe = z.clamp_min(1.0e-6f);
             torch::Tensor u =
-                cam.fx * (xc.index({torch::indexing::Slice(), 0}) / z_safe) + cam.cx;
+                cam.fx *
+                    (xc.index({torch::indexing::Slice(), 0}) / z_safe) +
+                cam.cx;
             torch::Tensor v =
-                cam.fy * (xc.index({torch::indexing::Slice(), 1}) / z_safe) + cam.cy;
+                cam.fy *
+                    (xc.index({torch::indexing::Slice(), 1}) / z_safe) +
+                cam.cy;
             torch::Tensor in_img =
                 (z > 1.0e-6f) &
                 (u >= 0.0f) &
                 (u < static_cast<float>(cam.width)) &
                 (v >= 0.0f) &
                 (v < static_cast<float>(cam.height));
-            visible = (visible | in_img.to(torch::kBool)).to(torch::kBool);
+            visible = visible | in_img.to(torch::kBool);
         }
         torch::Tensor visible_local =
             torch::nonzero(visible).view({-1}).to(torch::kLong).contiguous();
         if (visible_local.numel() == 0) {
             return;
         }
-        update_idx = update_idx.index_select(0, visible_local).contiguous();
+        update_idx =
+            update_idx.index_select(0, visible_local).contiguous();
     }
 
-    if (update_idx.numel() == 0) {
-        return;
-    }
     torch::Tensor query_xyz =
-        grid_xyz.index_select(0, update_idx).to(torch::kCPU).to(torch::kFloat32).contiguous();
+        grid_xyz.index_select(0, update_idx)
+            .to(torch::kCPU)
+            .to(torch::kFloat32)
+            .contiguous();
     torch::Tensor support_cpu =
         pts.to(torch::kCPU).to(torch::kFloat32).contiguous();
     cv::Mat support_mat(
@@ -1359,27 +1331,14 @@ void VoxelModel::updateExistingUniformSupportSdfFromPoints_(
             .clone()
             .clamp_min_(0.0f)
             .sqrt_();
-    torch::Tensor near_idx_cpu;
-    if (initialize_all_visible_corners) {
-        // Match SVRecon's SfM/PI3 initialization for the primary dense prior.
-        near_idx_cpu = torch::arange(
-            nearest.size(0),
-            torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
-    } else {
-        // Incremental ORB points follow the monocular orb_prior behavior and
-        // only update corners in their configured local support radius.
-        const float radius_m =
-            std::max(0.0f, sdf_initialization_orb_radius_vox_) * fixed_vox_size_;
-        if (radius_m <= 0.0f) {
-            return;
-        }
-        near_idx_cpu = torch::nonzero(nearest.view({-1}) <= radius_m)
-                           .view({-1}).to(torch::kLong).contiguous();
-        if (near_idx_cpu.numel() == 0) {
-            return;
-        }
+    torch::Tensor near_idx_cpu =
+        torch::nonzero(nearest.view({-1}) <= radius_m)
+            .view({-1}).to(torch::kLong).contiguous();
+    if (near_idx_cpu.numel() == 0) {
+        return;
     }
-    update_idx = update_idx.index_select(0, near_idx_cpu.to(dev)).contiguous();
+    update_idx =
+        update_idx.index_select(0, near_idx_cpu.to(dev)).contiguous();
     torch::Tensor near_query_xyz =
         query_xyz.index_select(0, near_idx_cpu).to(dev).contiguous();
     torch::Tensor near_dist =
@@ -1581,152 +1540,6 @@ torch::Tensor VoxelModel::visibilitySignedPointPriorSdf_(
     return signed_sdf_cpu.to(dev).contiguous();
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-VoxelModel::buildSvreconUniformSupportCandidates_(
-    const torch::Tensor& support_xyz,
-    const torch::Tensor& support_rgb,
-    const std::vector<sv::MiniCam>& cams,
-    bool initial_layout) const
-{
-    auto dev = scene_center_.defined()
-        ? scene_center_.device()
-        : torch::Device(device_type_);
-    auto empty_oct = torch::empty(
-        {0, 1}, torch::TensorOptions().dtype(torch::kLong).device(dev));
-    auto empty_level = torch::empty(
-        {0, 1}, torch::TensorOptions().dtype(torch::kInt8).device(dev));
-    auto empty_rgb = torch::empty(
-        {0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-
-    if (!svrecon_uniform_support_ ||
-        !support_xyz.defined() ||
-        support_xyz.numel() == 0 ||
-        !scene_center_.defined() ||
-        !scene_extent_.defined() ||
-        !inside_extent_.defined() ||
-        !vox_eff_.defined()) {
-        return {empty_oct, empty_level, empty_rgb};
-    }
-
-    const int L = static_cast<int>(octlevel_);
-    if (L <= 0 || L > max_num_levels_) {
-        return {empty_oct, empty_level, empty_rgb};
-    }
-    const int n_inside = std::max(1, L - outside_level_);
-
-    torch::Tensor pts =
-        support_xyz.to(dev).to(torch::kFloat32).reshape({-1, 3}).contiguous();
-    if (pts.size(0) == 0) {
-        return {empty_oct, empty_level, empty_rgb};
-    }
-
-    torch::Tensor octpath;
-    torch::Tensor levels;
-    if (initial_layout) {
-        auto dense =
-            genSvreconDenseOctpath(
-                outside_level_,
-                n_inside,
-                max_num_levels_,
-                dev);
-        octpath = dense.first.contiguous();
-        levels = dense.second.contiguous();
-    } else {
-        const int64_t total_dim = 1LL << L;
-        auto min_xyz = std::get<0>(pts.min(/*dim=*/0, /*keepdim=*/false));
-        auto max_xyz = std::get<0>(pts.max(/*dim=*/0, /*keepdim=*/false));
-        const float vox = std::max(1.0e-6f, vox_eff_.view({-1})[0].item<float>());
-        const float margin = svrecon_uniform_growth_margin_vox_ * vox;
-        min_xyz = min_xyz - margin;
-        max_xyz = max_xyz + margin;
-
-        auto scene_min =
-            scene_center_.to(dev).to(torch::kFloat32).contiguous().view({3}) -
-            0.5f * scene_extent_.to(dev).to(torch::kFloat32).contiguous().view({1});
-        torch::Tensor min_ijk =
-            torch::floor((min_xyz - scene_min) / vox).to(torch::kLong);
-        torch::Tensor max_ijk =
-            torch::floor((max_xyz - scene_min) / vox).to(torch::kLong);
-        min_ijk = min_ijk.clamp(0, total_dim - 1);
-        max_ijk = max_ijk.clamp(0, total_dim - 1);
-
-        auto min_cpu = min_ijk.to(torch::kCPU).to(torch::kLong).contiguous();
-        auto max_cpu = max_ijk.to(torch::kCPU).to(torch::kLong).contiguous();
-        auto min_acc = min_cpu.accessor<int64_t, 1>();
-        auto max_acc = max_cpu.accessor<int64_t, 1>();
-        const int64_t nx = max_acc[0] - min_acc[0] + 1;
-        const int64_t ny = max_acc[1] - min_acc[1] + 1;
-        const int64_t nz = max_acc[2] - min_acc[2] + 1;
-        if (nx <= 0 || ny <= 0 || nz <= 0) {
-            return {empty_oct, empty_level, empty_rgb};
-        }
-
-        const int64_t total = nx * ny * nz;
-        torch::Tensor linear = torch::arange(
-            total, torch::TensorOptions().dtype(torch::kLong).device(dev));
-        if (linear.numel() == 0) {
-            return {empty_oct, empty_level, empty_rgb};
-        }
-
-        const int64_t yz = ny * nz;
-        auto ix = linear / yz;
-        auto rem = linear - ix * yz;
-        auto iy = rem / nz;
-        auto iz = rem - iy * nz;
-        auto ijk = torch::stack(
-            {ix + min_acc[0], iy + min_acc[1], iz + min_acc[2]},
-            /*dim=*/1).to(torch::kLong).contiguous();
-        levels = torch::full(
-            {ijk.size(0), 1},
-            static_cast<int8_t>(L),
-            torch::TensorOptions().dtype(torch::kInt8).device(dev));
-        octpath = SVRECON_UTILS::ijk_2_octpath(ijk, levels).contiguous();
-    }
-
-    if (!octpath.defined() || octpath.numel() == 0) {
-        return {empty_oct, empty_level, empty_rgb};
-    }
-    auto rgb = torch::full(
-        {octpath.size(0), 3},
-        0.5f,
-        torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-
-    if (!cams.empty() && octpath.size(0) > 0) {
-        auto [vox_center, vox_size] = decodeOctpath(
-            octpath.contiguous(),
-            levels.contiguous(),
-            scene_center_.contiguous(),
-            scene_extent_.contiguous());
-        if (vox_size.dim() == 1) {
-            vox_size = vox_size.view({-1, 1});
-        }
-        at::Tensor rate = markSvreconMaxSampRateDirect(cams, octpath, vox_center, vox_size);
-        if (rate.dim() == 2 && rate.size(1) == 1) {
-            rate = rate.squeeze(1);
-        }
-        at::Tensor kept = rate.to(torch::kFloat32) > 0.0f;
-        if (!initial_layout && filter_near_voxels_) {
-            const float near_thresh = 0.2f;
-            at::Tensor is_near =
-                markSvreconNearDirect(cams, octpath, vox_center, vox_size, near_thresh);
-            if (is_near.dim() == 2 && is_near.size(1) == 1) {
-                is_near = is_near.squeeze(1);
-            }
-            kept = kept & (~is_near.to(torch::kBool));
-        }
-        kept = kept.view({-1}).to(torch::kBool);
-        auto idx = torch::nonzero(kept).view({-1}).to(torch::kLong);
-        if (idx.numel() == 0) {
-            return {empty_oct, empty_level, empty_rgb};
-        }
-        octpath = octpath.index_select(0, idx).contiguous();
-        levels = levels.index_select(0, idx).contiguous();
-        rgb = rgb.index_select(0, idx).contiguous();
-    }
-
-    (void)support_rgb;
-    return {octpath.contiguous(), levels.contiguous(), rgb.contiguous()};
-}
 
 torch::Tensor VoxelModel::makePointPriorSdfInitRowsForKeys_(
     const torch::Tensor& grid_pts_key_rows,
@@ -1795,23 +1608,33 @@ torch::Tensor VoxelModel::makePointPriorSdfInitRowsForKeys_(
 
     torch::NoGradGuard no_grad;
     points = points.to(dev).to(torch::kFloat32).contiguous().view({-1, 3});
+    // Use the chunked CUDA nearest-prior calculation from the archived
+    // SVRecon runs. It is equivalent to the KD-tree nearest-distance query but
+    // avoids rebuilding and transferring a CPU index after every map update.
     const int64_t query_chunk = 2048;
     const int64_t point_chunk = 4096;
     std::vector<torch::Tensor> chunks;
-    chunks.reserve(static_cast<size_t>((rows + query_chunk - 1) / query_chunk));
+    chunks.reserve(
+        static_cast<size_t>((rows + query_chunk - 1) / query_chunk));
     for (int64_t begin = 0; begin < rows; begin += query_chunk) {
         const int64_t end = std::min<int64_t>(rows, begin + query_chunk);
-        auto q = grid_xyz.slice(/*dim=*/0, begin, end).contiguous();
+        torch::Tensor query =
+            grid_xyz.slice(/*dim=*/0, begin, end).contiguous();
         torch::Tensor best = torch::full(
             {end - begin, 1},
             std::numeric_limits<float>::infinity(),
             opts);
-        for (int64_t p_begin = 0; p_begin < points.size(0); p_begin += point_chunk) {
-            const int64_t p_end = std::min<int64_t>(points.size(0), p_begin + point_chunk);
-            auto p = points.slice(/*dim=*/0, p_begin, p_end).contiguous();
-            auto d = torch::cdist(q, p);
-            auto d_min = std::get<0>(d.min(/*dim=*/1, /*keepdim=*/true));
-            best = torch::minimum(best, d_min);
+        for (int64_t point_begin = 0;
+             point_begin < points.size(0);
+             point_begin += point_chunk) {
+            const int64_t point_end = std::min<int64_t>(
+                points.size(0), point_begin + point_chunk);
+            torch::Tensor point_rows =
+                points.slice(/*dim=*/0, point_begin, point_end).contiguous();
+            torch::Tensor distances = torch::cdist(query, point_rows);
+            torch::Tensor nearest =
+                std::get<0>(distances.min(/*dim=*/1, /*keepdim=*/true));
+            best = torch::minimum(best, nearest);
         }
         chunks.push_back(best.contiguous());
     }
@@ -1868,6 +1691,105 @@ torch::Tensor VoxelModel::makePointPriorSdfInitRowsForKeys_(
     return sdf.detach().requires_grad_();
 }
 
+void VoxelModel::setNextSdfInitializationGridSamples(
+    const torch::Tensor& grid_points_world,
+    const torch::Tensor& sdf_values)
+{
+    next_sdf_init_grid_keys_ = torch::Tensor();
+    next_sdf_init_grid_values_ = torch::Tensor();
+    if (!grid_points_world.defined() || !sdf_values.defined() ||
+        grid_points_world.numel() == 0 ||
+        grid_points_world.numel() / 3 != sdf_values.numel() ||
+        !scene_center_.defined() || !scene_extent_.defined() ||
+        max_num_levels_ <= 0 || max_num_levels_ > 20) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    auto dev = scene_center_.device();
+    torch::Tensor points = grid_points_world.to(dev).to(torch::kFloat32)
+                               .reshape({-1, 3}).contiguous();
+    torch::Tensor values = sdf_values.to(dev).to(torch::kFloat32)
+                               .reshape({-1, 1}).contiguous();
+    torch::Tensor scene_min =
+        scene_center_.to(dev).to(torch::kFloat32).reshape({1, 3}) -
+        0.5f * scene_extent_.to(dev).to(torch::kFloat32).reshape({1, 1});
+    const float finest_voxel =
+        scene_extent_.reshape({-1})[0].item<float>() *
+        std::ldexp(1.0f, -max_num_levels_);
+    if (!std::isfinite(finest_voxel) || finest_voxel <= 0.0f) {
+        return;
+    }
+
+    torch::Tensor grid_float = (points - scene_min) / finest_voxel;
+    torch::Tensor grid_keys = grid_float.round().to(torch::kInt64).contiguous();
+    const int64_t grid_dim = 1LL << max_num_levels_;
+    torch::Tensor valid =
+        torch::isfinite(points).all(/*dim=*/1) &
+        torch::isfinite(values).reshape({-1}) &
+        ((grid_float - grid_keys.to(torch::kFloat32)).abs() < 1.0e-3f)
+            .all(/*dim=*/1) &
+        (grid_keys >= 0).all(/*dim=*/1) &
+        (grid_keys <= grid_dim).all(/*dim=*/1);
+    torch::Tensor keep = torch::nonzero(valid).reshape({-1}).to(torch::kLong);
+    if (keep.numel() == 0) {
+        return;
+    }
+    next_sdf_init_grid_keys_ = grid_keys.index_select(0, keep).contiguous();
+    next_sdf_init_grid_values_ = values.index_select(0, keep).contiguous();
+}
+
+torch::Tensor VoxelModel::applyPendingSdfGridInitialization_(
+    const torch::Tensor& grid_pts_key_rows,
+    const torch::Tensor& initial_values) const
+{
+    if (!next_sdf_init_grid_keys_.defined() ||
+        !next_sdf_init_grid_values_.defined() ||
+        next_sdf_init_grid_keys_.numel() == 0 ||
+        grid_pts_key_rows.numel() == 0) {
+        return initial_values;
+    }
+
+    auto dev = grid_pts_key_rows.device();
+    const int64_t key_base = (1LL << max_num_levels_) + 1LL;
+    auto encode = [&](const torch::Tensor& keys_in) {
+        using torch::indexing::Slice;
+        torch::Tensor keys = keys_in.to(dev).to(torch::kInt64).contiguous();
+        return ((keys.index({Slice(), 0}) * key_base +
+                 keys.index({Slice(), 1})) * key_base +
+                keys.index({Slice(), 2})).contiguous();
+    };
+
+    torch::Tensor pending_linear = encode(next_sdf_init_grid_keys_);
+    auto sorted_result = pending_linear.sort(/*dim=*/0);
+    torch::Tensor sorted_linear = std::get<0>(sorted_result).contiguous();
+    torch::Tensor sorted_order = std::get<1>(sorted_result).to(torch::kLong);
+    torch::Tensor row_linear = encode(grid_pts_key_rows);
+    torch::Tensor positions = at::searchsorted(
+        sorted_linear, row_linear, /*out_int32=*/false, /*right=*/false)
+                                  .to(torch::kLong).contiguous();
+    torch::Tensor in_range = positions < sorted_linear.size(0);
+    torch::Tensor clamped = positions.clamp(
+        0, std::max<int64_t>(0, sorted_linear.size(0) - 1));
+    torch::Tensor matched =
+        in_range & (sorted_linear.index_select(0, clamped) == row_linear);
+    torch::Tensor row_idx = torch::nonzero(matched).reshape({-1}).to(torch::kLong);
+    if (row_idx.numel() == 0) {
+        return initial_values;
+    }
+
+    torch::Tensor pending_idx = sorted_order.index_select(
+        0, positions.index_select(0, row_idx));
+    torch::Tensor direct_values = next_sdf_init_grid_values_
+                                      .to(dev).to(torch::kFloat32)
+                                      .reshape({-1, 1})
+                                      .index_select(0, pending_idx)
+                                      .contiguous();
+    torch::Tensor output = initial_values.clone().contiguous();
+    output.index_put_({row_idx}, direct_values);
+    return output.contiguous();
+}
+
 void VoxelModel::rebuildGeoGridForNewGridKeys_(
     const torch::Tensor& grid_pts_key_new,
     float default_value)
@@ -1891,6 +1813,8 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
             makePointPriorSdfInitRowsForKeys_(grid_pts_key_new.contiguous(), default_value)
                 .detach()
                 .contiguous();
+        new_geo = applyPendingSdfGridInitialization_(
+            grid_pts_key_new.contiguous(), new_geo).detach().contiguous();
         _geo_grid_pts_ = new_geo.contiguous().detach().requires_grad_(true);
         adam_geo_.exp_avg = torch::zeros_like(new_geo);
         adam_geo_.exp_avg_sq = torch::zeros_like(new_geo);
@@ -1974,6 +1898,8 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
             makePointPriorSdfInitRowsForKeys_(unmatched_keys, default_value)
                 .detach()
                 .contiguous();
+        unmatched_geo = applyPendingSdfGridInitialization_(
+            unmatched_keys, unmatched_geo).detach().contiguous();
         new_geo.index_put_({unmatched_new_idx}, unmatched_geo);
     }
 
@@ -2508,28 +2434,11 @@ void VoxelModel::createFromPcd(
     // 3) utils: ijk -> octpath (no constructor calls)
     // ------------------------------------------------------------------------
     auto octpath = SVRECON_UTILS::ijk_2_octpath(ijk_u.contiguous(), L_u.contiguous()).contiguous(); // [Nu,1] int64
-    bool support_layout_used = false;
-    if (svrecon_uniform_support_) {
-        auto [uniform_octpath, uniform_level, uniform_rgb] =
-            buildSvreconUniformSupportCandidates_(
-                xyz.contiguous(),
-                rgb.contiguous(),
-                cams,
-                /*initial_layout=*/true);
-        if (uniform_octpath.defined() && uniform_octpath.size(0) > 0) {
-            octpath = uniform_octpath.contiguous();
-            L_u = uniform_level.contiguous();
-            rgb_u = uniform_rgb.contiguous();
-            Nu = octpath.size(0);
-            support_layout_used = true;
-        }
-    }
-
     // ------------------------------------------------------------------------
     // 3.5) Optional camera-based filtering for initialization candidates
     //      (same logic family as increasePcd insertion filter)
     // ------------------------------------------------------------------------
-    if (!support_layout_used && !cams.empty() && octpath.size(0) > 0) {
+    if (!cams.empty() && octpath.size(0) > 0) {
         auto [vox_center, vox_size] = decodeOctpath(
             octpath.contiguous(),
             L_u.contiguous(),
@@ -2587,27 +2496,17 @@ void VoxelModel::createFromPcd(
     // Grid link => allocate per-grid-point density
     auto [grid_pts_key, vox_key] = buildGridPtsLink(octpath, L_u.contiguous(), max_num_levels_);
     (void)vox_key;
-    const SdfInitMode requested_init_mode = pending_sdf_init_mode_;
-    if (support_layout_used) {
-        // The uniform layout is initialized below from one KD-tree query over
-        // the complete geometric-prior cloud. Avoid the quadratic point-prior
-        // path here, especially for dense LiDAR priors.
-        pending_sdf_init_mode_ = SdfInitMode::WeakPositive;
-    }
     auto geo_grid = makeGeoGridInitRows_(
         grid_pts_key,
         /*begin=*/0,
         /*end=*/grid_pts_key.size(0),
         /*default_value=*/std::max(1.0e-6f, 2.0f * fixed_vox_size_));
-    pending_sdf_init_mode_ = requested_init_mode;
 
     // ------------------------------------------------------------------------
     // 5) Initialize C++ members directly.
     // ------------------------------------------------------------------------
     this->oct_path_      = octpath.contiguous();
     this->oct_level_     = L_u.contiguous();
-    sparse_voxel_blocks_.clear();
-    registerSparseVoxelBlocks_(this->oct_path_, this->oct_level_, /*iteration=*/0);
     {
         auto [center, size] = decodeOctpath(
             this->oct_path_.contiguous(),
@@ -2626,13 +2525,6 @@ void VoxelModel::createFromPcd(
     // learnables
     this->_geo_grid_pts_ = geo_grid.contiguous().detach().requires_grad_(true);
     ensureSvrasterSdfField();
-    if (support_layout_used) {
-        updateExistingUniformSupportSdfFromPoints_(
-            xyz.contiguous(),
-            rgb.contiguous(),
-            cams,
-            /*initialize_all_visible_corners=*/true);
-    }
     this->sh0_           = sh0_dc.contiguous().detach().requires_grad_(true);
     this->shs_           = shs.contiguous().detach().requires_grad_(true);
     this->subdiv_p_      = subdiv_p.contiguous().detach().requires_grad_(true);
@@ -2643,19 +2535,13 @@ void VoxelModel::createFromPcd(
     // stats buffer
     this->max_w_ = torch::zeros({center_.size(0), 1}, torch::dtype(torch::kFloat32).device(dev));
     
-    // SVRecon support layouts are not ORB-created surface voxels. ORB points
-    // initialize SDF observations inside the support volume.
-    this->is_orb_voxel_ = torch::full(
+    this->is_orb_voxel_ = torch::ones(
         {center_.size(0)},
-        !support_layout_used,
         torch::TensorOptions().dtype(torch::kBool).device(dev));
     this->is_inactive_geo_voxel_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kBool).device(dev));
     this->is_rgbd_fill_render_holes_voxel_ = torch::zeros(
-        {center_.size(0)},
-        torch::TensorOptions().dtype(torch::kBool).device(dev));
-    this->is_svrecon_ray_support_voxel_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kBool).device(dev));
     this->exist_since_iter_ = torch::zeros(
@@ -2683,21 +2569,19 @@ void VoxelModel::increasePcd(
     const int iteration,
     const std::vector<sv::MiniCam>& cams)
 {
-    // Match Photo-SLAM's GaussianModel topology-growth memory handling. Large
-    // temporary tensors from rendering and prior insertions otherwise remain
-    // reserved in incompatible CUDA allocator blocks and can make a modest
-    // increasePcd allocation fail despite low live tensor memory.
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    struct EmptyCudaCacheOnExit {
-        ~EmptyCudaCacheOnExit()
-        {
-            c10::cuda::CUDACachingAllocator::emptyCache();
-        }
-    } empty_cuda_cache_on_exit;
-
     sdf_init_cams_ = cams;
     torch::Tensor explicit_sdf_support_points = next_sdf_init_support_points_;
     next_sdf_init_support_points_ = torch::Tensor();
+    struct PendingGridInitializationReset {
+        torch::Tensor& keys;
+        torch::Tensor& values;
+        ~PendingGridInitializationReset()
+        {
+            keys = torch::Tensor();
+            values = torch::Tensor();
+        }
+    } pending_grid_initialization_reset{
+        next_sdf_init_grid_keys_, next_sdf_init_grid_values_};
     const int Nf = static_cast<int>(pcd_full.size());
     last_increase_pcd_stats_ = IncreasePcdStats{};
     if (Nf < 3 || colors.size() < 3) return;
@@ -2766,16 +2650,11 @@ void VoxelModel::increasePcd(
         pending_real_insert_rr_entity_path_ == "world/voxels_inactive_geo_densify/created";
     const bool add_as_rgbd_fill_render_holes =
         pending_real_insert_rr_entity_path_ == "world/rgbd_fill_render_holes/created" ||
-        pending_real_insert_rr_entity_path_ == "world/rgbd_surface_points/created";
-    const bool add_as_octree_block_support =
-        pending_real_insert_rr_entity_path_ == "world/octree_block_support/created";
-    const bool add_as_svrecon_ray_support =
-        pending_real_insert_rr_entity_path_ == "world/svrecon_ray_support/created" ||
-        add_as_octree_block_support;
+        pending_real_insert_rr_entity_path_ == "world/rgbd_surface_points/created" ||
+        pending_real_insert_rr_entity_path_ == "world/rgbd_tsdf_evidence/promoted";
     const bool add_as_topology_support =
         add_as_inactive_geo ||
-        add_as_rgbd_fill_render_holes ||
-        add_as_svrecon_ray_support;
+        add_as_rgbd_fill_render_holes;
 
     // Build the min/max AABB tensor once:
     at::Tensor aabb = torch::stack({
@@ -2881,9 +2760,6 @@ void VoxelModel::increasePcd(
     auto octpath_new = SVRECON_UTILS::ijk_2_octpath(ijk_u.contiguous(), L_u.contiguous()).contiguous();          // [Nu,1] int64
 
     const bool has_topology_support =
-        (is_svrecon_ray_support_voxel_.defined() &&
-         is_svrecon_ray_support_voxel_.numel() > 0 &&
-         is_svrecon_ray_support_voxel_.to(torch::kBool).any().item<bool>()) ||
         (is_inactive_geo_voxel_.defined() &&
          is_inactive_geo_voxel_.numel() > 0 &&
          is_inactive_geo_voxel_.to(torch::kBool).any().item<bool>()) ||
@@ -2891,49 +2767,10 @@ void VoxelModel::increasePcd(
          is_rgbd_fill_render_holes_voxel_.numel() > 0 &&
          is_rgbd_fill_render_holes_voxel_.to(torch::kBool).any().item<bool>());
     if (add_as_orb && has_topology_support) {
-        updateExistingUniformSupportSdfFromPoints_(
+        updateExistingSupportSdfFromPoints_(
             xyz.contiguous(),
             rgb.contiguous(),
-            cams,
-            /*initialize_all_visible_corners=*/false);
-    }
-
-    if (svrecon_uniform_support_) {
-        // Uniform SVRecon support treats topology as fixed volumetric support.
-        // Only multi-view ORB/SfM-style points should act like SVRecon's strong
-        // point priors. RGB-D inactive-geo / render-hole samples are single-view
-        // densification cues; using them as nearest-surface priors creates an SDF
-        // zero level around depth floaters and then pruning cannot remove them.
-        if (add_as_orb) {
-            updateExistingUniformSupportSdfFromPoints_(
-                xyz.contiguous(),
-                rgb.contiguous(),
-                cams,
-                /*initialize_all_visible_corners=*/false);
-            appendSparseSupportPoints_(xyz);
-
-            auto new_pts_cpu = xyz_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
-            if (!real_pcd_points_accum_cpu_.defined() || real_pcd_points_accum_cpu_.numel() == 0) {
-                real_pcd_points_accum_cpu_ = new_pts_cpu;
-            } else {
-                real_pcd_points_accum_cpu_ =
-                    torch::cat({real_pcd_points_accum_cpu_, new_pts_cpu}, 0).contiguous();
-            }
-        }
-
-        last_increase_pcd_stats_.unique_voxel_candidates_before_insert_filter =
-            unique_voxel_candidates_before_insert_filter;
-        last_increase_pcd_stats_.unique_voxel_candidates_after_insert_filter = Nu;
-        last_increase_pcd_stats_.duplicate_existing_voxels = Nu;
-        last_increase_pcd_stats_.new_voxels = 0;
-        last_increase_pcd_stats_.pending_promotions = 0;
-        last_increase_pcd_stats_.pending_support_updates = Nu;
-        sdf_init_local_support_points_ = torch::Tensor();
-        pending_sdf_init_mode_ = SdfInitMode::SignedPointPrior;
-        if (!pending_real_insert_rr_entity_path_.empty()) {
-            pending_real_insert_rr_entity_path_.clear();
-        }
-        return;
+            cams);
     }
 
     // ---- Active insertion-time SVR-style filtering (kept separate from OLD block) ----
@@ -2993,24 +2830,6 @@ void VoxelModel::increasePcd(
                     "rgb_u shape mismatch after insertion-time filtering");
 	    }
 	    // ---- end active insertion-time filtering ----
-    bool uniform_growth_used = false;
-    if (svrecon_uniform_support_) {
-        auto [uniform_octpath, uniform_level, uniform_rgb] =
-            buildSvreconUniformSupportCandidates_(
-                xyz.contiguous(),
-                rgb.contiguous(),
-                cams,
-                /*initial_layout=*/false);
-        if (uniform_octpath.defined() && uniform_octpath.size(0) > 0) {
-            octpath_new = uniform_octpath.contiguous();
-            L_u = uniform_level.contiguous();
-            rgb_u = uniform_rgb.contiguous();
-            Nu = octpath_new.size(0);
-            ijk_u = torch::zeros(
-                {Nu, 3}, torch::TensorOptions().dtype(torch::kLong).device(dev));
-            uniform_growth_used = true;
-        }
-    }
 	    const int64_t unique_voxel_candidates_after_insert_filter = Nu;
     last_increase_pcd_stats_.unique_voxel_candidates_before_insert_filter =
         unique_voxel_candidates_before_insert_filter;
@@ -3035,12 +2854,6 @@ void VoxelModel::increasePcd(
         is_orb_voxel_ = torch::zeros({octpath_old.size(0)}, bool_opts_old);
     } else if (is_orb_voxel_.device() != dev) {
         is_orb_voxel_ = is_orb_voxel_.to(dev);
-    }
-    if (!is_svrecon_ray_support_voxel_.defined() ||
-        is_svrecon_ray_support_voxel_.size(0) != octpath_old.size(0)) {
-        is_svrecon_ray_support_voxel_ = torch::zeros({octpath_old.size(0)}, bool_opts_old);
-    } else if (is_svrecon_ray_support_voxel_.device() != dev) {
-        is_svrecon_ray_support_voxel_ = is_svrecon_ray_support_voxel_.to(dev);
     }
     torch::Tensor new_mask;
     if (octpath_old.numel() == 0) {
@@ -3137,9 +2950,7 @@ void VoxelModel::increasePcd(
         // RGB-D hole samples allocate cells but never enter this ORB set.
         appendSparseSupportPoints_(xyz);
     }
-    pending_sdf_init_mode_ = add_as_octree_block_support
-        ? SdfInitMode::OrbPriorWeakCandidate
-        : topology_sdf_init_mode_;
+    pending_sdf_init_mode_ = topology_sdf_init_mode_;
     if (xyz_cpu.defined() && xyz_cpu.numel() > 0) {
         const bool uses_local_point_prior =
             pending_sdf_init_mode_ == SdfInitMode::SignedPointPrior ||
@@ -3158,14 +2969,12 @@ void VoxelModel::increasePcd(
             !add_as_orb) {
             appendSparseSupportPoints_(xyz);
         }
-        if (!add_as_svrecon_ray_support) {
-            auto new_pts_cpu = xyz_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
-            if (!real_pcd_points_accum_cpu_.defined() || real_pcd_points_accum_cpu_.numel() == 0) {
-                real_pcd_points_accum_cpu_ = new_pts_cpu;
-            } else {
-                real_pcd_points_accum_cpu_ =
-                    torch::cat({real_pcd_points_accum_cpu_, new_pts_cpu}, 0).contiguous();
-            }
+        auto new_pts_cpu = xyz_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
+        if (!real_pcd_points_accum_cpu_.defined() || real_pcd_points_accum_cpu_.numel() == 0) {
+            real_pcd_points_accum_cpu_ = new_pts_cpu;
+        } else {
+            real_pcd_points_accum_cpu_ =
+                torch::cat({real_pcd_points_accum_cpu_, new_pts_cpu}, 0).contiguous();
         }
     }
     if (sel.numel() == 0) {
@@ -3178,7 +2987,6 @@ void VoxelModel::increasePcd(
     auto L_add       = L_u.index_select(0, sel);                                                         // [Nk,1]
     auto rgb_add     = rgb_u.index_select(0, sel);                                                       // [Nk,3]
     const int Nk = sel.size(0);
-    registerSparseVoxelBlocks_(octpath_add, L_add, iteration);
 
     ensureSvrasterSdfField();
     torch::Tensor old_vox_sdf_values =
@@ -3209,13 +3017,6 @@ void VoxelModel::increasePcd(
             is_rgbd_fill_render_holes_voxel_ =
                 is_rgbd_fill_render_holes_voxel_.to(octpath_old.device());
         }
-        if (!is_svrecon_ray_support_voxel_.defined() ||
-            is_svrecon_ray_support_voxel_.size(0) != octpath_old.size(0)) {
-            is_svrecon_ray_support_voxel_ = torch::zeros({octpath_old.size(0)}, bool_opts);
-        } else if (is_svrecon_ray_support_voxel_.device() != octpath_old.device()) {
-            is_svrecon_ray_support_voxel_ =
-                is_svrecon_ray_support_voxel_.to(octpath_old.device());
-        }
         if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != octpath_old.size(0)) {
             exist_since_iter_ = torch::zeros({octpath_old.size(0)}, i32_opts);
         } else if (exist_since_iter_.device() != octpath_old.device()) {
@@ -3231,8 +3032,6 @@ void VoxelModel::increasePcd(
             auto inactive_geo_add_flag = torch::full({Nk}, add_as_inactive_geo, bool_opts);
             auto rgbd_fill_render_holes_add_flag =
                 torch::full({Nk}, add_as_rgbd_fill_render_holes, bool_opts);
-            auto svrecon_ray_support_add_flag =
-                torch::full({Nk}, add_as_svrecon_ray_support, bool_opts);
             auto exist_since_add = torch::full(
                 {Nk}, static_cast<int32_t>(iteration), i32_opts);
             auto exist_since_kf_add = torch::full(
@@ -3241,8 +3040,6 @@ void VoxelModel::increasePcd(
             is_inactive_geo_voxel_ = torch::cat({is_inactive_geo_voxel_, inactive_geo_add_flag}, 0).contiguous();
             is_rgbd_fill_render_holes_voxel_ =
                 torch::cat({is_rgbd_fill_render_holes_voxel_, rgbd_fill_render_holes_add_flag}, 0).contiguous();
-            is_svrecon_ray_support_voxel_ =
-                torch::cat({is_svrecon_ray_support_voxel_, svrecon_ray_support_add_flag}, 0).contiguous();
             exist_since_iter_ = torch::cat({exist_since_iter_, exist_since_add}, 0).contiguous();
             exist_since_kf_ = torch::cat({exist_since_kf_, exist_since_kf_add}, 0).contiguous();
         }
@@ -3397,22 +3194,6 @@ void VoxelModel::increasePcd(
             }
         }
         is_rgbd_fill_render_holes_voxel_ = aligned;
-    }
-    if (!is_svrecon_ray_support_voxel_.defined() ||
-        is_svrecon_ray_support_voxel_.size(0) != center_.size(0)) {
-        auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(dev);
-        auto aligned = torch::zeros({center_.size(0)}, bool_opts);
-        if (is_svrecon_ray_support_voxel_.defined() &&
-            is_svrecon_ray_support_voxel_.numel() > 0) {
-            auto old = is_svrecon_ray_support_voxel_.to(dev).to(torch::kBool).contiguous();
-            const int64_t copy_n = std::min<int64_t>(old.size(0), aligned.size(0));
-            if (copy_n > 0) {
-                aligned.index_put_(
-                    {torch::indexing::Slice(0, copy_n)},
-                    old.index({torch::indexing::Slice(0, copy_n)}));
-            }
-        }
-        is_svrecon_ray_support_voxel_ = aligned;
     }
     // Keep exist_since_iter tensor aligned with current topology size.
     if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != center_.size(0)) {
@@ -3735,7 +3516,6 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     ensure_bool(is_orb_voxel_);
     ensure_bool(is_inactive_geo_voxel_);
     ensure_bool(is_rgbd_fill_render_holes_voxel_);
-    ensure_bool(is_svrecon_ray_support_voxel_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
@@ -3833,7 +3613,6 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     remap_bool(is_orb_voxel_);
     remap_bool(is_inactive_geo_voxel_);
     remap_bool(is_rgbd_fill_render_holes_voxel_);
-    remap_bool(is_svrecon_ray_support_voxel_);
     is_leaf_ = is_leaf_.index_select(0, kept_idx.to(is_leaf_.device())).contiguous();
     exist_since_iter_ =
         exist_since_iter_.to(mask.device()).to(torch::kInt32)
@@ -3864,7 +3643,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     ensure_bool(is_orb_voxel_);
     ensure_bool(is_inactive_geo_voxel_);
     ensure_bool(is_rgbd_fill_render_holes_voxel_);
-    ensure_bool(is_svrecon_ray_support_voxel_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
@@ -3885,8 +3663,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     auto inactive_geo_before = is_inactive_geo_voxel_.to(torch::kBool).contiguous();
     auto rgbd_fill_render_holes_before =
         is_rgbd_fill_render_holes_voxel_.to(torch::kBool).contiguous();
-    auto svrecon_ray_support_before =
-        is_svrecon_ray_support_voxel_.to(torch::kBool).contiguous();
     auto exist_since_before = exist_since_iter_.to(torch::kInt32).contiguous();
     auto exist_since_kf_before = exist_since_kf_.to(torch::kInt32).contiguous();
 
@@ -4043,7 +3819,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     remap_child_bool(is_orb_voxel_);
     remap_child_bool(is_inactive_geo_voxel_);
     remap_child_bool(is_rgbd_fill_render_holes_voxel_);
-    remap_child_bool(is_svrecon_ray_support_voxel_);
 
     auto kept_exist_iter =
         exist_since_before.to(mask.device()).index_select(0, kept_idx.to(mask.device())).contiguous();

@@ -1427,7 +1427,122 @@ void VoxelMapper::integrateKeyframeIntoSvrasterSdf(
     }
 }
 
-void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
+torch::Tensor VoxelMapper::detectSdfEvidenceResidualHoles(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const cv::Mat& depth_meters,
+    torch::Tensor& full_hole_mask)
+{
+    full_hole_mask = torch::Tensor();
+    if (!kf || !voxel_model_ || depth_meters.empty() ||
+        kf->image_width_ <= 0 || kf->image_height_ <= 0) {
+        return torch::Tensor();
+    }
+
+    cv::Mat depth32 = depth_meters;
+    if (depth32.channels() > 1) {
+        cv::extractChannel(depth32, depth32, 0);
+    }
+    if (depth32.type() != CV_32FC1) {
+        depth32.convertTo(depth32, CV_32FC1);
+    }
+    if (depth32.rows != kf->image_height_ ||
+        depth32.cols != kf->image_width_) {
+        return torch::Tensor();
+    }
+
+    std::unordered_map<std::string, torch::Tensor> render_pkg;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        render_pkg = voxel_model_->render(
+            kf->toMiniCam(kf->image_height_, kf->image_width_),
+            kf->image_height_,
+            kf->image_width_,
+            torch::Tensor(),
+            "dontcare",
+            false,
+            std::nullopt,
+            true,
+            false,
+            true,
+            false,
+            false,
+            sv::RenderOpts{});
+    }
+
+    torch::Tensor render_depth_cpu;
+    torch::Tensor render_alpha_cpu;
+    torch::Tensor render_n_contrib_cpu;
+    if (!voxel_utils::renderPkgToDepthAlphaMaps(
+            render_pkg,
+            kf->image_height_,
+            kf->image_width_,
+            render_depth_cpu,
+            render_alpha_cpu,
+            render_n_contrib_cpu)) {
+        return torch::Tensor();
+    }
+
+    const int stride = std::max(1, rgbd_fill_render_holes_stride_);
+    std::vector<uint8_t> selected(
+        static_cast<size_t>(kf->image_height_) *
+            static_cast<size_t>(kf->image_width_),
+        0);
+    std::vector<uint8_t> all_holes(selected.size(), 0);
+    auto render_depth = render_depth_cpu.accessor<float, 2>();
+    auto render_n_contrib = render_n_contrib_cpu.accessor<int, 2>();
+    for (int y = 0; y < kf->image_height_; ++y) {
+        const float* depth_row = depth32.ptr<float>(y);
+        for (int x = 0; x < kf->image_width_; ++x) {
+            const float measured_depth = depth_row[x];
+            if (!std::isfinite(measured_depth) ||
+                measured_depth <= RGBD_min_depth_ ||
+                measured_depth >= RGBD_max_depth_ ||
+                (sdf_params_.svraster_tsdf_max_integration_distance_m_ > 0.0f &&
+                 measured_depth >
+                     sdf_params_.svraster_tsdf_max_integration_distance_m_)) {
+                continue;
+            }
+
+            const float rendered_depth = render_depth[y][x];
+            const bool structural_hole =
+                render_n_contrib[y][x] <= 0 &&
+                (!std::isfinite(rendered_depth) ||
+                 rendered_depth <= 1.0e-6f);
+            if (!structural_hole) {
+                continue;
+            }
+
+            const size_t index =
+                static_cast<size_t>(y) *
+                    static_cast<size_t>(kf->image_width_) +
+                static_cast<size_t>(x);
+            all_holes[index] = 1;
+            if ((x % stride) == 0 && (y % stride) == 0) {
+                selected[index] = 1;
+            }
+        }
+    }
+
+    full_hole_mask =
+        torch::from_blob(
+            all_holes.data(),
+            {static_cast<int64_t>(all_holes.size())},
+            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+            .clone()
+            .to(device_type_)
+            .to(torch::kBool)
+            .contiguous();
+    return torch::from_blob(
+               selected.data(),
+               {static_cast<int64_t>(selected.size())},
+               torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+        .clone()
+        .to(device_type_)
+        .to(torch::kBool)
+        .contiguous();
+}
+
+torch::Tensor VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
     const std::shared_ptr<VoxelKeyframe>& kf,
     const cv::Mat& depth_meters)
 {
@@ -1439,7 +1554,7 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
         depth_meters.empty() ||
         kf->image_width_ <= 0 ||
         kf->image_height_ <= 0) {
-        return;
+        return torch::Tensor();
     }
 
     cv::Mat depth32 = depth_meters;
@@ -1450,11 +1565,11 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
         depth32.convertTo(depth32, CV_32FC1);
     }
     if (depth32.empty()) {
-        return;
+        return torch::Tensor();
     }
 
     if (kf->cam_.model_id_ != sv::Camera::PINHOLE) {
-        return;
+        return torch::Tensor();
     }
 
     const float fx = kf->cam_.fx();
@@ -1462,8 +1577,24 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
     const float cx = kf->cam_.cx();
     const float cy = kf->cam_.cy();
     if (!(fx > 0.0f && fy > 0.0f)) {
-        return;
+        return torch::Tensor();
     }
+
+    torch::Tensor full_hole_mask;
+    torch::Tensor selected_hole_mask =
+        detectSdfEvidenceResidualHoles(kf, depth32, full_hole_mask);
+    if (!selected_hole_mask.defined() ||
+        selected_hole_mask.numel() != static_cast<int64_t>(depth32.total()) ||
+        !selected_hole_mask.any().item<bool>()) {
+        return full_hole_mask;
+    }
+    torch::Tensor selected_hole_mask_cpu =
+        selected_hole_mask.detach()
+            .to(torch::kCPU)
+            .to(torch::kBool)
+            .contiguous()
+            .view({depth32.rows, depth32.cols});
+    auto selected_hole = selected_hole_mask_cpu.accessor<bool, 2>();
 
     const float vox_m = std::max(1.0e-6f, tsdfMetricVoxelSize());
     const float trunc_m =
@@ -1504,6 +1635,9 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
     for (int y = 0; y < depth32.rows; ++y) {
         const float* depth_row = depth32.ptr<float>(y);
         for (int x = 0; x < depth32.cols; ++x) {
+            if (!selected_hole[y][x]) {
+                continue;
+            }
             const float d = depth_row[x];
             if (!std::isfinite(d) ||
                 d <= RGBD_min_depth_ ||
@@ -1545,7 +1679,7 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
     }
 
     if (pts_cam.empty()) {
-        return;
+        return full_hole_mask;
     }
 
     if (rgbd_fill_render_holes_max_points_per_kf_ > 0 &&
@@ -1612,6 +1746,204 @@ void VoxelMapper::integrateKeyframeSdfEvidenceVoxels(
     voxel_model_->increasePcd(points, color_tensor, getIteration(), tr_cams);
     voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
     voxel_model_->setNextRealInsertionRerunEntityPath("");
+    return full_hole_mask;
+}
+
+void VoxelMapper::recordSdfEvidenceViewSupport(
+    const std::shared_ptr<VoxelKeyframe>& kf,
+    const cv::Mat& depth_meters,
+    const torch::Tensor& residual_hole_mask)
+{
+    if (!kf || !voxel_model_ || depth_meters.empty() ||
+        !residual_hole_mask.defined() ||
+        residual_hole_mask.numel() !=
+            static_cast<int64_t>(kf->image_height_) *
+                static_cast<int64_t>(kf->image_width_)) {
+        return;
+    }
+
+    cv::Mat depth32 = depth_meters;
+    if (depth32.channels() > 1) {
+        cv::extractChannel(depth32, depth32, 0);
+    }
+    if (depth32.type() != CV_32FC1) {
+        depth32.convertTo(depth32, CV_32FC1);
+    }
+    if (depth32.rows != kf->image_height_ ||
+        depth32.cols != kf->image_width_) {
+        return;
+    }
+
+    torch::Tensor evidence_mask;
+    torch::Tensor centers;
+    torch::Tensor octpath;
+    torch::Tensor octlevel;
+    torch::Tensor scene_center;
+    torch::Tensor scene_extent;
+    {
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        evidence_mask =
+            voxel_model_->sdfEvidenceOnlyMask().detach().to(torch::kCPU)
+                .to(torch::kBool).contiguous().view({-1});
+        centers =
+            voxel_model_->voxCenter().detach().to(torch::kCPU)
+                .to(torch::kFloat32).contiguous();
+        octpath =
+            voxel_model_->octPath().detach().to(torch::kCPU)
+                .to(torch::kInt64).contiguous().view({-1});
+        octlevel =
+            voxel_model_->octLevel().detach().to(torch::kCPU)
+                .to(torch::kInt8).contiguous().view({-1});
+        scene_center =
+            voxel_model_->SceneCenter().detach().to(torch::kCPU)
+                .to(torch::kFloat32).contiguous().view({3});
+        scene_extent =
+            voxel_model_->SceneExtent().detach().to(torch::kCPU)
+                .to(torch::kFloat32).contiguous().view({-1});
+    }
+
+    const int64_t count = evidence_mask.numel();
+    if (count <= 0 || centers.dim() != 2 || centers.size(0) != count ||
+        centers.size(1) != 3 || octpath.numel() != count ||
+        octlevel.numel() != count || scene_extent.numel() != 1) {
+        return;
+    }
+
+    const int base_level =
+        octlevel.numel() > 0
+            ? static_cast<int>(octlevel.min().item<int8_t>())
+            : 0;
+    const float extent = scene_extent.item<float>();
+    const std::array<float, 3> center_values{{
+        scene_center[0].item<float>(),
+        scene_center[1].item<float>(),
+        scene_center[2].item<float>(),
+    }};
+    const float layout_tolerance =
+        std::max(1.0e-6f, 1.0e-5f * std::max(1.0f, std::abs(extent)));
+    const bool layout_changed =
+        !sdf_state_.sdf_evidence_layout_valid_ ||
+        sdf_state_.sdf_evidence_base_level_ != base_level ||
+        std::abs(sdf_state_.sdf_evidence_scene_extent_ - extent) >
+            layout_tolerance ||
+        std::abs(sdf_state_.sdf_evidence_scene_center_[0] - center_values[0]) >
+            layout_tolerance ||
+        std::abs(sdf_state_.sdf_evidence_scene_center_[1] - center_values[1]) >
+            layout_tolerance ||
+        std::abs(sdf_state_.sdf_evidence_scene_center_[2] - center_values[2]) >
+            layout_tolerance;
+    if (layout_changed) {
+        sdf_state_.sdf_evidence_observed_keyframes_.clear();
+        sdf_state_.sdf_evidence_layout_valid_ = true;
+        sdf_state_.sdf_evidence_scene_center_ = center_values;
+        sdf_state_.sdf_evidence_scene_extent_ = extent;
+        sdf_state_.sdf_evidence_base_level_ = base_level;
+    }
+
+    torch::Tensor holes =
+        residual_hole_mask.detach().to(torch::kCPU).to(torch::kBool)
+            .contiguous().view({kf->image_height_, kf->image_width_});
+    auto holes_acc = holes.accessor<bool, 2>();
+    auto evidence_acc = evidence_mask.accessor<bool, 1>();
+    auto centers_acc = centers.accessor<float, 2>();
+    auto path_acc = octpath.accessor<int64_t, 1>();
+    auto level_acc = octlevel.accessor<int8_t, 1>();
+
+    const Sophus::SE3f Tcw = kf->getPosef();
+    const float fx = kf->cam_.fx();
+    const float fy = kf->cam_.fy();
+    const float cx = kf->cam_.cx();
+    const float cy = kf->cam_.cy();
+    const float trunc_m =
+        std::max(
+            1.0e-6f,
+            sdf_params_.tsdf_density_init_trunc_vox_ *
+                tsdfMetricVoxelSize());
+    const std::size_t keyframe_id = kf->fid_;
+
+    for (int64_t index = 0; index < count; ++index) {
+        if (!evidence_acc[index]) {
+            continue;
+        }
+        const Eigen::Vector3f world(
+            centers_acc[index][0],
+            centers_acc[index][1],
+            centers_acc[index][2]);
+        const Eigen::Vector3f camera = Tcw * world;
+        if (!std::isfinite(camera.z()) || camera.z() <= 1.0e-6f) {
+            continue;
+        }
+        const int x = static_cast<int>(
+            std::lround(fx * camera.x() / camera.z() + cx));
+        const int y = static_cast<int>(
+            std::lround(fy * camera.y() / camera.z() + cy));
+        if (x < 0 || x >= kf->image_width_ ||
+            y < 0 || y >= kf->image_height_ ||
+            !holes_acc[y][x]) {
+            continue;
+        }
+        const float measured_depth = depth32.at<float>(y, x);
+        if (!std::isfinite(measured_depth) ||
+            measured_depth <= RGBD_min_depth_ ||
+            measured_depth >= RGBD_max_depth_ ||
+            std::abs(measured_depth - camera.z()) > trunc_m) {
+            continue;
+        }
+
+        const SdfEvidenceOctreeKey key{
+            path_acc[index],
+            level_acc[index],
+        };
+        std::vector<std::size_t>& observed =
+            sdf_state_.sdf_evidence_observed_keyframes_[key];
+        const std::size_t required_views = static_cast<std::size_t>(
+            std::max(1, sdf_params_.sdf_evidence_promote_min_views_));
+        if (observed.size() < required_views &&
+            std::find(observed.begin(), observed.end(), keyframe_id) ==
+                observed.end()) {
+            observed.push_back(keyframe_id);
+        }
+    }
+}
+
+void VoxelMapper::processPendingSdfEvidenceKeyframes(const bool force)
+{
+    if (!voxel_model_ || !scene_ ||
+        !sdf_params_.sdf_evidence_densify_ ||
+        !sdf_params_.use_tsdf_mapping_ ||
+        sensor_type_ != RGBD ||
+        !useSvrasterTsdfBackend() ||
+        sdf_evidence_pending_keyframes_.empty()) {
+        return;
+    }
+    if (!force && inactive_geo_densify_ && depth_cached_ != 0) {
+        return;
+    }
+
+    std::vector<std::shared_ptr<VoxelKeyframe>> keyframes;
+    keyframes.swap(sdf_evidence_pending_keyframes_);
+    for (const auto& kf : keyframes) {
+        if (!kf) {
+            continue;
+        }
+        cv::Mat depth_meters;
+        if (!voxel_utils::depthMatToMeters(
+                kf->img_auxiliary_undist_, depth_meters) ||
+            depth_meters.empty()) {
+            continue;
+        }
+
+        torch::Tensor residual_holes =
+            integrateKeyframeSdfEvidenceVoxels(kf, depth_meters);
+        integrateKeyframeIntoSvrasterSdf(*kf, depth_meters);
+        if (residual_holes.defined() && residual_holes.numel() > 0) {
+            recordSdfEvidenceViewSupport(
+                kf,
+                depth_meters,
+                residual_holes);
+        }
+    }
+    promoteSdfEvidenceVoxelsFromTsdfField();
 }
 
 void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
@@ -1633,8 +1965,7 @@ void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
     }
 
     TsdfCornerSample corners =
-        sampleTsdfAtSvrasterGridCornersWorld(
-            sdf_params_.sdf_evidence_zero_crossing_refresh_);
+        sampleTsdfAtSvrasterGridCornersWorld(/*include_points_world=*/false);
     if (!corners.tsdf.defined() ||
         corners.tsdf.dim() != 2 ||
         corners.tsdf.size(1) != 8) {
@@ -1671,36 +2002,8 @@ void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
 
     torch::Tensor edge_surface_support =
         torch::zeros({N}, torch::TensorOptions().dtype(torch::kBool).device(device_type_));
-    std::vector<torch::Tensor> zero_crossing_points;
-    std::vector<torch::Tensor> zero_crossing_colors;
-    if (sdf_params_.sdf_evidence_zero_crossing_refresh_ &&
-        corners.points_world.defined() &&
-        corners.points_world.dim() == 3 &&
-        corners.points_world.size(0) == N &&
-        corners.points_world.size(1) == 8 &&
-        corners.points_world.size(2) == 3) {
+    if (sdf_params_.sdf_evidence_zero_crossing_refresh_) {
         using torch::indexing::Slice;
-        torch::Tensor points8 =
-            corners.points_world.to(device_type_).to(torch::kFloat32).contiguous();
-        torch::Tensor sh0 = voxel_model_->sh0().detach();
-        torch::Tensor colors_all;
-        if (sh0.defined() && sh0.numel() > 0) {
-            sh0 = sh0.to(device_type_).to(torch::kFloat32);
-            if (sh0.dim() == 3 && sh0.size(1) == 1 && sh0.size(2) == 3) {
-                sh0 = sh0.view({sh0.size(0), 3});
-            }
-            if (sh0.dim() == 2 && sh0.size(0) == N && sh0.size(1) == 3) {
-                constexpr float kSHC0 = 0.28209479177387814f;
-                colors_all = torch::clamp(sh0 * kSHC0 + 0.5f, 0.0f, 1.0f).contiguous();
-            }
-        }
-        if (!colors_all.defined()) {
-            colors_all = torch::full(
-                {N, 3},
-                0.5f,
-                torch::TensorOptions().dtype(torch::kFloat32).device(device_type_));
-        }
-
         const std::array<std::array<int, 2>, 12> edges{{
             {{0, 1}}, {{0, 2}}, {{0, 4}},
             {{1, 3}}, {{1, 5}},
@@ -1722,38 +2025,13 @@ void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
                  corner_valid.index({Slice(), b}))
                     .to(torch::kBool);
             torch::Tensor sign_change =
-                (((v0 <= 0.0f) & (v1 >= 0.0f)) |
-                 ((v0 >= 0.0f) & (v1 <= 0.0f)))
+                (((v0 < 0.0f) & (v1 > 0.0f)) |
+                 ((v0 > 0.0f) & (v1 < 0.0f)))
                     .to(torch::kBool);
             torch::Tensor edge_support =
                 (edge_valid & sign_change).to(torch::kBool);
             edge_surface_support =
                 (edge_surface_support | edge_support).to(torch::kBool);
-
-            torch::Tensor edge_idx = torch::nonzero(edge_support).view({-1});
-            if (!edge_idx.defined() || edge_idx.numel() == 0) {
-                continue;
-            }
-
-            torch::Tensor v0_sel = v0.index_select(0, edge_idx).to(torch::kFloat32);
-            torch::Tensor v1_sel = v1.index_select(0, edge_idx).to(torch::kFloat32);
-            torch::Tensor denom = (v0_sel - v1_sel);
-            torch::Tensor alpha_cross =
-                torch::clamp(
-                    torch::where(
-                        torch::abs(denom) > 1.0e-8f,
-                        v0_sel / denom,
-                        torch::full_like(v0_sel, 0.5f)),
-                    0.0f,
-                    1.0f);
-            torch::Tensor alpha = alpha_cross.view({-1, 1});
-
-            torch::Tensor p0 = points8.index({edge_idx, a, Slice()});
-            torch::Tensor p1 = points8.index({edge_idx, b, Slice()});
-            torch::Tensor p = p0 + alpha * (p1 - p0);
-            zero_crossing_points.push_back(p.contiguous());
-            zero_crossing_colors.push_back(
-                colors_all.index_select(0, edge_idx).contiguous());
         }
     }
 
@@ -1761,8 +2039,36 @@ void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
         sdf_params_.sdf_evidence_zero_crossing_refresh_
             ? edge_surface_support
             : surface_or_crossing_support;
+    torch::Tensor view_support_cpu = torch::zeros(
+        {N},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    torch::Tensor octpath_cpu =
+        voxel_model_->octPath().detach().to(torch::kCPU)
+            .to(torch::kInt64).contiguous().view({-1});
+    torch::Tensor octlevel_cpu =
+        voxel_model_->octLevel().detach().to(torch::kCPU)
+            .to(torch::kInt8).contiguous().view({-1});
+    if (octpath_cpu.numel() == N && octlevel_cpu.numel() == N) {
+        auto path_acc = octpath_cpu.accessor<int64_t, 1>();
+        auto level_acc = octlevel_cpu.accessor<int8_t, 1>();
+        auto view_acc = view_support_cpu.accessor<bool, 1>();
+        for (int64_t index = 0; index < N; ++index) {
+            const SdfEvidenceOctreeKey key{
+                path_acc[index],
+                level_acc[index],
+            };
+            const auto observed =
+                sdf_state_.sdf_evidence_observed_keyframes_.find(key);
+            view_acc[index] =
+                observed != sdf_state_.sdf_evidence_observed_keyframes_.end() &&
+                static_cast<int>(observed->second.size()) >=
+                    sdf_params_.sdf_evidence_promote_min_views_;
+        }
+    }
+    torch::Tensor view_support =
+        view_support_cpu.to(device_type_).to(torch::kBool).contiguous();
     torch::Tensor eligible_evidence =
-        (evidence_mask & promotion_support).to(torch::kBool);
+        (evidence_mask & promotion_support & view_support).to(torch::kBool);
     torch::Tensor promote_mask = eligible_evidence.to(torch::kBool).contiguous();
     {
         std::vector<sv::MiniCam> tr_cams;
@@ -1817,35 +2123,30 @@ void VoxelMapper::promoteSdfEvidenceVoxelsFromTsdfField()
     }
     const int64_t promoted = promote_mask.sum().item<int64_t>();
 
-    if (!zero_crossing_points.empty()) {
-        torch::Tensor surface_points =
-            torch::cat(zero_crossing_points, 0).to(device_type_).to(torch::kFloat32).contiguous();
-        torch::Tensor surface_colors =
-            torch::cat(zero_crossing_colors, 0).to(device_type_).to(torch::kFloat32).contiguous();
-        std::vector<sv::MiniCam> tr_cams;
-        tr_cams.reserve(scene_->keyframes().size());
-        for (const auto& kv : scene_->keyframes()) {
-            if (kv.second) {
-                tr_cams.push_back(
-                    kv.second->toMiniCam(kv.second->image_height_, kv.second->image_width_));
-            }
-        }
-        if (surface_points.numel() > 0 && !tr_cams.empty()) {
-            std::unique_lock<std::mutex> lock_render(mutex_render_);
-            voxel_model_->setNextRealInsertionRerunEntityPath("world/sdf_evidence/created");
-            voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
-            voxel_model_->increasePcd(surface_points, surface_colors, getIteration(), tr_cams);
-            voxel_model_->setNextInsertionVoxelState(sv::VoxelRuntimeState::ActiveRenderable);
-            voxel_model_->setNextRealInsertionRerunEntityPath("");
-            if (rerun_params_.run_whole_run_) {
-                rerun_state_.whole_run_live_voxels_dirty_ = true;
-            }
-        }
-    }
-
     if (promoted > 0) {
+        std::vector<SdfEvidenceOctreeKey> promoted_keys;
+        torch::Tensor promote_cpu =
+            promote_mask.detach().to(torch::kCPU).to(torch::kBool)
+                .contiguous().view({-1});
+        auto promote_acc = promote_cpu.accessor<bool, 1>();
+        auto path_acc = octpath_cpu.accessor<int64_t, 1>();
+        auto level_acc = octlevel_cpu.accessor<int8_t, 1>();
+        promoted_keys.reserve(static_cast<size_t>(promoted));
+        for (int64_t index = 0; index < N; ++index) {
+            if (promote_acc[index]) {
+                promoted_keys.push_back({
+                    path_acc[index],
+                    level_acc[index],
+                });
+            }
+        }
+
         std::unique_lock<std::mutex> lock_render(mutex_render_);
         voxel_model_->promoteSdfEvidenceVoxels(promote_mask);
+        lock_render.unlock();
+        for (const SdfEvidenceOctreeKey& key : promoted_keys) {
+            sdf_state_.sdf_evidence_observed_keyframes_.erase(key);
+        }
         if (rerun_params_.run_whole_run_) {
             rerun_state_.whole_run_live_voxels_dirty_ = true;
         }

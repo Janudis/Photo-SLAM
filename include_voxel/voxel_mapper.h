@@ -208,7 +208,7 @@ protected:
     void keyframesToJson(const std::filesystem::path& dir);   
     void writeKeyframeUsedTimes(std::filesystem::path result_dir, std::string name_suffix = "");
     void saveRenderedTsdfMeshPly(const std::filesystem::path& result_path);
-    void saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path);
+    torch::Tensor colorizeRenderedMeshVertices(const torch::Tensor& vertices);
 
     // sdf-based mapping -------------------------------------------------------
     void initializeNvbloxMapper();
@@ -220,9 +220,18 @@ protected:
     float tsdfMetricVoxelSize() const;
     void integrateKeyframeIntoSvrasterSdf(VoxelKeyframe& kf,
                                           const cv::Mat& depth_meters);
-    void integrateKeyframeSdfEvidenceVoxels(
+    torch::Tensor integrateKeyframeSdfEvidenceVoxels(
         const std::shared_ptr<VoxelKeyframe>& kf,
         const cv::Mat& depth_meters);
+    void recordSdfEvidenceViewSupport(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const cv::Mat& depth_meters,
+        const torch::Tensor& residual_hole_mask);
+    void processPendingSdfEvidenceKeyframes(bool force = false);
+    torch::Tensor detectSdfEvidenceResidualHoles(
+        const std::shared_ptr<VoxelKeyframe>& kf,
+        const cv::Mat& depth_meters,
+        torch::Tensor& full_hole_mask);
     void promoteSdfEvidenceVoxelsFromTsdfField();
     void refitSvrasterTsdfFromRegisteredKeyframes(const std::string& reason);
     bool prepareSvrasterTsdfInitContext(const std::shared_ptr<VoxelKeyframe>& kf);
@@ -469,6 +478,7 @@ protected:
     int max_depth_cached_ = 1;
     torch::Tensor depth_cache_points_;
     torch::Tensor depth_cache_colors_;
+    std::vector<std::shared_ptr<VoxelKeyframe>> sdf_evidence_pending_keyframes_;
 
     // Artificial dense-core fill
     bool fill_empty_cells_ = false;

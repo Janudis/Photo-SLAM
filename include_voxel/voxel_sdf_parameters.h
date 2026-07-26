@@ -4,10 +4,35 @@
 #include <opencv2/opencv.hpp>
 
 #include <cstdint>
+#include <array>
 #include <limits>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
+
+struct SdfEvidenceOctreeKey
+{
+    int64_t octpath = 0;
+    int8_t octlevel = 0;
+
+    bool operator==(const SdfEvidenceOctreeKey& other) const noexcept
+    {
+        return octpath == other.octpath && octlevel == other.octlevel;
+    }
+};
+
+struct SdfEvidenceOctreeKeyHash
+{
+    std::size_t operator()(const SdfEvidenceOctreeKey& key) const noexcept
+    {
+        std::size_t seed = std::hash<int64_t>{}(key.octpath);
+        seed ^= std::hash<int>{}(static_cast<int>(key.octlevel)) +
+                0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+        return seed;
+    }
+};
 
 struct VoxelSdfParameters
 {
@@ -29,6 +54,7 @@ struct VoxelSdfParameters
     bool svraster_tsdf_refit_on_topology_change_ = true;
     bool sdf_evidence_densify_ = false;
     bool sdf_evidence_zero_crossing_refresh_ = false;
+    int sdf_evidence_promote_min_views_ = 2;
     bool tsdf_subdivide_near_zero_crossing_ = false;
     float tsdf_subdivide_min_weight_ = 0.5f;
     float tsdf_subdivide_surface_band_vox_ = 2.0f;
@@ -76,4 +102,13 @@ struct VoxelSdfState
     int64_t tsdf_ablation_inactive_geo_pruned_by_sdf_ = 0;
     int64_t tsdf_ablation_rgbd_fill_pruned_by_sdf_ = 0;
     int64_t tsdf_ablation_sdf_prune_passes_ = 0;
+
+    std::unordered_map<
+        SdfEvidenceOctreeKey,
+        std::vector<std::size_t>,
+        SdfEvidenceOctreeKeyHash> sdf_evidence_observed_keyframes_;
+    bool sdf_evidence_layout_valid_ = false;
+    std::array<float, 3> sdf_evidence_scene_center_{{0.0f, 0.0f, 0.0f}};
+    float sdf_evidence_scene_extent_ = 0.0f;
+    int sdf_evidence_base_level_ = 0;
 };

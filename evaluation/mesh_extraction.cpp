@@ -3,29 +3,22 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <limits>
-#include <numeric>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
+#include <ATen/ops/unique_dim.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+
+#include "include_voxel/svrecon_marching_cubes_table.h"
 #include "third_party/tinyply/tinyply.h"
 
 namespace {
-
-constexpr float kDefaultEvalVoxelLength = 5.0f / 512.0f;
-constexpr float kDefaultEvalSdfTrunc = 0.04f;
-constexpr float kEvalDepthTrunc = 30.0f;
-constexpr int kEvalMedianKernel = 21; // Gaussian-SLAM evaluator.py uses 20; OpenCV requires an odd kernel.
-constexpr float kEvalDepthOutlierThreshold = 0.1f;
-const Eigen::Vector3f kEvalCompensation(
-    0.0f / 512.0f,
-    2.5f / 512.0f,
-    -2.5f / 512.0f);
 
 struct TriangleMeshRgb
 {
@@ -33,40 +26,6 @@ struct TriangleMeshRgb
     std::vector<std::array<uint32_t, 3>> faces;
     std::vector<std::array<uint8_t, 3>> colors;
 };
-
-cv::Mat filterDepthOutliersLikeGaussianSlam(const cv::Mat& depth_map)
-{
-    CV_Assert(depth_map.type() == CV_32FC1);
-    if (depth_map.empty()) return depth_map.clone();
-
-    cv::Mat median_filtered = depth_map.clone();
-    const int num_passes = std::max(1, kEvalMedianKernel / 5);
-    for (int pass = 0; pass < num_passes; ++pass)
-    {
-        cv::medianBlur(median_filtered, median_filtered, 5);
-    }
-
-    cv::Mat filtered = depth_map.clone();
-    for (int y = 0; y < depth_map.rows; ++y)
-    {
-        const float* src_ptr = depth_map.ptr<float>(y);
-        const float* med_ptr = median_filtered.ptr<float>(y);
-        float* out_ptr = filtered.ptr<float>(y);
-        for (int x = 0; x < depth_map.cols; ++x)
-        {
-            const float d = src_ptr[x];
-            const float m = med_ptr[x];
-            if (!std::isfinite(d) || d <= 0.0f)
-            {
-                out_ptr[x] = 0.0f;
-                continue;
-            }
-            if (!std::isfinite(m) || m <= 0.0f) continue;
-            if (std::abs(d - m) > kEvalDepthOutlierThreshold) out_ptr[x] = m;
-        }
-    }
-    return filtered;
-}
 
 bool saveTriangleMeshPly(
     const std::filesystem::path& ply_path,
@@ -139,284 +98,246 @@ bool saveTriangleMeshPly(
     return true;
 }
 
-bool depthMatToMetersForMeshExtraction(const cv::Mat& depth_in, cv::Mat& depth_meters)
+std::pair<torch::Tensor, torch::Tensor> marchingCubesVoxels(
+    const torch::Tensor& unit_val,
+    const torch::Tensor& unit_xyz,
+    float iso)
 {
-    if (depth_in.empty()) return false;
-
-    cv::Mat d = depth_in;
-    if (d.channels() > 1) cv::extractChannel(d, d, 0);
-
-    if (d.type() == CV_32FC1)
-    {
-        depth_meters = d;
-        return true;
-    }
-    if (d.type() == CV_16UC1)
-    {
-        double max_val = 0.0;
-        cv::minMaxLoc(d, nullptr, &max_val);
-        const double scale = (max_val > 20000.0) ? (1.0 / 6553.5) : (1.0 / 1000.0);
-        d.convertTo(depth_meters, CV_32FC1, scale);
-        return true;
+    auto mask =
+        (unit_val > iso).any(1) &
+        (unit_val < iso).any(1) &
+        ~torch::isnan(unit_val).any(1);
+    auto filter_idx = torch::nonzero(mask).view({-1}).to(torch::kLong);
+    if (filter_idx.numel() == 0) {
+        return {
+            torch::empty({0, 3}, unit_xyz.options()),
+            torch::empty({0, 3}, unit_val.options().dtype(torch::kLong))};
     }
 
-    d.convertTo(depth_meters, CV_32FC1);
-    return true;
+    auto values = unit_val.index_select(0, filter_idx).contiguous();
+    auto xyz = unit_xyz.index_select(0, filter_idx).contiguous();
+    const auto dev = values.device();
+    const int64_t n_vox = values.size(0);
+
+    static constexpr int64_t kEdgePairs[12][2] = {
+        {0, 1}, {1, 5}, {5, 4}, {4, 0},
+        {2, 3}, {3, 7}, {7, 6}, {6, 2},
+        {0, 2}, {1, 3}, {5, 7}, {4, 6}};
+    auto edges = torch::from_blob(
+                     const_cast<int64_t*>(&kEdgePairs[0][0]),
+                     {12, 2},
+                     torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU))
+                     .clone()
+                     .to(dev);
+    auto edge_a = edges.index({torch::indexing::Slice(), 0});
+    auto edge_b = edges.index({torch::indexing::Slice(), 1});
+    auto value_a = values.index_select(1, edge_a);
+    auto value_b = values.index_select(1, edge_b);
+    auto xyz_a = xyz.index_select(1, edge_a);
+    auto xyz_b = xyz.index_select(1, edge_b);
+    auto denom = value_b - value_a;
+    auto ratio = (iso - value_a) / denom;
+    ratio = torch::where(
+        denom.abs() < 1.0e-9f,
+        torch::full_like(ratio, 0.5f),
+        ratio);
+    auto edge_vertices =
+        (xyz_a + ratio.unsqueeze(2) * (xyz_b - xyz_a)).contiguous();
+
+    static constexpr int64_t kCubeIndexBases[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    auto bases = torch::from_blob(
+                     const_cast<int64_t*>(kCubeIndexBases),
+                     {8},
+                     torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU))
+                     .clone()
+                     .to(dev);
+    auto cube_idx =
+        ((values < iso).to(torch::kLong) * bases.view({1, 8})).sum(1).to(torch::kLong);
+    auto tri_table = torch::from_blob(
+                         const_cast<int64_t*>(&svrecon_mesh::kTriangleTable[0][0]),
+                         {256, 15},
+                         torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU))
+                         .clone()
+                         .to(dev);
+    auto tri_idx = tri_table.index_select(0, cube_idx).contiguous();
+    auto gather_idx = tri_idx.clamp_min(0).unsqueeze(2).expand({n_vox, 15, 3});
+    auto faces_xyz = edge_vertices.gather(1, gather_idx);
+    faces_xyz = faces_xyz.index({tri_idx != -1}).view({-1, 3}).contiguous();
+    if (faces_xyz.numel() == 0) {
+        return {
+            torch::empty({0, 3}, unit_xyz.options()),
+            torch::empty({0, 3}, unit_val.options().dtype(torch::kLong))};
+    }
+
+    auto unique_result = at::unique_dim(
+        faces_xyz,
+        /*dim=*/0,
+        /*sorted=*/true,
+        /*return_inverse=*/true,
+        /*return_counts=*/false);
+    auto vertices = std::get<0>(unique_result).contiguous();
+    auto faces = std::get<1>(unique_result).view({-1, 3}).to(torch::kLong).contiguous();
+    return {vertices, faces};
 }
 
-bool loadReplicaDepthFromRgbPathForMeshExtraction(
-    const std::string& rgb_filename,
-    cv::Mat& depth_meters)
+std::pair<torch::Tensor, torch::Tensor> marchingCubesGrid(
+    const torch::Tensor& grid_pts_val,
+    const torch::Tensor& grid_pts_xyz,
+    const torch::Tensor& vox_key,
+    float iso = 0.0f)
 {
-    if (rgb_filename.empty()) return false;
+    constexpr int64_t kChunkSize = 1000000;
+    std::vector<torch::Tensor> vertices_chunks;
+    std::vector<torch::Tensor> faces_chunks;
+    int64_t vertex_offset = 0;
 
-    const std::filesystem::path rgb_path(rgb_filename);
-    if (!std::filesystem::exists(rgb_path)) return false;
-
-    const std::string name = rgb_path.filename().string();
-    if (name.rfind("frame", 0) != 0) return false;
-
-    const std::filesystem::path parent = rgb_path.parent_path();
-    const std::string stem = rgb_path.stem().string();
-    const std::string suffix_stem = (stem.size() > 5 ? stem.substr(5) : std::string());
-    const std::string suffix_name = name.substr(5);
-
-    std::vector<std::filesystem::path> candidates;
-    candidates.push_back(parent / ("depth" + suffix_name));
-    if (!suffix_stem.empty())
-    {
-        candidates.push_back(parent / ("depth" + suffix_stem + ".png"));
-        candidates.push_back(parent / ("depth" + suffix_stem + ".exr"));
-        candidates.push_back(parent / ("depth" + suffix_stem + ".tiff"));
-        candidates.push_back(parent / ("depth" + suffix_stem + ".tif"));
+    for (int64_t begin = 0; begin < vox_key.size(0); begin += kChunkSize) {
+        const int64_t count = std::min(kChunkSize, vox_key.size(0) - begin);
+        auto key = vox_key.narrow(0, begin, count).to(torch::kLong).contiguous();
+        auto unit_val = grid_pts_val.index({key}).reshape({count, 8}).contiguous();
+        auto unit_xyz = grid_pts_xyz.index({key}).reshape({count, 8, 3}).contiguous();
+        auto [vertices, faces] = marchingCubesVoxels(unit_val, unit_xyz, iso);
+        if (faces.numel() == 0) continue;
+        vertices_chunks.push_back(vertices);
+        faces_chunks.push_back(faces + vertex_offset);
+        vertex_offset += vertices.size(0);
     }
 
-    for (const auto& path : candidates)
-    {
-        if (!std::filesystem::exists(path)) continue;
-        const cv::Mat depth_raw = cv::imread(path.string(), cv::IMREAD_UNCHANGED);
-        if (depth_raw.empty()) continue;
-        return depthMatToMetersForMeshExtraction(depth_raw, depth_meters);
+    if (vertices_chunks.empty()) {
+        return {
+            torch::empty({0, 3}, grid_pts_xyz.options()),
+            torch::empty({0, 3}, vox_key.options().dtype(torch::kLong))};
+    }
+    if (vertices_chunks.size() == 1) {
+        return {vertices_chunks.front(), faces_chunks.front()};
     }
 
-    return false;
+    auto all_vertices = torch::cat(vertices_chunks, 0).contiguous();
+    auto all_faces = torch::cat(faces_chunks, 0).to(torch::kLong).contiguous();
+    auto faces_xyz = all_vertices.index({all_faces}).reshape({-1, 3}).contiguous();
+    auto unique_result = at::unique_dim(
+        faces_xyz,
+        /*dim=*/0,
+        /*sorted=*/true,
+        /*return_inverse=*/true,
+        /*return_counts=*/false);
+    return {
+        std::get<0>(unique_result).contiguous(),
+        std::get<1>(unique_result).view({-1, 3}).to(torch::kLong).contiguous()};
 }
 
-bool loadTumDepthFromRgbPathForMeshExtraction(
-    const std::string& rgb_filename,
-    cv::Mat& depth_meters)
+TriangleMeshRgb meshFromTensors(
+    const torch::Tensor& vertices,
+    const torch::Tensor& faces)
 {
-    if (rgb_filename.empty()) return false;
+    TriangleMeshRgb mesh;
+    auto vertices_cpu = vertices.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto faces_cpu = faces.detach().to(torch::kCPU).to(torch::kLong).contiguous();
+    if (vertices_cpu.numel() == 0 || faces_cpu.numel() == 0) return mesh;
 
-    const std::filesystem::path rgb_path(rgb_filename);
-    if (!std::filesystem::exists(rgb_path)) return false;
-
-    const std::filesystem::path rgb_dir = rgb_path.parent_path();
-    if (rgb_dir.filename() != "rgb") return false;
-
-    const std::filesystem::path dataset_root = rgb_dir.parent_path();
-    const std::filesystem::path depth_dir = dataset_root / "depth";
-    const std::filesystem::path depth_txt = dataset_root / "depth.txt";
-    if (!std::filesystem::exists(depth_dir)) return false;
-
-    const std::string stem = rgb_path.stem().string();
-    const std::filesystem::path exact_depth_path = depth_dir / (stem + rgb_path.extension().string());
-    if (std::filesystem::exists(exact_depth_path))
-    {
-        const cv::Mat depth_raw = cv::imread(exact_depth_path.string(), cv::IMREAD_UNCHANGED);
-        if (!depth_raw.empty()) return depthMatToMetersForMeshExtraction(depth_raw, depth_meters);
+    auto verts = vertices_cpu.accessor<float, 2>();
+    auto tris = faces_cpu.accessor<int64_t, 2>();
+    mesh.vertices.reserve(static_cast<size_t>(vertices_cpu.size(0)));
+    mesh.faces.reserve(static_cast<size_t>(faces_cpu.size(0)));
+    for (int64_t i = 0; i < vertices_cpu.size(0); ++i) {
+        mesh.vertices.emplace_back(verts[i][0], verts[i][1], verts[i][2]);
     }
-
-    double rgb_ts = 0.0;
-    try
-    {
-        rgb_ts = std::stod(stem);
+    for (int64_t i = 0; i < faces_cpu.size(0); ++i) {
+        mesh.faces.push_back({
+            static_cast<uint32_t>(tris[i][0]),
+            static_cast<uint32_t>(tris[i][1]),
+            static_cast<uint32_t>(tris[i][2])});
     }
-    catch (...)
-    {
-        return false;
-    }
-
-    struct TumDepthIndexEntry
-    {
-        double timestamp = 0.0;
-        std::filesystem::path path;
-    };
-
-    static std::mutex s_tum_depth_cache_mutex;
-    static std::unordered_map<std::string, std::vector<TumDepthIndexEntry>> s_tum_depth_cache;
-
-    std::vector<TumDepthIndexEntry> depth_index;
-    {
-        std::lock_guard<std::mutex> lock(s_tum_depth_cache_mutex);
-        auto it = s_tum_depth_cache.find(dataset_root.string());
-        if (it == s_tum_depth_cache.end())
-        {
-            std::vector<TumDepthIndexEntry> parsed;
-            if (std::filesystem::exists(depth_txt))
-            {
-                std::ifstream in(depth_txt);
-                std::string line;
-                while (std::getline(in, line))
-                {
-                    if (line.empty() || line[0] == '#') continue;
-                    std::istringstream iss(line);
-                    double ts = 0.0;
-                    std::string rel_path;
-                    if (!(iss >> ts >> rel_path)) continue;
-                    std::filesystem::path path = dataset_root / rel_path;
-                    if (!std::filesystem::exists(path)) continue;
-                    parsed.push_back({ts, path});
-                }
-            }
-            std::sort(
-                parsed.begin(),
-                parsed.end(),
-                [](const TumDepthIndexEntry& a, const TumDepthIndexEntry& b)
-                {
-                    return a.timestamp < b.timestamp;
-                });
-            it = s_tum_depth_cache.emplace(dataset_root.string(), std::move(parsed)).first;
-        }
-        depth_index = it->second;
-    }
-
-    if (depth_index.empty()) return false;
-
-    auto lb = std::lower_bound(
-        depth_index.begin(),
-        depth_index.end(),
-        rgb_ts,
-        [](const TumDepthIndexEntry& e, double t)
-        {
-            return e.timestamp < t;
-        });
-
-    auto best_it = depth_index.end();
-    double best_dt = std::numeric_limits<double>::infinity();
-    if (lb != depth_index.end())
-    {
-        best_it = lb;
-        best_dt = std::abs(lb->timestamp - rgb_ts);
-    }
-    if (lb != depth_index.begin())
-    {
-        auto prev = std::prev(lb);
-        const double prev_dt = std::abs(prev->timestamp - rgb_ts);
-        if (prev_dt < best_dt)
-        {
-            best_it = prev;
-            best_dt = prev_dt;
-        }
-    }
-
-    constexpr double kTumMaxDepthAssocDeltaSec = 0.05;
-    if (best_it == depth_index.end() || !(best_dt <= kTumMaxDepthAssocDeltaSec)) return false;
-
-    const cv::Mat depth_raw = cv::imread(best_it->path.string(), cv::IMREAD_UNCHANGED);
-    if (depth_raw.empty()) return false;
-    return depthMatToMetersForMeshExtraction(depth_raw, depth_meters);
+    return mesh;
 }
 
-bool getKeyframeDepthMetersForMeshExtraction(
-    const std::shared_ptr<VoxelKeyframe>& pkf,
-    int expected_h,
-    int expected_w,
-    cv::Mat& depth_meters)
+torch::Tensor sampleBilinear(
+    const torch::Tensor& image,
+    const torch::Tensor& normalized_uv)
 {
-    if (!pkf) return false;
-
-    if (!pkf->img_auxiliary_undist_.empty())
-    {
-        if (!depthMatToMetersForMeshExtraction(pkf->img_auxiliary_undist_, depth_meters)) return false;
-    }
-    else
-    {
-        if (!loadReplicaDepthFromRgbPathForMeshExtraction(pkf->img_filename_, depth_meters) &&
-            !loadTumDepthFromRgbPathForMeshExtraction(pkf->img_filename_, depth_meters))
-        {
-            return false;
-        }
-    }
-
-    if (depth_meters.empty()) return false;
-
-    if (depth_meters.rows != expected_h || depth_meters.cols != expected_w)
-    {
-        cv::resize(
-            depth_meters,
-            depth_meters,
-            cv::Size(expected_w, expected_h),
-            0.0,
-            0.0,
-            cv::INTER_NEAREST);
-    }
-
-    return true;
+    const int64_t height = image.size(-2);
+    const int64_t width = image.size(-1);
+    auto options = torch::nn::functional::GridSampleFuncOptions()
+                       .mode(torch::kBilinear)
+                       .padding_mode(torch::kZeros)
+                       .align_corners(false);
+    return torch::nn::functional::grid_sample(
+               image.contiguous().view({1, 1, height, width}),
+               normalized_uv.contiguous().view({1, 1, -1, 2}),
+               options)
+        .flatten();
 }
 
-struct SparseTsdfVolume
+torch::Tensor sampleBilinearChannels(
+    const torch::Tensor& image,
+    const torch::Tensor& normalized_uv)
 {
-    struct Voxel
+    const int64_t height = image.size(-2);
+    const int64_t width = image.size(-1);
+    const int64_t channels = image.numel() / (height * width);
+    auto options = torch::nn::functional::GridSampleFuncOptions()
+                       .mode(torch::kBilinear)
+                       .padding_mode(torch::kZeros)
+                       .align_corners(false);
+    return torch::nn::functional::grid_sample(
+               image.contiguous().view({1, channels, height, width}),
+               normalized_uv.contiguous().view({1, 1, -1, 2}),
+               options)
+        .squeeze(0)
+        .squeeze(1)
+        .transpose(0, 1)
+        .contiguous();
+}
+
+struct RenderedMeshView
+{
+    sv::MiniCam cam;
+    torch::Tensor depth;
+    torch::Tensor alpha;
+};
+
+struct SparseTsdfKey
+{
+    int x = 0;
+    int y = 0;
+    int z = 0;
+
+    bool operator==(const SparseTsdfKey& other) const noexcept
     {
-        float tsdf = 1.0f;
-        uint16_t weight = 0;
-        std::array<uint8_t, 3> color{0, 0, 0};
-    };
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
 
-    struct Key
+struct SparseTsdfKeyHash
+{
+    std::size_t operator()(const SparseTsdfKey& key) const noexcept
     {
-        int x;
-        int y;
-        int z;
+        const std::uint64_t x = static_cast<std::uint32_t>(key.x) * 73856093u;
+        const std::uint64_t y = static_cast<std::uint32_t>(key.y) * 19349663u;
+        const std::uint64_t z = static_cast<std::uint32_t>(key.z) * 83492791u;
+        return static_cast<std::size_t>(x ^ y ^ z);
+    }
+};
 
-        bool operator==(const Key& other) const noexcept
-        {
-            return x == other.x && y == other.y && z == other.z;
-        }
-    };
-
-    struct KeyHash
-    {
-        std::size_t operator()(const Key& key) const noexcept
-        {
-            const std::uint64_t x = static_cast<std::uint32_t>(key.x) * 73856093u;
-            const std::uint64_t y = static_cast<std::uint32_t>(key.y) * 19349663u;
-            const std::uint64_t z = static_cast<std::uint32_t>(key.z) * 83492791u;
-            return static_cast<std::size_t>(x ^ y ^ z);
-        }
-    };
-
-    explicit SparseTsdfVolume(float voxel_length_in, float sdf_trunc_in)
-        : voxel_length(voxel_length_in),
-          sdf_trunc(sdf_trunc_in)
+class SparseRenderedTsdfGrid
+{
+public:
+    SparseRenderedTsdfGrid(float voxel_length, float sdf_trunc)
+        : voxel_length_(voxel_length), sdf_trunc_(sdf_trunc)
     {}
 
-    static Key fromVector(const Eigen::Vector3i& idx)
-    {
-        return Key{idx.x(), idx.y(), idx.z()};
-    }
-
-    static Eigen::Vector3i toVector(const Key& key)
-    {
-        return Eigen::Vector3i(key.x, key.y, key.z);
-    }
-
-    Eigen::Vector3f voxelCenter(const Eigen::Vector3i& idx) const
-    {
-        return (idx.cast<float>().array() + 0.5f).matrix() * voxel_length;
-    }
-
-    void integrate(
-        const cv::Mat& color_rgb,
+    bool allocateFromKeyframe(
         const cv::Mat& depth_map,
         const std::vector<float>& intr,
         const Sophus::SE3f& Tcw,
-        float depth_trunc)
+        float depth_max)
     {
-        CV_Assert(color_rgb.type() == CV_8UC3);
         CV_Assert(depth_map.type() == CV_32FC1);
-        if (intr.size() < 4) throw std::runtime_error("SparseTsdfVolume::integrate: expected fx, fy, cx, cy");
+        if (intr.size() < 4) {
+            throw std::runtime_error(
+                "SparseRenderedTsdfGrid::allocateFromKeyframe: expected fx, fy, cx, cy");
+        }
+        const std::size_t size_before = grid_keys_.size();
 
         const float fx = intr[0];
         const float fy = intr[1];
@@ -425,561 +346,538 @@ struct SparseTsdfVolume
         const Sophus::SE3f Twc = Tcw.inverse();
         const Eigen::Matrix3f Rwc = Twc.rotationMatrix();
         const Eigen::Vector3f twc = Twc.translation();
-        const float step = voxel_length;
 
-        for (int v = 0; v < depth_map.rows; ++v)
-        {
+        for (int v = 0; v < depth_map.rows; ++v) {
             const float ry = (static_cast<float>(v) - cy) / fy;
             const float* depth_ptr = depth_map.ptr<float>(v);
-            const cv::Vec3b* color_ptr = color_rgb.ptr<cv::Vec3b>(v);
-
-            for (int u = 0; u < depth_map.cols; ++u)
-            {
+            for (int u = 0; u < depth_map.cols; ++u) {
                 const float depth = depth_ptr[u];
-                if (!std::isfinite(depth) || depth <= 0.0f || depth > depth_trunc) continue;
+                if (!std::isfinite(depth) || depth <= 0.0f || depth > depth_max) {
+                    continue;
+                }
 
                 const float rx = (static_cast<float>(u) - cx) / fx;
-                const float z_min = std::max(0.0f, depth - sdf_trunc);
-                const float z_max = std::min(depth_trunc, depth + sdf_trunc);
-                const cv::Vec3b rgb = color_ptr[u];
-                Key last_key{
+                const float z_min = std::max(0.0f, depth - sdf_trunc_);
+                const float z_max = std::min(depth_max, depth + sdf_trunc_);
+                SparseTsdfKey last_key{
                     std::numeric_limits<int>::min(),
                     std::numeric_limits<int>::min(),
                     std::numeric_limits<int>::min()};
 
-                for (float zv = z_min; zv <= z_max + 1e-6f; zv += step)
-                {
-                    const Eigen::Vector3f p_cam(rx * zv, ry * zv, zv);
+                for (float z = z_min; z <= z_max + 1.0e-6f; z += voxel_length_) {
+                    const Eigen::Vector3f p_cam(rx * z, ry * z, z);
                     const Eigen::Vector3f p_world = Rwc * p_cam + twc;
                     const Eigen::Vector3i idx =
-                        (p_world / voxel_length).array().floor().cast<int>().matrix();
-                    const Key key = fromVector(idx);
+                        (p_world / voxel_length_).array().floor().cast<int>().matrix();
+                    const SparseTsdfKey key{idx.x(), idx.y(), idx.z()};
                     if (key == last_key) continue;
                     last_key = key;
 
-                    const float sdf = depth - zv;
-                    const float tsdf_sample = std::max(-1.0f, std::min(1.0f, sdf / sdf_trunc));
-                    auto& voxel = voxels[key];
-                    const float weight_old = static_cast<float>(voxel.weight);
-                    const float weight_new = std::min(65535.0f, weight_old + 1.0f);
-                    voxel.tsdf = (voxel.tsdf * weight_old + tsdf_sample) / weight_new;
-                    for (int c = 0; c < 3; ++c)
-                    {
-                        const float fused =
-                            (static_cast<float>(voxel.color[c]) * weight_old +
-                             static_cast<float>(rgb[c])) / weight_new;
-                        voxel.color[c] = static_cast<uint8_t>(
-                            std::lround(std::max(0.0f, std::min(255.0f, fused))));
-                    }
-                    voxel.weight = static_cast<uint16_t>(weight_new);
+                    grid_keys_.insert(key);
                 }
             }
         }
+        return grid_keys_.size() > size_before;
     }
 
-    TriangleMeshRgb extractMesh(float min_weight) const
+    std::pair<torch::Tensor, torch::Tensor> buildGrid(
+        const torch::Device& device) const
     {
-        TriangleMeshRgb mesh;
-        if (voxels.empty()) return mesh;
-        min_weight = std::max(0.0f, min_weight);
+        std::unordered_map<SparseTsdfKey, int64_t, SparseTsdfKeyHash> point_index;
+        point_index.reserve(grid_keys_.size());
+        std::vector<float> xyz;
+        xyz.reserve(grid_keys_.size() * 3);
 
-        const std::array<Eigen::Vector3i, 8> corner_offsets = {
-            Eigen::Vector3i(0, 0, 0), Eigen::Vector3i(1, 0, 0),
-            Eigen::Vector3i(1, 1, 0), Eigen::Vector3i(0, 1, 0),
-            Eigen::Vector3i(0, 0, 1), Eigen::Vector3i(1, 0, 1),
-            Eigen::Vector3i(1, 1, 1), Eigen::Vector3i(0, 1, 1)};
-        const std::array<std::array<int, 4>, 6> tetrahedra = {{
-            {{0, 5, 1, 6}},
-            {{0, 1, 2, 6}},
-            {{0, 2, 3, 6}},
-            {{0, 3, 7, 6}},
-            {{0, 7, 4, 6}},
-            {{0, 4, 5, 6}}
-        }};
-        const std::array<std::array<int, 2>, 6> tetra_edges = {{
-            {{0, 1}}, {{1, 2}}, {{2, 0}}, {{0, 3}}, {{1, 3}}, {{2, 3}}
-        }};
+        for (const auto& key : grid_keys_) {
+            const int64_t index = static_cast<int64_t>(point_index.size());
+            point_index.emplace(key, index);
+            xyz.push_back((static_cast<float>(key.x) + 0.5f) * voxel_length_);
+            xyz.push_back((static_cast<float>(key.y) + 0.5f) * voxel_length_);
+            xyz.push_back((static_cast<float>(key.z) + 0.5f) * voxel_length_);
+        }
 
-        struct CellKey
-        {
-            int x;
-            int y;
-            int z;
-            bool operator==(const CellKey& other) const noexcept
-            {
-                return x == other.x && y == other.y && z == other.z;
-            }
-        };
-        struct CellHash
-        {
-            std::size_t operator()(const CellKey& key) const noexcept
-            {
-                return KeyHash{}(Key{key.x, key.y, key.z});
-            }
-        };
-
-        std::unordered_set<CellKey, CellHash> candidate_cells;
-        candidate_cells.reserve(voxels.size() * 8);
-        for (const auto& kv : voxels)
-        {
-            const Eigen::Vector3i base = toVector(kv.first);
-            for (int dz = -1; dz <= 0; ++dz)
-            {
-                for (int dy = -1; dy <= 0; ++dy)
-                {
-                    for (int dx = -1; dx <= 0; ++dx)
-                    {
-                        const Eigen::Vector3i cell = base + Eigen::Vector3i(dx, dy, dz);
-                        candidate_cells.insert(CellKey{cell.x(), cell.y(), cell.z()});
+        static constexpr int kCornerOffsets[8][3] = {
+            {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0},
+            {0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}};
+        std::unordered_set<SparseTsdfKey, SparseTsdfKeyHash> candidate_cells;
+        candidate_cells.reserve(point_index.size() * 8);
+        for (const auto& [key, index] : point_index) {
+            (void)index;
+            for (int dz = -1; dz <= 0; ++dz) {
+                for (int dy = -1; dy <= 0; ++dy) {
+                    for (int dx = -1; dx <= 0; ++dx) {
+                        candidate_cells.insert({key.x + dx, key.y + dy, key.z + dz});
                     }
                 }
             }
         }
 
-        struct InterpVertex
-        {
-            Eigen::Vector3f pos;
-            Eigen::Vector3f color;
-        };
-
-        auto append_triangle = [&](const InterpVertex& a, const InterpVertex& b, const InterpVertex& c)
-        {
-            const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-            mesh.vertices.push_back(a.pos);
-            mesh.vertices.push_back(b.pos);
-            mesh.vertices.push_back(c.pos);
-            auto clamp_color = [](const Eigen::Vector3f& col)
-            {
-                return std::array<uint8_t, 3>{
-                    static_cast<uint8_t>(std::lround(std::max(0.0f, std::min(255.0f, col.x())))),
-                    static_cast<uint8_t>(std::lround(std::max(0.0f, std::min(255.0f, col.y())))),
-                    static_cast<uint8_t>(std::lround(std::max(0.0f, std::min(255.0f, col.z()))))};
-            };
-            mesh.colors.push_back(clamp_color(a.color));
-            mesh.colors.push_back(clamp_color(b.color));
-            mesh.colors.push_back(clamp_color(c.color));
-            mesh.faces.push_back({base, base + 1, base + 2});
-        };
-
-        for (const auto& cell_key : candidate_cells)
-        {
-            const Eigen::Vector3i cell(cell_key.x, cell_key.y, cell_key.z);
-            std::array<float, 8> corner_tsdf{};
-            std::array<uint16_t, 8> corner_weight{};
-            std::array<Eigen::Vector3f, 8> corner_pos{};
-            std::array<Eigen::Vector3f, 8> corner_color{};
-            bool any_weight = false;
-
-            for (int i = 0; i < 8; ++i)
-            {
-                const Key key = fromVector(cell + corner_offsets[i]);
-                const auto it = voxels.find(key);
-                if (it == voxels.end())
-                {
-                    corner_weight[i] = 0;
-                    continue;
+        std::vector<int64_t> voxel_keys;
+        voxel_keys.reserve(candidate_cells.size() * 8);
+        for (const auto& cell : candidate_cells) {
+            std::array<int64_t, 8> corners{};
+            bool complete = true;
+            for (int i = 0; i < 8; ++i) {
+                const SparseTsdfKey key{
+                    cell.x + kCornerOffsets[i][0],
+                    cell.y + kCornerOffsets[i][1],
+                    cell.z + kCornerOffsets[i][2]};
+                const auto it = point_index.find(key);
+                if (it == point_index.end()) {
+                    complete = false;
+                    break;
                 }
-                corner_tsdf[i] = it->second.tsdf;
-                corner_weight[i] = it->second.weight;
-                corner_pos[i] = voxelCenter(cell + corner_offsets[i]);
-                corner_color[i] = Eigen::Vector3f(
-                    static_cast<float>(it->second.color[0]),
-                    static_cast<float>(it->second.color[1]),
-                    static_cast<float>(it->second.color[2]));
-                any_weight = any_weight || (static_cast<float>(corner_weight[i]) >= min_weight);
+                corners[i] = it->second;
             }
-            if (!any_weight) continue;
-
-            for (const auto& tet : tetrahedra)
-            {
-                bool tet_valid = true;
-                for (int local_idx = 0; local_idx < 4; ++local_idx)
-                {
-                    if (static_cast<float>(corner_weight[tet[local_idx]]) < min_weight)
-                    {
-                        tet_valid = false;
-                        break;
-                    }
-                }
-                if (!tet_valid) continue;
-
-                std::vector<InterpVertex> poly_vertices;
-                poly_vertices.reserve(4);
-                for (const auto& edge : tetra_edges)
-                {
-                    const int a = tet[edge[0]];
-                    const int b = tet[edge[1]];
-                    const bool a_inside = corner_tsdf[a] < 0.0f;
-                    const bool b_inside = corner_tsdf[b] < 0.0f;
-                    if (a_inside == b_inside) continue;
-
-                    const float denom = corner_tsdf[a] - corner_tsdf[b];
-                    float t = 0.5f;
-                    if (std::abs(denom) > 1e-8f) t = corner_tsdf[a] / denom;
-                    t = std::max(0.0f, std::min(1.0f, t));
-                    poly_vertices.push_back({
-                        corner_pos[a] + t * (corner_pos[b] - corner_pos[a]),
-                        corner_color[a] + t * (corner_color[b] - corner_color[a])});
-                }
-
-                if (poly_vertices.size() < 3) continue;
-                if (poly_vertices.size() == 3)
-                {
-                    append_triangle(poly_vertices[0], poly_vertices[1], poly_vertices[2]);
-                    continue;
-                }
-
-                Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-                for (const auto& vtx : poly_vertices) centroid += vtx.pos;
-                centroid /= static_cast<float>(poly_vertices.size());
-
-                Eigen::Vector3f normal = (poly_vertices[1].pos - poly_vertices[0].pos)
-                                       .cross(poly_vertices[2].pos - poly_vertices[0].pos);
-                if (normal.norm() < 1e-8f && poly_vertices.size() >= 4)
-                {
-                    normal = (poly_vertices[2].pos - poly_vertices[0].pos)
-                           .cross(poly_vertices[3].pos - poly_vertices[0].pos);
-                }
-                if (normal.norm() < 1e-8f) continue;
-                normal.normalize();
-
-                Eigen::Vector3f axis_u = poly_vertices[0].pos - centroid;
-                if (axis_u.norm() < 1e-8f) axis_u = poly_vertices[1].pos - centroid;
-                if (axis_u.norm() < 1e-8f) continue;
-                axis_u.normalize();
-                Eigen::Vector3f axis_v = normal.cross(axis_u);
-                if (axis_v.norm() < 1e-8f) continue;
-                axis_v.normalize();
-
-                std::vector<int> order(poly_vertices.size());
-                std::iota(order.begin(), order.end(), 0);
-                std::sort(
-                    order.begin(),
-                    order.end(),
-                    [&](int lhs, int rhs)
-                    {
-                        const Eigen::Vector3f dl = poly_vertices[lhs].pos - centroid;
-                        const Eigen::Vector3f dr = poly_vertices[rhs].pos - centroid;
-                        const float al = std::atan2(dl.dot(axis_v), dl.dot(axis_u));
-                        const float ar = std::atan2(dr.dot(axis_v), dr.dot(axis_u));
-                        return al < ar;
-                    });
-
-                append_triangle(poly_vertices[order[0]], poly_vertices[order[1]], poly_vertices[order[2]]);
-                if (poly_vertices.size() == 4)
-                {
-                    append_triangle(poly_vertices[order[0]], poly_vertices[order[2]], poly_vertices[order[3]]);
-                }
-            }
+            if (!complete) continue;
+            voxel_keys.insert(voxel_keys.end(), corners.begin(), corners.end());
         }
 
-        return mesh;
+        auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+        auto cpu_long = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+        if (xyz.empty() || voxel_keys.empty()) {
+            return {
+                torch::empty({0, 3}, cpu_float).to(device),
+                torch::empty({0, 8}, cpu_long).to(device)};
+        }
+        auto xyz_tensor = torch::from_blob(
+                              xyz.data(),
+                              {static_cast<int64_t>(xyz.size() / 3), 3},
+                              cpu_float)
+                              .clone()
+                              .to(device);
+        auto key_tensor = torch::from_blob(
+                              voxel_keys.data(),
+                              {static_cast<int64_t>(voxel_keys.size() / 8), 8},
+                              cpu_long)
+                              .clone()
+                              .to(device);
+        return {xyz_tensor.contiguous(), key_tensor.contiguous()};
     }
 
-    float voxel_length;
-    float sdf_trunc;
-    std::unordered_map<Key, Voxel, KeyHash> voxels;
+private:
+    float voxel_length_ = 0.05f;
+    float sdf_trunc_ = 0.4f;
+    std::unordered_set<SparseTsdfKey, SparseTsdfKeyHash> grid_keys_;
 };
+
+torch::Tensor projectNormalized(
+    const torch::Tensor& points,
+    const sv::MiniCam& cam)
+{
+    auto w2c = cam.w2c.to(points.device()).to(torch::kFloat32).contiguous();
+    auto cam_xyz =
+        torch::matmul(
+            points,
+            w2c.index({torch::indexing::Slice(0, 3),
+                       torch::indexing::Slice(0, 3)}).transpose(0, 1)) +
+        w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
+    auto z = cam_xyz.index({torch::indexing::Slice(), 2});
+    return torch::stack({
+        cam_xyz.index({torch::indexing::Slice(), 0}) /
+                z / std::max(1.0e-8f, cam.tanfovx) +
+            (2.0f * cam.cx / static_cast<float>(cam.width) - 1.0f),
+        cam_xyz.index({torch::indexing::Slice(), 1}) /
+                z / std::max(1.0e-8f, cam.tanfovy) +
+            (2.0f * cam.cy / static_cast<float>(cam.height) - 1.0f)},
+        1).contiguous();
+}
+
+struct FusedRenderedTsdf
+{
+    torch::Tensor tsdf;
+    torch::Tensor keyframe_support;
+};
+
+FusedRenderedTsdf fuseRenderedTsdfWithSupport(
+    const torch::Tensor& grid_xyz,
+    const std::vector<RenderedMeshView>& views,
+    float trunc_dist,
+    float crop_border,
+    float alpha_thres,
+    bool use_unit_keyframe_weight)
+{
+    constexpr int64_t kPointChunk = 500000;
+    std::vector<torch::Tensor> tsdf_chunks;
+    std::vector<torch::Tensor> support_chunks;
+    tsdf_chunks.reserve(
+        static_cast<size_t>((grid_xyz.size(0) + kPointChunk - 1) / kPointChunk));
+    support_chunks.reserve(tsdf_chunks.capacity());
+
+    for (int64_t begin = 0; begin < grid_xyz.size(0); begin += kPointChunk) {
+        const int64_t count = std::min(kPointChunk, grid_xyz.size(0) - begin);
+        auto xyz = grid_xyz.narrow(0, begin, count).contiguous();
+        auto weight = torch::zeros({count}, xyz.options().dtype(torch::kFloat32));
+        auto keyframe_support = torch::zeros_like(weight);
+        auto weighted_tsdf = torch::zeros_like(weight);
+
+        for (const auto& view : views) {
+            auto uv = projectNormalized(xyz, view.cam);
+            auto camera_position =
+                view.cam.position.to(xyz.device()).to(torch::kFloat32).view({1, 3});
+            auto camera_lookat =
+                view.cam.lookat.to(xyz.device()).to(torch::kFloat32).view({3, 1});
+            auto xyz_depth =
+                torch::matmul(xyz - camera_position, camera_lookat).flatten();
+            auto projected =
+                (uv.abs() <= (1.0f - crop_border)).all(1) & (xyz_depth > 0.0f);
+            auto valid_idx = torch::nonzero(projected).view({-1}).to(torch::kLong);
+            if (valid_idx.numel() == 0) continue;
+
+            auto valid_uv = uv.index_select(0, valid_idx);
+            auto sampled_depth = sampleBilinear(view.depth, valid_uv);
+            auto valid_depth = xyz_depth.index_select(0, valid_idx);
+            auto depth_idx = torch::nonzero(
+                                 torch::isfinite(sampled_depth) & (sampled_depth > 0.0f))
+                                 .view({-1})
+                                 .to(torch::kLong);
+            if (depth_idx.numel() == 0) continue;
+            valid_idx = valid_idx.index_select(0, depth_idx);
+            valid_uv = valid_uv.index_select(0, depth_idx);
+            sampled_depth = sampled_depth.index_select(0, depth_idx);
+            valid_depth = valid_depth.index_select(0, depth_idx);
+            auto valid_sdf = (sampled_depth - valid_depth) / trunc_dist;
+
+            auto trunc_idx = torch::nonzero(valid_sdf >= -1.0f)
+                                 .view({-1})
+                                 .to(torch::kLong);
+            if (trunc_idx.numel() == 0) continue;
+            valid_idx = valid_idx.index_select(0, trunc_idx);
+            valid_uv = valid_uv.index_select(0, trunc_idx);
+            valid_sdf = valid_sdf.index_select(0, trunc_idx).clamp(-1.0f, 1.0f);
+
+            auto valid_alpha = sampleBilinear(view.alpha, valid_uv);
+            auto alpha_idx = torch::nonzero(valid_alpha >= alpha_thres)
+                                 .view({-1})
+                                 .to(torch::kLong);
+            if (alpha_idx.numel() == 0) continue;
+            valid_idx = valid_idx.index_select(0, alpha_idx);
+            valid_sdf = valid_sdf.index_select(0, alpha_idx);
+            auto integration_weight = use_unit_keyframe_weight
+                ? torch::ones_like(valid_sdf)
+                : valid_alpha.index_select(0, alpha_idx);
+
+            weight.index_add_(0, valid_idx, integration_weight);
+            keyframe_support.index_add_(0, valid_idx, torch::ones_like(valid_sdf));
+            weighted_tsdf.index_add_(
+                0, valid_idx, integration_weight * valid_sdf);
+        }
+        auto nan = torch::full_like(weight, std::numeric_limits<float>::quiet_NaN());
+        tsdf_chunks.push_back(torch::where(weight > 0.0f, weighted_tsdf / weight, nan));
+        support_chunks.push_back(keyframe_support.contiguous());
+    }
+    return {
+        torch::cat(tsdf_chunks, 0).contiguous(),
+        torch::cat(support_chunks, 0).contiguous()};
+}
+
+void setMeshColors(TriangleMeshRgb& mesh, const torch::Tensor& colors)
+{
+    auto colors_cpu =
+        (colors.detach().to(torch::kCPU).to(torch::kFloat32).clamp(0.0f, 1.0f) * 255.0f)
+            .round()
+            .to(torch::kUInt8)
+            .contiguous();
+    if (colors_cpu.dim() != 2 || colors_cpu.size(0) != static_cast<int64_t>(mesh.vertices.size()) ||
+        colors_cpu.size(1) != 3) {
+        return;
+    }
+    auto acc = colors_cpu.accessor<uint8_t, 2>();
+    mesh.colors.reserve(mesh.vertices.size());
+    for (int64_t i = 0; i < colors_cpu.size(0); ++i) {
+        mesh.colors.push_back({acc[i][0], acc[i][1], acc[i][2]});
+    }
+}
 
 } // namespace
 
-void VoxelMapper::saveRenderedTsdfMeshPly(const std::filesystem::path& result_path)
+torch::Tensor VoxelMapper::colorizeRenderedMeshVertices(
+    const torch::Tensor& vertices)
 {
-    saveRenderedTsdfMeshPlySparseCpp(result_path);
+    auto points = vertices.detach().to(torch::kFloat32).contiguous();
+    auto closest_color = torch::full(
+        {points.size(0), 3}, 0.5f, points.options());
+    auto closest_dist = torch::full(
+        {points.size(0)}, std::numeric_limits<float>::infinity(), points.options());
+
+    const auto keyframes = scene_->getAllKeyframes();
+    for (const auto& [kf_id, pkf] : keyframes) {
+        if (!pkf || !pkf->set_pose_) continue;
+        const int height = std::max(1, pkf->image_height_);
+        const int width = std::max(1, pkf->image_width_);
+        const auto cam = pkf->toMiniCam(height, width);
+
+        sv::RenderOpts render_opts;
+        render_opts.output_depth = true;
+        render_opts.output_T = true;
+        auto render_pkg = voxel_model_->render(
+            cam, height, width, torch::Tensor(), "sh0", false, std::nullopt,
+            true, false, true, false, false, render_opts);
+        auto color_it = render_pkg.find("color");
+        auto depth_it = render_pkg.find("raw_depth");
+        auto transmittance_it = render_pkg.find("raw_T");
+        if (color_it == render_pkg.end() || depth_it == render_pkg.end() ||
+            transmittance_it == render_pkg.end()) {
+            continue;
+        }
+
+        auto raw_depth = depth_it->second.detach().to(points.device()).to(torch::kFloat32);
+        if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) raw_depth = raw_depth.squeeze(0);
+        if (raw_depth.dim() != 3 || raw_depth.size(0) < 3) continue;
+        const int64_t depth_channel = 2;
+        auto frame_depth = raw_depth.index({depth_channel}).contiguous();
+        auto frame_alpha =
+            (1.0f - transmittance_it->second.detach()
+                        .to(points.device()).to(torch::kFloat32)).contiguous();
+        auto frame_color =
+            color_it->second.detach().to(points.device()).to(torch::kFloat32).contiguous();
+
+        auto uv = projectNormalized(points, cam);
+        auto camera_position =
+            cam.position.to(points.device()).to(torch::kFloat32).view({1, 3});
+        auto camera_lookat =
+            cam.lookat.to(points.device()).to(torch::kFloat32).view({3, 1});
+        auto all_point_depth =
+            torch::matmul(points - camera_position, camera_lookat).flatten();
+        auto valid_idx = torch::nonzero(
+                             (uv.abs() <= 1.0f).all(1) & (all_point_depth > 0.0f))
+                             .view({-1}).to(torch::kLong);
+        if (valid_idx.numel() == 0) continue;
+        auto valid_uv = uv.index_select(0, valid_idx);
+        auto sampled_alpha = sampleBilinear(frame_alpha, valid_uv);
+        auto alpha_idx = torch::nonzero(
+                             sampled_alpha >=
+                                 rerun_params_.rendered_mesh_eval_alpha_thres_)
+                             .view({-1}).to(torch::kLong);
+        if (alpha_idx.numel() == 0) continue;
+        valid_idx = valid_idx.index_select(0, alpha_idx);
+        valid_uv = valid_uv.index_select(0, alpha_idx);
+
+        auto sampled_depth = sampleBilinear(frame_depth, valid_uv);
+        auto point_depth = all_point_depth.index_select(0, valid_idx);
+        auto point_dist = (sampled_depth - point_depth).abs();
+        auto better = point_dist < closest_dist.index_select(0, valid_idx);
+        auto better_idx = torch::nonzero(better).view({-1}).to(torch::kLong);
+        if (better_idx.numel() == 0) continue;
+        valid_idx = valid_idx.index_select(0, better_idx);
+        valid_uv = valid_uv.index_select(0, better_idx);
+        point_dist = point_dist.index_select(0, better_idx);
+        auto point_color = sampleBilinearChannels(frame_color, valid_uv);
+        closest_dist.index_put_({valid_idx}, point_dist);
+        closest_color.index_put_({valid_idx}, point_color);
+    }
+    return closest_color.contiguous();
 }
 
-void VoxelMapper::saveRenderedTsdfMeshPlySparseCpp(const std::filesystem::path& result_path)
+void VoxelMapper::saveRenderedTsdfMeshPly(
+    const std::filesystem::path& result_path)
 {
     namespace fs = std::filesystem;
     torch::NoGradGuard no_grad;
-
-    const auto& keyframes = scene_->keyframes();
-    if (keyframes.empty())
-    {
-        std::cout << "[saveRenderedTsdfMeshPly] skipped: no keyframes available.\n";
+    if (!voxel_model_ || !scene_) {
+        std::cout << "[mesh/rendered-TSDF-fixed] skipped: mapper is not initialized.\n";
         return;
     }
-    if (!result_path.parent_path().empty())
-    {
+
+    const auto& keyframes = scene_->keyframes();
+    if (keyframes.empty()) {
+        std::cout << "[mesh/rendered-TSDF-fixed] skipped: no keyframes available.\n";
+        return;
+    }
+    if (!result_path.parent_path().empty()) {
         fs::create_directories(result_path.parent_path());
     }
 
-    auto centers_cpu = voxel_model_->voxCenter().detach().to(torch::kCPU).contiguous();
-    if (!centers_cpu.defined() || centers_cpu.numel() == 0)
-    {
-        std::cout << "[saveRenderedTsdfMeshPly] skipped: no voxels available.\n";
-        return;
-    }
-
-    auto min_res = centers_cpu.min(0, false);
-    auto max_res = centers_cpu.max(0, false);
-    auto centers_min = std::get<0>(min_res);
-    auto centers_max = std::get<0>(max_res);
-    Eigen::Vector3f bb_min(
-        centers_min.index({0}).item<float>(),
-        centers_min.index({1}).item<float>(),
-        centers_min.index({2}).item<float>());
-    Eigen::Vector3f bb_max(
-        centers_max.index({0}).item<float>(),
-        centers_max.index({1}).item<float>(),
-        centers_max.index({2}).item<float>());
-
-    for (const auto& [_, pkf] : keyframes)
-    {
-        if (!pkf) continue;
-        const Sophus::SE3f Twc = pkf->getPosef().inverse();
-        bb_min = bb_min.cwiseMin(Twc.translation());
-        bb_max = bb_max.cwiseMax(Twc.translation());
-    }
-
     const float voxel_length =
-        std::max(1.0e-6f, std::isfinite(rerun_params_.rendered_mesh_eval_voxel_size_m_)
-                              ? rerun_params_.rendered_mesh_eval_voxel_size_m_
-                              : kDefaultEvalVoxelLength);
-    const float min_weight =
-        std::max(0.0f, std::isfinite(rerun_params_.rendered_mesh_eval_min_weight_)
-                          ? rerun_params_.rendered_mesh_eval_min_weight_
-                          : 1.0e-4f);
-    const Eigen::Vector3f margin = Eigen::Vector3f::Constant(3.0f * kDefaultEvalSdfTrunc);
-    bb_min -= margin;
-    bb_max += margin;
-    const Eigen::Vector3f extent = bb_max - bb_min;
-    SparseTsdfVolume volume(voxel_length, kDefaultEvalSdfTrunc);
+        std::max(1.0e-6f, rerun_params_.rendered_mesh_eval_voxel_size_m_);
+    const float min_keyframe_weight =
+        std::max(0.0f, rerun_params_.rendered_mesh_eval_min_weight_);
+    const float sdf_trunc = std::max(
+        voxel_length,
+        rerun_params_.rendered_mesh_eval_trunc_vox_ * voxel_length);
+    const float depth_max =
+        std::max(1.0e-6f, rerun_params_.rendered_mesh_eval_depth_max_m_);
+    SparseRenderedTsdfGrid support_grid(voxel_length, sdf_trunc);
 
-    std::cout << "[saveRenderedTsdfMeshPly] begin kfs=" << keyframes.size()
-              << " backend=cpp_sparse_tsdf"
-              << " voxel_length=" << std::fixed << std::setprecision(8) << voxel_length
-              << " min_weight=" << min_weight
-              << " sdf_trunc=" << kDefaultEvalSdfTrunc
-              << " depth_trunc=" << kEvalDepthTrunc
-              << " bounds_min=(" << bb_min.x() << "," << bb_min.y() << "," << bb_min.z() << ")"
-              << " bounds_max=(" << bb_max.x() << "," << bb_max.y() << "," << bb_max.z() << ")"
-              << " extent=(" << extent.x() << "," << extent.y() << "," << extent.z() << ")"
-              << std::endl;
-
+    std::unique_lock<std::mutex> render_lock(mutex_render_);
     bool froze_geo = false;
-    try
-    {
-        c10::cuda::CUDACachingAllocator::emptyCache();
+    auto unfreeze_geo = [&]() {
+        if (froze_geo) {
+            voxel_model_->unfreezeVoxGeo();
+            froze_geo = false;
+        }
+    };
 
+    try {
+        c10::cuda::CUDACachingAllocator::emptyCache();
         voxel_model_->freezeVoxGeo();
         froze_geo = true;
 
-        std::size_t frame_idx = 0;
-        for (const auto& [kfid, pkf] : keyframes)
-        {
-            if (!pkf) continue;
-            if (pkf->image_width_ <= 0 || pkf->image_height_ <= 0 || pkf->intr_.size() < 4) continue;
-            const int image_height = pkf->image_height_;
-            const int image_width = pkf->image_width_;
+        std::vector<RenderedMeshView> views;
+        views.reserve(keyframes.size());
+        for (const auto& [kfid, pkf] : keyframes) {
+            if (!pkf || !pkf->set_pose_ || pkf->intr_.size() < 4 ||
+                pkf->image_height_ <= 0 || pkf->image_width_ <= 0) {
+                continue;
+            }
+            const int height = pkf->image_height_;
+            const int width = pkf->image_width_;
+            const auto cam = pkf->toMiniCam(height, width);
 
-            const sv::MiniCam cam = pkf->toMiniCam(pkf->image_height_, pkf->image_width_);
-            std::unordered_map<std::string, torch::Tensor> render_pkg =
-                voxel_model_->render(
-                    cam,
-                    image_height,
-                    image_width,
-                    torch::Tensor(),
-                    nullptr,
-                    false,
-                    1.0f,
-                    true,
-                    false,
-                    false,
-                    false,
-                    false,
-                    sv::RenderOpts{});
-            if (render_pkg.empty())
-            {
-                std::cout << "[saveRenderedTsdfMeshPly] render failed for kf=" << kfid
-                          << ", skipping frame.\n";
+            sv::RenderOpts render_opts;
+            render_opts.output_depth = true;
+            render_opts.output_T = true;
+            auto render_pkg = voxel_model_->render(
+                cam,
+                height,
+                width,
+                torch::Tensor(),
+                nullptr,
+                false,
+                std::nullopt,
+                true,
+                false,
+                true,
+                false,
+                false,
+                render_opts);
+
+            auto depth_it = render_pkg.find("raw_depth");
+            auto transmittance_it = render_pkg.find("raw_T");
+            if (depth_it == render_pkg.end() || transmittance_it == render_pkg.end() ||
+                !depth_it->second.defined() || !transmittance_it->second.defined()) {
+                std::cout << "[mesh/rendered-TSDF-fixed] missing depth/transmittance for kf="
+                          << kfid << ", skipping.\n";
                 continue;
             }
 
-            auto normalize_color_chw = [&](torch::Tensor t)
-            {
-                t = t.detach().contiguous();
-                if (t.dim() == 4 && t.size(0) == 1) t = t.squeeze(0);
-                if (t.dim() != 3)
-                {
-                    throw std::runtime_error("saveRenderedTsdfMeshPlySparseCpp: unexpected color tensor rank");
-                }
-                if (t.size(0) == 3 && t.size(1) == image_height && t.size(2) == image_width)
-                {
-                    return t.to(torch::kFloat32).contiguous();
-                }
-                if (t.size(0) == 3 && t.size(1) == image_width && t.size(2) == image_height)
-                {
-                    return t.transpose(1, 2).to(torch::kFloat32).contiguous();
-                }
-                if (t.size(0) == image_height && t.size(1) == image_width && t.size(2) == 3)
-                {
-                    return t.permute({2, 0, 1}).to(torch::kFloat32).contiguous();
-                }
-                if (t.size(0) == image_width && t.size(1) == image_height && t.size(2) == 3)
-                {
-                    return t.permute({2, 1, 0}).to(torch::kFloat32).contiguous();
-                }
-                std::ostringstream oss;
-                oss << "saveRenderedTsdfMeshPlySparseCpp: unsupported color shape " << t.sizes();
-                throw std::runtime_error(oss.str());
-            };
-            auto normalize_hw = [&](torch::Tensor t, const char* name)
-            {
-                t = t.detach().to(torch::kFloat32).contiguous();
-                if (t.dim() == 3 && t.size(0) == 1) t = t.squeeze(0);
-                if (t.dim() != 2)
-                {
-                    std::ostringstream oss;
-                    oss << "saveRenderedTsdfMeshPlySparseCpp: unexpected " << name << " tensor rank";
-                    throw std::runtime_error(oss.str());
-                }
-                if (t.size(0) == image_height && t.size(1) == image_width)
-                {
-                    return t.contiguous();
-                }
-                if (t.size(0) == image_width && t.size(1) == image_height)
-                {
-                    return t.transpose(0, 1).contiguous();
-                }
-                std::ostringstream oss;
-                oss << "saveRenderedTsdfMeshPlySparseCpp: unsupported " << name << " shape " << t.sizes();
-                throw std::runtime_error(oss.str());
-            };
-
-            auto it_color = render_pkg.find("color");
-            auto it_depth = render_pkg.find("depth");
-            if (it_color == render_pkg.end() || it_depth == render_pkg.end() ||
-                !it_color->second.defined() || !it_depth->second.defined())
-            {
-                std::cout << "[saveRenderedTsdfMeshPly] incomplete render package for kf="
-                          << kfid << ", skipping frame.\n";
+            auto raw_depth = depth_it->second.detach().to(torch::kFloat32).contiguous();
+            if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) {
+                raw_depth = raw_depth.squeeze(0);
+            }
+            if (raw_depth.dim() != 3 || raw_depth.size(0) < 3) {
+                std::cout << "[mesh/rendered-TSDF-fixed] expected three rendered-depth channels for kf="
+                          << kfid << ", got " << raw_depth.sizes() << ", skipping.\n";
                 continue;
             }
 
-            torch::Tensor rendered_color = normalize_color_chw(it_color->second);
-            torch::Tensor depth_pkg = it_depth->second.detach().contiguous();
-            torch::Tensor rendered_depth;
-            if (depth_pkg.dim() == 3 && depth_pkg.size(0) >= 3)
-            {
-                rendered_depth = normalize_hw(depth_pkg.index({2}), "depth[2]");
+            const int64_t depth_channel = 2;
+            auto rendered_depth = raw_depth.index({depth_channel}).contiguous();
+            auto rendered_transmittance =
+                transmittance_it->second.detach().to(torch::kFloat32).contiguous();
+            if (rendered_transmittance.dim() == 3 &&
+                rendered_transmittance.size(0) == 1) {
+                rendered_transmittance = rendered_transmittance.squeeze(0);
             }
-            else
-            {
-                rendered_depth = normalize_hw(depth_pkg, "depth");
+            if (rendered_transmittance.dim() != 2 ||
+                rendered_transmittance.size(0) != height ||
+                rendered_transmittance.size(1) != width) {
+                throw std::runtime_error(
+                    "saveRenderedTsdfMeshPly: invalid transmittance shape");
             }
+            auto rendered_alpha =
+                (1.0f - rendered_transmittance).clamp(0.0f, 1.0f);
+            const auto valid_surface =
+                torch::isfinite(rendered_depth) &
+                torch::isfinite(rendered_alpha) &
+                (rendered_depth > 0.0f) &
+                (rendered_alpha >=
+                 rerun_params_.rendered_mesh_eval_alpha_thres_);
+            rendered_depth = torch::where(
+                valid_surface,
+                rendered_depth,
+                torch::zeros_like(rendered_depth));
 
             const auto mask_it = undistort_mask_.find(pkf->camera_id_);
-            if (mask_it != undistort_mask_.end())
-            {
-                auto mask = mask_it->second;
+            if (mask_it != undistort_mask_.end()) {
+                auto mask = mask_it->second.to(rendered_depth.device());
                 if (mask.dim() == 3) mask = mask.index({0});
-                mask = normalize_hw(mask.to(rendered_depth.device()), "undistort_mask");
-                rendered_color = rendered_color * mask.unsqueeze(0);
-                rendered_depth = rendered_depth * mask;
-            }
-
-            auto color_cpu = rendered_color.clamp(0, 1)
-                .mul(255.0f)
-                .to(torch::kUInt8)
-                .permute({1, 2, 0})
-                .contiguous()
-                .to(torch::kCPU);
-            auto depth_cpu = rendered_depth
-                .to(torch::kFloat32)
-                .contiguous()
-                .to(torch::kCPU);
-
-            cv::Mat color_mat(
-                image_height, image_width, CV_8UC3, color_cpu.data_ptr<uint8_t>());
-            cv::Mat depth_mat(
-                image_height, image_width, CV_32FC1, depth_cpu.data_ptr<float>());
-
-            cv::Mat depth_for_fusion = depth_mat.clone();
-            cv::Mat gt_depth_meters;
-            if (getKeyframeDepthMetersForMeshExtraction(pkf, image_height, image_width, gt_depth_meters))
-            {
-                for (int y = 0; y < image_height; ++y)
-                {
-                    const float* gt_ptr = gt_depth_meters.ptr<float>(y);
-                    float* depth_ptr = depth_for_fusion.ptr<float>(y);
-                    for (int x = 0; x < image_width; ++x)
-                    {
-                        const float gt_depth = gt_ptr[x];
-                        if (!std::isfinite(gt_depth) || gt_depth <= 0.0f)
-                        {
-                            depth_ptr[x] = 0.0f;
-                        }
-                    }
+                if (mask.dim() == 2 &&
+                    mask.size(0) == width && mask.size(1) == height) {
+                    mask = mask.transpose(0, 1);
                 }
+                if (mask.dim() != 2 || mask.size(0) != height || mask.size(1) != width) {
+                    throw std::runtime_error(
+                        "saveRenderedTsdfMeshPly: invalid undistortion mask shape");
+                }
+                rendered_depth = rendered_depth * mask.to(torch::kFloat32);
             }
 
-            cv::Mat filtered_depth = filterDepthOutliersLikeGaussianSlam(depth_for_fusion);
-            volume.integrate(
-                color_mat.clone(),
-                filtered_depth,
+            auto depth_cpu = rendered_depth.contiguous().to(torch::kCPU);
+            cv::Mat depth_mat(height, width, CV_32FC1, depth_cpu.data_ptr<float>());
+            support_grid.allocateFromKeyframe(
+                depth_mat,
                 pkf->intr_,
                 pkf->getPosef(),
-                kEvalDepthTrunc);
+                depth_max);
 
-            ++frame_idx;
-            if (frame_idx % 10 == 0 || frame_idx == keyframes.size())
-            {
-                std::cout << "[saveRenderedTsdfMeshPly] fused " << frame_idx << "/" << keyframes.size()
-                          << " keyframes (last_kfid=" << kfid << ")"
-                          << " active_voxels=" << volume.voxels.size() << std::endl;
-            }
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            RenderedMeshView view;
+            view.cam = cam;
+            view.depth = rendered_depth;
+            view.alpha = rendered_alpha;
+            views.push_back(std::move(view));
         }
 
-        auto mesh = volume.extractMesh(min_weight);
-        if (mesh.vertices.empty() || mesh.faces.empty())
-        {
-            std::cout << "[saveRenderedTsdfMeshPly] extraction produced an empty mesh.\n";
-            if (froze_geo)
-            {
-                voxel_model_->unfreezeVoxGeo();
-            }
-            return;
+        auto [grid_xyz, vox_key] = support_grid.buildGrid(
+            voxel_model_->geoGridPts().device());
+        if (grid_xyz.numel() == 0 || vox_key.numel() == 0 || views.empty()) {
+            unfreeze_geo();
+            throw std::runtime_error(
+                "saveRenderedTsdfMeshPly: rendered depths allocated no complete TSDF cells");
         }
 
-        for (auto& v : mesh.vertices) v += kEvalCompensation;
-
-        if (!saveTriangleMeshPly(result_path, mesh))
-        {
-            throw std::runtime_error("saveRenderedTsdfMeshPly: failed to write mesh PLY");
+        auto fused = fuseRenderedTsdfWithSupport(
+            grid_xyz,
+            views,
+            sdf_trunc,
+            /*crop_border=*/0.0f,
+            rerun_params_.rendered_mesh_eval_alpha_thres_,
+            /*use_unit_keyframe_weight=*/true);
+        auto vox_sdf = fused.tsdf.index({vox_key});
+        auto vox_support = fused.keyframe_support.index({vox_key});
+        auto keep_mask =
+            torch::isfinite(vox_sdf).all(1) &
+            (std::get<0>(vox_support.min(1)) >= min_keyframe_weight) &
+            (std::get<0>(vox_sdf.min(1)) < 0.0f) &
+            (std::get<0>(vox_sdf.max(1)) > 0.0f);
+        auto keep_idx = torch::nonzero(keep_mask).view({-1}).to(torch::kLong);
+        vox_key = vox_key.index_select(0, keep_idx).contiguous();
+        auto [vertices, faces] = marchingCubesGrid(
+            -fused.tsdf,
+            grid_xyz,
+            vox_key,
+            /*iso=*/0.0f);
+        auto mesh = meshFromTensors(vertices, faces);
+        if (mesh.vertices.empty() || mesh.faces.empty()) {
+            unfreeze_geo();
+            throw std::runtime_error(
+                "saveRenderedTsdfMeshPly: zero-crossing TSDF produced an empty mesh");
         }
-
-        const std::filesystem::path nocolor_path =
-            result_path.parent_path() /
-            (result_path.stem().string() + "_nocolor" + result_path.extension().string());
-        if (!saveTriangleMeshPly(nocolor_path, mesh, false))
-        {
-            throw std::runtime_error("saveRenderedTsdfMeshPly: failed to write no-color mesh PLY");
+        setMeshColors(mesh, colorizeRenderedMeshVertices(vertices));
+        if (!saveTriangleMeshPly(
+                result_path,
+                mesh,
+                /*write_vertex_colors=*/true)) {
+            unfreeze_geo();
+            throw std::runtime_error(
+                "saveRenderedTsdfMeshPly: failed to write mesh PLY");
         }
-    }
-    catch (...)
-    {
-        try
-        {
-            c10::cuda::CUDACachingAllocator::emptyCache();
-        }
-        catch (...) {}
-        if (froze_geo)
-        {
-            voxel_model_->unfreezeVoxGeo();
-        }
+        unfreeze_geo();
+        std::cout << "[mesh/rendered-TSDF-fixed] wrote " << result_path
+                  << " depth_source="
+                  << "median_opacity"
+                  << " views=" << views.size()
+                  << " voxel_size=" << voxel_length
+                  << " truncation=" << sdf_trunc
+                  << " min_keyframe_weight=" << min_keyframe_weight
+                  << " alpha_threshold="
+                  << rerun_params_.rendered_mesh_eval_alpha_thres_
+                  << " candidate_grid_points=" << grid_xyz.size(0)
+                  << " surface_grid_voxels=" << vox_key.size(0)
+                  << " vertices=" << mesh.vertices.size()
+                  << " faces=" << mesh.faces.size() << "\n";
+    } catch (...) {
+        unfreeze_geo();
         throw;
     }
-
-    if (froze_geo)
-    {
-        voxel_model_->unfreezeVoxGeo();
-    }
-
-    std::cout << "[saveRenderedTsdfMeshPly] Wrote C++ sparse-TSDF fused mesh to "
-              << result_path << " and "
-              << (result_path.parent_path() /
-                  (result_path.stem().string() + "_nocolor" + result_path.extension().string()))
-              << "\n";
 }

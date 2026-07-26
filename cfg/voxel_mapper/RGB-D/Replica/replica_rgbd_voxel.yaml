@@ -18,13 +18,13 @@ RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
 Mapper.use_tsdf_mapping: 1 # 1: integrate RGB-D frames into the configured TSDF backend
-Mapper.use_tsdf_pruning: 1 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
+Mapper.use_tsdf_pruning: 0 # 1: add conservative SVRecon-style positive/free-space TSDF pruning
 Mapper.use_tsdf_planning: 0 # 0: do not run ESDF path planning at shutdown
 Mapper.tsdf_backend: "svraster" # svraster: SDF stored on SVRaster grid points, nvblox: external nvblox TSDF
 Mapper.tsdf_voxel_size_m: 0.05 # nvblox voxel size / fallback before SVRaster voxels exist
 Mapper.svraster_tsdf_refit_on_topology_change: 0 # 1: replay registered RGB-D KFs after insertion/subdivision so new corners receive TSDF
 Mapper.tsdf_protect_surface_band_from_pruning: 0 # 1: prevent non-SDF pruning from deleting estimated TSDF surface-band voxels
-Mapper.tsdf_prune_min_weight: 1.0
+Mapper.tsdf_prune_min_weight: 0.1
 Mapper.tsdf_prune_surface_band_vox: 1.0
 Mapper.tsdf_prune_min_valid_corners: 2.0
 Mapper.tsdf_density_init: 0 # 1: initialize new SVRaster grid densities from TSDF with NeuS-style bell mapping
@@ -33,9 +33,10 @@ Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many configured
 Mapper.svraster_tsdf_max_integration_distance_m: 0.0 # nvblox-style projective integration range for SVRaster TSDF
 Mapper.svraster_tsdf_inverse_square_weighting: 1 # nvblox default TSDF measurement weighting
 Mapper.svraster_tsdf_max_weight: 5.0 # nvblox default TSDF accumulated-weight cap
-Mapper.sdf_evidence_densify: 0 # 1:create hidden TSDF evidence voxels in RGB-D depth bands, promote confident surface-band cells
-Mapper.sdf_evidence_zero_crossing_refresh: 0 # 1:insert renderable voxels from TSDF edge zero-crossing samples
-Mapper.tsdf_subdivide_near_zero_crossing: 1 # 1:prefer subdividing renderable voxels with TSDF surface/zero-crossing support
+Mapper.sdf_evidence_densify: 1 # hidden TSDF depth-band evidence only at residual RGB-D render holes
+Mapper.sdf_evidence_zero_crossing_refresh: 1 # promote hidden cells only when a valid TSDF edge has a strict sign crossing
+Mapper.sdf_evidence_promote_min_views: 2 # minimum distinct RGB-D keyframes supporting an evidence cell
+Mapper.tsdf_subdivide_near_zero_crossing: 0 # 1:prefer subdividing renderable voxels with TSDF surface/zero-crossing support
 Mapper.tsdf_subdivide_min_weight: 0.5
 Mapper.tsdf_subdivide_surface_band_vox: 2.0
 Mapper.tsdf_subdivide_min_valid_corners: 2
@@ -46,10 +47,10 @@ Mapper.tsdf_density_init_alpha_max: 0.5
 
 Mapper.fill_empty_cells: 0 # one-shot artificial dense-core fill; separate from rendered_depth_insert
 Mapper.dense_core_pcd_density_rate: 0.001 # larger=tighter fill_empty_cells dense-core bbox, smaller=larger bbox
-Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
-Mapper.rgbd_inactive_geo_initial_backfill: 1 # run inactive-geo densify once for initial RGB-D keyframes after createFromPcd
+Mapper.inactive_geo_densify: 0 # 0:false, 1 or other integer:true
+Mapper.rgbd_inactive_geo_initial_backfill: 0 # run inactive-geo densify once for initial RGB-D keyframes after createFromPcd
 Mapper.depth_cache: 10
-Mapper.rgbd_fill_render_holes: 1 # RGB-D only: use real depth to fill pixels where current voxel render has holes
+Mapper.rgbd_fill_render_holes: 0 # RGB-D only: use real depth to fill pixels where current voxel render has holes
 Mapper.rgbd_fill_render_holes_stride: 2 # only check every Nth pixel in rendered depth for hole filling
 Mapper.rgbd_fill_render_holes_max_points_per_kf: 0 # 0 disables cap
 Mapper.rgbd_surface_band_support: 0 # if 1, fill render holes with samples around RGB-D depth instead of one point
@@ -109,8 +110,11 @@ Record.rerun_gt_mesh: 0 # raw Replica mesh is not aligned to the current SLAM fr
 Record.rerun_gt_mesh_path: "/home/dimitris/Photo-SLAM/scripts/data/Replica/office0_mesh.ply"
 
 Record.save_rendered_mesh_eval: 1 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
-Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
-Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
+Record.rendered_mesh_eval_voxel_size_m: 0.05 # match local HI-SLAM2 Replica evaluation
+Record.rendered_mesh_eval_min_weight: 2.0 # match tsdf_mesh_*_w2.0 extraction
+Record.rendered_mesh_eval_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
+Record.rendered_mesh_eval_depth_max_m: 5.0 # HI-SLAM2 TSDF integration depth limit
+Record.rendered_mesh_eval_alpha_thres: 0.5 # reject weak SVRaster rendered-depth surfaces
 
 ##############################################################################
 # SVRaster-style optimisation parameters
@@ -134,17 +138,17 @@ Optimization.lr_decay_mult: 0.1
 # --------------------------------------------------------------------------------------------
 # Adaptive prune/subdivide (SVRaster schedule)
 # --------------------------------------------------------------------------------------------
-Optimization.adapt_from: 600
-Optimization.adapt_every: 600
+Optimization.adapt_from: 1000
+Optimization.adapt_every: 1000
 Optimization.prune_every: 1000
-Optimization.subdivide_every: 600
+Optimization.subdivide_every: 1000
 
 # Pruning heuristics
 Optimization.filter_near_voxels: 1 # 0:false, 1:true, insertion-time mark_near filtering
 Optimization.prune_far_voxels: 1 # 0:false, 1:true
 Optimization.prune_near_voxels_geometric: 1 # 0:false, 1:true, prune-time near-to-camera geometry (also behind camera)
 Optimization.prune_recent_unstable: 0
-Optimization.prune_recent_keyframes: 10
+Optimization.prune_recent_keyframes: 0
 Optimization.prune_recent_min_views_real: 3
 Optimization.prune_recent_min_views_artificial: 3
 Optimization.final_special_prune_enable: 0

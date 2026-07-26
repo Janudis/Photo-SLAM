@@ -34,8 +34,9 @@ Mapper.tsdf_density_init_trunc_vox: 4.0 # normalize TSDF by this many configured
 Mapper.svraster_tsdf_max_integration_distance_m: 4.0 # nvblox-style projective integration range for SVRaster TSDF
 Mapper.svraster_tsdf_inverse_square_weighting: 1 # nvblox default TSDF measurement weighting
 Mapper.svraster_tsdf_max_weight: 5.0 # nvblox default TSDF accumulated-weight cap
-Mapper.sdf_evidence_densify: 0 # 1:create hidden TSDF evidence voxels in RGB-D depth bands, promote confident surface-band cells
-Mapper.sdf_evidence_zero_crossing_refresh: 0 # 1:insert renderable voxels from TSDF edge zero-crossing samples
+Mapper.sdf_evidence_densify: 0 # hidden TSDF depth-band evidence only at residual RGB-D render holes
+Mapper.sdf_evidence_zero_crossing_refresh: 0 # promote hidden cells only when a valid TSDF edge has a strict sign crossing
+Mapper.sdf_evidence_promote_min_views: 2 # minimum distinct RGB-D keyframes supporting an evidence cell
 Mapper.tsdf_subdivide_near_zero_crossing: 0 # 1:prefer subdividing renderable voxels with TSDF surface/zero-crossing support
 Mapper.tsdf_subdivide_min_weight: 0.5
 Mapper.tsdf_subdivide_surface_band_vox: 2.0
@@ -102,8 +103,11 @@ Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
 Record.rerun_gt_mesh_path: ""
 
 Record.save_rendered_mesh_eval: 1 # 0:skip voxel_surface_mesh.ply shutdown export, 1:save it
-Record.rendered_mesh_eval_voxel_size_m: 0.05 # final eval TSDF voxel size, comparable to HI-SLAM2 TSDF_VOXEL_SIZE
-Record.rendered_mesh_eval_min_weight: 2.0 # final eval mesh extraction weight threshold, comparable to HI-SLAM2 TSDF_WEIGHT
+Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
+Record.rendered_mesh_eval_min_weight: 1.0 # HI-SLAM2 mesh extraction weight threshold
+Record.rendered_mesh_eval_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
+Record.rendered_mesh_eval_depth_max_m: 5.0 # HI-SLAM2 TSDF integration depth limit
+Record.rendered_mesh_eval_alpha_thres: 0.5 # reject weak SVRaster rendered-depth surfaces
 
 ##############################################################################
 # SVRaster-style optimisation parameters

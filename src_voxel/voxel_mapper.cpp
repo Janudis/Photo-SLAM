@@ -391,6 +391,12 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             sdf_params_.sdf_evidence_zero_crossing_refresh_ =
                 (settings_file["Mapper.sdf_evidence_zero_crossing_refresh"].operator int()) != 0;
         }
+        if (!settings_file["Mapper.sdf_evidence_promote_min_views"].empty()) {
+            sdf_params_.sdf_evidence_promote_min_views_ =
+                std::max(
+                    1,
+                    settings_file["Mapper.sdf_evidence_promote_min_views"].operator int());
+        }
         if (!settings_file["Mapper.tsdf_subdivide_near_zero_crossing"].empty()) {
             sdf_params_.tsdf_subdivide_near_zero_crossing_ =
                 (settings_file["Mapper.tsdf_subdivide_near_zero_crossing"].operator int()) != 0;
@@ -781,12 +787,31 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         (settings_file["Record.rerun_rendered_mesh_eval"].operator int()) != 0;
     rerun_params_.rendered_mesh_eval_voxel_size_m_ =
         settings_file["Record.rendered_mesh_eval_voxel_size_m"].empty()
-            ? (5.0f / 512.0f)
+            ? 0.05f
             : std::max(1.0e-6f, settings_file["Record.rendered_mesh_eval_voxel_size_m"].operator float());
     rerun_params_.rendered_mesh_eval_min_weight_ =
         settings_file["Record.rendered_mesh_eval_min_weight"].empty()
-            ? 1.0e-4f
+            ? 2.0f
             : std::max(0.0f, settings_file["Record.rendered_mesh_eval_min_weight"].operator float());
+    rerun_params_.rendered_mesh_eval_trunc_vox_ =
+        settings_file["Record.rendered_mesh_eval_trunc_vox"].empty()
+            ? 8.0f
+            : std::max(
+                  1.0f,
+                  settings_file["Record.rendered_mesh_eval_trunc_vox"].operator float());
+    rerun_params_.rendered_mesh_eval_depth_max_m_ =
+        settings_file["Record.rendered_mesh_eval_depth_max_m"].empty()
+            ? 5.0f
+            : std::max(
+                  1.0e-6f,
+                  settings_file["Record.rendered_mesh_eval_depth_max_m"].operator float());
+    rerun_params_.rendered_mesh_eval_alpha_thres_ =
+        settings_file["Record.rendered_mesh_eval_alpha_thres"].empty()
+            ? 0.5f
+            : std::clamp(
+                  settings_file["Record.rendered_mesh_eval_alpha_thres"].operator float(),
+                  0.0f,
+                  1.0f);
     rerun_params_.rerun_reconstruction_mesh_ =
         !settings_file["Record.run_reconstruction_mesh"].empty() &&
         (settings_file["Record.run_reconstruction_mesh"].operator int()) != 0;
@@ -1142,7 +1167,10 @@ void VoxelMapper::run()
                 if (rerun_params_.run_whole_run_) {
                     rerun_state_.whole_run_live_voxels_dirty_ = true;
                 }
-                if (sensor_type_ == RGBD && sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
+                if (sensor_type_ == RGBD &&
+                    sdf_params_.use_tsdf_mapping_ &&
+                    useSvrasterTsdfBackend() &&
+                    !sdf_params_.sdf_evidence_densify_) {
                     for (const auto& kv : scene_->keyframes()) {
                         if (!kv.second) {
                             continue;
@@ -1180,9 +1208,31 @@ void VoxelMapper::run()
                         initial_rgbd_kfs.push_back(kv.second);
                     }
                 }
+                const int previous_depth_cache_limit = max_depth_cached_;
+                if (sdf_params_.sdf_evidence_densify_ &&
+                    !initial_rgbd_kfs.empty()) {
+                    max_depth_cached_ = std::max(
+                        1,
+                        depth_cached_ +
+                            static_cast<int>(initial_rgbd_kfs.size()));
+                }
                 for (const auto& pkf : initial_rgbd_kfs) {
                     increasePcdByKeyframeInactiveGeoDensify(pkf);
                 }
+                max_depth_cached_ = previous_depth_cache_limit;
+            }
+
+            if (sensor_type_ == RGBD &&
+                sdf_params_.sdf_evidence_densify_ &&
+                sdf_params_.use_tsdf_mapping_ &&
+                useSvrasterTsdfBackend()) {
+                sdf_evidence_pending_keyframes_.clear();
+                for (const auto& kv : scene_->keyframes()) {
+                    if (kv.second) {
+                        sdf_evidence_pending_keyframes_.push_back(kv.second);
+                    }
+                }
+                processPendingSdfEvidenceKeyframes(/*force=*/true);
             }
 
             if (sensor_type_ == MONOCULAR &&
@@ -3869,6 +3919,7 @@ void VoxelMapper::combineMappingOperations()
                     }
 	                }
 	            }
+                processPendingSdfEvidenceKeyframes();
                 if (kf_changed || (initial_mapped_ && points.size() >= 30)) {
                     refreshPendingRecentUnstablePruneMask();
                 }
@@ -3998,6 +4049,7 @@ void VoxelMapper::combineMappingOperations()
                     }
                 }
 	             }
+                 processPendingSdfEvidenceKeyframes();
                  if (kf_changed || (initial_mapped_ && points.size() >= 30)) {
                      refreshPendingRecentUnstablePruneMask();
                  }
@@ -4491,6 +4543,13 @@ void VoxelMapper::handleNewKeyframe(
 
     pkf->kps_pixel_ = std::move(std::get<6>(kf));
     pkf->kps_point_local_ = std::move(std::get<7>(kf));
+
+    if (sensor_type_ == RGBD &&
+        sdf_params_.sdf_evidence_densify_ &&
+        sdf_params_.use_tsdf_mapping_ &&
+        useSvrasterTsdfBackend()) {
+        sdf_evidence_pending_keyframes_.push_back(pkf);
+    }
     
     if (isdoingInactiveGeoDensify())
         increasePcdByKeyframeInactiveGeoDensify(pkf);
@@ -4554,12 +4613,8 @@ void VoxelMapper::handleNewKeyframe(
                 }
             }
             if (sdf_params_.use_tsdf_mapping_ && useSvrasterTsdfBackend()) {
-                if (sdf_params_.sdf_evidence_densify_) {
-                    integrateKeyframeSdfEvidenceVoxels(pkf, depth_meters);
-                }
-                integrateKeyframeIntoSvrasterSdf(*pkf, depth_meters);
-                if (sdf_params_.sdf_evidence_densify_) {
-                    promoteSdfEvidenceVoxelsFromTsdfField();
+                if (!sdf_params_.sdf_evidence_densify_) {
+                    integrateKeyframeIntoSvrasterSdf(*pkf, depth_meters);
                 }
                 if (rerun_params_.rerun_tsdf_unknown_voxels_) {
                     rerun_state_.rerun_tsdf_unknown_dirty_ = true;

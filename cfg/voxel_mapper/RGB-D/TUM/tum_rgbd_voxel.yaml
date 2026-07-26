@@ -19,10 +19,10 @@ Camera.z_near: 0.01
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.inactive_geo_densify: 0 # 0:false, 1 or other integer:true
+Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
-Mapper.rgbd_fill_render_holes: 0 # direct SVRaster-style fill: cache one measured-surface cell for each strict rendered hole
+Mapper.rgbd_fill_render_holes: 1 # direct SVRaster-style fill: cache one measured-surface cell for each strict rendered hole
 Mapper.rgbd_fill_render_holes_initial_backfill: 0 # run only RGB-D render-hole fill for initial keyframes after createFromPcd
 Mapper.rgbd_fill_render_holes_stride: 4 # pixel stride for each keyframe's pre-insertion hole detection
 
@@ -33,7 +33,7 @@ Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance f
 # Hybrid RGB-D completion: residual holes update non-renderable nvblox-style
 # TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
 # promoted into the active SVRecon map.
-Mapper.rgbd_tsdf_evidence: 1
+Mapper.rgbd_tsdf_evidence: 0
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
 Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # nvblox raycast_subsampling_factor default
 Mapper.rgbd_tsdf_evidence_trunc_vox: 4.0 # nvblox TSDF truncation default

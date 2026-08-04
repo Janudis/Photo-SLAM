@@ -37,8 +37,8 @@ Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance f
 # promoted into the active SVRecon map.
 Mapper.rgbd_tsdf_evidence: 1
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
-Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # nvblox raycast_subsampling_factor default
-Mapper.rgbd_tsdf_evidence_trunc_vox: 4.0 # nvblox TSDF truncation default
+Mapper.rgbd_tsdf_evidence_pixel_stride: 2 # match the octree-block-support hole sampling
+Mapper.rgbd_tsdf_evidence_trunc_vox: 3.0 # sample the RGB-D band [D-3v, D+3v]
 Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # nvblox TSDF maximum weight default
 Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
 Mapper.sdf_voxel_size_m: 0.05
@@ -66,6 +66,8 @@ Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
 Record.enable_rerun: 0  # enable the reconstruction timeline below

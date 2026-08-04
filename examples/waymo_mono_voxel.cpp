@@ -124,6 +124,7 @@ int main(int argc, char** argv)
         output_root,
         0,
         device_type);
+    mapper->setRuntimeFrameCount(static_cast<int>(frames.size()));
 
     std::thread mapping_thread(&VoxelMapper::run, mapper.get());
     std::shared_ptr<ImGuiViewer> viewer;
@@ -157,11 +158,15 @@ int main(int argc, char** argv)
         cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
 
         const auto start = std::chrono::steady_clock::now();
-        slam->TrackMonocular(
-            image,
-            frames[index].timestamp,
-            std::vector<ORB_SLAM3::IMU::Point>(),
-            image_path.string());
+        {
+            auto tracking_profile =
+                mapper->profileLaptopModule("orb_tracking");
+            slam->TrackMonocular(
+                image,
+                frames[index].timestamp,
+                std::vector<ORB_SLAM3::IMU::Point>(),
+                image_path.string());
+        }
         const auto end = std::chrono::steady_clock::now();
         const float tracking_time =
             std::chrono::duration_cast<std::chrono::duration<float>>(end - start).count();

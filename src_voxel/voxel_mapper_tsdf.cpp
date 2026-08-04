@@ -753,6 +753,8 @@ void VoxelMapper::runFinalSpecialPrune()
         std::cout << "[FINAL/prune] disabled\n";
         return;
     }
+    auto final_pruning_profile =
+        profileLaptopModule("final_pruning");
 
     const int before_final_special = voxel_model_->numVoxels();
     if (before_final_special <= 0) {
@@ -938,6 +940,16 @@ void VoxelMapper::runFinalSpecialPrune()
                     .to(final_centers.device())
                     .to(torch::kBool)
                     .contiguous();
+            torch::Tensor final_special_near_mask =
+                prune_mask_near_final_special
+                    .index_select(
+                        0,
+                        final_idx.to(
+                            prune_mask_near_final_special.device())
+                            .to(torch::kLong))
+                    .to(final_centers.device())
+                    .to(torch::kBool)
+                    .contiguous();
             appendWholeRunPrunedVoxels(
                 getIteration(),
                 final_centers,
@@ -946,6 +958,9 @@ void VoxelMapper::runFinalSpecialPrune()
                 final_colors,
                 torch::Tensor(),
                 torch::Tensor(),
+                torch::Tensor(),
+                torch::Tensor(),
+                final_special_near_mask,
                 final_surface_mask);
         }
     }

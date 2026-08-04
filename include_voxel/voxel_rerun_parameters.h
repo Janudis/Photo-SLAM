@@ -3,8 +3,12 @@
 #include <torch/torch.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <array>
 #include <limits>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 struct VoxelRerunParameters
 {
@@ -15,6 +19,8 @@ struct VoxelRerunParameters
     bool rerun_svrecon_debug_ = false;
     bool rerun_gt_mesh_ = false;
     std::string rerun_gt_mesh_path_;
+    bool rerun_nvblox_mesh_ = false;
+    std::string rerun_nvblox_mesh_path_;
     bool save_rendered_mesh_eval_ = true;
     bool rerun_rendered_mesh_eval_ = false;
     float rendered_mesh_eval_voxel_size_m_ = 0.05f;
@@ -57,10 +63,36 @@ struct VoxelRerunState
     torch::Tensor whole_run_pruned_surface_views_sizes_accum_;
     torch::Tensor whole_run_pruned_surface_views_levels_accum_;
     torch::Tensor whole_run_pruned_surface_views_colors_accum_;
+    torch::Tensor whole_run_pruned_near_camera_centers_accum_;
+    torch::Tensor whole_run_pruned_near_camera_sizes_accum_;
+    torch::Tensor whole_run_pruned_near_camera_levels_accum_;
+    torch::Tensor whole_run_pruned_near_camera_colors_accum_;
+    torch::Tensor whole_run_pruned_far_centers_accum_;
+    torch::Tensor whole_run_pruned_far_sizes_accum_;
+    torch::Tensor whole_run_pruned_far_levels_accum_;
+    torch::Tensor whole_run_pruned_far_colors_accum_;
+    torch::Tensor whole_run_pruned_near_centers_accum_;
+    torch::Tensor whole_run_pruned_near_sizes_accum_;
+    torch::Tensor whole_run_pruned_near_levels_accum_;
+    torch::Tensor whole_run_pruned_near_colors_accum_;
     torch::Tensor whole_run_pruned_final_surface_centers_accum_;
     torch::Tensor whole_run_pruned_final_surface_sizes_accum_;
     torch::Tensor whole_run_pruned_final_surface_levels_accum_;
     torch::Tensor whole_run_pruned_final_surface_colors_accum_;
+    torch::Tensor whole_run_pruned_monocular_covis_centers_accum_;
+    torch::Tensor whole_run_pruned_monocular_covis_sizes_accum_;
+    torch::Tensor whole_run_pruned_monocular_covis_levels_accum_;
+    torch::Tensor whole_run_pruned_monocular_covis_colors_accum_;
+    bool whole_run_logged_orb_source_ = false;
+    bool whole_run_logged_inactive_source_ = false;
+    bool whole_run_logged_rgbd_source_ = false;
+    bool whole_run_logged_monocular_rendered_depth_source_ = false;
+    bool whole_run_logged_monocular_mvs_source_ = false;
+    bool whole_run_logged_monocular_omnidata_source_ = false;
+    std::unordered_map<
+        std::uint64_t,
+        std::array<float, 6>>
+        whole_run_orb_points_by_id_;
 
     torch::Tensor rerun_gt_sdf_grid_keys_cpu_;
     torch::Tensor rerun_gt_sdf_grid_pts_cpu_;

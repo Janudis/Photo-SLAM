@@ -71,22 +71,26 @@ void saveGaussianRuntimeMetrics(
     int gaussians,
     int iterations,
     double total_seconds,
-    const std::filesystem::path& map_path)
+    const std::filesystem::path& map_path,
+    const GaussianGpuMemoryStats& gpu_stats)
 {
     if (!path.parent_path().empty())
         std::filesystem::create_directories(path.parent_path());
-    const GaussianGpuMemoryStats gpu_stats = getGaussianGpuPeakMemoryStats();
 
     std::ofstream out(path);
     out << std::fixed << std::setprecision(6);
     out << "{\n";
     out << "  \"frames\": " << frames << ",\n";
     out << "  \"keyframes\": " << keyframes << ",\n";
+    out << "  \"primitive_type\": \"gaussians\",\n";
+    out << "  \"primitive_count\": " << gaussians << ",\n";
     out << "  \"gaussians\": " << gaussians << ",\n";
     out << "  \"iterations\": " << iterations << ",\n";
     out << "  \"total_seconds\": " << total_seconds << ",\n";
     out << "  \"fps_hz\": "
         << (total_seconds > 0.0 ? static_cast<double>(frames) / total_seconds : 0.0) << ",\n";
+    out << "  \"runtime_scope\": "
+           "\"mapping and tail optimization; evaluation export excluded\",\n";
     out << "  \"map_path\": \"" << map_path.string() << "\",\n";
     out << "  \"map_size_mb\": " << fileSizeMbGaussian(map_path) << ",\n";
     out << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb << ",\n";
@@ -676,6 +680,18 @@ void saveGaussianDepthAndNormalMaps(
          settings_file["Optimization.prune_big_point_after_iter"].operator int();
      densify_min_opacity_ =
          settings_file["Optimization.densify_min_opacity"].operator float();
+     filter_near_voxels_ =
+         !settings_file["Optimization.filter_near_voxels"].empty() &&
+         (settings_file["Optimization.filter_near_voxels"].operator int()) != 0;
+     prune_far_voxels_ =
+         !settings_file["Optimization.prune_far_voxels"].empty() &&
+         (settings_file["Optimization.prune_far_voxels"].operator int()) != 0;
+     prune_near_voxels_geometric_ =
+         !settings_file["Optimization.prune_near_voxels_geometric"].empty() &&
+         (settings_file["Optimization.prune_near_voxels_geometric"].operator int()) != 0;
+     final_special_prune_enable_ =
+         !settings_file["Optimization.final_special_prune_enable"].empty() &&
+         (settings_file["Optimization.final_special_prune_enable"].operator int()) != 0;
  
      // Viewer Parameters
      rendered_image_viewer_scale_ =
@@ -799,7 +815,12 @@ void GaussianMapper::run()
              {
                  std::unique_lock<std::mutex> lock_render(mutex_render_);
                  scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
-                 gaussians_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_);
+                 const auto initial_point_cloud =
+                     filterNearInsertionPoints(scene_->cached_point_cloud_);
+                 TORCH_CHECK(
+                     !initial_point_cloud.empty(),
+                     "Gaussian near-camera insertion filter rejected the complete initial point cloud");
+                 gaussians_->createFromPcd(initial_point_cloud, scene_->cameras_extent_);
                  std::unique_lock<std::mutex> lock(mutex_settings_);
                  gaussians_->trainingSetup(opt_params_);
              }
@@ -845,12 +866,23 @@ void GaussianMapper::run()
      // Third loop: Tail gaussian optimization
      int densify_interval = densifyInterval();
      int n_delay_iters = densify_interval * 0.8;
-     while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
-         trainForOneIteration();
-         densify_interval = densifyInterval();
-         n_delay_iters = densify_interval * 0.8;
-     }
- 
+    while (getIteration() - SLAM_stop_iter <= n_delay_iters || getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
+        trainForOneIteration();
+        densify_interval = densifyInterval();
+        n_delay_iters = densify_interval * 0.8;
+    }
+    {
+        torch::NoGradGuard no_grad;
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        runGaussianHeuristicPrune(/*final_cleanup=*/true);
+    }
+
+    const double total_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - run_start_time).count();
+    const GaussianGpuMemoryStats runtime_gpu_stats =
+        getGaussianGpuPeakMemoryStats();
+
     // Save and clear
     const int final_iteration = getIteration();
     const std::filesystem::path shutdown_dir =
@@ -872,9 +904,6 @@ void GaussianMapper::run()
     const std::filesystem::path final_map_path =
         shutdown_dir / "ply" / "point_cloud" /
         ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";
-    const double total_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(
-            std::chrono::steady_clock::now() - run_start_time).count();
     saveGaussianGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
     saveGaussianRuntimeMetrics(
         shutdown_dir / "runtime_metrics.json",
@@ -883,7 +912,8 @@ void GaussianMapper::run()
         gaussians_ ? static_cast<int>(gaussians_->getXYZ().size(0)) : 0,
         final_iteration,
         total_seconds,
-        final_map_path);
+        final_map_path,
+        runtime_gpu_stats);
     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
  
      signalStop();
@@ -925,7 +955,12 @@ void GaussianMapper::trainColmap()
      {
          std::unique_lock<std::mutex> lock_render(mutex_render_);
          scene_->cameras_extent_ = std::get<1>(scene_->getNerfppNorm());
-         gaussians_->createFromPcd(scene_->cached_point_cloud_, scene_->cameras_extent_);
+         const auto initial_point_cloud =
+             filterNearInsertionPoints(scene_->cached_point_cloud_);
+         TORCH_CHECK(
+             !initial_point_cloud.empty(),
+             "Gaussian near-camera insertion filter rejected the complete initial point cloud");
+         gaussians_->createFromPcd(initial_point_cloud, scene_->cameras_extent_);
          std::unique_lock<std::mutex> lock(mutex_settings_);
          gaussians_->trainingSetup(opt_params_);
          this->initial_mapped_ = true;
@@ -943,12 +978,23 @@ void GaussianMapper::trainColmap()
      // Tail gaussian optimization
      int densify_interval = densifyInterval();
      int n_delay_iters = densify_interval * 0.8;
-     while (getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
-         trainForOneIteration();
-         densify_interval = densifyInterval();
-         n_delay_iters = densify_interval * 0.8;
-     }
- 
+    while (getIteration() % densify_interval <= n_delay_iters || isKeepingTraining()) {
+        trainForOneIteration();
+        densify_interval = densifyInterval();
+        n_delay_iters = densify_interval * 0.8;
+    }
+    {
+        torch::NoGradGuard no_grad;
+        std::unique_lock<std::mutex> lock_render(mutex_render_);
+        runGaussianHeuristicPrune(/*final_cleanup=*/true);
+    }
+
+    const double total_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - run_start_time).count();
+    const GaussianGpuMemoryStats runtime_gpu_stats =
+        getGaussianGpuPeakMemoryStats();
+
     // Save and clear
     const int final_iteration = getIteration();
     const std::filesystem::path shutdown_dir =
@@ -970,9 +1016,6 @@ void GaussianMapper::trainColmap()
     const std::filesystem::path final_map_path =
         shutdown_dir / "ply" / "point_cloud" /
         ("iteration_" + std::to_string(final_iteration)) / "point_cloud.ply";
-    const double total_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(
-            std::chrono::steady_clock::now() - run_start_time).count();
     saveGaussianGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
     saveGaussianRuntimeMetrics(
         shutdown_dir / "runtime_metrics.json",
@@ -983,7 +1026,8 @@ void GaussianMapper::trainColmap()
         gaussians_ ? static_cast<int>(gaussians_->getXYZ().size(0)) : 0,
         final_iteration,
         total_seconds,
-        final_map_path);
+        final_map_path,
+        runtime_gpu_stats);
     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
  
      signalStop();
@@ -1109,6 +1153,7 @@ void GaussianMapper::trainColmap()
                      scene_->cameras_extent_,
                      size_threshold
                  );
+                 runGaussianHeuristicPrune(/*final_cleanup=*/false);
              }
  
              if (opacityResetInterval()
@@ -1235,8 +1280,14 @@ void GaussianMapper::trainColmap()
              // Add new points to the model
              if (initial_mapped_ && points.size() >= 30) {
                  torch::NoGradGuard no_grad;
+                 std::vector<float> filtered_points = points;
+                 std::vector<float> filtered_colors = colors;
+                 filterNearInsertionPoints(filtered_points, filtered_colors);
                  std::unique_lock<std::mutex> lock_render(mutex_render_);
-                 gaussians_->increasePcd(points, colors, getIteration());
+                 gaussians_->increasePcd(
+                     filtered_points,
+                     filtered_colors,
+                     getIteration());
              }
          }
          break;
@@ -1336,8 +1387,14 @@ void GaussianMapper::trainColmap()
              // Add new points to the model
              if (initial_mapped_ && points.size() >= 30) {
                  torch::NoGradGuard no_grad;
+                 std::vector<float> filtered_points = points;
+                 std::vector<float> filtered_colors = colors;
+                 filterNearInsertionPoints(filtered_points, filtered_colors);
                  std::unique_lock<std::mutex> lock_render(mutex_render_);
-                 gaussians_->increasePcd(points, colors, getIteration());
+                 gaussians_->increasePcd(
+                     filtered_points,
+                     filtered_colors,
+                     getIteration());
              }
  
              // Mark this iteration
@@ -1644,6 +1701,7 @@ void GaussianMapper::trainColmap()
              tensor_utils::EigenMatrix2TorchTensor(
                  Twc.matrix(), device_type_).transpose(0, 1);
          transformPoints(points3D_valid, Twc_tensor);
+         filterNearInsertionPoints(points3D_valid, colors_valid);
          // Add new points to the cache
          if (depth_cached_ == 0) {
              depth_cache_points_ = points3D_valid;
@@ -1743,6 +1801,7 @@ void GaussianMapper::trainColmap()
              tensor_utils::EigenMatrix2TorchTensor(
                  Twc.matrix(), device_type_).transpose(0, 1);
          transformPoints(points3D_valid, Twc_tensor);
+         filterNearInsertionPoints(points3D_valid, colors_valid);
  
          // Add new points to the cache
          if (depth_cached_ == 0) {
@@ -1817,6 +1876,7 @@ void GaussianMapper::trainColmap()
              tensor_utils::EigenMatrix2TorchTensor(
                  Twc.matrix(), device_type_).transpose(0, 1);
          transformPoints(points3D_valid, Twc_tensor);
+         filterNearInsertionPoints(points3D_valid, colors_valid);
  
          // Add new points to the cache
          if (depth_cached_ == 0) {

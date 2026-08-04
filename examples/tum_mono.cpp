@@ -34,7 +34,8 @@
 #include "include/gaussian_mapper.h"
 #include "viewer/gaussian_imgui_viewer.h"
 
-void LoadImages(const std::string &strFile, std::vector<std::string> &vstrImageFilenames,
+void LoadImages(const std::filesystem::path &sequencePath,
+                std::vector<std::string> &vstrImageFilenames,
                 std::vector<double> &vTimestamps);
 void saveTrackingTime(std::vector<float> &vTimesTrack, const std::string &strSavePath);
 void saveGpuPeakMemoryUsage(std::filesystem::path pathSave);
@@ -66,8 +67,10 @@ int main(int argc, char **argv)
     // Retrieve paths to images
     std::vector<std::string> vstrImageFilenamesRGB;
     std::vector<double> vTimestamps;
-    std::string strFile = std::string(argv[4]) + "/rgb.txt";
-    LoadImages(strFile, vstrImageFilenamesRGB, vTimestamps);
+    LoadImages(
+        std::filesystem::path(argv[4]),
+        vstrImageFilenamesRGB,
+        vTimestamps);
 
     // Check consistency in the number of images and depthmaps
     int nImages = vstrImageFilenamesRGB.size();
@@ -101,6 +104,7 @@ int main(int argc, char **argv)
     std::shared_ptr<GaussianMapper> pGausMapper =
         std::make_shared<GaussianMapper>(
             pSLAM, gaussian_cfg_path, output_dir, 0, device_type);
+    pGausMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&GaussianMapper::run, pGausMapper.get());
 
     // Create Gaussian Viewer
@@ -127,16 +131,18 @@ int main(int argc, char **argv)
         if (pSLAM->isShutDown())
             break;
         // Read image and depthmap from file
-        im = cv::imread(std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni], cv::IMREAD_UNCHANGED); //,cv::IMREAD_UNCHANGED);
-        cv::cvtColor(im, im, CV_BGR2RGB);
-        double tframe = vTimestamps[ni];
+        const std::string image_path =
+            std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni];
+        im = cv::imread(image_path, cv::IMREAD_UNCHANGED);
 
         if (im.empty())
         {
             std::cerr << std::endl << "Failed to load image at: "
-                      << std::string(argv[4]) << "/" << vstrImageFilenamesRGB[ni] << std::endl;
+                      << image_path << std::endl;
             return 1;
         }
+        cv::cvtColor(im, im, CV_BGR2RGB);
+        double tframe = vTimestamps[ni];
 
         if (imageScale != 1.f)
         {
@@ -148,7 +154,11 @@ int main(int argc, char **argv)
         std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
         // Pass the image to the SLAM system
-        pSLAM->TrackMonocular(im, tframe, std::vector<ORB_SLAM3::IMU::Point>(), vstrImageFilenamesRGB[ni]);
+        pSLAM->TrackMonocular(
+            im,
+            tframe,
+            std::vector<ORB_SLAM3::IMU::Point>(),
+            image_path);
 
         std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 
@@ -172,48 +182,64 @@ int main(int argc, char **argv)
     if (use_viewer)
         viewer_thd.join();
 
+    const std::filesystem::path shutdown_dir =
+        output_dir /
+        (std::to_string(pGausMapper->getIteration()) + "_shutdown");
+
     // GPU peak usage
     saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
 
     // Tracking time statistics
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
 
-    // Save camera trajectory
-    pSLAM->SaveTrajectoryTUM((output_dir / "CameraTrajectory_TUM.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryTUM((output_dir / "KeyFrameTrajectory_TUM.txt").string());
-    pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
+    const auto save_trajectories =
+        [&](const std::filesystem::path& directory)
+    {
+        std::filesystem::create_directories(directory);
+        pSLAM->SaveTrajectoryTUM(
+            (directory / "CameraTrajectory_TUM.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryTUM(
+            (directory / "KeyFrameTrajectory_TUM.txt").string());
+        pSLAM->SaveTrajectoryEuRoC(
+            (directory / "CameraTrajectory_EuRoC.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryEuRoC(
+            (directory / "KeyFrameTrajectory_EuRoC.txt").string());
+    };
+    save_trajectories(output_dir);
+    save_trajectories(shutdown_dir);
     // pSLAM->SaveTrajectoryKITTI((output_dir / "CameraTrajectory_KITTI.txt").string());
 
     return 0;
 }
 
-void LoadImages(const std::string &strFile, std::vector<std::string> &vstrImageFilenames,
+void LoadImages(const std::filesystem::path &sequencePath,
+                std::vector<std::string> &vstrImageFilenames,
                 std::vector<double> &vTimestamps)
 {
-    ifstream f;
-    f.open(strFile.c_str());
+    std::filesystem::path image_list = sequencePath / "rgb.txt";
+    if (!std::filesystem::exists(image_list)) {
+        image_list = sequencePath / "association.txt";
+    }
 
-    // skip first three lines
-    string s0;
-    std::getline(f,s0);
-    std::getline(f,s0);
-    std::getline(f,s0);
+    std::ifstream input(image_list);
+    if (!input.is_open()) {
+        std::cerr << "Could not open monocular image list: "
+                  << image_list << std::endl;
+        return;
+    }
 
-    while(!f.eof())
-    {
-        std::string s;
-        std::getline(f,s);
-        if(!s.empty())
-        {
-            std::stringstream ss;
-            ss << s;
-            double t;
-            std::string sRGB;
-            ss >> t;
-            vTimestamps.push_back(t);
-            ss >> sRGB;
-            vstrImageFilenames.push_back(sRGB);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        std::stringstream stream(line);
+        double timestamp = 0.0;
+        std::string rgb_path;
+        if (stream >> timestamp >> rgb_path) {
+            vTimestamps.push_back(timestamp);
+            vstrImageFilenames.push_back(rgb_path);
         }
     }
 }
@@ -226,7 +252,7 @@ void saveTrackingTime(std::vector<float> &vTimesTrack, const std::string &strSav
     float totaltime = 0;
     for (int ni = 0; ni < nImages; ni++)
     {
-        out << std::fixed << std::setprecision(4)
+        out << std::fixed << std::setprecision(8)
             << vTimesTrack[ni] << std::endl;
         totaltime += vTimesTrack[ni];
     }

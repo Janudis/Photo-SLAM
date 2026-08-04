@@ -46,6 +46,7 @@
 #include "include_voxel/voxel_rerun_parameters.h"
 #include "include_voxel/voxel_sdf_parameters.h"
 #include "include_voxel/rgbd_tsdf_evidence.h"
+#include "include_voxel/laptop_precheck_profiler.h"
 // #include "include/stereo_vision.h"
 // #include "include/operate_points.h"
 
@@ -80,6 +81,13 @@ enum SystemSensorType {
     STEREO = 2,
     RGBD = 3
 };
+
+namespace sv {
+class TandemMvsBackend;
+struct TandemMvsResult;
+class OmnidataDepthBackend;
+struct OmnidataDepthResult;
+}
 
  struct VariableParameters
  {
@@ -122,6 +130,10 @@ public:
     int  getIteration();
     void increaseIteration(const int inc=1);
     void waitForInputQueueSlot();
+    void setRuntimeFrameCount(int frame_count);
+    sv::LaptopPrecheckProfiler::Scope profileLaptopModule(
+        const std::string& module,
+        std::uint64_t work_items = 1);
     
     float geoLearningRateInit();
     float sh0LearningRate();
@@ -174,6 +186,43 @@ protected:
         bool include_rgbd_hole_fill = true);
     void flushInactiveGeoCache();
     void processRgbdClosureCache();
+    bool isMatureMonocularOrbMapPoint(
+        ORB_SLAM3::MapPoint* map_point,
+        unsigned long current_keyframe_id) const;
+    void collectNewMonocularOrbSamplingSupport(
+        std::vector<float>& points,
+        std::vector<float>& colors);
+    void densifyMonocularFromRenderedDepth(
+        const std::shared_ptr<VoxelKeyframe>& pkf);
+    void captureMonocularMvsKeyframeMetadata(
+        const std::shared_ptr<VoxelKeyframe>& pkf,
+        ORB_SLAM3::KeyFrame* orb_keyframe);
+    void refreshMonocularMvsKeyframeMetadata();
+    std::vector<std::shared_ptr<VoxelKeyframe>>
+    selectMonocularMvsSourceKeyframes(
+        const std::shared_ptr<VoxelKeyframe>& reference,
+        int view_num = -1) const;
+    bool scheduleMonocularMvsDensification(
+        const std::shared_ptr<VoxelKeyframe>& reference);
+    void scheduleLatestMonocularMvsKeyframe(
+        const std::vector<std::shared_ptr<VoxelKeyframe>>& candidates);
+    void pollMonocularMvsDensification(bool wait_for_result = false);
+    void integrateMonocularMvsDepth(const sv::TandemMvsResult& result);
+    void integrateMonocularLearnedDepth(
+        const cv::Mat& depth,
+        const std::string& source_name,
+        const std::string& rerun_entity_path,
+        bool clear_cuda_cache_before_insertion);
+    bool scheduleMonocularOmnidataDensification(
+        const std::shared_ptr<VoxelKeyframe>& reference);
+    void scheduleLatestMonocularOmnidataKeyframe(
+        const std::vector<std::shared_ptr<VoxelKeyframe>>& candidates);
+    void pollMonocularOmnidataDensification(bool wait_for_result = false);
+    void integrateMonocularOmnidataDepth(
+        const sv::OmnidataDepthResult& result);
+    void validateMonocularRenderedDepthVoxels(bool final_pass = false);
+    void logMonocularCoVisibilityPrunedVoxels(
+        const torch::Tensor& prune_mask);
     torch::Tensor detectRgbdRenderHolePixels(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         const torch::Tensor& depth,
@@ -253,6 +302,11 @@ protected:
     torch::Tensor computeSvreconSdfPruneMask(float* sdf_threshold_out = nullptr);
 
     void ensureEmbeddedPythonRuntime(bool import_torch_cuda = false);
+    void beginLaptopAsyncModule(
+        const std::string& module,
+        std::uint64_t work_items = 1);
+    void endLaptopAsyncModule(const std::string& module);
+    std::string laptopPrecheckPipeline() const;
 
     // rerun debugging ---------------------------------------------------------
     void logKeyframeCameraToRerunRecordings(
@@ -277,7 +331,11 @@ protected:
         const torch::Tensor& colors,
         const torch::Tensor& pruned_by_sdf,
         const torch::Tensor& pruned_by_surface_views,
-        const torch::Tensor& pruned_by_final_surface = torch::Tensor());
+        const torch::Tensor& pruned_by_near_camera = torch::Tensor(),
+        const torch::Tensor& pruned_by_far = torch::Tensor(),
+        const torch::Tensor& pruned_by_final_special_near = torch::Tensor(),
+        const torch::Tensor& pruned_by_final_surface = torch::Tensor(),
+        const torch::Tensor& pruned_by_monocular_covisibility = torch::Tensor());
     void logSvreconDebugVoxelMaskToRerun(
         int iteration,
         const torch::Tensor& mask,
@@ -408,6 +466,57 @@ protected:
     float RGBD_max_depth_ = 100.0f;
 
     bool inactive_geo_densify_ = true;
+    bool monocular_rendered_depth_densify_ = false;
+    int monocular_rendered_depth_pixel_stride_ = 8;
+    int monocular_rendered_depth_window_size_ = 8;
+    int monocular_rendered_depth_min_views_ = 4;
+    float monocular_rendered_depth_min_weight_ = 0.1f;
+    bool monocular_mvs_densify_ = false;
+    std::filesystem::path monocular_mvs_model_dir_;
+    int monocular_mvs_width_ = 512;
+    int monocular_mvs_height_ = 320;
+    int monocular_mvs_view_num_ = 7;
+    std::string monocular_mvs_depth_range_mode_ = "fixed";
+    float monocular_mvs_depth_min_m_ = 0.1f;
+    float monocular_mvs_depth_max_m_ = 5.0f;
+    float monocular_mvs_depth_min_scene_ = 0.01f;
+    float monocular_mvs_inverse_depth_quantile_ = 0.20f;
+    float monocular_mvs_depth_max_multiplier_ = 3.0f;
+    float monocular_mvs_discard_percentage_ = 10.0f;
+    bool monocular_mvs_empty_cache_before_launch_ = false;
+    bool monocular_mvs_requires_inertial_ba1_ = false;
+    std::shared_ptr<sv::TandemMvsBackend> monocular_mvs_backend_;
+    std::shared_ptr<VoxelKeyframe> monocular_mvs_pending_reference_;
+    sv::MiniCam monocular_mvs_pending_camera_;
+    Eigen::Matrix4f monocular_mvs_pending_c2w_ =
+        Eigen::Matrix4f::Identity();
+    std::vector<unsigned long> monocular_mvs_pending_view_ids_;
+    std::vector<Eigen::Matrix4f> monocular_mvs_pending_view_c2w_;
+    float monocular_mvs_pending_depth_min_ = 0.0f;
+    float monocular_mvs_pending_depth_max_ = 0.0f;
+    cv::Mat monocular_mvs_pending_reference_rgb_;
+    std::unordered_set<unsigned long> monocular_mvs_scheduled_keyframes_;
+    bool monocular_omnidata_densify_ = false;
+    std::filesystem::path monocular_omnidata_model_path_;
+    int monocular_omnidata_input_size_ = 512;
+    int monocular_omnidata_width_ = 512;
+    int monocular_omnidata_height_ = 320;
+    int monocular_omnidata_view_num_ = 7;
+    float monocular_omnidata_depth_multiplier_ = 50.0f;
+    int monocular_omnidata_min_alignment_anchors_ = 16;
+    float monocular_omnidata_max_alignment_rel_error_ = 0.30f;
+    int monocular_omnidata_min_source_views_ = 1;
+    float monocular_omnidata_consistency_rel_tol_ = 0.10f;
+    float monocular_omnidata_consistency_vox_ = 2.0f;
+    bool monocular_omnidata_use_amp_ = true;
+    bool monocular_omnidata_empty_cache_before_launch_ = true;
+    std::shared_ptr<sv::OmnidataDepthBackend> monocular_omnidata_backend_;
+    std::shared_ptr<VoxelKeyframe> monocular_omnidata_pending_reference_;
+    std::vector<unsigned long> monocular_omnidata_pending_view_ids_;
+    std::unordered_set<unsigned long>
+        monocular_omnidata_scheduled_keyframes_;
+    std::unordered_map<unsigned long, cv::Mat>
+        monocular_omnidata_raw_depth_cache_;
     bool rgbd_fill_render_holes_initial_backfill_ = true;
     int depth_cached_ = 0;
     int max_depth_cached_ = 1;
@@ -429,8 +538,8 @@ protected:
     // residual-hole cells into the active SVRecon octree.
     bool rgbd_tsdf_evidence_ = false;
     bool rgbd_tsdf_evidence_initial_backfill_ = true;
-    int rgbd_tsdf_evidence_pixel_stride_ = 4;
-    float rgbd_tsdf_evidence_trunc_vox_ = 4.0f;
+    int rgbd_tsdf_evidence_pixel_stride_ = 2;
+    float rgbd_tsdf_evidence_trunc_vox_ = 3.0f;
     float rgbd_tsdf_evidence_max_weight_ = 5.0f;
     int rgbd_tsdf_evidence_promote_min_views_ = 2;
     std::unordered_map<
@@ -444,6 +553,11 @@ protected:
     Eigen::Vector3f rgbd_tsdf_layout_scene_min_ = Eigen::Vector3f::Zero();
     float rgbd_tsdf_layout_cell_size_ = 0.0f;
     int rgbd_tsdf_layout_grid_dim_ = 0;
+
+    // Orbeez-style sparse support: only live ORB MapPoints that have survived
+    // ORB's recent-point culling period seed weak SVRecon candidates.
+    std::map<point3D_id_t, Point3D> monocular_orb_sampling_support_;
+    std::unordered_set<point3D_id_t> monocular_orb_inserted_point_ids_;
     unsigned long min_num_initial_map_kfs_;
     torch::Tensor background_;
     float large_rot_th_;
@@ -459,11 +573,16 @@ protected:
     bool do_gaus_pyramid_training_;
 
     std::filesystem::path result_dir_;
+    std::atomic<int> runtime_frame_count_{0};
     int keyframe_record_interval_;
     int all_keyframes_record_interval_;
     bool record_rendered_image_;
     bool record_ground_truth_image_;
     bool record_loss_image_;
+
+    bool laptop_precheck_enabled_ = true;
+    int laptop_precheck_sample_interval_ms_ = 50;
+    std::unique_ptr<sv::LaptopPrecheckProfiler> laptop_precheck_profiler_;
 
     int training_report_interval_;   
     bool record_loop_ply_;

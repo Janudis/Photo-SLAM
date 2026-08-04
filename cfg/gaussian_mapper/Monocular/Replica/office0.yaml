@@ -44,6 +44,12 @@ Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
 Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 0 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
+Record.save_rendered_mesh_eval: 1
+Record.rendered_mesh_eval_voxel_size_m: 0.03
+Record.rendered_mesh_eval_min_weight: 1.0
+Record.rendered_mesh_eval_trunc_vox: 8.0
+Record.rendered_mesh_eval_depth_max_m: 40.0
+Record.rendered_mesh_eval_alpha_thres: 0.5
 Record.training_report_interval: 0 # 0:never, 1:always, others:periodically
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
@@ -69,6 +75,10 @@ Optimization.densification_interval: 100
 Optimization.opacity_reset_interval: 0  # 0:never, 1:always, others:periodically
 Optimization.prune_big_point_after_iter: 30000
 Optimization.densify_min_opacity: 0.02 #0.005
+Optimization.filter_near_voxels: 1
+Optimization.prune_far_voxels: 1
+Optimization.prune_near_voxels_geometric: 1
+Optimization.final_special_prune_enable: 1
 Optimization.densify_from_iter: 600
 Optimization.densify_until_iter: 15000
 Optimization.densify_grad_threshold: 0.001

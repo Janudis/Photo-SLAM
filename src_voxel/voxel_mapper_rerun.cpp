@@ -1260,24 +1260,43 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
         normalizeBoolMaskOrZeros(voxel_model_->inactiveGeoVoxelMask(), N, dev);
     torch::Tensor rgbd_fill_mask =
         normalizeBoolMaskOrZeros(voxel_model_->rgbdFillRenderHolesVoxelMask(), N, dev);
+    torch::Tensor monocular_rendered_depth_mask =
+        normalizeBoolMaskOrZeros(
+            voxel_model_->monocularRenderedDepthVoxelMask(), N, dev);
+    torch::Tensor monocular_mvs_mask =
+        normalizeBoolMaskOrZeros(
+            voxel_model_->monocularMvsVoxelMask(), N, dev);
+    torch::Tensor monocular_omnidata_mask =
+        normalizeBoolMaskOrZeros(
+            voxel_model_->monocularOmnidataVoxelMask(), N, dev);
     torch::Tensor active_mask =
         normalizeBoolMaskOrZeros(voxel_model_->activeRenderableMask(), N, dev);
     torch::Tensor active_source_count =
         (orb_mask.to(torch::kInt32) +
          inactive_geo_mask.to(torch::kInt32) +
-         rgbd_fill_mask.to(torch::kInt32))
+         rgbd_fill_mask.to(torch::kInt32) +
+         monocular_rendered_depth_mask.to(torch::kInt32) +
+         monocular_mvs_mask.to(torch::kInt32) +
+         monocular_omnidata_mask.to(torch::kInt32))
             .masked_select(active_mask);
     TORCH_CHECK(
         active_source_count.numel() == active_mask.sum().item<int64_t>() &&
             (active_source_count == 1).all().item<bool>(),
         "SVRecon Rerun provenance invariant failed: every active voxel must "
-        "have exactly one source (ORB, inactive geometry, or RGB-D).");
+        "have exactly one source (ORB, inactive geometry, RGB-D, or "
+        "monocular depth densification).");
     torch::Tensor orb_live_mask =
         (orb_mask & active_mask).to(torch::kBool);
     torch::Tensor rgbd_fill_live_mask =
         (rgbd_fill_mask & active_mask).to(torch::kBool);
     torch::Tensor inactive_geo_live_mask =
         (inactive_geo_mask & active_mask).to(torch::kBool);
+    torch::Tensor monocular_rendered_depth_live_mask =
+        (monocular_rendered_depth_mask & active_mask).to(torch::kBool);
+    torch::Tensor monocular_mvs_live_mask =
+        (monocular_mvs_mask & active_mask).to(torch::kBool);
+    torch::Tensor monocular_omnidata_live_mask =
+        (monocular_omnidata_mask & active_mask).to(torch::kBool);
     auto colors_for_indices =
         [&](const torch::Tensor& idx_in,
             const std::array<float, 4>& fallback_rgba) -> torch::Tensor
@@ -1350,43 +1369,65 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
         }
 
         for (const std::string& recording : recordings) {
-            if (recording == "svrecon_debug") {
-                sv::RerunVisualizerBridge::instance().visualizeDebugVoxelGridMap(
-                    recording,
-                    centers_sel,
-                    sizes_sel,
-                    levels_sel,
-                    colors_sel,
-                    grid_origin,
-                    iteration,
-                    entity_path,
-                    1.0f);
-            } else {
-                sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
-                    recording,
-                    centers_sel,
-                    sizes_sel,
-                    colors_sel,
-                    iteration,
-                    entity_path);
-            }
+            sv::RerunVisualizerBridge::instance().visualizeDebugVoxelGridMap(
+                recording,
+                centers_sel,
+                sizes_sel,
+                levels_sel,
+                colors_sel,
+                grid_origin,
+                iteration,
+                entity_path,
+                1.0f);
         }
     };
 
-    log_subset(orb_live_mask, "world/svrecon/source/orb", {0.75f, 0.75f, 0.75f, 1.0f}, true);
-    log_subset(
+    auto log_used_source =
+        [&](const torch::Tensor& mask,
+            const std::string& entity_path,
+            bool& was_logged)
+    {
+        const bool has_voxels =
+            mask.defined() && mask.numel() == N &&
+            mask.any().item<bool>();
+        if (!has_voxels && !was_logged) {
+            return;
+        }
+        log_subset(
+            mask,
+            entity_path,
+            {0.75f, 0.75f, 0.75f, 1.0f},
+            true);
+        was_logged = was_logged || has_voxels;
+    };
+
+    log_used_source(
+        orb_live_mask,
+        "world/svrecon/source/orb",
+        rerun_state_.whole_run_logged_orb_source_);
+    log_used_source(
         inactive_geo_live_mask,
-        "world/svrecon/source/inactive_geo",
-        {0.75f, 0.75f, 0.75f, 1.0f},
-        inactive_geo_densify_);
+        "world/svrecon/source/inactive",
+        rerun_state_.whole_run_logged_inactive_source_);
     const std::string rgbd_source_entity = rgbd_tsdf_evidence_
         ? "world/svrecon/source/rgbd_tsdf_promoted"
         : "world/svrecon/source/rgbd_fill_render_holes";
-    log_subset(
+    log_used_source(
         rgbd_fill_live_mask,
         rgbd_source_entity,
-        {0.75f, 0.75f, 0.75f, 1.0f},
-        rgbd_fill_render_holes_ || rgbd_tsdf_evidence_);
+        rerun_state_.whole_run_logged_rgbd_source_);
+    log_used_source(
+        monocular_rendered_depth_live_mask,
+        "world/svrecon/source/monocular_rendered_depth",
+        rerun_state_.whole_run_logged_monocular_rendered_depth_source_);
+    log_used_source(
+        monocular_mvs_live_mask,
+        "world/svrecon/source/monocular_mvs",
+        rerun_state_.whole_run_logged_monocular_mvs_source_);
+    log_used_source(
+        monocular_omnidata_live_mask,
+        "world/svrecon/source/monocular_omnidata",
+        rerun_state_.whole_run_logged_monocular_omnidata_source_);
 }
 
 void VoxelMapper::logSvreconDebugVoxelMaskToRerun(
@@ -1492,7 +1533,11 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
     const torch::Tensor& colors_in,
     const torch::Tensor& pruned_by_sdf_in,
     const torch::Tensor& pruned_by_surface_views_in,
-    const torch::Tensor& pruned_by_final_surface_in)
+    const torch::Tensor& pruned_by_near_camera_in,
+    const torch::Tensor& pruned_by_far_in,
+    const torch::Tensor& pruned_by_final_special_near_in,
+    const torch::Tensor& pruned_by_final_surface_in,
+    const torch::Tensor& pruned_by_monocular_covisibility_in)
 {
     if (!rerun_params_.enable_rerun_ ||
         (!rerun_params_.run_whole_run_ &&
@@ -1588,6 +1633,42 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 .contiguous()
                 .view({K});
     }
+    torch::Tensor near_camera_mask = torch::zeros(
+        {K},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    if (pruned_by_near_camera_in.defined() &&
+        pruned_by_near_camera_in.numel() == K) {
+        near_camera_mask =
+            pruned_by_near_camera_in.detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .contiguous()
+                .view({K});
+    }
+    torch::Tensor far_mask = torch::zeros(
+        {K},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    if (pruned_by_far_in.defined() &&
+        pruned_by_far_in.numel() == K) {
+        far_mask =
+            pruned_by_far_in.detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .contiguous()
+                .view({K});
+    }
+    torch::Tensor final_special_near_mask = torch::zeros(
+        {K},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    if (pruned_by_final_special_near_in.defined() &&
+        pruned_by_final_special_near_in.numel() == K) {
+        final_special_near_mask =
+            pruned_by_final_special_near_in.detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .contiguous()
+                .view({K});
+    }
     torch::Tensor final_surface_mask = torch::zeros(
         {K},
         torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
@@ -1600,13 +1681,42 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 .contiguous()
                 .view({K});
     }
-    // Keep the three active source topics disjoint. Scheduled SVRecon SDF
-    // pruning takes precedence, followed by the additional multi-view test and
-    // the final surface-confidence pass.
+    torch::Tensor monocular_covisibility_mask = torch::zeros(
+        {K},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    if (pruned_by_monocular_covisibility_in.defined() &&
+        pruned_by_monocular_covisibility_in.numel() == K) {
+        monocular_covisibility_mask =
+            pruned_by_monocular_covisibility_in.detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .contiguous()
+                .view({K});
+    }
+    // Keep concrete prune causes disjoint. The final-special operation is
+    // represented by its near and final-surface subcauses.
     surface_views_mask =
         (surface_views_mask & (~sdf_mask)).to(torch::kBool);
+    near_camera_mask =
+        (near_camera_mask & (~sdf_mask) & (~surface_views_mask))
+            .to(torch::kBool);
+    far_mask =
+        (far_mask & (~sdf_mask) & (~surface_views_mask) &
+         (~near_camera_mask))
+            .to(torch::kBool);
+    final_special_near_mask =
+        (final_special_near_mask & (~sdf_mask) & (~surface_views_mask) &
+         (~near_camera_mask) & (~far_mask))
+            .to(torch::kBool);
     final_surface_mask =
-        (final_surface_mask & (~sdf_mask) & (~surface_views_mask))
+        (final_surface_mask & (~sdf_mask) & (~surface_views_mask) &
+         (~near_camera_mask) & (~far_mask) &
+         (~final_special_near_mask))
+            .to(torch::kBool);
+    monocular_covisibility_mask =
+        (monocular_covisibility_mask & (~sdf_mask) &
+         (~surface_views_mask) & (~near_camera_mask) & (~far_mask) &
+         (~final_special_near_mask) & (~final_surface_mask))
             .to(torch::kBool);
 
     torch::Tensor grid_origin;
@@ -1627,8 +1737,7 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
             torch::Tensor& sizes_accum,
             torch::Tensor& levels_accum,
             torch::Tensor& colors_accum,
-            const std::string& debug_entity_path,
-            const std::string& whole_run_entity_path)
+            const std::string& entity_path)
     {
         torch::Tensor idx = mask.nonzero().squeeze(1);
         if (!idx.defined() || idx.numel() <= 0) {
@@ -1652,7 +1761,7 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         }
 
         for (const std::string& recording : recordings) {
-            if (recording == "svrecon_debug" && grid_origin.defined()) {
+            if (grid_origin.defined()) {
                 sv::RerunVisualizerBridge::instance().visualizeDebugVoxelGridMap(
                     recording,
                     centers_accum,
@@ -1661,16 +1770,8 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                     colors_accum,
                     grid_origin,
                     iteration,
-                    debug_entity_path,
+                    entity_path,
                     1.0f);
-            } else {
-                sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
-                    recording,
-                    centers_accum,
-                    sizes_accum,
-                    colors_accum,
-                    iteration,
-                    whole_run_entity_path);
             }
         }
     };
@@ -1692,10 +1793,7 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
     }
 
     for (const std::string& recording : recordings) {
-        if (recording == "svrecon_debug" && voxel_model_) {
-            torch::Tensor grid_origin =
-                (voxel_model_->SceneCenter() - 0.5f * voxel_model_->SceneExtent())
-                    .detach().to(torch::kCPU).to(torch::kFloat32).reshape({3}).contiguous();
+        if (grid_origin.defined()) {
             sv::RerunVisualizerBridge::instance().visualizeDebugVoxelGridMap(
                 recording,
                 rerun_state_.whole_run_pruned_centers_accum_,
@@ -1704,16 +1802,8 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 rerun_state_.whole_run_pruned_colors_accum_,
                 grid_origin,
                 iteration,
-                "world/svrecon/pruned_accumulated",
+                "world/pruned_voxels",
                 1.0f);
-        } else {
-            sv::RerunVisualizerBridge::instance().visualizeDebugVoxelBoxes(
-                recording,
-                rerun_state_.whole_run_pruned_centers_accum_,
-                rerun_state_.whole_run_pruned_sizes_accum_,
-                rerun_state_.whole_run_pruned_colors_accum_,
-                iteration,
-                "world/pruned");
         }
     }
 
@@ -1723,31 +1813,57 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         rerun_state_.whole_run_pruned_sdf_sizes_accum_,
         rerun_state_.whole_run_pruned_sdf_levels_accum_,
         rerun_state_.whole_run_pruned_sdf_colors_accum_,
-        "world/svrecon/pruned_accumulated/source/svrecon_sdf",
-        "world/pruned/source/svrecon_sdf");
+        "world/pruned_voxels/source/svrecon_sdf");
     append_source(
         surface_views_mask,
         rerun_state_.whole_run_pruned_surface_views_centers_accum_,
         rerun_state_.whole_run_pruned_surface_views_sizes_accum_,
         rerun_state_.whole_run_pruned_surface_views_levels_accum_,
         rerun_state_.whole_run_pruned_surface_views_colors_accum_,
-        "world/svrecon/pruned_accumulated/source/surface_views",
-        "world/pruned/source/surface_views");
+        "world/pruned_voxels/source/surface_views");
+    append_source(
+        near_camera_mask,
+        rerun_state_.whole_run_pruned_near_camera_centers_accum_,
+        rerun_state_.whole_run_pruned_near_camera_sizes_accum_,
+        rerun_state_.whole_run_pruned_near_camera_levels_accum_,
+        rerun_state_.whole_run_pruned_near_camera_colors_accum_,
+        "world/pruned_voxels/source/near_camera");
+    append_source(
+        far_mask,
+        rerun_state_.whole_run_pruned_far_centers_accum_,
+        rerun_state_.whole_run_pruned_far_sizes_accum_,
+        rerun_state_.whole_run_pruned_far_levels_accum_,
+        rerun_state_.whole_run_pruned_far_colors_accum_,
+        "world/pruned_voxels/source/far");
+    append_source(
+        final_special_near_mask,
+        rerun_state_.whole_run_pruned_near_centers_accum_,
+        rerun_state_.whole_run_pruned_near_sizes_accum_,
+        rerun_state_.whole_run_pruned_near_levels_accum_,
+        rerun_state_.whole_run_pruned_near_colors_accum_,
+        "world/pruned_voxels/source/final_special/near");
     append_source(
         final_surface_mask,
         rerun_state_.whole_run_pruned_final_surface_centers_accum_,
         rerun_state_.whole_run_pruned_final_surface_sizes_accum_,
         rerun_state_.whole_run_pruned_final_surface_levels_accum_,
         rerun_state_.whole_run_pruned_final_surface_colors_accum_,
-        "world/svrecon/pruned_accumulated/source/final_surface",
-        "world/pruned/source/final_surface");
+        "world/pruned_voxels/source/final_special/final_surface");
+    append_source(
+        monocular_covisibility_mask,
+        rerun_state_.whole_run_pruned_monocular_covis_centers_accum_,
+        rerun_state_.whole_run_pruned_monocular_covis_sizes_accum_,
+        rerun_state_.whole_run_pruned_monocular_covis_levels_accum_,
+        rerun_state_.whole_run_pruned_monocular_covis_colors_accum_,
+        "world/pruned_voxels/source/monocular_covisibility");
 }
 
 void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)
 {
     if (!rerun_params_.enable_rerun_ ||
         (!rerun_params_.rerun_reconstruction_mesh_ &&
-         !rerun_params_.rerun_svrecon_debug_) ||
+         !rerun_params_.rerun_svrecon_debug_ &&
+         !rerun_params_.run_whole_run_) ||
         !mpSLAM || !mpSLAM->getAtlas()) {
         return;
     }
@@ -1757,13 +1873,9 @@ void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)
         return;
     }
 
-    std::vector<float> pts;
-    std::vector<float> cols;
     {
         std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
         const std::vector<ORB_SLAM3::MapPoint*> map_points = pMap->GetAllMapPoints();
-        pts.reserve(map_points.size() * 3);
-        cols.reserve(map_points.size() * 3);
         for (auto* pMP : map_points) {
             if (!pMP || pMP->isBad()) {
                 continue;
@@ -1773,13 +1885,29 @@ void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)
             if (!pos.allFinite() || !color.allFinite()) {
                 continue;
             }
-            pts.push_back(pos.x());
-            pts.push_back(pos.y());
-            pts.push_back(pos.z());
-            cols.push_back(color.x());
-            cols.push_back(color.y());
-            cols.push_back(color.z());
+            rerun_state_.whole_run_orb_points_by_id_[
+                static_cast<std::uint64_t>(pMP->mnId)] = {
+                    pos.x(), pos.y(), pos.z(),
+                    color.x(), color.y(), color.z()};
         }
+    }
+
+    std::vector<std::uint64_t> point_ids;
+    point_ids.reserve(rerun_state_.whole_run_orb_points_by_id_.size());
+    for (const auto& item : rerun_state_.whole_run_orb_points_by_id_) {
+        point_ids.push_back(item.first);
+    }
+    std::sort(point_ids.begin(), point_ids.end());
+
+    std::vector<float> pts;
+    std::vector<float> cols;
+    pts.reserve(point_ids.size() * 3);
+    cols.reserve(point_ids.size() * 3);
+    for (const std::uint64_t point_id : point_ids) {
+        const auto& value =
+            rerun_state_.whole_run_orb_points_by_id_.at(point_id);
+        pts.insert(pts.end(), {value[0], value[1], value[2]});
+        cols.insert(cols.end(), {value[3], value[4], value[5]});
     }
 
     const int64_t n_points = static_cast<int64_t>(pts.size() / 3);
@@ -1814,13 +1942,23 @@ void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)
             "world/orb/map_points",
             0.015f);
     }
+    if (rerun_params_.run_whole_run_) {
+        sv::RerunVisualizerBridge::instance().visualizeDebugPoints3D(
+            "whole_run",
+            points,
+            colors,
+            iteration,
+            "world/orb/map_points",
+            0.015f);
+    }
 }
 
 void VoxelMapper::logCurrentOrbKeyframePosesToReconstructionRerun(int iteration)
 {
     if (!rerun_params_.enable_rerun_ ||
         (!rerun_params_.rerun_reconstruction_mesh_ &&
-         !rerun_params_.rerun_svrecon_debug_) ||
+         !rerun_params_.rerun_svrecon_debug_ &&
+         !rerun_params_.run_whole_run_) ||
         !mpSLAM || !mpSLAM->getAtlas()) {
         return;
     }
@@ -1873,6 +2011,13 @@ void VoxelMapper::logCurrentOrbKeyframePosesToReconstructionRerun(int iteration)
         if (rerun_params_.rerun_svrecon_debug_) {
             sv::RerunVisualizerBridge::instance().visualizeDebugCameraPose(
                 "svrecon_debug",
+                T_W_C,
+                iteration,
+                static_cast<int>(kf_id));
+        }
+        if (rerun_params_.run_whole_run_) {
+            sv::RerunVisualizerBridge::instance().visualizeDebugCameraPose(
+                "whole_run",
                 T_W_C,
                 iteration,
                 static_cast<int>(kf_id));

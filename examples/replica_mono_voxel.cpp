@@ -66,7 +66,7 @@ static void saveTrackingTime(const std::vector<float> &vTimesTrack,
 
     for (size_t i = 0; i < vTimesTrack.size(); ++i)
     {
-        out << std::fixed << std::setprecision(4)
+        out << std::fixed << std::setprecision(8)
             << vTimesTrack[i] << "\n";
         totaltime += vTimesTrack[i];
     }
@@ -191,6 +191,7 @@ int main(int argc, char **argv)
             0,                                // sequence idx
             device_type);
 
+    pVoxelMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
     // -------------------------------------------------------------------------
@@ -256,12 +257,16 @@ int main(int argc, char **argv)
         auto t1 = std::chrono::steady_clock::now();
 
         // Feed to SLAM -- matches TUM call signature
-        pSLAM->TrackMonocular(
-            im,
-            tframe,
-            std::vector<ORB_SLAM3::IMU::Point>(),  // no IMU here
-            vstrImageFilenamesRGB[ni]              // frame ID / name
-        );
+        {
+            auto tracking_profile =
+                pVoxelMapper->profileLaptopModule("orb_tracking");
+            pSLAM->TrackMonocular(
+                im,
+                tframe,
+                std::vector<ORB_SLAM3::IMU::Point>(),  // no IMU here
+                vstrImageFilenamesRGB[ni]              // frame ID / name
+            );
+        }
 
         auto t2 = std::chrono::steady_clock::now();
 
@@ -301,23 +306,35 @@ int main(int argc, char **argv)
     pSLAM->Shutdown();
     training_thd.join();
 
+    const std::filesystem::path shutdown_dir =
+        output_dir /
+        (std::to_string(pVoxelMapper->getIteration()) + "_shutdown");
+
     // GPU peak usage
     saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
 
     // Tracking time statistics
     saveTrackingTime(
         vTimesTrack,
         (output_dir / "TrackingTime.txt").string());
 
-    // Save camera trajectory
-    pSLAM->SaveTrajectoryTUM(
-        (output_dir / "CameraTrajectory_TUM.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryTUM(
-        (output_dir / "KeyFrameTrajectory_TUM.txt").string());
-    pSLAM->SaveTrajectoryEuRoC(
-        (output_dir / "CameraTrajectory_EuRoC.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryEuRoC(
-        (output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
+    // Preserve the trajectory beside the exact reconstruction that uses it.
+    const auto save_trajectories =
+        [&](const std::filesystem::path& directory)
+    {
+        std::filesystem::create_directories(directory);
+        pSLAM->SaveTrajectoryTUM(
+            (directory / "CameraTrajectory_TUM.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryTUM(
+            (directory / "KeyFrameTrajectory_TUM.txt").string());
+        pSLAM->SaveTrajectoryEuRoC(
+            (directory / "CameraTrajectory_EuRoC.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryEuRoC(
+            (directory / "KeyFrameTrajectory_EuRoC.txt").string());
+    };
+    save_trajectories(output_dir);
+    save_trajectories(shutdown_dir);
     // KITTI is optional for Replica, usually not saved:
     // pSLAM->SaveTrajectoryKITTI(
     //     (output_dir / "CameraTrajectory_KITTI.txt").string());

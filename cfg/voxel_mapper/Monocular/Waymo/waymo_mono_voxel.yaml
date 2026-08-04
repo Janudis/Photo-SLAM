@@ -1,7 +1,7 @@
 %YAML:1.0
 
-# Waymo monocular SVRecon mapper. The trajectory scale is estimated by
-# ORB-SLAM and is aligned with Sim(3) during evaluation.
+# Waymo monocular SVRecon configuration. The trajectory scale is estimated by
+# ORB-SLAM and aligned with Sim(3) during evaluation.
 
 # Model
 Model.sh_degree: 3
@@ -17,13 +17,14 @@ Model.global_scene_extent: 0 #64.0
 # Pipeline
 Pipeline.convert_SHs: 0
 Camera.z_near: 0.01
+Camera.z_far: 200.0
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 200.0
 
-# Sparse SVRecon topology: ORB points first, then Photo-SLAM monocular
-# inactive geometry. No depth, TSDF, or RGB-D hole allocation is used.
+# Mature ORB MapPoints allocate weak SVRecon candidates. Select exactly one
+# monocular densification backend below for the ablation study.
 Mapper.geometry_mode: "svrecon_sdf"
-Mapper.sdf_initialization_mode: "orb_prior"
+Mapper.sdf_initialization_mode: "weak_surface_prior"
 Mapper.sdf_initialization_orb_radius_vox: 1.0
 Mapper.inactive_geo_densify: 0
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0
@@ -31,6 +32,37 @@ Mapper.depth_cache: 10
 Mapper.rgbd_fill_render_holes: 0
 Mapper.rgbd_fill_render_holes_initial_backfill: 0
 Mapper.rgbd_fill_render_holes_stride: 2
+
+Mapper.monocular_rendered_depth_densify: 0
+Mapper.monocular_mvs_densify: 0
+Mapper.monocular_mvs_model_dir: "third_party/tandem/tandem/exported/tandem_512x320"
+Mapper.monocular_mvs_width: 512
+Mapper.monocular_mvs_height: 320
+Mapper.monocular_mvs_view_num: 7
+Mapper.monocular_mvs_depth_range_mode: "tandem_sparse_quantile"
+Mapper.monocular_mvs_depth_min_scene: 0.01
+Mapper.monocular_mvs_inverse_depth_quantile: 0.20
+Mapper.monocular_mvs_depth_max_multiplier: 3.0
+Mapper.monocular_mvs_discard_percentage: 10.0
+
+# Omnidata ablation. Enable this and disable the two alternatives above.
+# Its relative inverse depth is fitted to mature ORB points before the shared
+# source-view consistency and structural-hole insertion stages.
+Mapper.monocular_omnidata_densify: 1
+Mapper.monocular_omnidata_model_path: "mono_priors/models/omnidata_dpt_depth_v2_512.pt"
+Mapper.monocular_omnidata_input_size: 512
+Mapper.monocular_omnidata_width: 512
+Mapper.monocular_omnidata_height: 320
+Mapper.monocular_omnidata_view_num: 7
+Mapper.monocular_omnidata_depth_multiplier: 50.0
+Mapper.monocular_omnidata_min_alignment_anchors: 16
+Mapper.monocular_omnidata_max_alignment_rel_error: 0.30
+Mapper.monocular_omnidata_min_source_views: 1
+Mapper.monocular_omnidata_consistency_rel_tol: 0.10
+Mapper.monocular_omnidata_consistency_vox: 2.0
+Mapper.monocular_omnidata_use_amp: 1
+Mapper.monocular_omnidata_empty_cache_before_launch: 1
+
 Mapper.sdf_voxel_size_m: 0.005
 Mapper.sdf_init_trunc_vox: 4.0
 Mapper.sdf_init_max_depth_m: 0.0
@@ -54,6 +86,8 @@ Record.record_rendered_image: 1
 Record.record_ground_truth_image: 1
 Record.record_loss_image: 0
 Record.training_report_interval: 100
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0
 Record.enable_rerun: 0
 Record.rerun_max_keyframes: -1

@@ -897,6 +897,81 @@ torch::Tensor VoxelModel::activeRenderableMask() const
     return torch::ones({N}, opts);
 }
 
+void VoxelModel::accumulateMonocularRenderObservation(
+    const torch::Tensor& max_render_weight,
+    const float min_render_weight)
+{
+    const int64_t N = center_.defined() ? center_.size(0) : 0;
+    if (N <= 0) {
+        return;
+    }
+
+    auto bool_opts =
+        torch::TensorOptions().dtype(torch::kBool).device(device_type_);
+    auto i32_opts =
+        torch::TensorOptions().dtype(torch::kInt32).device(device_type_);
+    if (!is_monocular_provisional_voxel_.defined() ||
+        is_monocular_provisional_voxel_.size(0) != N) {
+        is_monocular_provisional_voxel_ = torch::zeros({N}, bool_opts);
+    }
+    if (!monocular_render_support_hits_.defined() ||
+        monocular_render_support_hits_.size(0) != N) {
+        monocular_render_support_hits_ = torch::zeros({N}, i32_opts);
+    }
+    if (!monocular_render_opportunities_.defined() ||
+        monocular_render_opportunities_.size(0) != N) {
+        monocular_render_opportunities_ = torch::zeros({N}, i32_opts);
+    }
+
+    torch::Tensor weight = max_render_weight;
+    TORCH_CHECK(
+        weight.defined() && weight.numel() == N,
+        "accumulateMonocularRenderObservation: max weight must contain one value per voxel");
+    weight =
+        weight.to(device_type_).to(torch::kFloat32).reshape({N}).contiguous();
+    torch::Tensor provisional =
+        is_monocular_provisional_voxel_.to(device_type_)
+            .to(torch::kBool)
+            .contiguous();
+    torch::Tensor supported =
+        provisional & (weight > min_render_weight);
+
+    torch::NoGradGuard no_grad;
+    monocular_render_opportunities_ =
+        (monocular_render_opportunities_.to(device_type_).to(torch::kInt32) +
+         provisional.to(torch::kInt32))
+            .contiguous();
+    monocular_render_support_hits_ =
+        (monocular_render_support_hits_.to(device_type_).to(torch::kInt32) +
+         supported.to(torch::kInt32))
+            .contiguous();
+}
+
+void VoxelModel::resolveMonocularProvisionalVoxels(
+    const torch::Tensor& resolved_mask)
+{
+    const int64_t N = center_.defined() ? center_.size(0) : 0;
+    if (N <= 0 || !resolved_mask.defined()) {
+        return;
+    }
+    TORCH_CHECK(
+        resolved_mask.numel() == N,
+        "resolveMonocularProvisionalVoxels: mask length mismatch");
+    auto bool_opts =
+        torch::TensorOptions().dtype(torch::kBool).device(device_type_);
+    if (!is_monocular_provisional_voxel_.defined() ||
+        is_monocular_provisional_voxel_.size(0) != N) {
+        is_monocular_provisional_voxel_ = torch::zeros({N}, bool_opts);
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    is_monocular_provisional_voxel_ =
+        (is_monocular_provisional_voxel_.to(device_type_).to(torch::kBool) &
+         (~resolved_mask.to(device_type_).to(torch::kBool).reshape({N})))
+            .contiguous();
+}
+
 int VoxelModel::maxNumLevels() const {
     return max_num_levels_;
 }
@@ -2273,9 +2348,20 @@ void VoxelModel::createFromPcd(
         }
     }
     rgb.clamp_(0.0f, 1.0f);
-    sparse_points_xyz_ = xyz.detach().to(torch::kFloat32).contiguous();
+    if (topology_sdf_init_mode_ == SdfInitMode::WeakSurfacePrior) {
+        sparse_points_xyz_ = torch::empty(
+            {0, 3},
+            torch::TensorOptions()
+                .dtype(torch::kFloat32)
+                .device(dev));
+        sdf_init_local_support_points_ =
+            xyz.detach().to(torch::kFloat32).contiguous();
+    } else {
+        sparse_points_xyz_ =
+            xyz.detach().to(torch::kFloat32).contiguous();
+        sdf_init_local_support_points_ = torch::Tensor();
+    }
     sparse_points_color_ = rgb.detach().to(torch::kFloat32).contiguous();
-    sdf_init_local_support_points_ = torch::Tensor();
     pending_sdf_init_mode_ = topology_sdf_init_mode_;
 
     // Reset accumulated real-point history. We seed it later from actually
@@ -2501,6 +2587,7 @@ void VoxelModel::createFromPcd(
         /*begin=*/0,
         /*end=*/grid_pts_key.size(0),
         /*default_value=*/std::max(1.0e-6f, 2.0f * fixed_vox_size_));
+    sdf_init_local_support_points_ = torch::Tensor();
 
     // ------------------------------------------------------------------------
     // 5) Initialize C++ members directly.
@@ -2544,6 +2631,24 @@ void VoxelModel::createFromPcd(
     this->is_rgbd_fill_render_holes_voxel_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kBool).device(dev));
+    this->is_monocular_rendered_depth_voxel_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kBool).device(dev));
+    this->is_monocular_mvs_voxel_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kBool).device(dev));
+    this->is_monocular_omnidata_voxel_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kBool).device(dev));
+    this->is_monocular_provisional_voxel_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kBool).device(dev));
+    this->monocular_render_support_hits_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kInt32).device(dev));
+    this->monocular_render_opportunities_ = torch::zeros(
+        {center_.size(0)},
+        torch::TensorOptions().dtype(torch::kInt32).device(dev));
     this->exist_since_iter_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kInt32).device(dev));
@@ -2552,8 +2657,10 @@ void VoxelModel::createFromPcd(
         current_kf_count,
         torch::TensorOptions().dtype(torch::kInt32).device(dev));
 
-    // Keep the complete raw real-point history for diagnostics and source masks.
-    real_pcd_points_accum_cpu_ = xyz.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    // Dense-core pruning must be estimated from cells that survived layout
+    // filtering, not from raw points that were rejected as invisible or near.
+    real_pcd_points_accum_cpu_ =
+        center_.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
 
     // Match SVRecon initialization while adapting sharpness to the actual
     // online octree resolution rather than a fixed offline scene scale.
@@ -2567,7 +2674,8 @@ void VoxelModel::increasePcd(
     std::vector<float> pcd_full,
     std::vector<float> colors,
     const int iteration,
-    const std::vector<sv::MiniCam>& cams)
+    const std::vector<sv::MiniCam>& cams,
+    const bool clear_cuda_cache_before_parameter_append)
 {
     sdf_init_cams_ = cams;
     torch::Tensor explicit_sdf_support_points = next_sdf_init_support_points_;
@@ -2652,9 +2760,31 @@ void VoxelModel::increasePcd(
         pending_real_insert_rr_entity_path_ == "world/rgbd_fill_render_holes/created" ||
         pending_real_insert_rr_entity_path_ == "world/rgbd_surface_points/created" ||
         pending_real_insert_rr_entity_path_ == "world/rgbd_tsdf_evidence/promoted";
-    const bool add_as_topology_support =
-        add_as_inactive_geo ||
-        add_as_rgbd_fill_render_holes;
+    const bool add_as_monocular_rendered_depth =
+        pending_real_insert_rr_entity_path_ ==
+        "world/monocular_rendered_depth/created";
+    const bool add_as_monocular_mvs =
+        pending_real_insert_rr_entity_path_ ==
+        "world/monocular_mvs/created";
+    const bool add_as_monocular_omnidata =
+        pending_real_insert_rr_entity_path_ ==
+        "world/monocular_omnidata/created";
+    torch::Tensor orb_metric_support;
+    if (add_as_orb) {
+        if (topology_sdf_init_mode_ ==
+            SdfInitMode::WeakSurfacePrior) {
+            if (explicit_sdf_support_points.defined() &&
+                explicit_sdf_support_points.numel() > 0) {
+                orb_metric_support =
+                    explicit_sdf_support_points.to(dev)
+                        .to(torch::kFloat32)
+                        .reshape({-1, 3})
+                        .contiguous();
+            }
+        } else {
+            orb_metric_support = xyz.detach().contiguous();
+        }
+    }
 
     // Build the min/max AABB tensor once:
     at::Tensor aabb = torch::stack({
@@ -2758,20 +2888,6 @@ void VoxelModel::increasePcd(
 
     // ── 4) Build octpath for this batch ─────────────────────────────────────
     auto octpath_new = SVRECON_UTILS::ijk_2_octpath(ijk_u.contiguous(), L_u.contiguous()).contiguous();          // [Nu,1] int64
-
-    const bool has_topology_support =
-        (is_inactive_geo_voxel_.defined() &&
-         is_inactive_geo_voxel_.numel() > 0 &&
-         is_inactive_geo_voxel_.to(torch::kBool).any().item<bool>()) ||
-        (is_rgbd_fill_render_holes_voxel_.defined() &&
-         is_rgbd_fill_render_holes_voxel_.numel() > 0 &&
-         is_rgbd_fill_render_holes_voxel_.to(torch::kBool).any().item<bool>());
-    if (add_as_orb && has_topology_support) {
-        updateExistingSupportSdfFromPoints_(
-            xyz.contiguous(),
-            rgb.contiguous(),
-            cams);
-    }
 
     // ---- Active insertion-time SVR-style filtering (kept separate from OLD block) ----
     // Keep this at insertion-time so bad candidates never enter the topology.
@@ -2946,9 +3062,9 @@ void VoxelModel::increasePcd(
     last_increase_pcd_stats_.pending_promotions = 0;
     last_increase_pcd_stats_.pending_support_updates = pending_support_updates;
     if (add_as_orb) {
-        // Keep one dedicated accumulated prior set. Inactive geometry and
-        // RGB-D hole samples allocate cells but never enter this ORB set.
-        appendSparseSupportPoints_(xyz);
+        // Weak monocular ORB candidates allocate topology, but only validated
+        // support enters the metric SDF prior.
+        appendSparseSupportPoints_(orb_metric_support);
     }
     pending_sdf_init_mode_ = topology_sdf_init_mode_;
     if (xyz_cpu.defined() && xyz_cpu.numel() > 0) {
@@ -2956,12 +3072,20 @@ void VoxelModel::increasePcd(
             pending_sdf_init_mode_ == SdfInitMode::SignedPointPrior ||
             pending_sdf_init_mode_ == SdfInitMode::WeakSurfacePrior;
         if (uses_local_point_prior) {
-            sdf_init_local_support_points_ =
-                explicit_sdf_support_points.defined() &&
-                        explicit_sdf_support_points.numel() > 0
-                    ? explicit_sdf_support_points.to(dev).to(torch::kFloat32)
-                          .reshape({-1, 3}).contiguous()
-                    : xyz.detach().contiguous();
+            if (pending_sdf_init_mode_ ==
+                SdfInitMode::WeakSurfacePrior) {
+                sdf_init_local_support_points_ =
+                    xyz.detach().contiguous();
+            } else {
+                sdf_init_local_support_points_ =
+                    explicit_sdf_support_points.defined() &&
+                            explicit_sdf_support_points.numel() > 0
+                        ? explicit_sdf_support_points.to(dev)
+                              .to(torch::kFloat32)
+                              .reshape({-1, 3})
+                              .contiguous()
+                        : xyz.detach().contiguous();
+            }
         } else {
             sdf_init_local_support_points_ = torch::Tensor();
         }
@@ -2969,15 +3093,15 @@ void VoxelModel::increasePcd(
             !add_as_orb) {
             appendSparseSupportPoints_(xyz);
         }
-        auto new_pts_cpu = xyz_cpu.to(torch::kCPU).to(torch::kFloat32).contiguous();
-        if (!real_pcd_points_accum_cpu_.defined() || real_pcd_points_accum_cpu_.numel() == 0) {
-            real_pcd_points_accum_cpu_ = new_pts_cpu;
-        } else {
-            real_pcd_points_accum_cpu_ =
-                torch::cat({real_pcd_points_accum_cpu_, new_pts_cpu}, 0).contiguous();
-        }
     }
     if (sel.numel() == 0) {
+        if (orb_metric_support.defined() &&
+            orb_metric_support.numel() > 0) {
+            updateExistingSupportSdfFromPoints_(
+                orb_metric_support,
+                torch::Tensor(),
+                cams);
+        }
         sdf_init_local_support_points_ = torch::Tensor();
         pending_sdf_init_mode_ = SdfInitMode::SignedPointPrior;
         pending_real_insert_rr_entity_path_.clear();
@@ -2987,6 +3111,29 @@ void VoxelModel::increasePcd(
     auto L_add       = L_u.index_select(0, sel);                                                         // [Nk,1]
     auto rgb_add     = rgb_u.index_select(0, sel);                                                       // [Nk,3]
     const int Nk = sel.size(0);
+    if (Nk > 0) {
+        auto [accepted_centers, accepted_sizes] = decodeOctpath(
+            octpath_add.contiguous(),
+            L_add.contiguous(),
+            scene_center_.contiguous(),
+            scene_extent_.contiguous());
+        (void)accepted_sizes;
+        auto accepted_centers_cpu =
+            accepted_centers.detach()
+                .to(torch::kCPU)
+                .to(torch::kFloat32)
+                .contiguous();
+        if (!real_pcd_points_accum_cpu_.defined() ||
+            real_pcd_points_accum_cpu_.numel() == 0) {
+            real_pcd_points_accum_cpu_ = accepted_centers_cpu;
+        } else {
+            real_pcd_points_accum_cpu_ =
+                torch::cat(
+                    {real_pcd_points_accum_cpu_, accepted_centers_cpu},
+                    0)
+                    .contiguous();
+        }
+    }
 
     ensureSvrasterSdfField();
     torch::Tensor old_vox_sdf_values =
@@ -3017,6 +3164,60 @@ void VoxelModel::increasePcd(
             is_rgbd_fill_render_holes_voxel_ =
                 is_rgbd_fill_render_holes_voxel_.to(octpath_old.device());
         }
+        if (!is_monocular_rendered_depth_voxel_.defined() ||
+            is_monocular_rendered_depth_voxel_.size(0) != octpath_old.size(0)) {
+            is_monocular_rendered_depth_voxel_ =
+                torch::zeros({octpath_old.size(0)}, bool_opts);
+        } else if (is_monocular_rendered_depth_voxel_.device() !=
+                   octpath_old.device()) {
+            is_monocular_rendered_depth_voxel_ =
+                is_monocular_rendered_depth_voxel_.to(octpath_old.device());
+        }
+        if (!is_monocular_mvs_voxel_.defined() ||
+            is_monocular_mvs_voxel_.size(0) != octpath_old.size(0)) {
+            is_monocular_mvs_voxel_ =
+                torch::zeros({octpath_old.size(0)}, bool_opts);
+        } else if (is_monocular_mvs_voxel_.device() !=
+                   octpath_old.device()) {
+            is_monocular_mvs_voxel_ =
+                is_monocular_mvs_voxel_.to(octpath_old.device());
+        }
+        if (!is_monocular_omnidata_voxel_.defined() ||
+            is_monocular_omnidata_voxel_.size(0) != octpath_old.size(0)) {
+            is_monocular_omnidata_voxel_ =
+                torch::zeros({octpath_old.size(0)}, bool_opts);
+        } else if (is_monocular_omnidata_voxel_.device() !=
+                   octpath_old.device()) {
+            is_monocular_omnidata_voxel_ =
+                is_monocular_omnidata_voxel_.to(octpath_old.device());
+        }
+        if (!is_monocular_provisional_voxel_.defined() ||
+            is_monocular_provisional_voxel_.size(0) != octpath_old.size(0)) {
+            is_monocular_provisional_voxel_ =
+                torch::zeros({octpath_old.size(0)}, bool_opts);
+        } else if (is_monocular_provisional_voxel_.device() !=
+                   octpath_old.device()) {
+            is_monocular_provisional_voxel_ =
+                is_monocular_provisional_voxel_.to(octpath_old.device());
+        }
+        if (!monocular_render_support_hits_.defined() ||
+            monocular_render_support_hits_.size(0) != octpath_old.size(0)) {
+            monocular_render_support_hits_ =
+                torch::zeros({octpath_old.size(0)}, i32_opts);
+        } else if (monocular_render_support_hits_.device() !=
+                   octpath_old.device()) {
+            monocular_render_support_hits_ =
+                monocular_render_support_hits_.to(octpath_old.device());
+        }
+        if (!monocular_render_opportunities_.defined() ||
+            monocular_render_opportunities_.size(0) != octpath_old.size(0)) {
+            monocular_render_opportunities_ =
+                torch::zeros({octpath_old.size(0)}, i32_opts);
+        } else if (monocular_render_opportunities_.device() !=
+                   octpath_old.device()) {
+            monocular_render_opportunities_ =
+                monocular_render_opportunities_.to(octpath_old.device());
+        }
         if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != octpath_old.size(0)) {
             exist_since_iter_ = torch::zeros({octpath_old.size(0)}, i32_opts);
         } else if (exist_since_iter_.device() != octpath_old.device()) {
@@ -3032,6 +3233,16 @@ void VoxelModel::increasePcd(
             auto inactive_geo_add_flag = torch::full({Nk}, add_as_inactive_geo, bool_opts);
             auto rgbd_fill_render_holes_add_flag =
                 torch::full({Nk}, add_as_rgbd_fill_render_holes, bool_opts);
+            auto monocular_rendered_depth_add_flag =
+                torch::full({Nk}, add_as_monocular_rendered_depth, bool_opts);
+            auto monocular_mvs_add_flag =
+                torch::full({Nk}, add_as_monocular_mvs, bool_opts);
+            auto monocular_omnidata_add_flag =
+                torch::full({Nk}, add_as_monocular_omnidata, bool_opts);
+            auto monocular_provisional_add_flag =
+                torch::full({Nk}, add_as_monocular_rendered_depth, bool_opts);
+            auto monocular_counter_add =
+                torch::zeros({Nk}, i32_opts);
             auto exist_since_add = torch::full(
                 {Nk}, static_cast<int32_t>(iteration), i32_opts);
             auto exist_since_kf_add = torch::full(
@@ -3040,6 +3251,39 @@ void VoxelModel::increasePcd(
             is_inactive_geo_voxel_ = torch::cat({is_inactive_geo_voxel_, inactive_geo_add_flag}, 0).contiguous();
             is_rgbd_fill_render_holes_voxel_ =
                 torch::cat({is_rgbd_fill_render_holes_voxel_, rgbd_fill_render_holes_add_flag}, 0).contiguous();
+            is_monocular_rendered_depth_voxel_ =
+                torch::cat(
+                    {is_monocular_rendered_depth_voxel_,
+                     monocular_rendered_depth_add_flag},
+                    0)
+                    .contiguous();
+            is_monocular_mvs_voxel_ =
+                torch::cat(
+                    {is_monocular_mvs_voxel_, monocular_mvs_add_flag},
+                    0)
+                    .contiguous();
+            is_monocular_omnidata_voxel_ =
+                torch::cat(
+                    {is_monocular_omnidata_voxel_,
+                     monocular_omnidata_add_flag},
+                    0)
+                    .contiguous();
+            is_monocular_provisional_voxel_ =
+                torch::cat(
+                    {is_monocular_provisional_voxel_,
+                     monocular_provisional_add_flag},
+                    0)
+                    .contiguous();
+            monocular_render_support_hits_ =
+                torch::cat(
+                    {monocular_render_support_hits_, monocular_counter_add},
+                    0)
+                    .contiguous();
+            monocular_render_opportunities_ =
+                torch::cat(
+                    {monocular_render_opportunities_, monocular_counter_add},
+                    0)
+                    .contiguous();
             exist_since_iter_ = torch::cat({exist_since_iter_, exist_since_add}, 0).contiguous();
             exist_since_kf_ = torch::cat({exist_since_kf_, exist_since_kf_add}, 0).contiguous();
         }
@@ -3087,7 +3331,13 @@ void VoxelModel::increasePcd(
     this->vox_key_ = vox_key_new.contiguous();
     if (Nk > 0) {
         appendGroup_(/*group_idx=*/1, /*add_rows=*/sh0_add, &this->sh0_);
+        if (clear_cuda_cache_before_parameter_append) {
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
         appendGroup_(/*group_idx=*/2, /*add_rows=*/shs_add, &this->shs_);
+        if (clear_cuda_cache_before_parameter_append) {
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
     }
 
     // ── 10) Rebuild renderer fields from the C++ topology ───────────────────
@@ -3195,6 +3445,56 @@ void VoxelModel::increasePcd(
         }
         is_rgbd_fill_render_holes_voxel_ = aligned;
     }
+    auto align_bool_metadata = [&](torch::Tensor& metadata) {
+        if (metadata.defined() && metadata.size(0) == center_.size(0)) {
+            metadata =
+                metadata.to(dev).to(torch::kBool).contiguous();
+            return;
+        }
+        auto bool_opts =
+            torch::TensorOptions().dtype(torch::kBool).device(dev);
+        auto aligned = torch::zeros({center_.size(0)}, bool_opts);
+        if (metadata.defined() && metadata.numel() > 0) {
+            auto old =
+                metadata.to(dev).to(torch::kBool).reshape({-1}).contiguous();
+            const int64_t copy_n =
+                std::min<int64_t>(old.size(0), aligned.size(0));
+            if (copy_n > 0) {
+                aligned.index_put_(
+                    {torch::indexing::Slice(0, copy_n)},
+                    old.index({torch::indexing::Slice(0, copy_n)}));
+            }
+        }
+        metadata = aligned.contiguous();
+    };
+    auto align_i32_metadata = [&](torch::Tensor& metadata) {
+        if (metadata.defined() && metadata.size(0) == center_.size(0)) {
+            metadata =
+                metadata.to(dev).to(torch::kInt32).contiguous();
+            return;
+        }
+        auto i32_opts =
+            torch::TensorOptions().dtype(torch::kInt32).device(dev);
+        auto aligned = torch::zeros({center_.size(0)}, i32_opts);
+        if (metadata.defined() && metadata.numel() > 0) {
+            auto old =
+                metadata.to(dev).to(torch::kInt32).reshape({-1}).contiguous();
+            const int64_t copy_n =
+                std::min<int64_t>(old.size(0), aligned.size(0));
+            if (copy_n > 0) {
+                aligned.index_put_(
+                    {torch::indexing::Slice(0, copy_n)},
+                    old.index({torch::indexing::Slice(0, copy_n)}));
+            }
+        }
+        metadata = aligned.contiguous();
+    };
+    align_bool_metadata(is_monocular_rendered_depth_voxel_);
+    align_bool_metadata(is_monocular_mvs_voxel_);
+    align_bool_metadata(is_monocular_omnidata_voxel_);
+    align_bool_metadata(is_monocular_provisional_voxel_);
+    align_i32_metadata(monocular_render_support_hits_);
+    align_i32_metadata(monocular_render_opportunities_);
     // Keep exist_since_iter tensor aligned with current topology size.
     if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != center_.size(0)) {
         auto i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(dev);
@@ -3224,6 +3524,14 @@ void VoxelModel::increasePcd(
         }
         exist_since_kf_ = aligned;
     }
+    if (orb_metric_support.defined() &&
+        orb_metric_support.numel() > 0) {
+        updateExistingSupportSdfFromPoints_(
+            orb_metric_support,
+            torch::Tensor(),
+            cams);
+    }
+
     // ── 10) Re-register with optimizer (new rows appended) ───────────────────
     VOXEL_MODEL_TENSORS_TO_VEC
 
@@ -3237,7 +3545,8 @@ void VoxelModel::increasePcd(
     torch::Tensor& new_point_cloud,
     torch::Tensor& new_colors,
     const int iteration,
-    const std::vector<sv::MiniCam>& cams)
+    const std::vector<sv::MiniCam>& cams,
+    const bool clear_cuda_cache_before_parameter_append)
 {
     // Follow GaussianModel::increasePcd(tensor) pattern, but reuse
     // our existing vector-based VoxelModel::increasePcd(..., cams).
@@ -3294,7 +3603,11 @@ void VoxelModel::increasePcd(
 
     // Reuse the main point-cloud insertion pipeline.
     increasePcd(
-        points, cols, iteration, cams);
+        points,
+        cols,
+        iteration,
+        cams,
+        clear_cuda_cache_before_parameter_append);
 }
 
 void VoxelModel::createTrainer(float geo_lr, float sh0_lr, float shs_lr,
@@ -3516,6 +3829,19 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     ensure_bool(is_orb_voxel_);
     ensure_bool(is_inactive_geo_voxel_);
     ensure_bool(is_rgbd_fill_render_holes_voxel_);
+    ensure_bool(is_monocular_rendered_depth_voxel_);
+    ensure_bool(is_monocular_mvs_voxel_);
+    ensure_bool(is_monocular_omnidata_voxel_);
+    ensure_bool(is_monocular_provisional_voxel_);
+    auto ensure_i32 = [&](torch::Tensor& t) {
+        if (!t.defined() || t.size(0) != N_before) {
+            t = torch::zeros({N_before}, i32_opts);
+        } else if (t.device() != mask.device()) {
+            t = t.to(mask.device());
+        }
+    };
+    ensure_i32(monocular_render_support_hits_);
+    ensure_i32(monocular_render_opportunities_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
@@ -3613,6 +3939,17 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     remap_bool(is_orb_voxel_);
     remap_bool(is_inactive_geo_voxel_);
     remap_bool(is_rgbd_fill_render_holes_voxel_);
+    remap_bool(is_monocular_rendered_depth_voxel_);
+    remap_bool(is_monocular_mvs_voxel_);
+    remap_bool(is_monocular_omnidata_voxel_);
+    remap_bool(is_monocular_provisional_voxel_);
+    auto remap_i32 = [&](torch::Tensor& t) {
+        t = t.to(mask.device()).to(torch::kInt32)
+                .index_select(0, kept_idx.to(mask.device()))
+                .contiguous();
+    };
+    remap_i32(monocular_render_support_hits_);
+    remap_i32(monocular_render_opportunities_);
     is_leaf_ = is_leaf_.index_select(0, kept_idx.to(is_leaf_.device())).contiguous();
     exist_since_iter_ =
         exist_since_iter_.to(mask.device()).to(torch::kInt32)
@@ -3643,12 +3980,29 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     ensure_bool(is_orb_voxel_);
     ensure_bool(is_inactive_geo_voxel_);
     ensure_bool(is_rgbd_fill_render_holes_voxel_);
+    ensure_bool(is_monocular_rendered_depth_voxel_);
+    ensure_bool(is_monocular_mvs_voxel_);
+    ensure_bool(is_monocular_omnidata_voxel_);
+    ensure_bool(is_monocular_provisional_voxel_);
+    auto ensure_i32 = [&](torch::Tensor& t) {
+        if (!t.defined() || t.size(0) != N_before) {
+            t = torch::zeros({N_before}, i32_opts);
+        } else if (t.device() != mask.device()) {
+            t = t.to(mask.device());
+        }
+    };
+    ensure_i32(monocular_render_support_hits_);
+    ensure_i32(monocular_render_opportunities_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
         is_leaf_ = is_leaf_.to(mask.device()).to(torch::kBool).reshape({N_before, 1});
     }
-    mask = mask & is_leaf_.view({-1});
+    // Provisional monocular cells must first pass the MonoGS-style
+    // co-visibility gate. Subdivision would otherwise make their children
+    // indistinguishable from validated surface cells.
+    mask = mask & is_leaf_.view({-1}) &
+           (~is_monocular_provisional_voxel_.view({-1}));
     if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != N_before) {
         exist_since_iter_ = torch::zeros({N_before}, i32_opts);
     } else if (exist_since_iter_.device() != mask.device()) {
@@ -3659,10 +4013,10 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     } else if (exist_since_kf_.device() != mask.device()) {
         exist_since_kf_ = exist_since_kf_.to(mask.device());
     }
-    auto orb_before = is_orb_voxel_.to(torch::kBool).contiguous();
-    auto inactive_geo_before = is_inactive_geo_voxel_.to(torch::kBool).contiguous();
-    auto rgbd_fill_render_holes_before =
-        is_rgbd_fill_render_holes_voxel_.to(torch::kBool).contiguous();
+    auto monocular_render_support_before =
+        monocular_render_support_hits_.to(torch::kInt32).contiguous();
+    auto monocular_render_opportunities_before =
+        monocular_render_opportunities_.to(torch::kInt32).contiguous();
     auto exist_since_before = exist_since_iter_.to(torch::kInt32).contiguous();
     auto exist_since_kf_before = exist_since_kf_.to(torch::kInt32).contiguous();
 
@@ -3819,6 +4173,33 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     remap_child_bool(is_orb_voxel_);
     remap_child_bool(is_inactive_geo_voxel_);
     remap_child_bool(is_rgbd_fill_render_holes_voxel_);
+    remap_child_bool(is_monocular_rendered_depth_voxel_);
+    remap_child_bool(is_monocular_mvs_voxel_);
+    remap_child_bool(is_monocular_omnidata_voxel_);
+    remap_child_bool(is_monocular_provisional_voxel_);
+
+    auto remap_child_i32 = [&](torch::Tensor& t,
+                               const torch::Tensor& before) {
+        auto kept =
+            before.to(mask.device()).to(torch::kInt32)
+                .index_select(0, kept_idx.to(mask.device()))
+                .contiguous();
+        auto child =
+            before.to(mask.device()).to(torch::kInt32)
+                .index_select(0, subdiv_idx.to(mask.device()))
+                .repeat_interleave(8, 0)
+                .contiguous();
+        t = torch::cat({kept, child}, 0)
+                .to(device_type_)
+                .to(torch::kInt32)
+                .contiguous();
+    };
+    remap_child_i32(
+        monocular_render_support_hits_,
+        monocular_render_support_before);
+    remap_child_i32(
+        monocular_render_opportunities_,
+        monocular_render_opportunities_before);
 
     auto kept_exist_iter =
         exist_since_before.to(mask.device()).index_select(0, kept_idx.to(mask.device())).contiguous();

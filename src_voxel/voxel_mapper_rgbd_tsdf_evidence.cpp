@@ -10,6 +10,8 @@
 
 namespace {
 
+constexpr int kMinObservedCornersForPromotion = 4;
+
 struct FrameCellObservation {
     cv::Vec3f color_sum{0.0f, 0.0f, 0.0f};
     std::uint32_t color_count = 0;
@@ -133,6 +135,8 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
         pkf->img_auxiliary_undist_.empty()) {
         return;
     }
+    auto evidence_profile =
+        profileLaptopModule("rgbd_tsdf_evidence_fusion");
 
     resetRgbdTsdfEvidenceIfLayoutChanged();
     if (rgbd_tsdf_layout_cell_size_ <= 0.0f ||
@@ -490,6 +494,8 @@ void VoxelMapper::promoteRgbdTsdfEvidenceCells(
         rgbd_tsdf_cell_evidence_.empty() || affected_cells.empty()) {
         return;
     }
+    auto promotion_profile =
+        profileLaptopModule("rgbd_tsdf_evidence_promotion");
 
     std::vector<sv::RgbdTsdfGridKey> promoted_cells;
     std::vector<sv::RgbdTsdfGridKey> rejected_non_surface_cells;
@@ -535,19 +541,19 @@ void VoxelMapper::promoteRgbdTsdfEvidenceCells(
         const auto corner_keys = sv::rgbdTsdfCellCornerKeys(key);
         bool has_positive = false;
         bool has_negative = false;
-        bool all_corners_observed = true;
+        int observed_corner_count = 0;
         for (const auto& corner_key : corner_keys) {
             const auto corner = rgbd_tsdf_corner_evidence_.find(corner_key);
             if (corner == rgbd_tsdf_corner_evidence_.end() ||
                 corner->second.weight <= 0.0f ||
                 !std::isfinite(corner->second.distance)) {
-                all_corners_observed = false;
-                break;
+                continue;
             }
+            ++observed_corner_count;
             has_positive = has_positive || corner->second.distance > 0.0f;
             has_negative = has_negative || corner->second.distance < 0.0f;
         }
-        if (!all_corners_observed) {
+        if (observed_corner_count < kMinObservedCornersForPromotion) {
             if (log_evidence_snapshot) {
                 incomplete_corner_cells.push_back(key);
             }
@@ -593,10 +599,15 @@ void VoxelMapper::promoteRgbdTsdfEvidenceCells(
         promoted_cells.push_back(key);
 
         for (const auto& corner_key : corner_keys) {
+            const auto corner = rgbd_tsdf_corner_evidence_.find(corner_key);
+            if (corner == rgbd_tsdf_corner_evidence_.end() ||
+                corner->second.weight <= 0.0f ||
+                !std::isfinite(corner->second.distance)) {
+                continue;
+            }
             if (!direct_corner_keys.insert(corner_key).second) {
                 continue;
             }
-            const auto corner = rgbd_tsdf_corner_evidence_.find(corner_key);
             const Eigen::Vector3f world = rgbd_tsdf_layout_scene_min_ +
                 rgbd_tsdf_layout_cell_size_ * Eigen::Vector3f(
                     static_cast<float>(corner_key.x),

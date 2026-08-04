@@ -21,29 +21,37 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include "viewer/imgui_viewer.h"
 
-void LoadImages(const std::string &strFile, std::vector<std::string> &vstrImageFilenames,
+void LoadImages(const std::filesystem::path &sequence_path,
+                std::vector<std::string> &vstrImageFilenames,
                 std::vector<double> &vTimestamps)
 {
-    std::ifstream f(strFile.c_str());
-    std::string s0;
-    std::getline(f, s0);
-    std::getline(f, s0);
-    std::getline(f, s0);
-
-    while (!f.eof())
+    std::filesystem::path image_list = sequence_path / "rgb.txt";
+    if (!std::filesystem::exists(image_list))
     {
-        std::string s;
-        std::getline(f, s);
-        if (!s.empty())
+        image_list = sequence_path / "association.txt";
+    }
+
+    std::ifstream input(image_list);
+    if (!input.is_open())
+    {
+        std::cerr << "[ERROR] Could not open monocular image list: "
+                  << image_list << std::endl;
+        return;
+    }
+
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (line.empty() || line.front() == '#')
+            continue;
+
+        std::stringstream stream(line);
+        double timestamp = 0.0;
+        std::string rgb_path;
+        if (stream >> timestamp >> rgb_path)
         {
-            std::stringstream ss;
-            ss << s;
-            double t;
-            std::string sRGB;
-            ss >> t;
-            vTimestamps.push_back(t);
-            ss >> sRGB;
-            vstrImageFilenames.push_back(sRGB);
+            vTimestamps.push_back(timestamp);
+            vstrImageFilenames.push_back(rgb_path);
         }
     }
 }
@@ -52,7 +60,7 @@ void saveTrackingTime(const std::vector<float> &times, const std::string &path)
 {
     std::ofstream out(path);
     for (float t : times)
-        out << std::fixed << std::setprecision(4) << t << "\n";
+        out << std::fixed << std::setprecision(8) << t << "\n";
     out.close();
 }
 
@@ -97,13 +105,13 @@ int main(int argc, char **argv)
 
     std::vector<std::string> vstrImageFilenamesRGB;
     std::vector<double> vTimestamps;
-    LoadImages(std::string(argv[4]) + "/rgb.txt", vstrImageFilenamesRGB, vTimestamps);
+    LoadImages(std::filesystem::path(argv[4]), vstrImageFilenamesRGB, vTimestamps);
 
     int nImages = vstrImageFilenamesRGB.size();
     if (nImages == 0)
     {
         std::cerr << std::endl
-                  << "No images found in: " << std::string(argv[4]) + "/rgb.txt" << std::endl;
+                  << "No images found in: " << argv[4] << std::endl;
         return 1;
     }
 
@@ -123,6 +131,7 @@ int main(int argc, char **argv)
                                       output_dir,
                                       0,
                                       device_type);
+    pVoxelMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
     std::thread viewer_thd;
@@ -148,8 +157,6 @@ int main(int argc, char **argv)
 
         const std::string image_path = std::string(argv[4]) + "/" + vstrImageFilenamesRGB[ni];
         cv::Mat im = cv::imread(image_path, cv::IMREAD_UNCHANGED);
-        cv::cvtColor(im, im, cv::COLOR_BGR2RGB);
-        double tframe = vTimestamps[ni];
 
         if (im.empty())
         {
@@ -158,6 +165,8 @@ int main(int argc, char **argv)
                       << image_path << std::endl;
             return 1;
         }
+        cv::cvtColor(im, im, cv::COLOR_BGR2RGB);
+        double tframe = vTimestamps[ni];
 
         if (imageScale != 1.f)
         {
@@ -168,7 +177,15 @@ int main(int argc, char **argv)
 
         auto t1 = std::chrono::steady_clock::now();
 
-        pSLAM->TrackMonocular(im, tframe, std::vector<ORB_SLAM3::IMU::Point>(), image_path);
+        {
+            auto tracking_profile =
+                pVoxelMapper->profileLaptopModule("orb_tracking");
+            pSLAM->TrackMonocular(
+                im,
+                tframe,
+                std::vector<ORB_SLAM3::IMU::Point>(),
+                image_path);
+        }
 
         auto t2 = std::chrono::steady_clock::now();
 
@@ -183,13 +200,28 @@ int main(int argc, char **argv)
     pSLAM->Shutdown();
     training_thd.join();
 
+    const std::filesystem::path shutdown_dir =
+        output_dir /
+        (std::to_string(pVoxelMapper->getIteration()) + "_shutdown");
     saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
 
-    pSLAM->SaveTrajectoryTUM((output_dir / "CameraTrajectory_TUM.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryTUM((output_dir / "KeyFrameTrajectory_TUM.txt").string());
-    pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
+    const auto save_trajectories =
+        [&](const std::filesystem::path& directory)
+    {
+        std::filesystem::create_directories(directory);
+        pSLAM->SaveTrajectoryTUM(
+            (directory / "CameraTrajectory_TUM.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryTUM(
+            (directory / "KeyFrameTrajectory_TUM.txt").string());
+        pSLAM->SaveTrajectoryEuRoC(
+            (directory / "CameraTrajectory_EuRoC.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryEuRoC(
+            (directory / "KeyFrameTrajectory_EuRoC.txt").string());
+    };
+    save_trajectories(output_dir);
+    save_trajectories(shutdown_dir);
 
     if (use_viewer)
         viewer_thd.join();

@@ -243,6 +243,7 @@ int main(int argc, char **argv)
                                       output_dir,
                                       0,
                                       device_type);
+    pVoxelMapper->setRuntimeFrameCount(nImages);
 
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
@@ -310,11 +311,15 @@ int main(int argc, char **argv)
 
         // TrackRGBD signature:
         // TrackRGBD(imRGB, imD, timestamp, imuVec, imgName)
-        pSLAM->TrackRGBD(imRGB,
-                         imD,
-                         tframe,
-                         std::vector<ORB_SLAM3::IMU::Point>(),
-                         vstrImageFilenamesRGB[ni]);
+        {
+            auto tracking_profile =
+                pVoxelMapper->profileLaptopModule("orb_tracking");
+            pSLAM->TrackRGBD(imRGB,
+                             imD,
+                             tframe,
+                             std::vector<ORB_SLAM3::IMU::Point>(),
+                             vstrImageFilenamesRGB[ni]);
+        }
 
         auto t2 = std::chrono::steady_clock::now();
 
@@ -355,12 +360,24 @@ int main(int argc, char **argv)
     // Save tracking time stats
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
 
-    // Save trajectories
-    pSLAM->SaveTrajectoryTUM((output_dir / "CameraTrajectory_TUM.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryTUM((output_dir / "KeyFrameTrajectory_TUM.txt").string());
-    pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
-    pSLAM->SaveTrajectoryKITTI((output_dir / "CameraTrajectory_KITTI.txt").string());
+    // Preserve a run-local trajectory beside the matching reconstruction.
+    const auto save_trajectories =
+        [&](const std::filesystem::path& trajectory_dir)
+    {
+        std::filesystem::create_directories(trajectory_dir);
+        pSLAM->SaveTrajectoryTUM(
+            (trajectory_dir / "CameraTrajectory_TUM.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryTUM(
+            (trajectory_dir / "KeyFrameTrajectory_TUM.txt").string());
+        pSLAM->SaveTrajectoryEuRoC(
+            (trajectory_dir / "CameraTrajectory_EuRoC.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryEuRoC(
+            (trajectory_dir / "KeyFrameTrajectory_EuRoC.txt").string());
+        pSLAM->SaveTrajectoryKITTI(
+            (trajectory_dir / "CameraTrajectory_KITTI.txt").string());
+    };
+    save_trajectories(output_dir);
+    save_trajectories(shutdown_dir);
 
     const auto total_end = std::chrono::steady_clock::now();
     const double total_wall_seconds =

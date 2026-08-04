@@ -27,6 +27,7 @@
 #include <thread>
 #include <filesystem>
 #include <memory>
+#include <unistd.h>
 
 #include <opencv2/core/core.hpp>
 
@@ -103,6 +104,7 @@ int main(int argc, char **argv)
     std::shared_ptr<GaussianMapper> pGausMapper =
         std::make_shared<GaussianMapper>(
             pSLAM, gaussian_cfg_path, output_dir, 0, device_type);
+    pGausMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&GaussianMapper::run, pGausMapper.get());
 
     // Create Gaussian Viewer
@@ -124,14 +126,13 @@ int main(int argc, char **argv)
 
     // Main loop
     cv::Mat im;
+    constexpr double replica_fps = 30.0;
     for (int ni = 0; ni < nImages; ni++)
     {
         if (pSLAM->isShutDown())
             break;
         // Read image and depthmap from file
         im = cv::imread(vstrImageFilenamesRGB[ni], cv::IMREAD_UNCHANGED);
-        cv::cvtColor(im, im, CV_BGR2RGB);
-        double tframe = ni;
 
         if (im.empty())
         {
@@ -139,6 +140,8 @@ int main(int argc, char **argv)
                       << vstrImageFilenamesRGB[ni] << std::endl;
             return 1;
         }
+        cv::cvtColor(im, im, CV_BGR2RGB);
+        const double tframe = static_cast<double>(ni) / replica_fps;
 
         if (imageScale != 1.f)
         {
@@ -156,6 +159,12 @@ int main(int argc, char **argv)
 
         double ttrack = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
         vTimesTrack[ni] = ttrack;
+
+        const double frame_period = 1.0 / replica_fps;
+        if (ttrack < frame_period) {
+            usleep(static_cast<useconds_t>(
+                (frame_period - ttrack) * 1.0e6));
+        }
     }
 
     // Stop all threads
@@ -164,17 +173,32 @@ int main(int argc, char **argv)
     if (use_viewer)
         viewer_thd.join();
 
+    const std::filesystem::path shutdown_dir =
+        output_dir /
+        (std::to_string(pGausMapper->getIteration()) + "_shutdown");
+
     // GPU peak usage
     saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
+    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
 
     // Tracking time statistics
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
 
-    // Save camera trajectory
-    pSLAM->SaveTrajectoryTUM((output_dir / "CameraTrajectory_TUM.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryTUM((output_dir / "KeyFrameTrajectory_TUM.txt").string());
-    pSLAM->SaveTrajectoryEuRoC((output_dir / "CameraTrajectory_EuRoC.txt").string());
-    pSLAM->SaveKeyFrameTrajectoryEuRoC((output_dir / "KeyFrameTrajectory_EuRoC.txt").string());
+    const auto save_trajectories =
+        [&](const std::filesystem::path& directory)
+    {
+        std::filesystem::create_directories(directory);
+        pSLAM->SaveTrajectoryTUM(
+            (directory / "CameraTrajectory_TUM.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryTUM(
+            (directory / "KeyFrameTrajectory_TUM.txt").string());
+        pSLAM->SaveTrajectoryEuRoC(
+            (directory / "CameraTrajectory_EuRoC.txt").string());
+        pSLAM->SaveKeyFrameTrajectoryEuRoC(
+            (directory / "KeyFrameTrajectory_EuRoC.txt").string());
+    };
+    save_trajectories(output_dir);
+    save_trajectories(shutdown_dir);
     // pSLAM->SaveTrajectoryKITTI((output_dir / "CameraTrajectory_KITTI.txt").string());
 
     return 0;
@@ -200,7 +224,7 @@ void saveTrackingTime(std::vector<float> &vTimesTrack, const std::string &strSav
     float totaltime = 0;
     for (int ni = 0; ni < nImages; ni++)
     {
-        out << std::fixed << std::setprecision(4)
+        out << std::fixed << std::setprecision(8)
             << vTimesTrack[ni] << std::endl;
         totaltime += vTimesTrack[ni];
     }

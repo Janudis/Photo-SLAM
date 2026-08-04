@@ -3345,6 +3345,7 @@ int main(int argc, char** argv)
         "{align_stride  |1| stride for trajectory pair sampling in Sim(3) fit }"
         "{align_max_pairs|0| max pose pairs for Sim(3) fit (0=all sampled pairs) }"
         "{save_aligned_mesh|0| save the aligned reconstruction mesh to the output directory }"
+        "{alignment_only|0| stop after alignment and full-resolution aligned-mesh export; do not compute geometry metrics }"
         "{save_precision_recall_meshes|0| save HI-SLAM2-style vertex-colored precision and recall meshes }"
         "{scene_name    | | output prefix for precision/recall meshes; inferred from GT filename when empty }"
         "{gs_unseen_npy | | unseen GT point cloud .npy for gaussian_slam random-view rejection; if empty and --gt ends with _culled.ply, infer _pc_unseen.npy }"
@@ -3400,6 +3401,7 @@ int main(int argc, char** argv)
     const int align_stride = parser.get<int>("align_stride");
     const int align_max_pairs = parser.get<int>("align_max_pairs");
     const bool save_aligned_mesh = parser.get<int>("save_aligned_mesh") != 0;
+    const bool alignment_only = parser.get<int>("alignment_only") != 0;
     const bool save_precision_recall_meshes =
         parser.get<int>("save_precision_recall_meshes") != 0;
     std::string scene_name = parser.get<std::string>("scene_name");
@@ -3457,6 +3459,12 @@ int main(int argc, char** argv)
     if (save_precision_recall_meshes && !(tau_m > 0.0f))
     {
         std::cerr << "[mesh_eval] --tau_cm must be positive for precision/recall mesh export\n";
+        return 1;
+    }
+    if (alignment_only && (!align_recon_to_gt || !save_aligned_mesh))
+    {
+        std::cerr << "[mesh_eval] alignment_only=1 requires "
+                     "align_recon_to_gt=1 and save_aligned_mesh=1\n";
         return 1;
     }
     if (gs_unseen_npy.empty())
@@ -3648,6 +3656,74 @@ int main(int argc, char** argv)
                       << " threshold=" << gs_settings.icp_threshold_m
                       << " t=(" << align_t[0] << "," << align_t[1] << "," << align_t[2] << ")\n";
         }
+    }
+
+    if (alignment_only)
+    {
+        if (!alignment_ok)
+        {
+            std::cerr << "[mesh_eval] alignment-only mode did not produce a valid alignment\n";
+            return 1;
+        }
+
+        const std::filesystem::path output_dir(out_dir);
+        const std::filesystem::path aligned_mesh_path =
+            output_dir / "recon_mesh_aligned.ply";
+        if (!savePlyMesh(aligned_mesh_path.string(), recon_mesh))
+        {
+            return 1;
+        }
+
+        Json::Value root;
+        root["mode"] = "alignment_only";
+        root["recon_mesh"] = recon_path;
+        root["gt_mesh"] = gt_path;
+        root["eval_mode"] = evalModeName(eval_mode);
+        root["geometry_metrics_computed"] = false;
+        root["aligned_mesh_path"] = aligned_mesh_path.string();
+        root["aligned_mesh_vertices"] =
+            static_cast<Json::UInt64>(recon_mesh.vertices.size());
+        root["aligned_mesh_faces"] =
+            static_cast<Json::UInt64>(recon_mesh.faces.size());
+        root["align_scale"] = align_scale;
+        root["align_pairs"] = static_cast<Json::UInt64>(align_pairs);
+        root["align_t_x"] = align_t[0];
+        root["align_t_y"] = align_t[1];
+        root["align_t_z"] = align_t[2];
+
+        const std::filesystem::path alignment_json = output_dir / "alignment.json";
+        const std::filesystem::path alignment_txt = output_dir / "alignment.txt";
+        {
+            std::ofstream f(alignment_json);
+            Json::StreamWriterBuilder builder;
+            builder["indentation"] = "  ";
+            f << Json::writeString(builder, root);
+        }
+        {
+            std::ofstream f(alignment_txt);
+            f << "mode alignment_only\n";
+            f << "geometry_metrics_computed 0\n";
+            f << "aligned_mesh_path " << aligned_mesh_path.string() << "\n";
+            f << "aligned_mesh_vertices " << recon_mesh.vertices.size() << "\n";
+            f << "aligned_mesh_faces " << recon_mesh.faces.size() << "\n";
+            f << "align_scale " << align_scale << "\n";
+            f << "align_pairs " << align_pairs << "\n";
+            f << "align_t_x " << align_t[0] << "\n";
+            f << "align_t_y " << align_t[1] << "\n";
+            f << "align_t_z " << align_t[2] << "\n";
+        }
+
+        std::error_code remove_error;
+        std::filesystem::remove(output_dir / "mesh_eval.json", remove_error);
+        remove_error.clear();
+        std::filesystem::remove(output_dir / "mesh_eval.txt", remove_error);
+
+        std::cout << "[mesh_eval] alignment-only saved full-resolution mesh: "
+                  << aligned_mesh_path << " (vertices=" << recon_mesh.vertices.size()
+                  << ", faces=" << recon_mesh.faces.size() << ")\n";
+        std::cout << "[mesh_eval] geometry metrics skipped; evaluate the aligned mesh "
+                     "with the selected reconstruction protocol.\n";
+        return 0;
     }
 
     std::vector<cv::Point3f> recon_pts;

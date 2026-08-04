@@ -189,6 +189,23 @@
  
      void increasePcdByKeyframeInactiveGeoDensify(
          std::shared_ptr<GaussianKeyframe> pkf);
+
+     std::map<point3D_id_t, Point3D> filterNearInsertionPoints(
+         const std::map<point3D_id_t, Point3D>& points) const;
+     void filterNearInsertionPoints(
+         std::vector<float>& points,
+         std::vector<float>& colors) const;
+     void filterNearInsertionPoints(
+         torch::Tensor& points,
+         torch::Tensor& colors) const;
+     torch::Tensor cameraFacingNearGaussianMask(
+         const torch::Tensor& points,
+         const torch::Tensor& support_radii) const;
+     torch::Tensor geometricNearGaussianMask(
+         const torch::Tensor& points,
+         const torch::Tensor& support_radii) const;
+     torch::Tensor denseCoreFarGaussianMask() const;
+     void runGaussianHeuristicPrune(bool final_cleanup);
  
      // bool needInterruptTraining();
      // void setInterruptTraining(const bool interrupt_training);
@@ -328,6 +345,10 @@
  
      int prune_big_point_after_iter_;
      float densify_min_opacity_ = 20;
+     bool filter_near_voxels_ = false;
+     bool prune_far_voxels_ = false;
+     bool prune_near_voxels_geometric_ = false;
+     bool final_special_prune_enable_ = false;
  
      // Tools
      std::random_device rd_;

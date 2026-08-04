@@ -2,6 +2,8 @@
 #include "include_voxel/voxel_mapper_utils.h"
 #include "include_voxel/voxel_mapper_evaluation.h"
 #include "include_voxel/mapper_depth_registry.h"
+#include "include_voxel/tandem_mvs_backend.h"
+#include "include_voxel/omnidata_depth_backend.h"
 #include "include/stereo_vision.h"
 #include "include/sh_utils.h"
 
@@ -31,6 +33,81 @@
 namespace py = pybind11;
 
 namespace {
+struct VoxelRuntimeGpuStats
+{
+    float reserved_mb = 0.0f;
+    float allocated_mb = 0.0f;
+};
+
+VoxelRuntimeGpuStats getVoxelRuntimeGpuStats()
+{
+    VoxelRuntimeGpuStats stats;
+    if (!torch::cuda::is_available()) {
+        return stats;
+    }
+
+    namespace c10Alloc = c10::cuda::CUDACachingAllocator;
+    const c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
+    stats.reserved_mb =
+        mem_stats.reserved_bytes[
+            static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        (1024.0f * 1024.0f);
+    stats.allocated_mb =
+        mem_stats.allocated_bytes[
+            static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        (1024.0f * 1024.0f);
+    return stats;
+}
+
+double voxelFileSizeMb(const std::filesystem::path& path)
+{
+    if (!std::filesystem::exists(path)) {
+        return 0.0;
+    }
+    return static_cast<double>(std::filesystem::file_size(path)) /
+           (1024.0 * 1024.0);
+}
+
+void saveVoxelRuntimeMetrics(
+    const std::filesystem::path& path,
+    int frames,
+    int keyframes,
+    int voxels,
+    int iterations,
+    double mapping_seconds,
+    const std::filesystem::path& map_path,
+    const VoxelRuntimeGpuStats& gpu_stats)
+{
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+
+    std::ofstream out(path);
+    out << std::fixed << std::setprecision(6);
+    out << "{\n";
+    out << "  \"frames\": " << frames << ",\n";
+    out << "  \"keyframes\": " << keyframes << ",\n";
+    out << "  \"primitive_type\": \"voxels\",\n";
+    out << "  \"primitive_count\": " << voxels << ",\n";
+    out << "  \"voxels\": " << voxels << ",\n";
+    out << "  \"iterations\": " << iterations << ",\n";
+    out << "  \"total_seconds\": " << mapping_seconds << ",\n";
+    out << "  \"fps_hz\": "
+        << (mapping_seconds > 0.0
+                ? static_cast<double>(frames) / mapping_seconds
+                : 0.0)
+        << ",\n";
+    out << "  \"runtime_scope\": "
+           "\"mapping and tail optimization; evaluation export excluded\",\n";
+    out << "  \"map_path\": \"" << map_path.string() << "\",\n";
+    out << "  \"map_size_mb\": " << voxelFileSizeMb(map_path) << ",\n";
+    out << "  \"gpu_memory_allocated_mb\": "
+        << gpu_stats.allocated_mb << ",\n";
+    out << "  \"gpu_memory_reserved_mb\": "
+        << gpu_stats.reserved_mb << "\n";
+    out << "}\n";
+}
+
 cv::Mat mapperDepthForKeyframe(
     const std::string& image_filename,
     const cv::Mat& tracking_depth,
@@ -53,6 +130,32 @@ cv::Mat mapperDepthForKeyframe(
         camera.undistort_map2,
         cv::INTER_NEAREST);
     return undistorted;
+}
+
+std::filesystem::path resolveMapperResourcePath(
+    const std::filesystem::path& config_file,
+    const std::filesystem::path& configured_path)
+{
+    if (configured_path.empty() || configured_path.is_absolute()) {
+        return configured_path;
+    }
+    if (std::filesystem::exists(configured_path)) {
+        return std::filesystem::absolute(configured_path);
+    }
+
+    std::filesystem::path cursor =
+        std::filesystem::absolute(config_file).parent_path();
+    while (!cursor.empty()) {
+        if (std::filesystem::exists(cursor / "CMakeLists.txt")) {
+            return cursor / configured_path;
+        }
+        const std::filesystem::path parent = cursor.parent_path();
+        if (parent == cursor) {
+            break;
+        }
+        cursor = parent;
+    }
+    return configured_path;
 }
 
 void ensurePythonRuntimeInitialized(bool import_torch_cuda)
@@ -136,6 +239,14 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     CHECK_DIRECTORY_AND_CREATE_IF_NOT_EXISTS(result_dir);
     config_file_path_ = config_file_path;
     readConfigFromFile(config_file_path);
+    laptop_precheck_profiler_ =
+        std::make_unique<sv::LaptopPrecheckProfiler>(
+            laptop_precheck_enabled_,
+            laptop_precheck_sample_interval_ms_,
+            device_type_ == torch::kCUDA);
+    laptop_precheck_profiler_->start();
+    auto mapper_initialization_profile =
+        profileLaptopModule("mapper_initialization");
 
     // Background & override color setup
     std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};  // no white-background logic needed
@@ -189,6 +300,28 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         throw std::runtime_error("[Gaussian Mapper]Unsupported sensor type!");
     }
     break;
+    }
+
+    if (sensor_type_ == MONOCULAR) {
+        std::cout
+            << "[VoxelMapper] Monocular map flow: ORB-controlled poses and "
+               "mature ORB MapPoints as weak SVRecon sampling support";
+        if (monocular_rendered_depth_densify_) {
+            std::cout
+                << "; local rendered-depth candidates with Orbeez weight "
+                   "support and MonoGS co-visibility validation";
+        }
+        if (monocular_mvs_densify_) {
+            std::cout
+                << "; TANDEM MVS depth closes residual render holes after "
+                   "ORB monocular map initialization";
+        }
+        if (monocular_omnidata_densify_) {
+            std::cout
+                << "; scale-aligned Omnidata depth closes multi-view-"
+                   "consistent residual render holes";
+        }
+        std::cout << ".\n";
     }
 
     // /* Load every ORB-SLAM3 camera, convert to Camera, pre–compute            */
@@ -297,6 +430,77 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         this->scene_->addCamera(camera);
     }
 
+    if (monocular_mvs_densify_ || monocular_omnidata_densify_) {
+        const ORB_SLAM3::System::eSensor slam_sensor = pSLAM->getSensorType();
+        if (sensor_type_ != MONOCULAR ||
+            (slam_sensor != ORB_SLAM3::System::MONOCULAR &&
+             slam_sensor != ORB_SLAM3::System::IMU_MONOCULAR)) {
+            throw std::runtime_error(
+                "Monocular learned-depth densification requires ORB-SLAM3 "
+                "MONOCULAR or IMU_MONOCULAR poses");
+        }
+        monocular_mvs_requires_inertial_ba1_ =
+            slam_sensor == ORB_SLAM3::System::IMU_MONOCULAR;
+        if (device_type_ != torch::kCUDA || !torch::cuda::is_available()) {
+            throw std::runtime_error(
+                "Monocular learned-depth inference requires CUDA");
+        }
+    }
+
+    if (monocular_mvs_densify_) {
+        auto model_load_profile =
+            profileLaptopModule("mvs_model_load");
+        std::filesystem::path model_path = resolveMapperResourcePath(
+            config_file_path_, monocular_mvs_model_dir_);
+        if (std::filesystem::is_directory(model_path) ||
+            model_path.extension() != ".pt") {
+            model_path /= "model.pt";
+        }
+        monocular_mvs_backend_ =
+            std::make_shared<sv::TandemMvsBackend>(model_path);
+        std::cout
+            << "[VoxelMapper] Loaded TANDEM MVS model: "
+            << model_path << "\n"
+            << "[VoxelMapper] TANDEM pose gauge: "
+            << (monocular_mvs_requires_inertial_ba1_
+                    ? "visual-inertial metric"
+                    : "pure-monocular ORB scene units")
+            << ", depth range: " << monocular_mvs_depth_range_mode_
+            << "\n";
+        if (monocular_mvs_empty_cache_before_launch_) {
+            std::cout
+                << "[VoxelMapper] TANDEM will release unused cached CUDA "
+                   "blocks before inference.\n";
+        }
+    }
+
+    if (monocular_omnidata_densify_) {
+        auto model_load_profile =
+            profileLaptopModule("omnidata_model_load");
+        const std::filesystem::path model_path = resolveMapperResourcePath(
+            config_file_path_, monocular_omnidata_model_path_);
+        if (!std::filesystem::exists(model_path)) {
+            throw std::runtime_error(
+                "Omnidata TorchScript model is missing: " +
+                model_path.string() +
+                ". Export it with scripts/export_omnidata_depth_torchscript.py");
+        }
+        monocular_omnidata_backend_ =
+            std::make_shared<sv::OmnidataDepthBackend>(
+                model_path,
+                monocular_omnidata_input_size_,
+                monocular_omnidata_use_amp_);
+        std::cout
+            << "[VoxelMapper] Loaded Omnidata depth model: "
+            << model_path << "\n"
+            << "[VoxelMapper] Omnidata alignment: HI-SLAM2 2x2 inverse-depth "
+               "scale field in "
+            << (monocular_mvs_requires_inertial_ba1_
+                    ? "visual-inertial metric units"
+                    : "pure-monocular ORB scene units")
+            << ".\n";
+    }
+
     // Debug snapshots are queued natively and Rerun is initialized only when
     // the recording is saved, so instrumentation cannot alter online cadence.
     auto& rerun_bridge = sv::RerunVisualizerBridge::instance();
@@ -306,6 +510,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         rerun_params_.rerun_reconstruction_mesh_ ||
         rerun_params_.rerun_maps_ ||
         rerun_params_.rerun_gt_mesh_ ||
+        rerun_params_.rerun_nvblox_mesh_ ||
         rerun_params_.rerun_rendered_mesh_eval_;
     if (rerun_params_.enable_rerun_ && requires_live_rerun) {
         ensureEmbeddedPythonRuntime(/*import_torch_cuda=*/false);
@@ -337,6 +542,11 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     /* ───────── PIPELINE FLAGS ───────── */
     z_near_ =
          settings_file["Camera.z_near"].operator float();
+    if (!settings_file["Camera.z_far"].empty()) {
+        z_far_ = std::max(
+            z_near_,
+            settings_file["Camera.z_far"].operator float());
+    }
     if (!settings_file["Mapper.inactive_geo_densify_max_pixel_dist"].empty()) {
         inactive_geo_densify_max_pixel_dist_ =
             settings_file["Mapper.inactive_geo_densify_max_pixel_dist"].operator float();
@@ -370,13 +580,240 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     loop_closure_increased_times_of_use_ = 
          settings_file["Mapper.loop_closure_increased_times_of_use_"].operator int();
 
-    RGBD_min_depth_ =
-        settings_file["RGBD.min_depth"].operator float();
-    RGBD_max_depth_ =
-        settings_file["RGBD.max_depth"].operator float();
+    // Monocular configurations use the generic camera clipping range and do
+    // not need RGB-D-specific entries. RGB-D configurations retain their
+    // explicit sensor limits.
+    RGBD_min_depth_ = z_near_;
+    RGBD_max_depth_ = z_far_;
+    if (!settings_file["RGBD.min_depth"].empty()) {
+        RGBD_min_depth_ =
+            settings_file["RGBD.min_depth"].operator float();
+    }
+    if (!settings_file["RGBD.max_depth"].empty()) {
+        RGBD_max_depth_ =
+            settings_file["RGBD.max_depth"].operator float();
+    }
 
     inactive_geo_densify_ =
         (settings_file["Mapper.inactive_geo_densify"].operator int()) != 0;
+    if (!settings_file["Mapper.monocular_rendered_depth_densify"].empty()) {
+        monocular_rendered_depth_densify_ =
+            (settings_file["Mapper.monocular_rendered_depth_densify"]
+                 .operator int()) != 0;
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_pixel_stride"].empty()) {
+        monocular_rendered_depth_pixel_stride_ = std::max(
+            1,
+            settings_file["Mapper.monocular_rendered_depth_pixel_stride"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_window_size"].empty()) {
+        monocular_rendered_depth_window_size_ = std::max(
+            1,
+            settings_file["Mapper.monocular_rendered_depth_window_size"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_min_views"].empty()) {
+        monocular_rendered_depth_min_views_ = std::max(
+            1,
+            settings_file["Mapper.monocular_rendered_depth_min_views"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_min_weight"].empty()) {
+        monocular_rendered_depth_min_weight_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_rendered_depth_min_weight"]
+                .operator float());
+    }
+    monocular_rendered_depth_min_views_ = std::min(
+        monocular_rendered_depth_min_views_,
+        monocular_rendered_depth_window_size_);
+    if (!settings_file["Mapper.monocular_mvs_densify"].empty()) {
+        monocular_mvs_densify_ =
+            (settings_file["Mapper.monocular_mvs_densify"].operator int()) != 0;
+    }
+    if (!settings_file["Mapper.monocular_mvs_model_dir"].empty()) {
+        monocular_mvs_model_dir_ =
+            settings_file["Mapper.monocular_mvs_model_dir"].operator std::string();
+    }
+    if (!settings_file["Mapper.monocular_mvs_width"].empty()) {
+        monocular_mvs_width_ = std::max(
+            1, settings_file["Mapper.monocular_mvs_width"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_mvs_height"].empty()) {
+        monocular_mvs_height_ = std::max(
+            1, settings_file["Mapper.monocular_mvs_height"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_mvs_view_num"].empty()) {
+        monocular_mvs_view_num_ = std::max(
+            2, settings_file["Mapper.monocular_mvs_view_num"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_mvs_depth_range_mode"].empty()) {
+        monocular_mvs_depth_range_mode_ =
+            settings_file["Mapper.monocular_mvs_depth_range_mode"]
+                .operator std::string();
+    }
+    if (!settings_file["Mapper.monocular_mvs_depth_min_m"].empty()) {
+        monocular_mvs_depth_min_m_ = std::max(
+            1.0e-4f,
+            settings_file["Mapper.monocular_mvs_depth_min_m"].operator float());
+    }
+    if (!settings_file["Mapper.monocular_mvs_depth_max_m"].empty()) {
+        monocular_mvs_depth_max_m_ = std::max(
+            monocular_mvs_depth_min_m_ + 1.0e-4f,
+            settings_file["Mapper.monocular_mvs_depth_max_m"].operator float());
+    }
+    if (!settings_file["Mapper.monocular_mvs_depth_min_scene"].empty()) {
+        monocular_mvs_depth_min_scene_ = std::max(
+            1.0e-4f,
+            settings_file["Mapper.monocular_mvs_depth_min_scene"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_mvs_inverse_depth_quantile"].empty()) {
+        monocular_mvs_inverse_depth_quantile_ =
+            settings_file["Mapper.monocular_mvs_inverse_depth_quantile"]
+                .operator float();
+    }
+    if (!settings_file["Mapper.monocular_mvs_depth_max_multiplier"].empty()) {
+        monocular_mvs_depth_max_multiplier_ =
+            settings_file["Mapper.monocular_mvs_depth_max_multiplier"]
+                .operator float();
+    }
+    if (!settings_file["Mapper.monocular_mvs_discard_percentage"].empty()) {
+        monocular_mvs_discard_percentage_ = std::clamp(
+            settings_file["Mapper.monocular_mvs_discard_percentage"].operator float(),
+            0.0f,
+            100.0f);
+    }
+    if (!settings_file["Mapper.monocular_mvs_empty_cache_before_launch"].empty()) {
+        monocular_mvs_empty_cache_before_launch_ =
+            settings_file["Mapper.monocular_mvs_empty_cache_before_launch"]
+                .operator int() != 0;
+    }
+    if (!settings_file["Mapper.monocular_omnidata_densify"].empty()) {
+        monocular_omnidata_densify_ =
+            settings_file["Mapper.monocular_omnidata_densify"].operator int() != 0;
+    }
+    if (!settings_file["Mapper.monocular_omnidata_model_path"].empty()) {
+        monocular_omnidata_model_path_ =
+            settings_file["Mapper.monocular_omnidata_model_path"]
+                .operator std::string();
+    }
+    if (!settings_file["Mapper.monocular_omnidata_input_size"].empty()) {
+        monocular_omnidata_input_size_ = std::max(
+            32,
+            settings_file["Mapper.monocular_omnidata_input_size"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_width"].empty()) {
+        monocular_omnidata_width_ = std::max(
+            1,
+            settings_file["Mapper.monocular_omnidata_width"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_height"].empty()) {
+        monocular_omnidata_height_ = std::max(
+            1,
+            settings_file["Mapper.monocular_omnidata_height"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_view_num"].empty()) {
+        monocular_omnidata_view_num_ = std::max(
+            2,
+            settings_file["Mapper.monocular_omnidata_view_num"].operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_depth_multiplier"].empty()) {
+        monocular_omnidata_depth_multiplier_ = std::max(
+            1.0e-4f,
+            settings_file["Mapper.monocular_omnidata_depth_multiplier"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_min_alignment_anchors"].empty()) {
+        monocular_omnidata_min_alignment_anchors_ = std::max(
+            4,
+            settings_file["Mapper.monocular_omnidata_min_alignment_anchors"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_max_alignment_rel_error"].empty()) {
+        monocular_omnidata_max_alignment_rel_error_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_omnidata_max_alignment_rel_error"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_min_source_views"].empty()) {
+        monocular_omnidata_min_source_views_ = std::max(
+            1,
+            settings_file["Mapper.monocular_omnidata_min_source_views"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_consistency_rel_tol"].empty()) {
+        monocular_omnidata_consistency_rel_tol_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_omnidata_consistency_rel_tol"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_consistency_vox"].empty()) {
+        monocular_omnidata_consistency_vox_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_omnidata_consistency_vox"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_omnidata_use_amp"].empty()) {
+        monocular_omnidata_use_amp_ =
+            settings_file["Mapper.monocular_omnidata_use_amp"].operator int() != 0;
+    }
+    if (!settings_file["Mapper.monocular_omnidata_empty_cache_before_launch"].empty()) {
+        monocular_omnidata_empty_cache_before_launch_ =
+            settings_file["Mapper.monocular_omnidata_empty_cache_before_launch"]
+                .operator int() != 0;
+    }
+    if (monocular_mvs_densify_ && monocular_omnidata_densify_) {
+        throw std::runtime_error(
+            "TANDEM MVS and Omnidata are mutually exclusive depth ablations");
+    }
+    if (monocular_mvs_densify_ || monocular_omnidata_densify_) {
+        if (monocular_mvs_depth_range_mode_ != "fixed" &&
+            monocular_mvs_depth_range_mode_ !=
+                "tandem_sparse_quantile") {
+            throw std::runtime_error(
+                "Mapper.monocular_mvs_depth_range_mode must be fixed or "
+                "tandem_sparse_quantile");
+        }
+        if (!(monocular_mvs_inverse_depth_quantile_ > 0.0f &&
+              monocular_mvs_inverse_depth_quantile_ < 1.0f)) {
+            throw std::runtime_error(
+                "Mapper.monocular_mvs_inverse_depth_quantile must be in "
+                "(0, 1)");
+        }
+        if (!(monocular_mvs_depth_max_multiplier_ > 0.0f)) {
+            throw std::runtime_error(
+                "Mapper.monocular_mvs_depth_max_multiplier must be positive");
+        }
+        if (monocular_mvs_densify_ && monocular_mvs_model_dir_.empty()) {
+            throw std::runtime_error(
+                "Mapper.monocular_mvs_model_dir is required when "
+                "Mapper.monocular_mvs_densify=1");
+        }
+        if (monocular_omnidata_densify_ &&
+            monocular_omnidata_model_path_.empty()) {
+            throw std::runtime_error(
+                "Mapper.monocular_omnidata_model_path is required when "
+                "Mapper.monocular_omnidata_densify=1");
+        }
+        if (monocular_omnidata_input_size_ % 32 != 0) {
+            throw std::runtime_error(
+                "Mapper.monocular_omnidata_input_size must be divisible by 32");
+        }
+        if (monocular_omnidata_densify_ &&
+            monocular_omnidata_min_source_views_ >=
+                monocular_omnidata_view_num_) {
+            throw std::runtime_error(
+                "Omnidata min_source_views must be smaller than view_num");
+        }
+        if (monocular_rendered_depth_densify_) {
+            std::cout
+                << "[VoxelMapper] Learned depth replaces rendered pseudo-depth "
+                   "densification; disabling the latter.\n";
+            monocular_rendered_depth_densify_ = false;
+        }
+    }
     if (!settings_file["Mapper.allocate_orb_voxels"].empty()) {
         allocate_orb_voxels_ =
             (settings_file["Mapper.allocate_orb_voxels"].operator int()) != 0;
@@ -774,6 +1211,17 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         (settings_file["Record.record_loss_image"].operator int()) != 0;
     record_loop_ply_ =
         (settings_file["Record.record_loop_ply"].operator int()) != 0;
+    laptop_precheck_enabled_ =
+        settings_file["Record.laptop_precheck"].empty()
+            ? true
+            : (settings_file["Record.laptop_precheck"].operator int()) != 0;
+    laptop_precheck_sample_interval_ms_ =
+        settings_file["Record.laptop_precheck_sample_interval_ms"].empty()
+            ? 50
+            : std::max(
+                  10,
+                  settings_file["Record.laptop_precheck_sample_interval_ms"]
+                      .operator int());
     rerun_params_.enable_rerun_ =
         (settings_file["Record.enable_rerun"].operator int()) != 0;
     rerun_params_.rerun_max_keyframes_ =
@@ -793,6 +1241,22 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         settings_file["Record.rerun_gt_mesh_path"].empty()
             ? std::string()
             : settings_file["Record.rerun_gt_mesh_path"].operator std::string();
+    rerun_params_.rerun_nvblox_mesh_ =
+        !settings_file["Record.rerun_nvblox_mesh"].empty() &&
+        (settings_file["Record.rerun_nvblox_mesh"].operator int()) != 0;
+    rerun_params_.rerun_nvblox_mesh_path_ =
+        settings_file["Record.rerun_nvblox_mesh_path"].empty()
+            ? std::string()
+            : settings_file["Record.rerun_nvblox_mesh_path"].operator std::string();
+    if (!rerun_params_.rerun_nvblox_mesh_path_.empty()) {
+        std::filesystem::path nvblox_path(
+            rerun_params_.rerun_nvblox_mesh_path_);
+        if (nvblox_path.is_relative()) {
+            nvblox_path = cfg_path.parent_path() / nvblox_path;
+        }
+        rerun_params_.rerun_nvblox_mesh_path_ =
+            nvblox_path.lexically_normal().string();
+    }
     rerun_params_.save_rendered_mesh_eval_ =
         settings_file["Record.save_rendered_mesh_eval"].empty()
             ? true
@@ -900,6 +1364,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rerun_params_.run_whole_run_ ||
         rerun_params_.rerun_svrecon_debug_ ||
         rerun_params_.rerun_gt_mesh_ ||
+        rerun_params_.rerun_nvblox_mesh_ ||
         rerun_params_.rerun_rendered_mesh_eval_ ||
         rerun_params_.rerun_reconstruction_mesh_ ||
         rerun_params_.rerun_maps_;
@@ -909,6 +1374,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rerun_params_.run_whole_run_ = false;
         rerun_params_.rerun_svrecon_debug_ = false;
         rerun_params_.rerun_gt_mesh_ = false;
+        rerun_params_.rerun_nvblox_mesh_ = false;
         rerun_params_.rerun_rendered_mesh_eval_ = false;
         rerun_params_.rerun_reconstruction_mesh_ = false;
         rerun_params_.rerun_maps_ = false;
@@ -926,8 +1392,71 @@ void VoxelMapper::ensureEmbeddedPythonRuntime(bool import_torch_cuda)
     ensurePythonRuntimeInitialized(import_torch_cuda);
 }
 
+sv::LaptopPrecheckProfiler::Scope VoxelMapper::profileLaptopModule(
+    const std::string& module,
+    const std::uint64_t work_items)
+{
+    if (!laptop_precheck_profiler_) {
+        return {};
+    }
+    return laptop_precheck_profiler_->profile(module, work_items);
+}
+
+void VoxelMapper::beginLaptopAsyncModule(
+    const std::string& module,
+    const std::uint64_t work_items)
+{
+    if (laptop_precheck_profiler_) {
+        laptop_precheck_profiler_->beginAsync(module, work_items);
+    }
+}
+
+void VoxelMapper::endLaptopAsyncModule(const std::string& module)
+{
+    if (laptop_precheck_profiler_) {
+        laptop_precheck_profiler_->endAsync(module);
+    }
+}
+
+std::string VoxelMapper::laptopPrecheckPipeline() const
+{
+    std::vector<std::string> modules;
+    modules.emplace_back(allocate_orb_voxels_ ? "orb" : "no_orb_allocation");
+    if (inactive_geo_densify_) {
+        modules.emplace_back("inactive_geo");
+    }
+    if (rgbd_surface_point_allocation_) {
+        modules.emplace_back("rgbd_surface_points");
+    }
+    if (rgbd_fill_render_holes_) {
+        modules.emplace_back("rgbd_hole_fill");
+    }
+    if (rgbd_tsdf_evidence_) {
+        modules.emplace_back("rgbd_tsdf_evidence");
+    }
+    if (monocular_rendered_depth_densify_) {
+        modules.emplace_back("rendered_depth_densify");
+    }
+    if (monocular_mvs_densify_) {
+        modules.emplace_back("tandem_mvs");
+    }
+    if (monocular_omnidata_densify_) {
+        modules.emplace_back("omnidata");
+    }
+
+    std::ostringstream pipeline;
+    for (std::size_t index = 0; index < modules.size(); ++index) {
+        if (index > 0) {
+            pipeline << '+';
+        }
+        pipeline << modules[index];
+    }
+    return pipeline.str();
+}
+
 void VoxelMapper::run()
 {
+    const auto run_start_time = std::chrono::steady_clock::now();
     sv::RerunVisualizerBridge::instance().setEnabled(rerun_params_.enable_rerun_);
 
     if (rerun_params_.enable_rerun_ && rerun_params_.rerun_gt_mesh_) {
@@ -943,12 +1472,50 @@ void VoxelMapper::run()
         }
     }
 
+    if (rerun_params_.enable_rerun_ &&
+        rerun_params_.rerun_nvblox_mesh_) {
+        if (!rerun_params_.rerun_nvblox_mesh_path_.empty() &&
+            std::filesystem::exists(
+                rerun_params_.rerun_nvblox_mesh_path_)) {
+            auto& rerun_bridge =
+                sv::RerunVisualizerBridge::instance();
+            auto log_mesh =
+                [&](const bool enabled,
+                    const std::string& recording_name)
+            {
+                if (!enabled) {
+                    return;
+                }
+                rerun_bridge.visualizeDebugPlyMesh(
+                    recording_name,
+                    rerun_params_.rerun_nvblox_mesh_path_,
+                    0,
+                    "world/reference/nvblox_mesh");
+            };
+            log_mesh(
+                rerun_params_.run_whole_run_,
+                "whole_run");
+            log_mesh(
+                rerun_params_.rerun_svrecon_debug_,
+                "svrecon_debug");
+            log_mesh(
+                rerun_params_.rerun_reconstruction_mesh_,
+                "reconstruction_mesh");
+        } else {
+            std::cerr << "[RERUN] nvblox mesh not found: "
+                      << rerun_params_.rerun_nvblox_mesh_path_
+                      << "\n";
+        }
+    }
+
     // First loop: Initial gaussian mapping
     while (!isStopped())
     {
         // Check conditions for initial mapping
         if (hasMetInitialMappingConditions())
         {
+            auto initial_map_profile =
+                profileLaptopModule("initial_map_build");
             mpSLAM->getAtlas()->clearMappingOperation();
 
             // Pull sparse SLAM map (get keyframes and map points)
@@ -959,8 +1526,21 @@ void VoxelMapper::run()
                 std::unique_lock<std::mutex> lock_map(pMap->mMutexMapUpdate);
                 vKFs = pMap->GetAllKeyFrames();
                 vMPs = pMap->GetAllMapPoints();
+                const unsigned long current_keyframe_id = pMap->GetMaxKFid();
+                if (sensor_type_ == MONOCULAR) {
+                    monocular_orb_sampling_support_.clear();
+                    monocular_orb_inserted_point_ids_.clear();
+                }
                 for (const auto& pMP : vMPs)
                 {
+                     if (!pMP) {
+                         continue;
+                     }
+                     if (sensor_type_ == MONOCULAR &&
+                         !isMatureMonocularOrbMapPoint(
+                             pMP, current_keyframe_id)) {
+                         continue;
+                     }
                      Point3D point3D;
                      auto pos = pMP->GetWorldPos();
                      point3D.xyz_(0) = pos.x();
@@ -971,6 +1551,11 @@ void VoxelMapper::run()
                      point3D.color_(1) = color(1);
                      point3D.color_(2) = color(2);
                      scene_->cachePoint3D(pMP->mnId, point3D);
+                     if (sensor_type_ == MONOCULAR) {
+                         monocular_orb_sampling_support_.emplace(
+                             pMP->mnId, point3D);
+                         monocular_orb_inserted_point_ids_.insert(pMP->mnId);
+                     }
                  }
                 // B) Create VoxelKeyframes from each SLAM KeyFrame
                 for (const auto& pKF : vKFs)
@@ -1034,6 +1619,10 @@ void VoxelMapper::run()
                     new_kf->kps_point_local_ = std::move(pointsLocal);
                     new_kf->img_undist_ = imgRGB_undistorted;
                     new_kf->img_auxiliary_undist_ = imgAux_undistorted;
+                    if (monocular_mvs_densify_ ||
+                        monocular_omnidata_densify_) {
+                        captureMonocularMvsKeyframeMetadata(new_kf, pKF);
+                    }
 
                     logKeyframeCameraToRerunRecordings(
                         new_kf,
@@ -1079,9 +1668,12 @@ void VoxelMapper::run()
                 // Use full-res here; you can choose a smaller level if you like.
                 tr_cams.emplace_back(kf.toMiniCam(kf.image_height_, kf.image_width_));
             }
+
             //  Create voxel model & trainer setup
             {
                 std::unique_lock<std::mutex> lock_render(mutex_render_);
+                auto initial_topology_profile =
+                    profileLaptopModule("initial_voxel_allocation");
                 if (sensor_type_ == RGBD && rgbd_surface_point_allocation_) {
                     const auto lidar_point_cloud = buildInitialRgbdPointCloud();
                     if (lidar_point_cloud.empty()) {
@@ -1125,6 +1717,7 @@ void VoxelMapper::run()
                     rerun_params_.rerun_svrecon_debug_) {
                     rerun_state_.whole_run_live_voxels_dirty_ = true;
                 }
+                initial_topology_profile.finish();
                 std::unique_lock<std::mutex> lock(mutex_settings_);
                 voxel_model_->createTrainer(
                                             opt_params_.geo_lr_,
@@ -1141,13 +1734,17 @@ void VoxelMapper::run()
             logCurrentOrbMapPointsToReconstructionRerun(getIteration());
             logCurrentOrbKeyframePosesToReconstructionRerun(getIteration());
 
-            if (sensor_type_ == RGBD &&
+            const bool initial_rgbd_densification =
+                sensor_type_ == RGBD &&
                 (inactive_geo_densify_ ||
                  rgbd_surface_point_allocation_ ||
                  (rgbd_tsdf_evidence_ &&
                   rgbd_tsdf_evidence_initial_backfill_) ||
                  (rgbd_fill_render_holes_ &&
-                  rgbd_fill_render_holes_initial_backfill_))) {
+                  rgbd_fill_render_holes_initial_backfill_));
+            const bool initial_monocular_inactive =
+                sensor_type_ == MONOCULAR && inactive_geo_densify_;
+            if (initial_rgbd_densification || initial_monocular_inactive) {
                 std::vector<std::shared_ptr<VoxelKeyframe>> initial_rgbd_kfs;
                 initial_rgbd_kfs.reserve(scene_->keyframes().size());
                 for (const auto& kv : scene_->keyframes()) {
@@ -1164,14 +1761,23 @@ void VoxelMapper::run()
                         pkf,
                         /*include_inactive_geo=*/inactive_geo_densify_,
                         /*include_rgbd_hole_fill=*/
-                            (rgbd_tsdf_evidence_ &&
-                             rgbd_tsdf_evidence_initial_backfill_) ||
-                            (rgbd_fill_render_holes_ &&
-                             rgbd_fill_render_holes_initial_backfill_));
+                            sensor_type_ == RGBD &&
+                            ((rgbd_tsdf_evidence_ &&
+                              rgbd_tsdf_evidence_initial_backfill_) ||
+                             (rgbd_fill_render_holes_ &&
+                              rgbd_fill_render_holes_initial_backfill_)));
                 }
                 flushInactiveGeoCache();
                 processRgbdClosureCache();
                 max_depth_cached_ = previous_depth_cache_limit;
+            }
+            if (sensor_type_ == MONOCULAR &&
+                monocular_rendered_depth_densify_) {
+                for (const auto& kv : scene_->keyframes()) {
+                    if (kv.second) {
+                        densifyMonocularFromRenderedDepth(kv.second);
+                    }
+                }
             }
             if (sensor_type_ == RGBD &&
                 sdf_initialization_rgbd_projective_) {
@@ -1194,10 +1800,44 @@ void VoxelMapper::run()
                     << " grid_corner_observations=" << fused_observations
                     << "\n";
             }
+            if (rerun_params_.enable_rerun_ &&
+                (rerun_params_.run_whole_run_ ||
+                 rerun_params_.rerun_svrecon_debug_)) {
+                logWholeRunLiveVoxelsToRerun(
+                    getIteration(),
+                    voxel_model_->voxCenter(),
+                    voxel_model_->voxSize(),
+                    torch::Tensor(),
+                    rerun_params_.run_whole_run_,
+                    rerun_params_.rerun_svrecon_debug_);
+                rerun_state_.svrecon_debug_has_source_snapshot_ =
+                    rerun_params_.rerun_svrecon_debug_;
+                rerun_state_.whole_run_live_voxels_dirty_ = false;
+            }
             // One warm-up optimization step
             trainForOneIteration();
 
             initial_mapped_ = true;
+            if (monocular_mvs_densify_) {
+                std::vector<std::shared_ptr<VoxelKeyframe>> initial_mvs_kfs;
+                initial_mvs_kfs.reserve(scene_->keyframes().size());
+                for (const auto& item : scene_->keyframes()) {
+                    if (item.second) {
+                        initial_mvs_kfs.push_back(item.second);
+                    }
+                }
+                scheduleLatestMonocularMvsKeyframe(initial_mvs_kfs);
+            }
+            if (monocular_omnidata_densify_) {
+                std::vector<std::shared_ptr<VoxelKeyframe>> initial_kfs;
+                initial_kfs.reserve(scene_->keyframes().size());
+                for (const auto& item : scene_->keyframes()) {
+                    if (item.second) {
+                        initial_kfs.push_back(item.second);
+                    }
+                }
+                scheduleLatestMonocularOmnidataKeyframe(initial_kfs);
+            }
             input_backpressure_ready_.store(true, std::memory_order_release);
             break;  // Exit the initial mapping loop
         }
@@ -1215,6 +1855,8 @@ void VoxelMapper::run()
     // Second loop: Incremental voxel mapping
      int SLAM_stop_iter = 0;
      while (!isStopped()) {
+        pollMonocularMvsDensification();
+        pollMonocularOmnidataDensification();
         // Check conditions for incremental mapping
         if (hasMetIncrementalMappingConditions()) {
             combineMappingOperations();
@@ -1236,6 +1878,20 @@ void VoxelMapper::run()
     
     // Third loop: Tail optimization. Match GaussianMapper: scheduled topology
     // adaptation remains active while the post-SLAM optimization finishes.
+    pollMonocularMvsDensification(/*wait_for_result=*/true);
+    pollMonocularOmnidataDensification(/*wait_for_result=*/true);
+    if (monocular_mvs_backend_) {
+        monocular_mvs_backend_.reset();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        std::cout << "[MONO/MVS] Released inference backend before tail refinement.\n";
+    }
+    if (monocular_omnidata_backend_) {
+        monocular_omnidata_backend_.reset();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        std::cout
+            << "[MONO/Omnidata] Released inference backend before tail "
+               "refinement.\n";
+    }
     flushInactiveGeoCache();
     processRgbdClosureCache();
     int adapt_interval = opt_params_.adapt_every_;          // cfg.procedure.adapt_every
@@ -1253,11 +1909,20 @@ void VoxelMapper::run()
     }
     tail_refinement_active_ = prev_tail_refinement_active;
 
+    validateMonocularRenderedDepthVoxels(/*final_pass=*/true);
     runFinalSpecialPrune();
+
+    const double mapping_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - run_start_time).count();
+    const VoxelRuntimeGpuStats runtime_gpu_stats =
+        getVoxelRuntimeGpuStats();
 
     // Save and clear
     const std::filesystem::path shutdown_dir =
         result_dir_ / (std::to_string(getIteration()) + "_shutdown");
+    auto shutdown_export_profile =
+        profileLaptopModule("shutdown_export");
     if (!config_file_path_.empty() && std::filesystem::exists(config_file_path_)) {
         try {
             std::filesystem::create_directories(shutdown_dir);
@@ -1324,6 +1989,7 @@ void VoxelMapper::run()
                 std::cerr << "[mesh/rendered-TSDF-fixed] shutdown export failed: "
                           << e.what() << "\n";
             }
+            c10::cuda::CUDACachingAllocator::emptyCache();
 
             // SVRecon extract_mesh.py --adaptive: render training views,
             // fuse median rendered depth into a TSDF, then extract iso=0.
@@ -1340,6 +2006,7 @@ void VoxelMapper::run()
                 std::cerr << "[SVRecon mesh/rendered-TSDF] shutdown export failed: "
                           << e.what() << "\n";
             }
+            c10::cuda::CUDACachingAllocator::emptyCache();
 
             // SVRecon extract_mesh_sdf.py: direct zero-level extraction from
             // the optimized grid SDF.
@@ -1353,14 +2020,72 @@ void VoxelMapper::run()
     }
     writeKeyframeUsedTimes(result_dir_ / "used_times", "final");
 
+    const int runtime_frames =
+        runtime_frame_count_.load(std::memory_order_acquire);
+    const std::filesystem::path final_map_path =
+        shutdown_dir / "ply" / "voxel_model" /
+        ("iteration_" + std::to_string(getIteration())) /
+        "voxel_model.ply";
+    if (runtime_frames > 0) {
+        saveVoxelRuntimeMetrics(
+            shutdown_dir / "runtime_metrics.json",
+            runtime_frames,
+            scene_ ? static_cast<int>(scene_->keyframes().size()) : 0,
+            voxel_model_ ? voxel_model_->numVoxels() : 0,
+            getIteration(),
+            mapping_seconds,
+            final_map_path,
+            runtime_gpu_stats);
+    }
+
+    shutdown_export_profile.finish();
+    if (laptop_precheck_profiler_ && laptop_precheck_profiler_->enabled()) {
+        laptop_precheck_profiler_->stop();
+        sv::LaptopPrecheckMetadata metadata;
+        metadata.config_file = config_file_path_;
+        metadata.map_path = final_map_path;
+        metadata.sensor =
+            sensor_type_ == MONOCULAR
+                ? "monocular"
+                : (sensor_type_ == STEREO ? "stereo" : "rgbd");
+        metadata.device = device_type_ == torch::kCUDA ? "cuda" : "cpu";
+        metadata.pipeline = laptopPrecheckPipeline();
+        metadata.frames = runtime_frames;
+        metadata.keyframes =
+            scene_ ? static_cast<int>(scene_->keyframes().size()) : 0;
+        metadata.voxels = voxel_model_ ? voxel_model_->numVoxels() : 0;
+        metadata.iterations = getIteration();
+        metadata.mapping_seconds = mapping_seconds;
+        metadata.map_size_mb = voxelFileSizeMb(final_map_path);
+        try {
+            laptop_precheck_profiler_->writeReports(shutdown_dir, metadata);
+            std::cout
+                << "[Laptop Precheck] saved: "
+                << (shutdown_dir / "laptop_precheck.json") << "\n";
+        } catch (const std::exception& error) {
+            std::cerr
+                << "[Laptop Precheck] failed to save report: "
+                << error.what() << "\n";
+        }
+    }
+
     saveRerunRecordingsAtShutdown();
 
     signalStop();
- }
+}
+
+void VoxelMapper::setRuntimeFrameCount(int frame_count)
+{
+    runtime_frame_count_.store(
+        std::max(0, frame_count),
+        std::memory_order_release);
+}
 
 // Add training with optimization loop
 void VoxelMapper::trainForOneIteration()
 {
+    auto iteration_profile =
+        profileLaptopModule("training_iteration");
     // 1) bump global iteration counter
     increaseIteration(1);
     auto iter_start_timing = std::chrono::steady_clock::now();
@@ -1485,21 +2210,26 @@ void VoxelMapper::trainForOneIteration()
 
     sv::MiniCam cam = viewpoint_cam->toMiniCam(image_height, image_width);
 
-    auto render_pkg = voxel_model_->render(
-        cam,
-        image_height,
-        image_width,
-        /* gt_image   */  gt_image,            
-        /* color_mode   */   nullptr,             
-        /* track_max_w   */  false,
-        /* ss            */  ropts.ss,
-        /* output_depth  */  ropts.output_depth,
-        /* output_normal */  ropts.output_normal,
-        /* output_T      */  ropts.output_T,
-        /* rand_bg       */  false,
-        /* use_auto_exp  */  false,
-        ropts               // your struct (will be used for **other_opt-safe fields)
-    );
+    std::unordered_map<std::string, torch::Tensor> render_pkg;
+    {
+        auto render_profile =
+            profileLaptopModule("training_render");
+        render_pkg = voxel_model_->render(
+            cam,
+            image_height,
+            image_width,
+            /* gt_image   */  gt_image,
+            /* color_mode   */   nullptr,
+            /* track_max_w   */  false,
+            /* ss            */  ropts.ss,
+            /* output_depth  */  ropts.output_depth,
+            /* output_normal */  ropts.output_normal,
+            /* output_T      */  ropts.output_T,
+            /* rand_bg       */  false,
+            /* use_auto_exp  */  false,
+            ropts               // your struct (will be used for **other_opt-safe fields)
+        );
+    }
     if (render_pkg.empty() || !render_pkg.count("color") || !render_pkg.at("color").defined()) {
         return;
     }
@@ -1617,34 +2347,38 @@ void VoxelMapper::trainForOneIteration()
             /*min_inside_level=*/9);
     }
 
-    voxel_model_->optimizerZeroGrad();   // move this BEFORE backward
-    loss.backward();
+    {
+        auto optimizer_profile =
+            profileLaptopModule("training_backward_optimizer");
+        voxel_model_->optimizerZeroGrad();
+        loss.backward();
 
-    if (opt_params_.lambda_tv_density_ > 0.f &&
-        iter >= opt_params_.tv_from_ &&
-        iter <= opt_params_.tv_until_) {
-        voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
-    }
-    if (eikonal_enabled &&
-        iter >= opt_params_.ge_from_ &&
-        iter <= opt_params_.ge_until_) {
-        const float ge_mult = std::pow(0.25f, std::min(iter / 2000, 2));
-        voxel_model_->applySvreconGridEikonalField(
-            opt_params_.lambda_ge_density_ * ge_mult);
-    }
-    if (opt_params_.lambda_ls_density_ > 0.f &&
-        iter >= opt_params_.ls_from_ &&
-        iter <= opt_params_.ls_until_) {
-        const float ls_mult = std::pow(0.25f, std::min(iter / 2000, 2));
-        voxel_model_->applySvreconLaplacianSmoothnessField(
-            opt_params_.lambda_ls_density_ * ls_mult);
-    }
+        if (opt_params_.lambda_tv_density_ > 0.f &&
+            iter >= opt_params_.tv_from_ &&
+            iter <= opt_params_.tv_until_) {
+            voxel_model_->applyTvOnDensityField(opt_params_.lambda_tv_density_);
+        }
+        if (eikonal_enabled &&
+            iter >= opt_params_.ge_from_ &&
+            iter <= opt_params_.ge_until_) {
+            const float ge_mult = std::pow(0.25f, std::min(iter / 2000, 2));
+            voxel_model_->applySvreconGridEikonalField(
+                opt_params_.lambda_ge_density_ * ge_mult);
+        }
+        if (opt_params_.lambda_ls_density_ > 0.f &&
+            iter >= opt_params_.ls_from_ &&
+            iter <= opt_params_.ls_until_) {
+            const float ls_mult = std::pow(0.25f, std::min(iter / 2000, 2));
+            voxel_model_->applySvreconLaplacianSmoothnessField(
+                opt_params_.lambda_ls_density_ * ls_mult);
+        }
 
-    if (iter >= 500) {
-        voxel_model_->accumulateSubdivisionPriority();
-    }
+        if (iter >= 500) {
+            voxel_model_->accumulateSubdivisionPriority();
+        }
 
-    voxel_model_->optimizerStep();   // <-- the actual update
+        voxel_model_->optimizerStep();
+    }
 
     // This is a live diagnostic of the learned SDF, independent of the pruning
     // schedule. Recompute it after every optimizer step so its Rerun timeline
@@ -1678,6 +2412,8 @@ void VoxelMapper::trainForOneIteration()
 
         if (need_pruning || need_subdividing)
         {
+            auto topology_profile =
+                profileLaptopModule("topology_adaptation");
             // HI-SLAM2 performs online map adaptation on its current window.
             // A zero window keeps the established full-history behavior.
             std::vector<sv::MiniCam> tr_cams = incrementalMappingCameras();
@@ -1693,6 +2429,8 @@ void VoxelMapper::trainForOneIteration()
 
             // ---------------- PRUNE ----------------
             auto run_pruning = [&]() {
+                auto pruning_profile =
+                    profileLaptopModule("pruning");
                 // 0) Refresh training statistics if topology changed since they were computed.
                 {
                     const int N_cur = voxel_model_->numVoxels();
@@ -2020,7 +2758,15 @@ void VoxelMapper::trainForOneIteration()
                                 }
                             }
 
-                            auto prune_near_union = (is_near | is_near_geom).to(torch::kBool);
+                            auto prune_near_union = torch::zeros_like(is_near);
+                            if (opt_params_.filter_near_voxels_) {
+                                prune_near_union =
+                                    (prune_near_union | is_near).to(torch::kBool);
+                            }
+                            if (opt_params_.prune_near_voxels_geometric_) {
+                                prune_near_union =
+                                    (prune_near_union | is_near_geom).to(torch::kBool);
+                            }
                             n_prune_near_front = n_near_hit;
                             n_prune_near_geom = n_near_geom_hit;
 
@@ -2032,9 +2778,8 @@ void VoxelMapper::trainForOneIteration()
                             prune_mask_near =
                                 prune_near_union.view({-1}).to(torch::kBool); // [N], near only
 
-                            // Keep these masks for diagnostics. SVRecon's train-time
-                            // SDF pruning is driven by SDF distance; visibility/near
-                            // filtering belongs to layout construction/filtering.
+                            // Visibility remains diagnostic. Configured near
+                            // filtering is applied below as a concrete prune cause.
 
                     } catch (const std::exception& e) {
                         std::cerr << "[PRUNE/visibility] exception: " << e.what() << "\n";
@@ -2059,13 +2804,30 @@ void VoxelMapper::trainForOneIteration()
                                     (centers >= bb_min).all(/*dim=*/1) &
                                     (centers <= bb_max).all(/*dim=*/1);
                                 prune_mask_far = (~in_dense_core.to(torch::kBool)).to(torch::kBool);
-                                // Diagnostic only for strict SVRecon-SDF pruning.
                             }
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "[PRUNE/far] exception: " << e.what() << "\n";
 	                    }
-	                }
+		                }
+
+                if (prune_mask_near.defined() &&
+                    prune_mask_near.numel() == N) {
+                    prune_mask =
+                        (prune_mask.to(torch::kBool) |
+                         prune_mask_near.to(prune_mask.device())
+                             .to(torch::kBool))
+                            .contiguous();
+                }
+                if (opt_params_.prune_far_voxels_ &&
+                    prune_mask_far.defined() &&
+                    prune_mask_far.numel() == N) {
+                    prune_mask =
+                        (prune_mask.to(torch::kBool) |
+                         prune_mask_far.to(prune_mask.device())
+                             .to(torch::kBool))
+                            .contiguous();
+                }
 
                 // Reuse final surface confidence during scheduled pruning. Connected
                 // unsupported neighbors are intentionally not retained here: a learned
@@ -2099,7 +2861,21 @@ void VoxelMapper::trainForOneIteration()
                                  leaf_mask.to(prune_mask.device())
                                      .to(torch::kBool).reshape({-1});
                 }
-
+                if (sensor_type_ == MONOCULAR &&
+                    monocular_rendered_depth_densify_) {
+                    torch::Tensor provisional =
+                        voxel_model_->monocularProvisionalVoxelMask();
+                    if (provisional.defined() &&
+                        provisional.numel() == N) {
+                        // The source-specific eight-keyframe co-visibility
+                        // gate owns these cells until it resolves them.
+                        prune_mask =
+                            prune_mask.to(torch::kBool) &
+                            (~provisional.to(prune_mask.device())
+                                  .to(torch::kBool)
+                                  .reshape({-1}));
+                    }
+                }
                 // 4) Use the accumulated SVRecon pruning mask.
                 prune_mask_default = prune_mask.to(torch::kBool);
 
@@ -2169,8 +2945,8 @@ void VoxelMapper::trainForOneIteration()
                           << " sdf=" << n_prune_stats_tsdf
                           << " surface_views_extra=" << n_prune_stats_surface_views_extra
                           << " diagnostic_overlap_visibility=" << n_prune_stats_visibility
-                          << " diagnostic_overlap_near=" << n_prune_stats_near
-                          << " diagnostic_overlap_far=" << n_prune_stats_far
+                          << " near_camera=" << n_prune_stats_near
+                          << " far=" << n_prune_stats_far
                           << " diagnostic_overlap_surface_views="
                           << n_prune_stats_surface_views
                           << "\n";
@@ -2224,7 +3000,7 @@ void VoxelMapper::trainForOneIteration()
                                         .index_select(0, prune_idx.to(torch::kLong))
                                         .contiguous();
                             }
-                            torch::Tensor whole_run_pruned_by_surface_views;
+	                            torch::Tensor whole_run_pruned_by_surface_views;
                             if (prune_mask_surface_views_extra.defined() &&
                                 prune_mask_surface_views_extra.numel() == N) {
                                 whole_run_pruned_by_surface_views =
@@ -2232,17 +3008,45 @@ void VoxelMapper::trainForOneIteration()
                                         .to(prune_idx.device())
                                         .to(torch::kBool)
                                         .contiguous()
-                                        .index_select(0, prune_idx.to(torch::kLong))
-                                        .contiguous();
-                            }
+	                                        .index_select(0, prune_idx.to(torch::kLong))
+	                                        .contiguous();
+	                            }
+                                torch::Tensor whole_run_pruned_by_near;
+                                if (prune_mask_near.defined() &&
+                                    prune_mask_near.numel() == N) {
+                                    whole_run_pruned_by_near =
+                                        prune_mask_near
+                                            .to(prune_idx.device())
+                                            .to(torch::kBool)
+                                            .contiguous()
+                                            .index_select(
+                                                0,
+                                                prune_idx.to(torch::kLong))
+                                            .contiguous();
+                                }
+                                torch::Tensor whole_run_pruned_by_far;
+                                if (prune_mask_far.defined() &&
+                                    prune_mask_far.numel() == N) {
+                                    whole_run_pruned_by_far =
+                                        prune_mask_far
+                                            .to(prune_idx.device())
+                                            .to(torch::kBool)
+                                            .contiguous()
+                                            .index_select(
+                                                0,
+                                                prune_idx.to(torch::kLong))
+                                            .contiguous();
+                                }
 	                            appendWholeRunPrunedVoxels(
 	                                iter,
 	                                pruned_centers,
 	                                pruned_sizes,
 	                                pruned_levels,
-                                    pruned_colors,
+	                                    pruned_colors,
 	                                whole_run_pruned_by_tsdf,
-	                                whole_run_pruned_by_surface_views);
+	                                whole_run_pruned_by_surface_views,
+                                    whole_run_pruned_by_near,
+                                    whole_run_pruned_by_far);
 
 	                        }
 	                    }
@@ -2274,6 +3078,8 @@ void VoxelMapper::trainForOneIteration()
 
             // ---------------- SUBDIVIDE ----------------
             if (need_subdividing) {
+                auto subdivision_profile =
+                    profileLaptopModule("subdivision");
                 voxel_model_->setTopologyBirthContext(iter, static_cast<int>(tr_cams.size()));
                 const int before = voxel_model_->numVoxels();
                 if (before == 0) {
@@ -2343,6 +3149,20 @@ void VoxelMapper::trainForOneIteration()
                         // or render as leaves.
                         auto valid_mask_svrecon =
                             (non_finest.to(torch::kBool) & leaf_mask).to(torch::kBool);
+                        if (sensor_type_ == MONOCULAR &&
+                            monocular_rendered_depth_densify_) {
+                            torch::Tensor provisional =
+                                voxel_model_->monocularProvisionalVoxelMask();
+                            if (provisional.defined() &&
+                                provisional.numel() == M) {
+                                valid_mask_svrecon =
+                                    valid_mask_svrecon &
+                                    (~provisional
+                                          .to(valid_mask_svrecon.device())
+                                          .to(torch::kBool)
+                                          .reshape({M}));
+                            }
+                        }
                         auto normal_candidate_mask = valid_mask_svrecon.clone();
                         n_normal_candidates = normal_candidate_mask.sum().item<int64_t>();
                         torch::Tensor sdf_subdivide_candidate_mask;
@@ -2681,8 +3501,88 @@ void VoxelMapper::trainForOneIteration()
     }
 }
 
+bool VoxelMapper::isMatureMonocularOrbMapPoint(
+    ORB_SLAM3::MapPoint* map_point,
+    const unsigned long current_keyframe_id) const
+{
+    if (!map_point || map_point->isBad() || map_point->mnFirstKFid < 0) {
+        return false;
+    }
+
+    // These are ORB-SLAM3's own monocular recent-point culling criteria.
+    const long age =
+        static_cast<long>(current_keyframe_id) - map_point->mnFirstKFid;
+    if (age < 3 ||
+        map_point->GetFoundRatio() < 0.25f ||
+        map_point->Observations() <= 2) {
+        return false;
+    }
+
+    const Eigen::Vector3f position = map_point->GetWorldPos();
+    const Eigen::Vector3f color = map_point->GetColorRGB();
+    return position.allFinite() && color.allFinite();
+}
+
+void VoxelMapper::collectNewMonocularOrbSamplingSupport(
+    std::vector<float>& points,
+    std::vector<float>& colors)
+{
+    points.clear();
+    colors.clear();
+    if (sensor_type_ != MONOCULAR || !mpSLAM || !mpSLAM->getAtlas()) {
+        return;
+    }
+
+    ORB_SLAM3::Map* map = mpSLAM->getAtlas()->GetCurrentMap();
+    if (!map) {
+        return;
+    }
+
+    std::map<point3D_id_t, Point3D> live_support;
+    std::vector<point3D_id_t> newly_transferred_ids;
+    {
+        std::unique_lock<std::mutex> lock_map(map->mMutexMapUpdate);
+        const unsigned long current_keyframe_id = map->GetMaxKFid();
+        const std::vector<ORB_SLAM3::MapPoint*> map_points =
+            map->GetAllMapPoints();
+        live_support.clear();
+        newly_transferred_ids.reserve(map_points.size());
+
+        for (ORB_SLAM3::MapPoint* map_point : map_points) {
+            if (!isMatureMonocularOrbMapPoint(
+                    map_point, current_keyframe_id)) {
+                continue;
+            }
+
+            const Eigen::Vector3f position = map_point->GetWorldPos();
+            const Eigen::Vector3f color = map_point->GetColorRGB();
+            Point3D point;
+            point.xyz_ = position.cast<double>();
+            point.color_ = color;
+            live_support.emplace(map_point->mnId, point);
+
+            if (monocular_orb_inserted_point_ids_.count(map_point->mnId) != 0) {
+                continue;
+            }
+            newly_transferred_ids.push_back(map_point->mnId);
+            points.insert(
+                points.end(),
+                {position.x(), position.y(), position.z()});
+            colors.insert(
+                colors.end(),
+                {color.x(), color.y(), color.z()});
+        }
+    }
+
+    monocular_orb_sampling_support_ = std::move(live_support);
+    monocular_orb_inserted_point_ids_.insert(
+        newly_transferred_ids.begin(), newly_transferred_ids.end());
+}
+
 void VoxelMapper::combineMappingOperations()
 {
+    auto incremental_map_profile =
+        profileLaptopModule("incremental_map_update");
     // Get Mapping Operations
     while (mpSLAM->getAtlas()->hasMappingOperation()) {
         ORB_SLAM3::MappingOperation opr =
@@ -2728,19 +3628,34 @@ void VoxelMapper::combineMappingOperations()
             auto& colors = std::get<1>(associated_points);
 
             const int iter = getIteration();
-            if (allocate_orb_voxels_ && initial_mapped_ && points.size() >= 30) {
-                torch::NoGradGuard no_grad;
-                std::unique_lock<std::mutex> lock_render(mutex_render_);
+            if (allocate_orb_voxels_ && initial_mapped_) {
+                std::vector<float> allocation_points;
+                std::vector<float> allocation_colors;
+                if (sensor_type_ == MONOCULAR) {
+                    collectNewMonocularOrbSamplingSupport(
+                        allocation_points, allocation_colors);
+                } else {
+                    allocation_points = points;
+                    allocation_colors = colors;
+                }
 
-                std::vector<sv::MiniCam> tr_cams = incrementalMappingCameras();
-                if (points.size() >= 30) {
+                if (allocation_points.size() >= 3) {
+                    torch::NoGradGuard no_grad;
+                    std::unique_lock<std::mutex> lock_render(
+                        mutex_render_);
+                    std::vector<sv::MiniCam> tr_cams =
+                        incrementalMappingCameras();
                     voxel_model_->setNextRealInsertionRerunEntityPath(
                         "world/orb/voxels_created");
-                    voxel_model_->increasePcd(
-                        points,
-                        colors,
-                        getIteration(),
-                        tr_cams);
+                    {
+                        auto insertion_profile =
+                            profileLaptopModule("orb_voxel_insertion");
+                        voxel_model_->increasePcd(
+                            std::move(allocation_points),
+                            std::move(allocation_colors),
+                            getIteration(),
+                            tr_cams);
+                    }
                     voxel_model_->setNextRealInsertionRerunEntityPath("");
                     if (voxel_model_->lastIncreasePcdStats().new_voxels > 0 &&
                         (rerun_params_.run_whole_run_ ||
@@ -2750,16 +3665,33 @@ void VoxelMapper::combineMappingOperations()
 		                }
 			        }
 
-            // Preserve the scheduling used by the established SVRecon runs:
-            // ORB topology first, then inactive geometry, then residual RGB-D.
-            if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
+            // Preserve the established scheduling: ORB topology first,
+            // then inactive geometry, then residual sensor evidence/fill.
+            if ((sensor_type_ == RGBD ||
+                 (sensor_type_ == MONOCULAR && inactive_geo_densify_)) &&
+                !new_densification_kfs.empty()) {
                 for (const auto& pkf : new_densification_kfs) {
                     increasePcdByKeyframeInactiveGeoDensify(
                         pkf,
                         /*include_inactive_geo=*/inactive_geo_densify_,
                         /*include_rgbd_hole_fill=*/
-                            rgbd_fill_render_holes_ || rgbd_tsdf_evidence_);
+                            sensor_type_ == RGBD &&
+                            (rgbd_fill_render_holes_ || rgbd_tsdf_evidence_));
                 }
+            }
+            if (sensor_type_ == MONOCULAR &&
+                monocular_rendered_depth_densify_) {
+                for (const auto& pkf : new_densification_kfs) {
+                    densifyMonocularFromRenderedDepth(pkf);
+                }
+            }
+            if (sensor_type_ == MONOCULAR && monocular_mvs_densify_) {
+                scheduleLatestMonocularMvsKeyframe(new_densification_kfs);
+            }
+            if (sensor_type_ == MONOCULAR &&
+                monocular_omnidata_densify_) {
+                scheduleLatestMonocularOmnidataKeyframe(
+                    new_densification_kfs);
             }
             processRgbdClosureCache();
         }
@@ -2851,23 +3783,38 @@ void VoxelMapper::combineMappingOperations()
 
              // Add new points to the model
              const int iter = getIteration();
-             if (loop_closure_reinsert_points_ &&
-                 allocate_orb_voxels_ &&
-                 initial_mapped_ &&
-                 points.size() >= 30) {
-                torch::NoGradGuard no_grad;
-                std::unique_lock<std::mutex> lock_render(mutex_render_);
+	             if (loop_closure_reinsert_points_ &&
+	                 allocate_orb_voxels_ &&
+	                 initial_mapped_) {
+                std::vector<float> allocation_points;
+                std::vector<float> allocation_colors;
+                if (sensor_type_ == MONOCULAR) {
+                    collectNewMonocularOrbSamplingSupport(
+                        allocation_points, allocation_colors);
+                } else {
+                    allocation_points = points;
+                    allocation_colors = colors;
+                }
 
-                // Match Photo-SLAM behavior: insert loop-closure associated points.
-                std::vector<sv::MiniCam> tr_cams = incrementalMappingCameras();
-                if (points.size() >= 30) {
+                if (allocation_points.size() >= 3) {
+                    torch::NoGradGuard no_grad;
+                    std::unique_lock<std::mutex> lock_render(
+                        mutex_render_);
+
+                    // Match Photo-SLAM behavior: insert loop-closure associated points.
+                    std::vector<sv::MiniCam> tr_cams =
+                        incrementalMappingCameras();
                     voxel_model_->setNextRealInsertionRerunEntityPath(
                         "world/orb/voxels_created");
-                    voxel_model_->increasePcd(
-                        points,
-                        colors,
-                        iter,
-                        tr_cams);
+                    {
+                        auto insertion_profile =
+                            profileLaptopModule("orb_voxel_insertion");
+                        voxel_model_->increasePcd(
+                            std::move(allocation_points),
+                            std::move(allocation_colors),
+                            iter,
+                            tr_cams);
+                    }
                     voxel_model_->setNextRealInsertionRerunEntityPath("");
                     if (voxel_model_->lastIncreasePcdStats().new_voxels > 0 &&
                         (rerun_params_.run_whole_run_ ||
@@ -2875,17 +3822,35 @@ void VoxelMapper::combineMappingOperations()
                         rerun_state_.whole_run_live_voxels_dirty_ = true;
                     }
                 }
-		             }
+			             }
 
-                if (sensor_type_ == RGBD && !new_densification_kfs.empty()) {
+                if ((sensor_type_ == RGBD ||
+                     (sensor_type_ == MONOCULAR && inactive_geo_densify_)) &&
+                    !new_densification_kfs.empty()) {
                     for (const auto& pkf : new_densification_kfs) {
                         increasePcdByKeyframeInactiveGeoDensify(
                             pkf,
                             /*include_inactive_geo=*/inactive_geo_densify_,
                             /*include_rgbd_hole_fill=*/
-                                rgbd_fill_render_holes_ ||
-                                rgbd_tsdf_evidence_);
+                                sensor_type_ == RGBD &&
+                                (rgbd_fill_render_holes_ ||
+                                 rgbd_tsdf_evidence_));
                     }
+                }
+                if (sensor_type_ == MONOCULAR &&
+                    monocular_rendered_depth_densify_) {
+                    for (const auto& pkf : new_densification_kfs) {
+                        densifyMonocularFromRenderedDepth(pkf);
+                    }
+                }
+                if (sensor_type_ == MONOCULAR && monocular_mvs_densify_) {
+                    scheduleLatestMonocularMvsKeyframe(
+                        new_densification_kfs);
+                }
+                if (sensor_type_ == MONOCULAR &&
+                    monocular_omnidata_densify_) {
+                    scheduleLatestMonocularOmnidataKeyframe(
+                        new_densification_kfs);
                 }
                 processRgbdClosureCache();
 			            // Mark this iteration
@@ -2899,8 +3864,8 @@ void VoxelMapper::combineMappingOperations()
              std::cout << "[Voxel Mapper]Scale refinement Detected. Transforming all kfs and points..."
                        << std::endl;
  
-             float s = opr.mfScale;
-             Sophus::SE3f& T = opr.mT;
+	             float s = opr.mfScale;
+	             Sophus::SE3f& T = opr.mT;
              if (initial_mapped_) {
                  // Apply the scaled transformation on gaussian model points
                  {
@@ -3313,6 +4278,8 @@ torch::Tensor VoxelMapper::detectRgbdRenderHolePixels(
 void VoxelMapper::fillRgbdRenderHolesSdf(
     const std::shared_ptr<VoxelKeyframe>& pkf)
 {
+    auto fill_profile =
+        profileLaptopModule("rgbd_direct_hole_sampling");
     if (!pkf || !voxel_model_ || !rgbd_fill_render_holes_ ||
         pkf->img_undist_.empty() || pkf->img_auxiliary_undist_.empty()) {
         return;
@@ -3451,6 +4418,8 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
     const bool include_inactive_geo,
     const bool include_rgbd_hole_fill)
 {
+    auto prepare_profile =
+        profileLaptopModule("inactive_geometry_depth_prepare");
     torch::NoGradGuard no_grad;
 
     // Pose of camera in world frame
@@ -3460,58 +4429,63 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
     {
     case MONOCULAR:
     {
-        assert(pkf->kps_pixel_.size() % 2 == 0);
-        int N = pkf->kps_pixel_.size() / 2;
+        if (include_inactive_geo && inactive_geo_densify_) {
+            assert(pkf->kps_pixel_.size() % 2 == 0);
+            int N = pkf->kps_pixel_.size() / 2;
 
-        // Keypoints and local 3D (camera frame)
-        torch::Tensor kps_pixel_tensor = torch::from_blob(
-            pkf->kps_pixel_.data(),
-            {N, 2},
-            torch::TensorOptions().dtype(torch::kFloat32)).to(device_type_);
+            // Keypoints and local 3D (camera frame)
+            torch::Tensor kps_pixel_tensor = torch::from_blob(
+                pkf->kps_pixel_.data(),
+                {N, 2},
+                torch::TensorOptions().dtype(torch::kFloat32)).to(device_type_);
 
-        torch::Tensor kps_point_local_tensor = torch::from_blob(
-            pkf->kps_point_local_.data(),
-            {N, 3},
-            torch::TensorOptions().dtype(torch::kFloat32)).to(device_type_);
+            torch::Tensor kps_point_local_tensor = torch::from_blob(
+                pkf->kps_point_local_.data(),
+                {N, 3},
+                torch::TensorOptions().dtype(torch::kFloat32)).to(device_type_);
 
-        torch::Tensor kps_has3D_tensor = torch::where(
-            kps_point_local_tensor.index({torch::indexing::Slice(), 2}) > 0.0f,
-            true,
-            false);
+            torch::Tensor kps_has3D_tensor = torch::where(
+                kps_point_local_tensor.index({torch::indexing::Slice(), 2}) > 0.0f,
+                true,
+                false);
 
-        // RGB image → torch
-        cv::cuda::GpuMat rgb_gpu;
-        rgb_gpu.upload(pkf->img_undist_);
-        torch::Tensor colors = tensor_utils::cvGpuMat2TorchTensor_Float32(rgb_gpu);
-        colors = colors.permute({1, 2, 0}).flatten(0, 1).contiguous();
+            // RGB image → torch
+            cv::cuda::GpuMat rgb_gpu;
+            rgb_gpu.upload(pkf->img_undist_);
+            torch::Tensor colors = tensor_utils::cvGpuMat2TorchTensor_Float32(rgb_gpu);
+            colors = colors.permute({1, 2, 0}).flatten(0, 1).contiguous();
 
-        // Photo-SLAM’s neighborhood densification
-        auto result =
-            monocularPinholeInactiveGeoDensifyBySearchingNeighborhoodKeypoints(
-                kps_pixel_tensor,
-                kps_has3D_tensor,
-                kps_point_local_tensor,
-                colors,
-                inactive_geo_densify_max_pixel_dist_,
-                pkf->intr_,
-                pkf->image_width_);
+            // Photo-SLAM’s neighborhood densification
+            auto result =
+                monocularPinholeInactiveGeoDensifyBySearchingNeighborhoodKeypoints(
+                    kps_pixel_tensor,
+                    kps_has3D_tensor,
+                    kps_point_local_tensor,
+                    colors,
+                    inactive_geo_densify_max_pixel_dist_,
+                    pkf->intr_,
+                    pkf->image_width_);
 
-        torch::Tensor& points3D_valid = std::get<0>(result);
-        torch::Tensor& colors_valid   = std::get<1>(result);
+            torch::Tensor& points3D_valid = std::get<0>(result);
+            torch::Tensor& colors_valid   = std::get<1>(result);
 
-        // Transform points to world coordinates
-        torch::Tensor Twc_tensor =
-            tensor_utils::EigenMatrix2TorchTensor(
-                Twc.matrix(), device_type_).transpose(0, 1);
-        voxel_utils::transformPoints(points3D_valid, Twc_tensor);
+            // Transform points to world coordinates
+            torch::Tensor Twc_tensor =
+                tensor_utils::EigenMatrix2TorchTensor(
+                    Twc.matrix(), device_type_).transpose(0, 1);
+            voxel_utils::transformPoints(points3D_valid, Twc_tensor);
 
-        // Add new points to the cache
-        if (depth_cached_ == 0) {
-            depth_cache_points_ = points3D_valid;
-            depth_cache_colors_ = colors_valid;
-        } else {
-            depth_cache_points_ = torch::cat({depth_cache_points_, points3D_valid}, /*dim=*/0);
-            depth_cache_colors_ = torch::cat({depth_cache_colors_, colors_valid},   /*dim=*/0);
+            // Add new points to the cache
+            if (!depth_cache_points_.defined() ||
+                depth_cache_points_.numel() == 0) {
+                depth_cache_points_ = points3D_valid;
+                depth_cache_colors_ = colors_valid;
+            } else {
+                depth_cache_points_ = torch::cat(
+                    {depth_cache_points_, points3D_valid}, /*dim=*/0);
+                depth_cache_colors_ = torch::cat(
+                    {depth_cache_colors_, colors_valid}, /*dim=*/0);
+            }
         }
     }
     break;
@@ -3740,6 +4714,8 @@ void VoxelMapper::increasePcdByKeyframeInactiveGeoDensify(
 
 void VoxelMapper::flushInactiveGeoCache()
 {
+    auto insertion_profile =
+        profileLaptopModule("inactive_geometry_insertion");
     const bool have_inactive_points =
         depth_cache_points_.defined() &&
         depth_cache_points_.dim() == 2 &&
@@ -3799,6 +4775,8 @@ void VoxelMapper::flushInactiveGeoCache()
 
 void VoxelMapper::processRgbdClosureCache()
 {
+    auto closure_profile =
+        profileLaptopModule("rgbd_gap_filling");
     std::vector<std::shared_ptr<VoxelKeyframe>> rgbd_closure_kfs;
     rgbd_closure_kfs.swap(rgbd_hole_fill_ready_keyframes_);
     std::unordered_set<

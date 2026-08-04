@@ -18,10 +18,10 @@ Camera.z_near: 0.01
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.inactive_geo_densify: 1 # optional Photo-SLAM inactive-geometry densification
+Mapper.inactive_geo_densify: 0 # optional Photo-SLAM inactive-geometry densification
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
-Mapper.rgbd_fill_render_holes: 1 # direct SVRaster-style alternative to TSDF-evidence completion
+Mapper.rgbd_fill_render_holes: 0 # direct SVRaster-style alternative to TSDF-evidence completion
 Mapper.rgbd_fill_render_holes_initial_backfill: 0
 Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for each keyframe's pre-insertion hole detection
 
@@ -32,10 +32,10 @@ Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance f
 # Hybrid RGB-D completion: residual holes update non-renderable nvblox-style
 # TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
 # promoted into the active SVRecon map.
-Mapper.rgbd_tsdf_evidence: 0
+Mapper.rgbd_tsdf_evidence: 1
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
-Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # nvblox raycast_subsampling_factor default
-Mapper.rgbd_tsdf_evidence_trunc_vox: 4.0 # nvblox TSDF truncation default
+Mapper.rgbd_tsdf_evidence_pixel_stride: 2 # match the octree-block-support hole sampling
+Mapper.rgbd_tsdf_evidence_trunc_vox: 3.0 # sample the RGB-D band [D-3v, D+3v]
 Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # nvblox TSDF maximum weight default
 Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
 Mapper.sdf_voxel_size_m: 0.05
@@ -62,6 +62,8 @@ Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
 Record.enable_rerun: 0 # enable the reconstruction timeline below
@@ -81,10 +83,10 @@ Record.rerun_rendered_mesh_eval: 0 # log the SVRecon progressive rendered-TSDF m
 Record.rerun_gt_mesh: 0 # raw Replica mesh is not aligned to the current SLAM frame in Rerun
 
 Record.save_rendered_mesh_eval: 1 # save common fixed-TSDF, SVRecon progressive-TSDF, and direct-SDF meshes
-Record.rendered_mesh_eval_voxel_size_m: 0.05 # match local HI-SLAM2 Replica evaluation
-Record.rendered_mesh_eval_min_weight: 2.0 # match tsdf_mesh_*_w2.0 extraction
-Record.rendered_mesh_eval_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
-Record.rendered_mesh_eval_depth_max_m: 5.0 # HI-SLAM2 TSDF integration depth limit
+Record.rendered_mesh_eval_voxel_size_m: 0.01 #0.05 # match local HI-SLAM2 Replica evaluation
+Record.rendered_mesh_eval_min_weight: 1 #2.0 # match tsdf_mesh_*_w2.0 extraction
+Record.rendered_mesh_eval_trunc_vox: 4 #8.0 # Open3D VoxelBlockGrid integration default
+Record.rendered_mesh_eval_depth_max_m: 30 #5.0 # HI-SLAM2 TSDF integration depth limit
 Record.svrecon_mesh_init_lv: 7 # SVRecon extract_mesh.py --init_lv (progressive extraction)
 Record.svrecon_mesh_final_lv: 9 # SVRecon extract_mesh.py --final_lv; level 10 exceeds an 8 GB GPU
 Record.svrecon_mesh_trunc_lv: 10 # SVRecon extract_mesh.py --trunc_lv
@@ -92,7 +94,7 @@ Record.svrecon_mesh_trunc_vox: 5.0 # SVRecon extract_mesh.py --trunc_vox
 Record.svrecon_mesh_pg_prune: 0.6 # SVRecon extract_mesh.py --pg_prune
 Record.svrecon_mesh_crop_border: 0.01 # SVRecon extract_mesh.py --crop_border
 Record.svrecon_mesh_alpha_thres: 0.5 # SVRecon extract_mesh.py --alpha_thres
-Record.svrecon_mesh_use_mean_depth: 0 # 0: median rendered depth, 1: mean rendered depth
+Record.svrecon_mesh_use_mean_depth: 1 # 0: median rendered depth, 1: mean rendered depth
 Record.svrecon_mesh_use_vert_color: 1 # SVRecon extract_mesh.py --use_vert_color
 
 ##############################################################################

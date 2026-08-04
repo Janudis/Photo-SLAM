@@ -19,10 +19,10 @@ Camera.z_near: 0.01
 RGBD.min_depth: 0.0000000001
 RGBD.max_depth: 40.0
 
-Mapper.inactive_geo_densify: 1 # 0:false, 1 or other integer:true
+Mapper.inactive_geo_densify: 0 # 0:false, 1 or other integer:true
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
-Mapper.rgbd_fill_render_holes: 1 # direct SVRaster-style fill: cache one measured-surface cell for each strict rendered hole
+Mapper.rgbd_fill_render_holes: 0 # direct SVRaster-style fill: cache one measured-surface cell for each strict rendered hole
 Mapper.rgbd_fill_render_holes_initial_backfill: 0 # run only RGB-D render-hole fill for initial keyframes after createFromPcd
 Mapper.rgbd_fill_render_holes_stride: 4 # pixel stride for each keyframe's pre-insertion hole detection
 
@@ -33,10 +33,10 @@ Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance f
 # Hybrid RGB-D completion: residual holes update non-renderable nvblox-style
 # TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
 # promoted into the active SVRecon map.
-Mapper.rgbd_tsdf_evidence: 0
+Mapper.rgbd_tsdf_evidence: 1
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
-Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # nvblox raycast_subsampling_factor default
-Mapper.rgbd_tsdf_evidence_trunc_vox: 4.0 # nvblox TSDF truncation default
+Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # match the octree-block-support hole sampling
+Mapper.rgbd_tsdf_evidence_trunc_vox: 3.0 # sample the RGB-D band [D-3v, D+3v]
 Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # nvblox TSDF maximum weight default
 Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
 Mapper.sdf_voxel_size_m: 0.05
@@ -61,14 +61,16 @@ Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
 Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
 Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
-Record.enable_rerun: 0  # enable the reconstruction timeline below
+Record.enable_rerun: 1  # enable the reconstruction timeline below
 Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
 Record.rerun_keyframe_start: 0
 Record.run_whole_run: 0 # svrecon_debug already contains the keyframes and live/pruned voxel timeline
-Record.rerun_svrecon_debug: 1 # separate optimization-debug recording; disabled for reconstruction capture
-Record.run_reconstruction_mesh: 0 # keyframes, ORB points, live preview mesh, and exact final mesh
+Record.rerun_svrecon_debug: 0 # separate optimization-debug recording; disabled for reconstruction capture
+Record.run_reconstruction_mesh: 1 # keyframes, ORB points, live preview mesh, and exact final mesh
 Record.run_reconstruction_mesh_interval: 200 # live preview interval; final mesh remains full-resolution
 Record.run_reconstruction_mesh_min_weight: 1e-4
 Record.run_reconstruction_mesh_weld_vertices: 1

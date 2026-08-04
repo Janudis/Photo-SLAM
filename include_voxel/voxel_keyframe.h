@@ -9,6 +9,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <string>
+#include <utility>
 #include <vector>
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 
@@ -121,6 +122,16 @@ public:
     std::vector<Point2D> points2D_;
     std::vector<float> kps_pixel_;
     std::vector<float> kps_point_local_;
+
+    // Snapshot of ORB-SLAM3's local covisibility graph for MVS source-frame
+    // selection. The mapper refreshes this metadata under Map::mMutexMapUpdate.
+    std::vector<std::pair<unsigned long, int>> covisible_keyframes_;
+    bool monocular_mvs_pose_ready_ = false;
+    float monocular_mvs_depth_min_ = 0.0f;
+    float monocular_mvs_depth_max_ = 0.0f;
+    std::size_t monocular_mvs_sparse_depth_count_ = 0;
+    std::vector<Eigen::Vector2f> monocular_depth_anchor_pixels_;
+    std::vector<float> monocular_depth_anchor_depths_;
 
     bool done_inactive_geo_densify_ = false;
 };

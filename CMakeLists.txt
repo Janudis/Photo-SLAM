@@ -59,6 +59,7 @@ find_package(glfw3 REQUIRED)
 find_package(realsense2)
 
 find_package(glog REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
 
 option(BUILD_NVBLOX_EXPERIMENT "Build the separate ORB-SLAM + nvblox RGB-D experiment" ON)
 if(BUILD_NVBLOX_EXPERIMENT)
@@ -226,6 +227,7 @@ add_library(gaussian_mapper SHARED
     src/gaussian_scene.cpp
     src/gaussian_trainer.cpp
     src/gaussian_mapper.cpp
+    src/gaussian_mapper_pruning.cpp
     evaluation/gaussian_mesh_extraction.cpp)
 target_link_libraries(gaussian_mapper
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
@@ -299,11 +301,27 @@ target_include_directories(gaussian_mapper
 # target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
 
 ### 3.2  C++ core / optimiser  ---------------------------------------
+add_library(tandem_mvsnet STATIC
+        third_party/tandem/tandem/libdr/dr_mvsnet/src/dr_mvsnet.cpp)
+target_include_directories(tandem_mvsnet
+        PUBLIC
+            third_party/tandem/tandem/libdr/dr_mvsnet/src
+            third_party/tandem/tandem/libdr/dr_mvsnet/src/dr_mvsnet)
+target_link_libraries(tandem_mvsnet
+        PRIVATE
+            "${TORCH_LIBRARIES}"
+            boost_system
+            boost_thread)
+
 add_library(voxel_core
         src/stereo_vision.cu
+        src_voxel/laptop_precheck_profiler.cpp
         src_voxel/mapper_depth_registry.cpp
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
+        src_voxel/voxel_mapper_monocular_densification.cpp
+        src_voxel/voxel_mapper_tandem_mvs.cpp
+        src_voxel/voxel_mapper_omnidata.cpp
         src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
         src_voxel/voxel_mapper_tsdf.cpp
         src_voxel/voxel_mapper_rerun.cpp
@@ -316,6 +334,8 @@ add_library(voxel_core
         src_voxel/voxel_model.cpp
         src_voxel/voxel_model_rerun.cpp
         src_voxel/voxel_svrecon_rasterizer.cpp
+        src_voxel/tandem_mvs_backend.cpp
+        src_voxel/omnidata_depth_backend.cpp
         src_voxel/rerun_utils.cpp
         third_party/tinyply/tinyply.h
         third_party/tinyply/tinyply.cpp)
@@ -335,6 +355,7 @@ target_link_libraries(voxel_core
             pybind11::embed
             ${OpenCV_LIBRARIES}
             rerun_sdk
+            tandem_mvsnet
             glog::glog)
 
 add_library(voxel_viewer SHARED
@@ -391,12 +412,21 @@ endif()
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
 
-# # Replica Monocular
-# add_executable(replica_mono examples/replica_mono.cpp)
-# target_link_libraries(replica_mono
-#     gaussian_viewer    
-#     gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# Replica Monocular (original Photo-SLAM Gaussian mapper)
+add_executable(replica_mono examples/replica_mono.cpp)
+target_include_directories(replica_mono PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(replica_mono
+    gaussian_viewer
+    gaussian_mapper
+    ${OpenCV_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(replica_mono PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 # Replica RGB-D (original Photo-SLAM Gaussian mapper)
 add_executable(replica_rgbd examples/replica_rgbd.cpp)
@@ -429,6 +459,23 @@ target_link_libraries(replica_rgbd_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 target_link_directories(replica_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+add_executable(replica_mono_voxel examples/replica_mono_voxel.cpp)
+target_include_directories(replica_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        pybind11::embed
+)
+target_link_libraries(replica_mono_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(replica_mono_voxel PRIVATE
+        /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 add_executable(waymo_mono_voxel examples/waymo_mono_voxel.cpp)
 target_include_directories(waymo_mono_voxel PRIVATE
@@ -467,12 +514,37 @@ endif()
 
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# # TUM Monocular
-# add_executable(tum_mono examples/tum_mono.cpp)
-# target_link_libraries(tum_mono
-#     gaussian_viewer    
-#     gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+# TUM Monocular (original Photo-SLAM Gaussian mapper)
+add_executable(tum_mono examples/tum_mono.cpp)
+target_include_directories(tum_mono PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(tum_mono
+    gaussian_viewer
+    gaussian_mapper
+    ${OpenCV_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(tum_mono PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+# ScanNet uses the generic timestamp/RGB loader from the TUM monocular runner.
+add_executable(scannet_mono examples/tum_mono.cpp)
+target_include_directories(scannet_mono PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(scannet_mono
+    gaussian_viewer
+    gaussian_mapper
+    ${OpenCV_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    ${Python3_LIBRARIES}
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+target_link_directories(scannet_mono PRIVATE
+    ${PROJECT_SOURCE_DIR}/lib
+    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
 # TUM RGBD
 add_executable(tum_rgbd examples/tum_rgbd.cpp)
@@ -508,6 +580,42 @@ target_link_libraries(tum_rgbd_voxel
 )
 target_link_directories(tum_rgbd_voxel PRIVATE /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 
+add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
+target_include_directories(tum_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        pybind11::embed
+)
+target_link_libraries(tum_mono_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(tum_mono_voxel PRIVATE
+        /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+# EuRoC cam0 monocular runner. Its CSV/grayscale loader is isolated from the
+# generic TUM/ScanNet image-list runner.
+add_executable(euroc_mono_voxel examples/euroc_mono_voxel.cpp)
+target_include_directories(euroc_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        pybind11::embed
+)
+target_link_libraries(euroc_mono_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(euroc_mono_voxel PRIVATE
+        /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
 # ScanNet uses the same generic timestamp/RGB/depth association runner as TUM,
 # but has a separate executable, generated camera calibration, and mapper YAML.
 add_executable(scannet_rgbd_voxel examples/tum_rgbd_voxel.cpp)
@@ -521,6 +629,25 @@ target_link_libraries(scannet_rgbd_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 target_link_directories(scannet_rgbd_voxel PRIVATE
+        /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
+
+# The monocular TUM loader also accepts ScanNet's association.txt and ignores
+# its depth columns.
+add_executable(scannet_mono_voxel examples/tum_mono_voxel.cpp)
+target_include_directories(scannet_mono_voxel PRIVATE
+        ${CMAKE_SOURCE_DIR}/include_voxel
+        pybind11::embed
+)
+target_link_libraries(scannet_mono_voxel
+        voxel_core
+        voxel_viewer
+        ${OpenCV_LIBS}
+        ${TORCH_LIBRARIES}
+        torch_python
+        ${Python3_LIBRARIES}
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+)
+target_link_directories(scannet_mono_voxel PRIVATE
         /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

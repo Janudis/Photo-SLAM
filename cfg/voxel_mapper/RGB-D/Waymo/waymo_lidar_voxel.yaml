@@ -60,6 +60,8 @@ Record.record_rendered_image: 1
 Record.record_ground_truth_image: 1
 Record.record_loss_image: 0
 Record.training_report_interval: 100
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0
 Record.enable_rerun: 0
 Record.rerun_max_keyframes: -1

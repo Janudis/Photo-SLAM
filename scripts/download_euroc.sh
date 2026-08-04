@@ -1,12 +1,6 @@
-mkdir -p ../data/EuRoC
-cd ../data/EuRoC
-wget http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_01_easy/MH_01_easy.zip
-unzip MH_01_easy.zip
-wget http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_02_easy/MH_02_easy.zip
-unzip MH_02_easy.zip
-wget http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.zip
-unzip V1_01_easy.zip
-wget http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room2/V2_01_easy/V2_01_easy.zip
-unzip V2_01_easy.zip
-cd scripts
+#!/usr/bin/env bash
 
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$script_dir/download_euroc.py"

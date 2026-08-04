@@ -268,6 +268,7 @@ int main(int argc, char **argv)
             output_dir,
             0,
             device_type);
+    pVoxelMapper->setRuntimeFrameCount(nImages);
 
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
@@ -311,7 +312,15 @@ int main(int argc, char **argv)
         double tframe = vTimestamps[ni];
 
         auto t1 = std::chrono::steady_clock::now();
-        pSLAM->TrackMonocular(im, tframe, std::vector<ORB_SLAM3::IMU::Point>(), vstrImageFilenamesRGB[ni]);
+        {
+            auto tracking_profile =
+                pVoxelMapper->profileLaptopModule("orb_tracking");
+            pSLAM->TrackMonocular(
+                im,
+                tframe,
+                std::vector<ORB_SLAM3::IMU::Point>(),
+                vstrImageFilenamesRGB[ni]);
+        }
         auto t2 = std::chrono::steady_clock::now();
 
         float ttrack = std::chrono::duration_cast<std::chrono::duration<float>>(t2 - t1).count();

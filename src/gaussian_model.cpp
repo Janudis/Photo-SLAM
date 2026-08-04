@@ -134,6 +134,10 @@ void GaussianModel::createFromPcd(
         color.index({point_idx, 2}) = point.color_(2);
         ++pcd_it;
     }
+    this->sparse_points_xyz_ =
+        fused_point_cloud.detach().to(torch::kFloat32).contiguous();
+    this->sparse_points_color_ =
+        color.detach().to(torch::kFloat32).contiguous();
 
     torch::Tensor fused_color = sh_utils::RGB2SH(color);
     auto temp = this->max_sh_degree_ + 1;
@@ -423,6 +427,11 @@ void GaussianModel::applyScaledTransformation(
     torch::Tensor T_tensor =
         tensor_utils::EigenMatrix2TorchTensor(T.matrix(), device_type_).transpose(0, 1);
     transformPoints(this->xyz_, T_tensor);
+    if (this->sparse_points_xyz_.defined() &&
+        this->sparse_points_xyz_.numel() > 0) {
+        this->sparse_points_xyz_ *= s;
+        transformPoints(this->sparse_points_xyz_, T_tensor);
+    }
 
 // torch::Tensor scales;
 // torch::Tensor point_cloud_copy = this->xyz_.clone();

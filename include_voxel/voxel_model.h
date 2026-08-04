@@ -88,12 +88,14 @@ public:
         std::vector<float> points,
         std::vector<float> colors,
         const int iteration,
-        const std::vector<sv::MiniCam>& cams);
+        const std::vector<sv::MiniCam>& cams,
+        bool clear_cuda_cache_before_parameter_append = false);
     void increasePcd(
         torch::Tensor& new_point_cloud,
         torch::Tensor& new_colors,
         const int iteration,
-        const std::vector<sv::MiniCam>& cams);
+        const std::vector<sv::MiniCam>& cams,
+        bool clear_cuda_cache_before_parameter_append = false);
 
     torch::Tensor voxCenter() { return this->center_; }
     int64_t numGridPts() const;
@@ -257,6 +259,29 @@ public:
     torch::Tensor orbVoxelMask() const { return this->is_orb_voxel_; } // [N] bool, true=originated from ORB map points
     torch::Tensor inactiveGeoVoxelMask() const { return this->is_inactive_geo_voxel_; } // [N] bool, true=originated from inactive-geo RGB-D gap fill
     torch::Tensor rgbdFillRenderHolesVoxelMask() const { return this->is_rgbd_fill_render_holes_voxel_; } // [N] bool
+    torch::Tensor monocularRenderedDepthVoxelMask() const {
+        return this->is_monocular_rendered_depth_voxel_;
+    }
+    torch::Tensor monocularMvsVoxelMask() const {
+        return this->is_monocular_mvs_voxel_;
+    }
+    torch::Tensor monocularOmnidataVoxelMask() const {
+        return this->is_monocular_omnidata_voxel_;
+    }
+    torch::Tensor monocularProvisionalVoxelMask() const {
+        return this->is_monocular_provisional_voxel_;
+    }
+    torch::Tensor monocularRenderSupportHits() const {
+        return this->monocular_render_support_hits_;
+    }
+    torch::Tensor monocularRenderOpportunities() const {
+        return this->monocular_render_opportunities_;
+    }
+    void accumulateMonocularRenderObservation(
+        const torch::Tensor& max_render_weight,
+        float min_render_weight);
+    void resolveMonocularProvisionalVoxels(
+        const torch::Tensor& resolved_mask);
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
     torch::Tensor activeRenderableMask() const;
@@ -405,6 +430,12 @@ public:
     torch::Tensor is_orb_voxel_;                 // [N] bool provenance: true=created from ORB map points
     torch::Tensor is_inactive_geo_voxel_;        // [N] bool provenance: true=created by inactive-geo densification
     torch::Tensor is_rgbd_fill_render_holes_voxel_; // [N] bool provenance: true=created by RGB-D render-hole fill
+    torch::Tensor is_monocular_rendered_depth_voxel_; // [N] bool provenance: rendered-depth densification
+    torch::Tensor is_monocular_mvs_voxel_; // [N] bool provenance: TANDEM MVS hole filling
+    torch::Tensor is_monocular_omnidata_voxel_; // [N] bool provenance: aligned Omnidata hole filling
+    torch::Tensor is_monocular_provisional_voxel_; // [N] bool pending co-visibility validation
+    torch::Tensor monocular_render_support_hits_; // [N] int32 keyframes with max(T*alpha) above threshold
+    torch::Tensor monocular_render_opportunities_; // [N] int32 keyframes tested since insertion
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA

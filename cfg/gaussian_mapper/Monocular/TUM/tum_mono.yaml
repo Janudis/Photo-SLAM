@@ -69,6 +69,10 @@ Optimization.densification_interval: 100
 Optimization.opacity_reset_interval: 0  # 0:never, 1:always, others:periodically
 Optimization.prune_big_point_after_iter: 30000
 Optimization.densify_min_opacity: 0.1 #0.005
+Optimization.filter_near_voxels: 1
+Optimization.prune_far_voxels: 1
+Optimization.prune_near_voxels_geometric: 1
+Optimization.final_special_prune_enable: 1
 Optimization.densify_from_iter: 800
 Optimization.densify_until_iter: 30000
 Optimization.densify_grad_threshold: 0.001

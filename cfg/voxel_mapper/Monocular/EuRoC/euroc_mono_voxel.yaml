@@ -1,0 +1,182 @@
+%YAML:1.0
+
+# EuRoC monocular SVRecon configuration. The map flow and optimization match
+# the current TUM monocular implementation.
+
+# Model
+Model.sh_degree: 3
+Model.resolution: -1.0
+Model.white_background: 0
+Model.eval: 0
+Model.outside_level: 5
+# ORB-SLAM3 visual-inertial initialization supplies metric EuRoC poses. Derive
+# the root from its initial sparse map and retain the outside-level margin.
+Model.global_scene_extent: 0.0
+
+# Pipeline
+Pipeline.convert_SHs: 0
+Camera.z_near: 0.01
+Camera.z_far: 40.0
+
+# ORB points select sparse cells but are weak surface priors. TANDEM MVS depth
+# is used only to initialize new cells at residual rendering holes.
+Mapper.geometry_mode: "svrecon_sdf"
+Mapper.sdf_initialization_mode: "weak_surface_prior"
+Mapper.sdf_initialization_orb_radius_vox: 1.0
+Mapper.inactive_geo_densify: 0
+Mapper.inactive_geo_densify_max_pixel_dist: 1.0
+Mapper.depth_cache: 10
+
+Mapper.monocular_rendered_depth_densify: 0
+Mapper.monocular_mvs_densify: 0
+Mapper.monocular_mvs_model_dir: "third_party/tandem/tandem/exported/tandem_512x320"
+Mapper.monocular_mvs_width: 512
+Mapper.monocular_mvs_height: 320
+Mapper.monocular_mvs_view_num: 7
+Mapper.monocular_mvs_depth_range_mode: "fixed"
+Mapper.monocular_mvs_depth_min_m: 0.1
+Mapper.monocular_mvs_depth_max_m: 5.0
+Mapper.monocular_mvs_discard_percentage: 10.0
+# SVRecon and TANDEM alternate different CUDA allocation shapes. Release only
+# unused cached blocks before inference to avoid fragmentation on an 8 GB GPU.
+Mapper.monocular_mvs_empty_cache_before_launch: 1
+
+# Omnidata ablation. Enable this and disable monocular_mvs_densify above.
+# Input preprocessing and the x50 depth convention match HI-SLAM2. The 2x2
+# inverse-depth scale field is fitted to mature ORB points, then source-view
+# consistency gates depths before the shared structural-hole insertion.
+Mapper.monocular_omnidata_densify: 1
+Mapper.monocular_omnidata_model_path: "mono_priors/models/omnidata_dpt_depth_v2_512.pt"
+Mapper.monocular_omnidata_input_size: 512
+Mapper.monocular_omnidata_width: 512
+Mapper.monocular_omnidata_height: 320
+Mapper.monocular_omnidata_view_num: 7
+Mapper.monocular_omnidata_depth_multiplier: 50.0
+Mapper.monocular_omnidata_min_alignment_anchors: 16
+Mapper.monocular_omnidata_max_alignment_rel_error: 0.30
+Mapper.monocular_omnidata_min_source_views: 1
+Mapper.monocular_omnidata_consistency_rel_tol: 0.10
+Mapper.monocular_omnidata_consistency_vox: 2.0
+Mapper.monocular_omnidata_use_amp: 1
+Mapper.monocular_omnidata_empty_cache_before_launch: 1
+
+Mapper.sdf_voxel_size_m: 0.05
+Mapper.sdf_init_trunc_vox: 4.0
+Mapper.sdf_init_max_depth_m: 0.0
+
+Mapper.min_num_initial_map_kfs: 28
+Mapper.new_keyframe_times_of_use: 2
+Mapper.local_BA_increased_times_of_use: 0
+Mapper.loop_closure_increased_times_of_use_: 2
+Mapper.cull_keyframes: 0
+Mapper.large_rotation_threshold: 30.0
+Mapper.large_translation_threshold: 1.0
+
+GausPyramid.do: 1
+GausPyramid.num_sub_levels: 2
+GausPyramid.sub_level_times_of_use: 8
+
+# Recording
+Record.keyframe_record_interval: 0
+Record.all_keyframes_record_interval: 0
+Record.record_rendered_image: 1
+Record.record_ground_truth_image: 1
+Record.record_loss_image: 0
+Record.training_report_interval: 100
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
+Record.record_loop_ply: 0
+
+Record.enable_rerun: 0
+Record.rerun_max_keyframes: -1
+Record.rerun_keyframe_start: 0
+Record.run_whole_run: 0
+Record.rerun_svrecon_debug: 0
+Record.run_reconstruction_mesh: 0
+Record.run_maps: 0
+Record.rerun_rendered_mesh_eval: 0
+Record.rerun_gt_mesh: 0
+Record.rerun_nvblox_mesh: 0
+Record.save_rendered_mesh_eval: 1
+Record.rendered_mesh_eval_voxel_size_m: 0.03
+Record.rendered_mesh_eval_min_weight: 1.0
+Record.rendered_mesh_eval_trunc_vox: 8.0
+Record.rendered_mesh_eval_depth_max_m: 40.0
+Record.svrecon_mesh_init_lv: 7
+Record.svrecon_mesh_final_lv: 9
+Record.svrecon_mesh_trunc_lv: 10
+Record.svrecon_mesh_trunc_vox: 5.0
+Record.svrecon_mesh_pg_prune: 0.6
+Record.svrecon_mesh_crop_border: 0.01
+Record.svrecon_mesh_alpha_thres: 0.5
+Record.svrecon_mesh_use_mean_depth: 0
+Record.svrecon_mesh_use_vert_color: 1
+
+# SVRecon optimization
+Optimization.max_num_iterations: 30100
+Optimization.geo_lr: 0.025
+Optimization.sh0_lr: 0.01
+Optimization.shs_lr: 0.00025
+Optimization.optim_beta1: 0.1
+Optimization.optim_beta2: 0.99
+Optimization.optim_eps: 1e-15
+Optimization.lr_decay_ckpt: [19000]
+Optimization.lr_decay_mult: 0.1
+
+Optimization.adapt_every: 1200
+Optimization.prune_every: 1200
+Optimization.subdivide_every: 1200
+Optimization.prune_from: 1200
+Optimization.prune_until: 15000
+Optimization.prune_thres_init: 0.001
+Optimization.prune_thres_final: 0.1
+Optimization.prune_thres_final_at_target: 0.1
+Optimization.filter_near_voxels: 1
+Optimization.prune_far_voxels: 1
+Optimization.prune_near_voxels_geometric: 1
+Optimization.final_special_prune_enable: 1
+Optimization.subdivide_from: 1200
+Optimization.subdivide_all_until: 0
+Optimization.subdivide_samp_thres: 0.5
+Optimization.subdivide_prop: 0.1
+# Reserve enough of an 8 GB GPU for concurrent TANDEM inference. This limits
+# refinement only; ORB/MVS cell insertion and final mesh extraction remain
+# uncapped.
+Optimization.subdivide_max_num: 100000000
+
+# SVRecon regularization
+Optimization.lambda_tv_density: 0.0
+Optimization.tv_from: 0
+Optimization.tv_until: 10000
+Optimization.lambda_ge_density: 0.0
+Optimization.ge_from: 0
+Optimization.ge_until: 6000
+Optimization.lambda_ls_density: 0.0
+Optimization.ls_from: 0
+Optimization.ls_until: 8000
+
+# Photometric loss
+Optimization.ss_aug_max: 0.0
+Optimization.lambda_R_concen: 0.0
+Optimization.lambda_dist: 0.0
+Optimization.dist_from: 2500
+Optimization.lambda_T_concen: 0.0
+Optimization.lambda_T_inside: 0.0
+Optimization.lambda_ssim: 0.02
+Optimization.use_l1: 0
+Optimization.use_huber: 0
+Optimization.huber_thres: 0.03
+Optimization.lambda_normal_dmean: 0.0
+Optimization.n_dmean_from: 1000
+Optimization.n_dmean_end: 15000
+Optimization.n_dmean_ks: 3
+Optimization.n_dmean_tol_deg: 90.0
+Optimization.lambda_sparse_depth: 0.0
+Optimization.sparse_depth_until: 15000
+
+# Viewer
+VoxelViewer.glfw_window_width: 1400
+VoxelViewer.glfw_window_height: 1050
+VoxelViewer.image_scale: 0.5
+VoxelViewer.image_scale_main: 1.0
+VoxelViewer.camera_watch_dist: 0.000001

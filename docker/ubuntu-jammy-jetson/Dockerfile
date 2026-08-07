@@ -1,4 +1,4 @@
-ARG BASE_IMAGE
+ARG BASE_IMAGE=ubuntu-jammy-humble-jetson:latest
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -7,7 +7,10 @@ ARG OPENCV_BUILD_JOBS=4
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN chmod 1777 /tmp \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         ccache \
@@ -98,7 +101,7 @@ ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     OpenCV_DIR=/usr/local/lib/cmake/opencv4 \
-    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH} \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig \
     PYTHONNOUSERSITE=1 \
     PHOTOSLAM_JETSON=1 \
     PHOTOSLAM_ENABLE_RERUN=OFF \

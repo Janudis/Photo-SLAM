@@ -1,6 +1,5 @@
 #include "include_voxel/tandem_mvs_backend.h"
-
-#include "dr_mvsnet/dr_mvsnet.h"
+#include "include_voxel/tandem_mvs_runtime.h"
 
 #include <torch/csrc/jit/codegen/cuda/interface.h>
 

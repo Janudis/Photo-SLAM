@@ -34,7 +34,7 @@ Mapper.rgbd_fill_render_holes_stride: 2
 
 Mapper.monocular_rendered_depth_densify: 0
 Mapper.monocular_mvs_densify: 0
-Mapper.monocular_mvs_model_dir: "third_party/tandem/tandem/exported/tandem_512x320"
+Mapper.monocular_mvs_model_dir: "models/tandem/model.pt"
 Mapper.monocular_mvs_width: 512
 Mapper.monocular_mvs_height: 320
 Mapper.monocular_mvs_view_num: 7

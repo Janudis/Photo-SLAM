@@ -17,8 +17,8 @@ struct TandemMvsResult
     cv::Mat confidence;
 };
 
-// Thin ownership and input-validation layer around TANDEM's published
-// asynchronous DrMvsnet wrapper. Inference semantics remain in TANDEM code.
+// Ownership and input-validation layer around the project-local copy of
+// TANDEM's published asynchronous DrMvsnet runtime.
 class TandemMvsBackend
 {
 public:

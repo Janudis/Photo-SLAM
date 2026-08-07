@@ -1412,6 +1412,10 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rerun_params_.rerun_rendered_mesh_eval_ ||
         rerun_params_.rerun_reconstruction_mesh_ ||
         rerun_params_.rerun_maps_;
+#if !PHOTOSLAM_ENABLE_RERUN
+    // Deployment builds exclude Rerun regardless of values in desktop YAMLs.
+    rerun_params_.enable_rerun_ = false;
+#endif
     rerun_params_.enable_rerun_ =
         rerun_params_.enable_rerun_ && any_rerun_recording_requested;
     if (!rerun_params_.enable_rerun_) {

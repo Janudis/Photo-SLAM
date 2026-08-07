@@ -79,10 +79,13 @@ RUN mkdir -p /tmp/opencv-src \
         -DCMAKE_CUDA_ARCHITECTURES=87 \
         -DOPENCV_EXTRA_MODULES_PATH="/tmp/opencv-src/opencv_contrib-${OPENCV_VERSION}/modules" \
         -DOPENCV_GENERATE_PKGCONFIG=ON \
+        -DBUILD_LIST=core,imgproc,imgcodecs,highgui,videoio,calib3d,features2d,flann,photo,video,cudev,cudaarithm,cudaimgproc,cudawarping,cudastereo,python3 \
         -DBUILD_EXAMPLES=OFF \
+        -DBUILD_JAVA=OFF \
         -DBUILD_PERF_TESTS=OFF \
         -DBUILD_TESTS=OFF \
         -DBUILD_opencv_python3=ON \
+        -DBUILD_opencv_sfm=OFF \
         -DBUILD_opencv_world=OFF \
         -DCUDA_ARCH_BIN=8.7 \
         -DCUDA_ARCH_PTX= \
@@ -93,7 +96,9 @@ RUN mkdir -p /tmp/opencv-src \
         -DWITH_CUDNN=OFF \
         -DWITH_FFMPEG=ON \
         -DWITH_GTK=ON \
-        -DWITH_OPENGL=ON \
+        -DWITH_OPENGL=OFF \
+        -DWITH_OPENJPEG=OFF \
+        -DWITH_VTK=OFF \
     && cmake --build build --parallel "${OPENCV_BUILD_JOBS}" \
     && cmake --install build \
     && ldconfig \

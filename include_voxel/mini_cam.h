@@ -1,7 +1,6 @@
 #pragma once
 #include <torch/torch.h>
 #include "include_voxel/voxel_camera.h"
-#include "include/graphics_utils.h"
 
 namespace sv {
 
@@ -46,8 +45,8 @@ inline MiniCam fromCamera(const Camera& cam,
     m.cx = cam.cx() * w_ss;
     m.cy = cam.cy() * h_ss;
 
-    const float fovx = graphics_utils::focal2fov(m.fx, m.width);
-    const float fovy = graphics_utils::focal2fov(m.fy, m.height);
+    const float fovx = focalToFov(m.fx, m.width);
+    const float fovy = focalToFov(m.fy, m.height);
     m.tanfovx = std::tan(fovx * 0.5f);
     m.tanfovy = std::tan(fovy * 0.5f);
 
@@ -60,14 +59,9 @@ inline MiniCam fromCamera(const Camera& cam,
     // normalize lookat to be safe
     auto norm = m.lookat.norm().item<float>();
     if (norm > 1e-6f) {
-        // std::cout << "minicam.h: normalizing lookat vector, norm = " << norm << std::endl;
         m.lookat = m.lookat / norm;
     }
     m.pix_size = 2.f * m.tanfovx / m.width;
-    // std::cout << "minicam.h: fovx = " << fovx << " fovy = " << fovy << " cx,cy=" << m.cx << "," << m.cy << " im_width,im_height=" << im_width << "," << im_height << std::endl;
-    // std::cout << "m.c2w" << m.c2w << std::endl;
-    // std::cout << "m.w2c" << m.w2c << std::endl;
-    // std::cout << "m.frame_id = " << m.frame_id << std::endl;
 
     return m;
 }

@@ -88,6 +88,8 @@ void unbiased_adam_step(
 
 namespace sv {
 
+// Selects the online topology initializer used for newly allocated SDF corners.
+// This is a Photo-SLAM integration extension; offline SVRecon has no runtime switch.
 void VoxelModel::setTopologySdfInitializationMode(const std::string& mode)
 {
     if (mode == "orb_prior") {
@@ -106,18 +108,6 @@ void VoxelModel::setTopologySdfInitializationMode(const std::string& mode)
 }
 
 namespace {
-constexpr float kSHC0 = 0.28209479177387814f;
-
-torch::Tensor rgbToShZero(const torch::Tensor& rgb)
-{
-    return (rgb - 0.5f) / kSHC0;
-}
-
-torch::Tensor shZeroToRgb(const torch::Tensor& sh)
-{
-    return sh * kSHC0 + 0.5f;
-}
-
 torch::Tensor levelToVoxSize(
     const torch::Tensor& scene_extent,
     const torch::Tensor& octlevel)
@@ -500,6 +490,8 @@ int64_t sv::VoxelModel::numGridPts() const {
            ? grid_pts_key_.size(0)
            : 0;
 }
+// Converts shared integer corner keys to world coordinates.
+// SVRecon reference: SVProperties.grid_pts_xyz.
 torch::Tensor VoxelModel::gridPointsWorld() const
 {
     TORCH_CHECK(grid_pts_key_.defined() &&
@@ -525,74 +517,11 @@ torch::Tensor VoxelModel::gridPointsWorld() const
         .contiguous();
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
-VoxelModel::buildSvreconExtractionGrid(int max_octree_level) const
-{
-    TORCH_CHECK(oct_path_.defined() && oct_level_.defined(),
-                "buildSvreconExtractionGrid: octree topology is not initialized");
-    TORCH_CHECK(scene_center_.defined() && scene_extent_.defined() && inside_extent_.defined(),
-                "buildSvreconExtractionGrid: scene bounds are not initialized");
-
-    auto octpath = oct_path_.reshape({-1, 1}).to(torch::kLong).contiguous();
-    auto octlevel = oct_level_.reshape({-1, 1}).to(torch::kLong).contiguous();
-    auto source_vox_key = vox_key_;
-    if (is_leaf_.defined() && is_leaf_.size(0) == octpath.size(0)) {
-        auto leaf_idx = torch::nonzero(is_leaf_.to(octpath.device())
-                                           .to(torch::kBool).reshape({-1}))
-                            .reshape({-1}).to(torch::kLong);
-        octpath = octpath.index_select(0, leaf_idx);
-        octlevel = octlevel.index_select(0, leaf_idx);
-        source_vox_key = source_vox_key.index_select(
-            0, leaf_idx.to(source_vox_key.device())).contiguous();
-    }
-
-    // Match SVRecon extract_mesh.py: retain cells touching the inside extent,
-    // then clamp the adaptive topology to outside_level + final_lv.
-    const auto current_grid_xyz = gridPointsWorld();
-    const auto inside_min = scene_center_.view({1, 3}) - 0.5f * inside_extent_.view({1, 1});
-    const auto inside_max = scene_center_.view({1, 3}) + 0.5f * inside_extent_.view({1, 1});
-    const auto grid_inside =
-        ((current_grid_xyz >= inside_min) & (current_grid_xyz <= inside_max)).all(1);
-    const auto vox_inside = grid_inside.index({source_vox_key}).any(1);
-    const auto inside_idx = torch::nonzero(vox_inside).view({-1}).to(torch::kLong);
-    octpath = octpath.index_select(0, inside_idx);
-    octlevel = octlevel.index_select(0, inside_idx);
-
-    const int target_level = std::clamp(max_octree_level, 0, max_num_levels_);
-    const int num_bits_to_mask = 3 * std::max(0, max_num_levels_ - target_level);
-    if (num_bits_to_mask > 0) {
-        const int64_t mask_scale = int64_t{1} << num_bits_to_mask;
-        octpath = torch::floor_divide(octpath, mask_scale) * mask_scale;
-    }
-    octlevel = octlevel.clamp_max(target_level);
-
-    auto topology = torch::cat({octpath, octlevel}, 1).contiguous();
-    auto unique_result = at::unique_dim(
-        topology,
-        /*dim=*/0,
-        /*sorted=*/true,
-        /*return_inverse=*/false,
-        /*return_counts=*/false);
-    topology = std::get<0>(unique_result).contiguous();
-    octpath = topology.index({torch::indexing::Slice(), 0}).view({-1, 1}).contiguous();
-    octlevel = topology.index({torch::indexing::Slice(), 1})
-                   .view({-1, 1})
-                   .to(torch::kInt8)
-                   .contiguous();
-
-    auto [grid_pts_key, vox_key] =
-        buildGridPtsLink(octpath, octlevel, max_num_levels_);
-    const auto scene_min = scene_center_.view({1, 3}) - 0.5f * scene_extent_.view({1, 1});
-    const float finest_scale = std::ldexp(1.0f, -max_num_levels_);
-    const auto finest_vox = scene_extent_.view({1, 1}) * finest_scale;
-    auto grid_xyz =
-        (scene_min + grid_pts_key.to(torch::kFloat32) * finest_vox).contiguous();
-    return {grid_xyz, vox_key.contiguous()};
-}
-
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 VoxelModel::buildSvreconDenseExtractionGrid(int inside_level) const
 {
+    // Builds the initial dense octree grid for progressive rendered-depth TSDF
+    // extraction. SVRecon reference: extract_mesh.py::extract_mesh_progressive.
     TORCH_CHECK(scene_center_.defined() && scene_extent_.defined() && inside_extent_.defined(),
                 "buildSvreconDenseExtractionGrid: scene bounds are not initialized");
     const int use_inside_level = std::clamp(
@@ -641,6 +570,8 @@ VoxelModel::subdivideSvreconExtractionGrid(
     const torch::Tensor& octpath,
     const torch::Tensor& octlevel) const
 {
+    // Replaces each retained extraction cell with its eight children.
+    // SVRecon reference: extract_mesh.py::extract_mesh_progressive.
     TORCH_CHECK(scene_center_.defined() && scene_extent_.defined(),
                 "subdivideSvreconExtractionGrid: scene bounds are not initialized");
     TORCH_CHECK(octpath.defined() && octlevel.defined() &&
@@ -667,6 +598,8 @@ VoxelModel::subdivideSvreconExtractionGrid(
 std::tuple<torch::Tensor, torch::Tensor>
 VoxelModel::querySdfTrilinear(const torch::Tensor& points_world) const
 {
+    // Locates the finest active leaf containing each query and interpolates its
+    // eight shared SDF corners. This is an online supervision/evidence helper.
     auto dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : points_world.device();
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
     auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(dev);
@@ -889,6 +822,8 @@ int VoxelModel::numVoxels() const {
 
 torch::Tensor VoxelModel::activeRenderableMask() const
 {
+    // Every cell stored by VoxelModel is active; evidence-only cells live in
+    // VoxelMapper and are never inserted into this topology.
     const int64_t N = center_.defined() ? center_.size(0) : 0;
     auto opts = torch::TensorOptions().dtype(torch::kBool).device(device_type_);
     if (N <= 0) {
@@ -901,6 +836,8 @@ void VoxelModel::accumulateMonocularRenderObservation(
     const torch::Tensor& max_render_weight,
     const float min_render_weight)
 {
+    // Accumulates co-visibility opportunities and renderer-weight support for
+    // provisional monocular cells. This is a Photo-SLAM integration extension.
     const int64_t N = center_.defined() ? center_.size(0) : 0;
     if (N <= 0) {
         return;
@@ -950,6 +887,8 @@ void VoxelModel::accumulateMonocularRenderObservation(
 void VoxelModel::resolveMonocularProvisionalVoxels(
     const torch::Tensor& resolved_mask)
 {
+    // Removes accepted or rejected cells from the provisional state after the
+    // mapper has applied its co-visibility decision.
     const int64_t N = center_.defined() ? center_.size(0) : 0;
     if (N <= 0 || !resolved_mask.defined()) {
         return;
@@ -999,7 +938,7 @@ torch::Tensor VoxelModel::InsideExtent() const {
 void VoxelModel::oneUpShDegree()
 {
     // '''
-    // sh_degree_add1 from svraster 
+    // Number of spherical-harmonic coefficients per color channel.
     // '''
     if (this->active_sh_degree_ < this->max_sh_degree_)
         this->active_sh_degree_ += 1;
@@ -1010,29 +949,29 @@ void VoxelModel::setShDegree(const int sh)
     this->active_sh_degree_ = (sh > this->max_sh_degree_ ? this->max_sh_degree_ : sh);
 }
 
-const torch::Tensor& sv::VoxelModel::svrasterSdfGridPts() const { return svraster_sdf_grid_pts_; }
-const torch::Tensor& sv::VoxelModel::svrasterSdfWeights() const { return svraster_sdf_weights_; }
-bool VoxelModel::hasSvrasterSdfField() const
+const torch::Tensor& sv::VoxelModel::fusedSdfGridPts() const { return fused_sdf_grid_pts_; }
+const torch::Tensor& sv::VoxelModel::fusedSdfWeights() const { return fused_sdf_weights_; }
+bool VoxelModel::hasFusedSdfField() const
 {
-    return svraster_sdf_grid_pts_.defined() &&
-           svraster_sdf_weights_.defined() &&
-           svraster_sdf_grid_pts_.dim() == 2 &&
-           svraster_sdf_weights_.dim() == 2 &&
-           svraster_sdf_grid_pts_.size(1) == 1 &&
-           svraster_sdf_weights_.size(1) == 1 &&
+    return fused_sdf_grid_pts_.defined() &&
+           fused_sdf_weights_.defined() &&
+           fused_sdf_grid_pts_.dim() == 2 &&
+           fused_sdf_weights_.dim() == 2 &&
+           fused_sdf_grid_pts_.size(1) == 1 &&
+           fused_sdf_weights_.size(1) == 1 &&
            grid_pts_key_.defined() &&
-           svraster_sdf_grid_pts_.size(0) == grid_pts_key_.size(0) &&
-           svraster_sdf_weights_.size(0) == grid_pts_key_.size(0);
+           fused_sdf_grid_pts_.size(0) == grid_pts_key_.size(0) &&
+           fused_sdf_weights_.size(0) == grid_pts_key_.size(0);
 }
 
-void VoxelModel::setEmptySvrasterSdfField_()
+void VoxelModel::setEmptyFusedSdfField_()
 {
     auto dev = _geo_grid_pts_.defined()
         ? _geo_grid_pts_.device()
         : torch::Device(device_type_);
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
-    svraster_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
-    svraster_sdf_weights_ = torch::empty({0, 1}, value_opts);
+    fused_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
+    fused_sdf_weights_ = torch::empty({0, 1}, value_opts);
 }
 
 torch::Tensor VoxelModel::voxelCornerScalarFromGrid_(const torch::Tensor& grid_scalar) const
@@ -1065,14 +1004,14 @@ torch::Tensor VoxelModel::voxelGeoCorners() const
 
 torch::Tensor VoxelModel::voxelSdfWeightCorners() const
 {
-    torch::Tensor corners = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+    torch::Tensor corners = voxelCornerScalarFromGrid_(fused_sdf_weights_);
     if (corners.defined() && corners.dim() == 3 && corners.size(2) == 1) {
         corners = corners.squeeze(2);
     }
     return corners.contiguous().detach();
 }
 
-void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
+void VoxelModel::rebuildFusedSdfFieldFromVoxelCorners_(
     const torch::Tensor& voxel_sdf_values,
     const torch::Tensor& voxel_sdf_weights)
 {
@@ -1083,7 +1022,7 @@ void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
         !vox_key_.defined() ||
         vox_key_.dim() != 2 ||
         vox_key_.size(1) != 8) {
-        setEmptySvrasterSdfField_();
+        setEmptyFusedSdfField_();
         return;
     }
 
@@ -1092,8 +1031,8 @@ void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
     auto dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : grid_pts_key_.device();
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
     if (M == 0) {
-        svraster_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
-        svraster_sdf_weights_ = torch::empty({0, 1}, value_opts);
+        fused_sdf_grid_pts_ = torch::empty({0, 1}, value_opts);
+        fused_sdf_weights_ = torch::empty({0, 1}, value_opts);
         return;
     }
     if (N == 0 ||
@@ -1103,8 +1042,8 @@ void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
         voxel_sdf_values.size(1) != 8 ||
         voxel_sdf_weights.size(0) != N ||
         voxel_sdf_weights.size(1) != 8) {
-        svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
-        svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+        fused_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+        fused_sdf_weights_ = torch::zeros({M, 1}, value_opts);
         return;
     }
 
@@ -1117,16 +1056,16 @@ void VoxelModel::rebuildSvrasterSdfFieldFromVoxelCorners_(
         w_vox = w_vox.unsqueeze(-1);
     }
 
-    svraster_sdf_grid_pts_ =
+    fused_sdf_grid_pts_ =
         aggregateVoxelCornersIntoGridPts(M, vox_key_.to(dev), sdf_vox).detach().contiguous();
-    svraster_sdf_weights_ =
+    fused_sdf_weights_ =
         aggregateVoxelCornersIntoGridPts(M, vox_key_.to(dev), w_vox).detach().contiguous();
 }
 
-void VoxelModel::ensureSvrasterSdfField()
+void VoxelModel::ensureFusedSdfField()
 {
     if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
-        setEmptySvrasterSdfField_();
+        setEmptyFusedSdfField_();
         return;
     }
 
@@ -1135,8 +1074,8 @@ void VoxelModel::ensureSvrasterSdfField()
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(tensor_dev);
 
     auto make_empty_values = [&]() {
-        svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
-        svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+        fused_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+        fused_sdf_weights_ = torch::zeros({M, 1}, value_opts);
     };
 
     if (M == 0) {
@@ -1144,13 +1083,13 @@ void VoxelModel::ensureSvrasterSdfField()
         return;
     }
 
-    if (svraster_sdf_grid_pts_.defined() &&
-        svraster_sdf_weights_.defined() &&
-        svraster_sdf_grid_pts_.size(0) == M &&
-        svraster_sdf_weights_.size(0) == M) {
-        if (svraster_sdf_grid_pts_.device() != tensor_dev) {
-            svraster_sdf_grid_pts_ = svraster_sdf_grid_pts_.to(tensor_dev).contiguous();
-            svraster_sdf_weights_ = svraster_sdf_weights_.to(tensor_dev).contiguous();
+    if (fused_sdf_grid_pts_.defined() &&
+        fused_sdf_weights_.defined() &&
+        fused_sdf_grid_pts_.size(0) == M &&
+        fused_sdf_weights_.size(0) == M) {
+        if (fused_sdf_grid_pts_.device() != tensor_dev) {
+            fused_sdf_grid_pts_ = fused_sdf_grid_pts_.to(tensor_dev).contiguous();
+            fused_sdf_weights_ = fused_sdf_weights_.to(tensor_dev).contiguous();
         }
         return;
     }
@@ -1158,34 +1097,36 @@ void VoxelModel::ensureSvrasterSdfField()
     make_empty_values();
 }
 
-void VoxelModel::resetSvrasterSdfField()
+void VoxelModel::resetFusedSdfField()
 {
     if (!grid_pts_key_.defined() || grid_pts_key_.dim() != 2 || grid_pts_key_.size(1) != 3) {
-        setEmptySvrasterSdfField_();
+        setEmptyFusedSdfField_();
         return;
     }
 
     const int64_t M = grid_pts_key_.size(0);
     auto tensor_dev = _geo_grid_pts_.defined() ? _geo_grid_pts_.device() : grid_pts_key_.device();
     auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(tensor_dev);
-    svraster_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
-    svraster_sdf_weights_ = torch::zeros({M, 1}, value_opts);
+    fused_sdf_grid_pts_ = torch::zeros({M, 1}, value_opts);
+    fused_sdf_weights_ = torch::zeros({M, 1}, value_opts);
 }
 
-void VoxelModel::fuseSvrasterSdfGridSamples(
+void VoxelModel::fuseProjectiveSdfGridSamples(
     const torch::Tensor& tsdf_values,
     const torch::Tensor& weights,
     const torch::Tensor& valid_mask,
     float max_weight)
 {
-    ensureSvrasterSdfField();
-    if (!hasSvrasterSdfField() || grid_pts_key_.size(0) == 0) {
+    // Maintains a non-learnable weighted projective SDF field aligned with the
+    // shared corner table; it never replaces the optimizer's parameter tensor.
+    ensureFusedSdfField();
+    if (!hasFusedSdfField() || grid_pts_key_.size(0) == 0) {
         return;
     }
 
     const int64_t M = grid_pts_key_.size(0);
     torch::NoGradGuard no_grad;
-    auto dev = svraster_sdf_grid_pts_.device();
+    auto dev = fused_sdf_grid_pts_.device();
     torch::Tensor sample_tsdf = tsdf_values.to(dev).to(torch::kFloat32).reshape({M, 1});
     torch::Tensor sample_w = weights.to(dev).to(torch::kFloat32).reshape({M, 1});
     sample_w = torch::where(
@@ -1196,8 +1137,8 @@ void VoxelModel::fuseSvrasterSdfGridSamples(
                           torch::isfinite(sample_tsdf) &
                           (sample_w > 0.0f);
 
-    torch::Tensor old_w = svraster_sdf_weights_;
-    torch::Tensor old_sdf = svraster_sdf_grid_pts_;
+    torch::Tensor old_w = fused_sdf_weights_;
+    torch::Tensor old_sdf = fused_sdf_grid_pts_;
     torch::Tensor fused_w = old_w + sample_w;
     torch::Tensor fused_sdf =
         (old_sdf * old_w + sample_tsdf * sample_w) / fused_w.clamp_min(1.0e-6f);
@@ -1205,8 +1146,8 @@ void VoxelModel::fuseSvrasterSdfGridSamples(
         fused_w = fused_w.clamp_max(max_weight);
     }
 
-    svraster_sdf_grid_pts_ = torch::where(valid, fused_sdf, old_sdf).contiguous();
-    svraster_sdf_weights_ = torch::where(valid, fused_w, old_w).contiguous();
+    fused_sdf_grid_pts_ = torch::where(valid, fused_sdf, old_sdf).contiguous();
+    fused_sdf_weights_ = torch::where(valid, fused_w, old_w).contiguous();
 }
 
 torch::Tensor VoxelModel::makeGeoGridInitRows_(
@@ -1258,6 +1199,8 @@ void VoxelModel::updateExistingSupportSdfFromPoints_(
     const torch::Tensor& support_rgb,
     const std::vector<sv::MiniCam>& cams)
 {
+    // Refreshes existing learned corners near newly observed sparse support.
+    // SVRecon reference: sdf_init_utils.initialize_sdf_from_sfm.
     if (!support_xyz.defined() ||
         support_xyz.numel() == 0 ||
         !grid_pts_key_.defined() ||
@@ -1434,17 +1377,17 @@ void VoxelModel::updateExistingSupportSdfFromPoints_(
             .contiguous();
     sdf_init_cams_ = old_cams;
 
-    ensureSvrasterSdfField();
-    if (!svraster_sdf_grid_pts_.defined() ||
-        !svraster_sdf_weights_.defined() ||
-        svraster_sdf_grid_pts_.size(0) != _geo_grid_pts_.size(0) ||
-        svraster_sdf_weights_.size(0) != _geo_grid_pts_.size(0)) {
-        resetSvrasterSdfField();
+    ensureFusedSdfField();
+    if (!fused_sdf_grid_pts_.defined() ||
+        !fused_sdf_weights_.defined() ||
+        fused_sdf_grid_pts_.size(0) != _geo_grid_pts_.size(0) ||
+        fused_sdf_weights_.size(0) != _geo_grid_pts_.size(0)) {
+        resetFusedSdfField();
     }
 
     torch::NoGradGuard no_grad;
     torch::Tensor old_w =
-        svraster_sdf_weights_.index_select(0, update_idx).to(torch::kFloat32).contiguous();
+        fused_sdf_weights_.index_select(0, update_idx).to(torch::kFloat32).contiguous();
     torch::Tensor old_sdf =
         _geo_grid_pts_.detach().index_select(0, update_idx).to(torch::kFloat32).contiguous();
     torch::Tensor new_w = old_w + 1.0f;
@@ -1452,8 +1395,8 @@ void VoxelModel::updateExistingSupportSdfFromPoints_(
         (old_sdf * old_w + measured_sdf) / new_w.clamp_min(1.0e-6f);
 
     _geo_grid_pts_.index_put_({update_idx}, fused_sdf);
-    svraster_sdf_grid_pts_.index_put_({update_idx}, fused_sdf.detach());
-    svraster_sdf_weights_.index_put_({update_idx}, new_w.detach().clamp_max(100.0f));
+    fused_sdf_grid_pts_.index_put_({update_idx}, fused_sdf.detach());
+    fused_sdf_weights_.index_put_({update_idx}, new_w.detach().clamp_max(100.0f));
 }
 
 torch::Tensor VoxelModel::visibilitySignedPointPriorSdf_(
@@ -1462,6 +1405,8 @@ torch::Tensor VoxelModel::visibilitySignedPointPriorSdf_(
     const torch::Tensor& points,
     float surface_band) const
 {
+    // Assigns point-distance signs using camera visibility before initializing
+    // new corners. SVRecon reference: sdf_init_utils.initialize_sdf_from_sfm.
     TORCH_CHECK(grid_xyz.defined() && grid_xyz.dim() == 2 && grid_xyz.size(1) == 3,
                 "visibilitySignedPointPriorSdf_: grid_xyz must be [N,3]");
     TORCH_CHECK(dist.defined() && dist.dim() == 2 && dist.size(1) == 1,
@@ -1620,6 +1565,8 @@ torch::Tensor VoxelModel::makePointPriorSdfInitRowsForKeys_(
     const torch::Tensor& grid_pts_key_rows,
     float fallback_value)
 {
+    // Produces initial learned SDF rows from the selected online source mode,
+    // falling back to a weak prior when no trusted support is nearby.
     TORCH_CHECK(grid_pts_key_rows.defined() &&
                     grid_pts_key_rows.dim() == 2 &&
                     grid_pts_key_rows.size(1) == 3,
@@ -1732,7 +1679,7 @@ torch::Tensor VoxelModel::makePointPriorSdfInitRowsForKeys_(
         (weak_delta_sdf * torch::tanh(signed_prior / surface_band))
             .contiguous();
     if (pending_sdf_init_mode_ == SdfInitMode::WeakSurfacePrior) {
-        // Match the useful property of SVRaster's raw density=-10: the new
+        // Keep the useful property that a newly inserted voxel starts
         // candidate is barely visible but remains above the rasterizer's
         // alpha cutoff and can receive a photometric geometry gradient. Keep
         // every corner positive initially: the directional SDF ramp is a
@@ -1770,6 +1717,8 @@ void VoxelModel::setNextSdfInitializationGridSamples(
     const torch::Tensor& grid_points_world,
     const torch::Tensor& sdf_values)
 {
+    // Stages exact corner values for the next topology insertion, used when a
+    // promoted evidence/MVS cell already has a geometric SDF estimate.
     next_sdf_init_grid_keys_ = torch::Tensor();
     next_sdf_init_grid_values_ = torch::Tensor();
     if (!grid_points_world.defined() || !sdf_values.defined() ||
@@ -1869,6 +1818,8 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
     const torch::Tensor& grid_pts_key_new,
     float default_value)
 {
+    // Rebuilds shared-corner parameters after topology changes while preserving
+    // matching values, Adam state, and auxiliary fused-SDF evidence.
     TORCH_CHECK(grid_pts_key_new.defined() &&
                     grid_pts_key_new.dim() == 2 &&
                     grid_pts_key_new.size(1) == 3,
@@ -1893,9 +1844,9 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
         _geo_grid_pts_ = new_geo.contiguous().detach().requires_grad_(true);
         adam_geo_.exp_avg = torch::zeros_like(new_geo);
         adam_geo_.exp_avg_sq = torch::zeros_like(new_geo);
-        if (svraster_sdf_grid_pts_.defined() || svraster_sdf_weights_.defined()) {
-            svraster_sdf_grid_pts_ = torch::zeros_like(new_geo);
-            svraster_sdf_weights_ = torch::zeros_like(new_geo);
+        if (fused_sdf_grid_pts_.defined() || fused_sdf_weights_.defined()) {
+            fused_sdf_grid_pts_ = torch::zeros_like(new_geo);
+            fused_sdf_weights_ = torch::zeros_like(new_geo);
         }
         return;
     }
@@ -1905,9 +1856,9 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
             torch::TensorOptions().dtype(torch::kFloat32).device(dev)).requires_grad_(true);
         adam_geo_.exp_avg = torch::zeros_like(_geo_grid_pts_);
         adam_geo_.exp_avg_sq = torch::zeros_like(_geo_grid_pts_);
-        if (svraster_sdf_grid_pts_.defined() || svraster_sdf_weights_.defined()) {
-            svraster_sdf_grid_pts_ = torch::zeros_like(_geo_grid_pts_);
-            svraster_sdf_weights_ = torch::zeros_like(_geo_grid_pts_);
+        if (fused_sdf_grid_pts_.defined() || fused_sdf_weights_.defined()) {
+            fused_sdf_grid_pts_ = torch::zeros_like(_geo_grid_pts_);
+            fused_sdf_weights_ = torch::zeros_like(_geo_grid_pts_);
         }
         return;
     }
@@ -1998,19 +1949,19 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
     adam_geo_.exp_avg = zero_or_remap(adam_geo_.exp_avg);
     adam_geo_.exp_avg_sq = zero_or_remap(adam_geo_.exp_avg_sq);
 
-    if (svraster_sdf_grid_pts_.defined() || svraster_sdf_weights_.defined()) {
+    if (fused_sdf_grid_pts_.defined() || fused_sdf_weights_.defined()) {
         auto value_opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
         torch::Tensor new_sdf = torch::zeros({M_new, 1}, value_opts);
         torch::Tensor new_w = torch::zeros({M_new, 1}, value_opts);
         if (matched_new_idx.numel() > 0 &&
-            svraster_sdf_grid_pts_.defined() &&
-            svraster_sdf_weights_.defined() &&
-            svraster_sdf_grid_pts_.size(0) == old_linear.size(0) &&
-            svraster_sdf_weights_.size(0) == old_linear.size(0)) {
+            fused_sdf_grid_pts_.defined() &&
+            fused_sdf_weights_.defined() &&
+            fused_sdf_grid_pts_.size(0) == old_linear.size(0) &&
+            fused_sdf_weights_.size(0) == old_linear.size(0)) {
             torch::Tensor old_sdf =
-                svraster_sdf_grid_pts_.to(dev).to(torch::kFloat32).contiguous();
+                fused_sdf_grid_pts_.to(dev).to(torch::kFloat32).contiguous();
             torch::Tensor old_w =
-                svraster_sdf_weights_.to(dev).to(torch::kFloat32).contiguous();
+                fused_sdf_weights_.to(dev).to(torch::kFloat32).contiguous();
             if (old_sdf.dim() == 1) {
                 old_sdf = old_sdf.view({-1, 1}).contiguous();
             }
@@ -2024,8 +1975,8 @@ void VoxelModel::rebuildGeoGridForNewGridKeys_(
                 {matched_new_idx},
                 old_w.index_select(0, matched_old_idx).contiguous());
         }
-        svraster_sdf_grid_pts_ = new_sdf.contiguous();
-        svraster_sdf_weights_ = new_w.contiguous();
+        fused_sdf_grid_pts_ = new_sdf.contiguous();
+        fused_sdf_weights_ = new_w.contiguous();
     }
 
     _geo_grid_pts_ = new_geo.contiguous().detach().requires_grad_(true);
@@ -2035,6 +1986,8 @@ void VoxelModel::applyGeoGridRawInit(
     const torch::Tensor& raw_values,
     const torch::Tensor& valid_mask)
 {
+    // Copies valid projective SDF samples into the learnable corner field.
+    // This is the online RGB-D initialization bridge, not ongoing TSDF fusion.
     if (!_geo_grid_pts_.defined() || _geo_grid_pts_.dim() != 2 || _geo_grid_pts_.size(1) != 1) {
         return;
     }
@@ -2056,6 +2009,8 @@ void VoxelModel::applyGeoGridRawInit(
 std::pair<torch::Tensor, torch::Tensor> VoxelModel::rgbdHoleSupportCellCenters(
     const torch::Tensor& surface_points_world) const
 {
+    // Quantizes surface samples to one insertion-level cell per measurement and
+    // returns the source-point mapping used by direct and learned-depth filling.
     if (!surface_points_world.defined() || surface_points_world.numel() == 0 ||
         !scene_min_t_.defined() || !vox_eff_.defined()) {
         return {torch::Tensor(), torch::Tensor()};
@@ -2097,148 +2052,10 @@ std::pair<torch::Tensor, torch::Tensor> VoxelModel::rgbdHoleSupportCellCenters(
         source_idx};
 }
 
-int64_t VoxelModel::applyRgbdHoleSdfEvidence(
-    const sv::MiniCam& cam,
-    const torch::Tensor& depth_meters,
-    const torch::Tensor& hole_mask,
-    const float truncation_m)
-{
-    if (!_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0 ||
-        !grid_pts_key_.defined() || grid_pts_key_.size(0) != _geo_grid_pts_.size(0) ||
-        !depth_meters.defined() || !hole_mask.defined() ||
-        cam.width <= 0 || cam.height <= 0 ||
-        cam.fx <= 1.0e-6f || cam.fy <= 1.0e-6f ||
-        !cam.w2c.defined() || cam.w2c.numel() < 16) {
-        return 0;
-    }
-
-    const int64_t expected_pixels =
-        static_cast<int64_t>(cam.width) * static_cast<int64_t>(cam.height);
-    if (depth_meters.numel() != expected_pixels || hole_mask.numel() != expected_pixels) {
-        return 0;
-    }
-
-    auto dev = _geo_grid_pts_.device();
-    torch::Tensor depth =
-        depth_meters.to(dev).to(torch::kFloat32).reshape({-1}).contiguous();
-    torch::Tensor holes =
-        hole_mask.to(dev).to(torch::kBool).reshape({-1}).contiguous();
-    // Grid corners around a selected surface cell project a few pixels away
-    // from the original hole ray. Include that local image neighborhood when
-    // assigning the shared corner SDF values.
-    torch::Tensor hole_image = holes.view({cam.height, cam.width});
-    torch::Tensor dilated_holes = hole_image.clone();
-    constexpr int kHoleDilationRadius = 4;
-    for (int dy = -kHoleDilationRadius; dy <= kHoleDilationRadius; ++dy) {
-        const int dst_y0 = std::max(0, dy);
-        const int dst_y1 = std::min(cam.height, cam.height + dy);
-        const int src_y0 = std::max(0, -dy);
-        const int src_y1 = std::min(cam.height, cam.height - dy);
-        for (int dx = -kHoleDilationRadius; dx <= kHoleDilationRadius; ++dx) {
-            const int dst_x0 = std::max(0, dx);
-            const int dst_x1 = std::min(cam.width, cam.width + dx);
-            const int src_x0 = std::max(0, -dx);
-            const int src_x1 = std::min(cam.width, cam.width - dx);
-            if (dst_y0 >= dst_y1 || dst_x0 >= dst_x1) {
-                continue;
-            }
-            using torch::indexing::Slice;
-            torch::Tensor dst = dilated_holes.index(
-                {Slice(dst_y0, dst_y1), Slice(dst_x0, dst_x1)});
-            torch::Tensor src = hole_image.index(
-                {Slice(src_y0, src_y1), Slice(src_x0, src_x1)});
-            dilated_holes.index_put_(
-                {Slice(dst_y0, dst_y1), Slice(dst_x0, dst_x1)},
-                dst | src);
-        }
-    }
-    holes = dilated_holes.reshape({-1}).contiguous();
-
-    torch::Tensor scene_min =
-        scene_center_.to(dev).to(torch::kFloat32).reshape({3}) -
-        0.5f * scene_extent_.to(dev).to(torch::kFloat32).reshape({1});
-    const float finest_vox =
-        scene_extent_.reshape({-1})[0].item<float>() *
-        std::ldexp(1.0f, -max_num_levels_);
-    torch::Tensor grid_xyz =
-        scene_min.view({1, 3}) +
-        grid_pts_key_.to(dev).to(torch::kFloat32) * finest_vox;
-
-    torch::Tensor w2c = cam.w2c.to(dev).to(torch::kFloat32).contiguous();
-    torch::Tensor R = w2c.index({torch::indexing::Slice(0, 3),
-                                 torch::indexing::Slice(0, 3)});
-    torch::Tensor t = w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
-    torch::Tensor camera_xyz = torch::matmul(grid_xyz, R.transpose(0, 1)) + t;
-    torch::Tensor z = camera_xyz.index({torch::indexing::Slice(), 2});
-    torch::Tensor z_safe = z.clamp_min(1.0e-6f);
-    torch::Tensor u =
-        (cam.fx * camera_xyz.index({torch::indexing::Slice(), 0}) / z_safe + cam.cx)
-            .round().to(torch::kLong);
-    torch::Tensor v =
-        (cam.fy * camera_xyz.index({torch::indexing::Slice(), 1}) / z_safe + cam.cy)
-            .round().to(torch::kLong);
-    torch::Tensor in_image =
-        (z > 1.0e-6f) &
-        (u >= 0) & (u < cam.width) &
-        (v >= 0) & (v < cam.height);
-    torch::Tensor pixel =
-        (v.clamp(0, cam.height - 1) * cam.width +
-         u.clamp(0, cam.width - 1)).to(torch::kLong);
-    torch::Tensor measured_depth = depth.index_select(0, pixel);
-    torch::Tensor projected_hole = holes.index_select(0, pixel);
-    torch::Tensor measured_sdf = measured_depth - z;
-    const float trunc = std::max(1.0e-4f, truncation_m);
-    torch::Tensor valid =
-        in_image & projected_hole &
-        torch::isfinite(measured_depth) &
-        (measured_depth > 0.0f) &
-        torch::isfinite(measured_sdf) &
-        (measured_sdf.abs() <= trunc);
-    torch::Tensor update_idx =
-        torch::nonzero(valid).view({-1}).to(torch::kLong).contiguous();
-    if (update_idx.numel() == 0) {
-        return 0;
-    }
-
-    torch::Tensor sample =
-        measured_sdf.index_select(0, update_idx)
-            .clamp(-trunc, trunc).view({-1, 1}).contiguous();
-    ensureSvrasterSdfField();
-    torch::NoGradGuard no_grad;
-    torch::Tensor old_w =
-        svraster_sdf_weights_.index_select(0, update_idx)
-            .to(torch::kFloat32).contiguous();
-    torch::Tensor old_evidence =
-        svraster_sdf_grid_pts_.index_select(0, update_idx)
-            .to(torch::kFloat32).contiguous();
-    torch::Tensor new_w = (old_w + 1.0f).clamp_max(100.0f);
-    torch::Tensor fused =
-        torch::where(
-            old_w > 0.0f,
-            (old_evidence * old_w + sample) / (old_w + 1.0f),
-            sample)
-            .contiguous();
-
-    // Hole closure is an initialization/update of the learnable SDF from the
-    // current valid RGB-D observation. Do not average the learnable geometry
-    // against stale pre-loop or pre-subdivision evidence; retain the weighted
-    // average only in the auxiliary evidence buffers.
-    _geo_grid_pts_.index_put_({update_idx}, sample);
-    svraster_sdf_grid_pts_.index_put_({update_idx}, fused);
-    svraster_sdf_weights_.index_put_({update_idx}, new_w);
-    if (adam_geo_.exp_avg.defined() &&
-        adam_geo_.exp_avg.size(0) == _geo_grid_pts_.size(0)) {
-        adam_geo_.exp_avg.index_put_({update_idx}, 0.0f);
-    }
-    if (adam_geo_.exp_avg_sq.defined() &&
-        adam_geo_.exp_avg_sq.size(0) == _geo_grid_pts_.size(0)) {
-        adam_geo_.exp_avg_sq.index_put_({update_idx}, 0.0f);
-    }
-    return update_idx.numel();
-}
-
 void VoxelModel::refreshSvreconLogSTargetFromVoxelSize(const bool initialize_current)
 {
+    // Recomputes NeuS sharpness from the finest active voxel size.
+    // SVRecon reference: SVConstructor.model_init log_s initialization.
     if (!size_.defined() || size_.numel() == 0) {
         return;
     }
@@ -2253,13 +2070,7 @@ void VoxelModel::refreshSvreconLogSTargetFromVoxelSize(const bool initialize_cur
     const float target_log_s = 0.1f * std::log(
         std::log(99.0f) /
         (min_vox_size * learning_thickness * 2.0f));
-    svrecon_log_s_target_ = target_log_s;
-
-    float current_log_s = svrecon_log_s_current_;
-    if (!std::isfinite(current_log_s) && log_s_.defined() && log_s_.numel() > 0) {
-        current_log_s = log_s_.detach().reshape({-1})[0].item<float>();
-    }
-    if (initialize_current || !std::isfinite(current_log_s)) {
+    if (initialize_current || !log_s_.defined() || log_s_.numel() == 0) {
         torch::NoGradGuard no_grad;
         if (!log_s_.defined() || log_s_.numel() == 0) {
             log_s_ = torch::full(
@@ -2268,34 +2079,8 @@ void VoxelModel::refreshSvreconLogSTargetFromVoxelSize(const bool initialize_cur
         } else {
             log_s_.fill_(target_log_s);
         }
-        current_log_s = target_log_s;
-        svrecon_log_s_current_ = target_log_s;
         adam_log_s_ = AdamGroupState{};
     }
-
-}
-
-void VoxelModel::advanceSvreconLogSTowardTarget(const float max_delta)
-{
-    if (max_delta <= 0.0f ||
-        !std::isfinite(svrecon_log_s_target_) ||
-        !log_s_.defined() || log_s_.numel() == 0) {
-        return;
-    }
-
-    float current = svrecon_log_s_current_;
-    if (!std::isfinite(current)) {
-        current = log_s_.detach().reshape({-1})[0].item<float>();
-        svrecon_log_s_current_ = current;
-    }
-    if (!std::isfinite(current) || current >= svrecon_log_s_target_) {
-        return;
-    }
-
-    const float next = std::min(svrecon_log_s_target_, current + max_delta);
-    torch::NoGradGuard no_grad;
-    log_s_.fill_(next);
-    svrecon_log_s_current_ = next;
 }
 
 namespace fs = std::filesystem;
@@ -2304,6 +2089,9 @@ void VoxelModel::createFromPcd(
     const std::map<point3D_id_t, Point3D>& pcd,
     const std::vector<sv::MiniCam>& cams)
 {
+    // Builds the initial sparse octree, shared SDF corners, and SH colors from
+    // SLAM points. SVRecon references: SVConstructor.model_init and
+    // sdf_init_utils.initialize_sdf_from_sfm; sparse online allocation is local.
     sdf_init_cams_ = cams;
 
     TORCH_CHECK(global_scene_extent_ > 0.f, "global_scene_extent_ must be set (>0).");
@@ -2611,7 +2399,7 @@ void VoxelModel::createFromPcd(
 
     // learnables
     this->_geo_grid_pts_ = geo_grid.contiguous().detach().requires_grad_(true);
-    ensureSvrasterSdfField();
+    ensureFusedSdfField();
     this->sh0_           = sh0_dc.contiguous().detach().requires_grad_(true);
     this->shs_           = shs.contiguous().detach().requires_grad_(true);
     this->subdiv_p_      = subdiv_p.contiguous().detach().requires_grad_(true);
@@ -2677,9 +2465,10 @@ void VoxelModel::increasePcd(
     const std::vector<sv::MiniCam>& cams,
     const bool clear_cuda_cache_before_parameter_append)
 {
+    // Incrementally inserts previously unseen source cells and remaps all
+    // topology-aligned parameters and optimizer state. Offline SVRecon has no
+    // direct equivalent because its topology is initialized before training.
     sdf_init_cams_ = cams;
-    torch::Tensor explicit_sdf_support_points = next_sdf_init_support_points_;
-    next_sdf_init_support_points_ = torch::Tensor();
     struct PendingGridInitializationReset {
         torch::Tensor& keys;
         torch::Tensor& values;
@@ -2758,7 +2547,6 @@ void VoxelModel::increasePcd(
         pending_real_insert_rr_entity_path_ == "world/voxels_inactive_geo_densify/created";
     const bool add_as_rgbd_fill_render_holes =
         pending_real_insert_rr_entity_path_ == "world/rgbd_fill_render_holes/created" ||
-        pending_real_insert_rr_entity_path_ == "world/rgbd_surface_points/created" ||
         pending_real_insert_rr_entity_path_ == "world/rgbd_tsdf_evidence/promoted";
     const bool add_as_monocular_rendered_depth =
         pending_real_insert_rr_entity_path_ ==
@@ -2770,20 +2558,9 @@ void VoxelModel::increasePcd(
         pending_real_insert_rr_entity_path_ ==
         "world/monocular_omnidata/created";
     torch::Tensor orb_metric_support;
-    if (add_as_orb) {
-        if (topology_sdf_init_mode_ ==
-            SdfInitMode::WeakSurfacePrior) {
-            if (explicit_sdf_support_points.defined() &&
-                explicit_sdf_support_points.numel() > 0) {
-                orb_metric_support =
-                    explicit_sdf_support_points.to(dev)
-                        .to(torch::kFloat32)
-                        .reshape({-1, 3})
-                        .contiguous();
-            }
-        } else {
-            orb_metric_support = xyz.detach().contiguous();
-        }
+    if (add_as_orb &&
+        topology_sdf_init_mode_ != SdfInitMode::WeakSurfacePrior) {
+        orb_metric_support = xyz.detach().contiguous();
     }
 
     // Build the min/max AABB tensor once:
@@ -2912,7 +2689,7 @@ void VoxelModel::increasePcd(
         at::Tensor kept = (rate > 0.0f);
 
         // 2) Near filtering
-        // NOTE: Upstream SVRaster layout initialization uses filter_near = -1 (disabled).
+        // Upstream layout initialization leaves near filtering disabled.
         if (filter_near_voxels_) {
             const float near_thresh = 0.2f;
             at::Tensor is_near =
@@ -2983,7 +2760,7 @@ void VoxelModel::increasePcd(
     {
         if (octpath_old.numel() > 0) {
             auto dev = octpath_old.device();
-            const int MAX_L  = max_num_levels_;            // must match svraster MAX_NUM_LEVELS
+            const int MAX_L  = max_num_levels_;            // must match SVRecon MAX_NUM_LEVELS
             const int base_L = static_cast<int>(octlevel_);// the level used by createFromPcd()
 
             TORCH_CHECK(base_L >= 1 && base_L <= MAX_L,
@@ -3072,20 +2849,7 @@ void VoxelModel::increasePcd(
             pending_sdf_init_mode_ == SdfInitMode::SignedPointPrior ||
             pending_sdf_init_mode_ == SdfInitMode::WeakSurfacePrior;
         if (uses_local_point_prior) {
-            if (pending_sdf_init_mode_ ==
-                SdfInitMode::WeakSurfacePrior) {
-                sdf_init_local_support_points_ =
-                    xyz.detach().contiguous();
-            } else {
-                sdf_init_local_support_points_ =
-                    explicit_sdf_support_points.defined() &&
-                            explicit_sdf_support_points.numel() > 0
-                        ? explicit_sdf_support_points.to(dev)
-                              .to(torch::kFloat32)
-                              .reshape({-1, 3})
-                              .contiguous()
-                        : xyz.detach().contiguous();
-            }
+            sdf_init_local_support_points_ = xyz.detach().contiguous();
         } else {
             sdf_init_local_support_points_ = torch::Tensor();
         }
@@ -3135,11 +2899,11 @@ void VoxelModel::increasePcd(
         }
     }
 
-    ensureSvrasterSdfField();
+    ensureFusedSdfField();
     torch::Tensor old_vox_sdf_values =
-        voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
+        voxelCornerScalarFromGrid_(fused_sdf_grid_pts_);
     torch::Tensor old_vox_sdf_weights =
-        voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+        voxelCornerScalarFromGrid_(fused_sdf_weights_);
 
     // ── 6) Append topology (old preserved) ──────────────────────────────────
     this->oct_path_ = torch::cat({octpath_old,  octpath_add}, 0).contiguous();
@@ -3372,7 +3136,7 @@ void VoxelModel::increasePcd(
         auto added_weights = torch::zeros({N_added, 8, 1}, value_opts);
         auto vox_sdf = torch::cat({old_vox_sdf_values, added_sdf}, 0).contiguous();
         auto vox_weights = torch::cat({old_vox_sdf_weights, added_weights}, 0).contiguous();
-        rebuildSvrasterSdfFieldFromVoxelCorners_(vox_sdf, vox_weights);
+        rebuildFusedSdfFieldFromVoxelCorners_(vox_sdf, vox_weights);
     }
     // (optimizer params already set by appendGroup_; just ensure requires_grad)
     this->subdiv_p_ = this->subdiv_p_.contiguous();
@@ -3548,8 +3312,8 @@ void VoxelModel::increasePcd(
     const std::vector<sv::MiniCam>& cams,
     const bool clear_cuda_cache_before_parameter_append)
 {
-    // Follow GaussianModel::increasePcd(tensor) pattern, but reuse
-    // our existing vector-based VoxelModel::increasePcd(..., cams).
+    // Tensor adapter following Photo-SLAM GaussianModel::increasePcd; the
+    // vector overload above remains the single topology-update implementation.
 
     if (!new_point_cloud.defined() || !new_colors.defined())
         return;
@@ -3616,6 +3380,8 @@ void VoxelModel::createTrainer(float geo_lr, float sh0_lr, float shs_lr,
                                float gamma,
                                float log_s_lr)
 {
+    // Initializes C++ Adam groups and the milestone scheduler.
+    // SVRecon reference: SVOptimizer.optimizer_init.
     optimizer_geo_lr_ = geo_lr;
     optimizer_sh0_lr_ = sh0_lr;
     optimizer_shs_lr_ = shs_lr;
@@ -3680,7 +3446,8 @@ void VoxelModel::appendGroup_(int group_idx,
 
 VoxelModel::StatPkg
 VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
-    // Mirrors SVAdaptive.compute_training_stat (but uses our renderer)
+    // Computes maximum render weight, minimum sampling interval, and view count.
+    // SVRecon reference: SVAdaptive.compute_training_stat.
     freezeVoxGeo();
 
     const int64_t N = center_.size(0);
@@ -3738,6 +3505,8 @@ VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
 }
 
 void VoxelModel::optimizerZeroGrad() {
+    // Clears gradients for the parameter groups used by the SVRecon renderer.
+    // SVRecon reference: the optimizer zero_grad step in train.py.
     _geo_grid_pts_.mutable_grad() = torch::Tensor();
     log_s_.mutable_grad() = torch::Tensor();
     sh0_.mutable_grad() = torch::Tensor();
@@ -3746,6 +3515,8 @@ void VoxelModel::optimizerZeroGrad() {
 }
 
 void VoxelModel::optimizerStep() {
+    // Applies SVRecon's CUDA unbiased Adam update to each online parameter group.
+    // SVRecon reference: svraster_cuda.sparse_adam.SparseAdam.step.
     if (!optimizer_initialized_) {
         return;
     }
@@ -3794,6 +3565,7 @@ void VoxelModel::optimizerStep() {
 
 void VoxelModel::schedulerStep()
 {
+    // Advances the local multi-step learning-rate schedule once per iteration.
     if (!optimizer_initialized_) {
         return;
     }
@@ -3810,6 +3582,8 @@ void VoxelModel::schedulerStep()
 }
 
 void VoxelModel::pruning(const torch::Tensor& prune_mask) {
+    // Removes selected cells and rebuilds shared corners, provenance, evidence,
+    // and optimizer state. SVRecon reference: SVAdaptive.pruning.
     auto mask = prune_mask.to(torch::kBool).to(device_type_).contiguous();
     if (mask.dim() == 2 && mask.size(1) == 1) {
         mask = mask.squeeze(1);
@@ -3872,9 +3646,9 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     auto old_geo_grid_pts = this->_geo_grid_pts_.detach().contiguous();
     auto old_vox_grid_pts_val =
         old_geo_grid_pts.index({old_vox_key.to(old_geo_grid_pts.device())}).contiguous();
-    ensureSvrasterSdfField();
-    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
-    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+    ensureFusedSdfField();
+    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(fused_sdf_grid_pts_);
+    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(fused_sdf_weights_);
 
     this->oct_path_ = old_octpath.index_select(0, kept_idx.to(old_octpath.device())).contiguous();
     this->oct_level_ = old_octlevel.index_select(0, kept_idx.to(old_octlevel.device())).contiguous();
@@ -3925,7 +3699,7 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
         old_vox_sdf_values.index_select(0, kept_idx.to(old_vox_sdf_values.device())).contiguous();
     auto kept_weights =
         old_vox_sdf_weights.index_select(0, kept_idx.to(old_vox_sdf_weights.device())).contiguous();
-    rebuildSvrasterSdfFieldFromVoxelCorners_(kept_sdf, kept_weights);
+    rebuildFusedSdfFieldFromVoxelCorners_(kept_sdf, kept_weights);
 
     this->max_w_ = torch::zeros(
         {center_.size(0), 1},
@@ -3961,6 +3735,9 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
 }
 
 void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
+    // Splits selected leaves into eight children and interpolates shared-corner
+    // fields while retaining refined parents when required by SVRecon.
+    // SVRecon reference: SVAdaptive.subdividing.
     auto mask = subdivide_mask.to(torch::kBool).to(device_type_).contiguous();
     if (mask.dim() == 2 && mask.size(1) == 1) {
         mask = mask.squeeze(1);
@@ -4037,9 +3814,9 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     auto old_geo_grid_pts = this->_geo_grid_pts_.detach().contiguous();
     auto old_vox_grid_pts_val =
         old_geo_grid_pts.index({old_vox_key.to(old_geo_grid_pts.device())}).contiguous();
-    ensureSvrasterSdfField();
-    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(svraster_sdf_grid_pts_);
-    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(svraster_sdf_weights_);
+    ensureFusedSdfField();
+    auto old_vox_sdf_values = voxelCornerScalarFromGrid_(fused_sdf_grid_pts_);
+    auto old_vox_sdf_weights = voxelCornerScalarFromGrid_(fused_sdf_weights_);
 
     auto [child_octpath, child_octlevel] =
         genChildrenOctpath(
@@ -4145,7 +3922,7 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
                 old_vox_sdf_weights.index_select(
                     0, subdiv_idx.to(old_vox_sdf_weights.device())).contiguous());
         auto new_weights = torch::cat({kept_weights, subdiv_weights}, 0).contiguous();
-        rebuildSvrasterSdfFieldFromVoxelCorners_(new_sdf, new_weights);
+        rebuildFusedSdfFieldFromVoxelCorners_(new_sdf, new_weights);
     }
     this->max_w_ = torch::zeros(
         {center_.size(0), 1},
@@ -4237,6 +4014,8 @@ torch::Tensor VoxelModel::subdivisionPriority() const {
 }
 
 void VoxelModel::accumulateSubdivisionPriority() {
+    // Accumulates the dummy subdivision parameter gradient used for ranking.
+    // SVRecon reference: train.py, `subdiv_meta += _subdiv_p.grad`.
     torch::Tensor g = this->subdiv_p_.grad();
     if (!g.defined() || !this->subdiv_p_.defined() || this->subdiv_p_.numel() == 0) {
         return;
@@ -4251,6 +4030,7 @@ void VoxelModel::accumulateSubdivisionPriority() {
 }
 
 void VoxelModel::resetSubdivisionPriority() {
+    // Clears the accumulated ranking statistic after an adaptive update.
     if (this->subdiv_meta_.defined()) {
         this->subdiv_meta_.zero_();
     }
@@ -4258,6 +4038,8 @@ void VoxelModel::resetSubdivisionPriority() {
 }
 
 void VoxelModel::freezeVoxGeo() {
+    // Pre-gathers shared corners per voxel for repeated no-gradient rendering.
+    // SVRecon reference: SVRenderer.freeze_vox_geo.
     const int64_t N = center_.size(0);
     auto care_idx = torch::arange(N, torch::dtype(torch::kLong).device(device_type_));
     torch::NoGradGuard no_grad;
@@ -4266,6 +4048,8 @@ void VoxelModel::freezeVoxGeo() {
 }
 
 void VoxelModel::unfreezeVoxGeo() {
+    // Releases the gathered cache and restores geometry gradients.
+    // SVRecon reference: SVRenderer.unfreeze_vox_geo.
     frozen_vox_geo_.reset();              // make it undefined
     _geo_grid_pts_.set_requires_grad(true);
 }
@@ -4285,6 +4069,8 @@ std::unordered_map<std::string, torch::Tensor> VoxelModel::render(
     bool use_auto_exposure,
     const sv::RenderOpts& other_opt) const
 {
+    // Dispatches the model tensors to the native SVRecon rasterizer.
+    // SVRecon reference: SVRenderer.render.
     return renderSvreconDirect(
         cam,
         im_height,
@@ -4317,6 +4103,8 @@ std::unordered_map<std::string, torch::Tensor> VoxelModel::render(
 }
 
 void VoxelModel::applyTvOnDensityField(float lambda_tv_density) {
+    // Injects SVRecon's total-variation gradient into the shared SDF corners.
+    // SVRecon reference: train.py calling grid_loss_bw.total_variation.
     if (!_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0 ||
         !vox_key_.defined() || vox_key_.numel() == 0 ||
         !vox_size_inv_.defined() || vox_size_inv_.numel() == 0) {
@@ -4450,6 +4238,8 @@ SvreconRegularizerTable buildSvreconRegularizerTable(
 
 void VoxelModel::applySvreconGridEikonalField(float lambda_ge_density)
 {
+    // Injects the CUDA grid-Eikonal regularizer gradient.
+    // SVRecon reference: train.py calling grid_loss_bw.grid_eikonal.
     if (lambda_ge_density <= 0.0f ||
         !_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0) {
         return;
@@ -4489,6 +4279,8 @@ void VoxelModel::applySvreconGridEikonalField(float lambda_ge_density)
 
 void VoxelModel::applySvreconLaplacianSmoothnessField(float lambda_ls_density)
 {
+    // Injects the CUDA Laplacian smoothness regularizer gradient.
+    // SVRecon reference: train.py calling grid_loss_bw.laplacian_smoothness.
     if (lambda_ls_density <= 0.0f ||
         !_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0) {
         return;
@@ -4530,6 +4322,8 @@ torch::Tensor VoxelModel::svreconLocalEikonalLoss(
     const float lambda_local_ge_density,
     const int min_inside_level) const
 {
+    // Computes a differentiable finite-difference Eikonal loss on sufficiently
+    // refined leaves. This local fallback is specific to the online mapper.
     if (lambda_local_ge_density <= 0.0f ||
         !_geo_grid_pts_.defined() || _geo_grid_pts_.numel() == 0 ||
         !vox_key_.defined() || vox_key_.numel() == 0 ||
@@ -4588,6 +4382,7 @@ torch::Tensor VoxelModel::svreconLocalEikonalLoss(
 
 VoxelModel::SchedulerState VoxelModel::schedulerState() const
 {
+    // Snapshots scheduler state across topology-triggered trainer recreation.
     SchedulerState state;
     state.valid = optimizer_initialized_;
     state.last_epoch = scheduler_epoch_;
@@ -4600,6 +4395,7 @@ VoxelModel::SchedulerState VoxelModel::schedulerState() const
 
 void VoxelModel::schedulerLoadState(const SchedulerState& state)
 {
+    // Restores learning rates and epoch after topology-triggered recreation.
     if (!state.valid) {
         return;
     }
@@ -4691,6 +4487,8 @@ static torch::Tensor decode_centers_from_octree(const torch::Tensor& octpath,
 
 void VoxelModel::savePly(const std::filesystem::path& result_path)
 {
+    // Exports every active leaf and its shared-corner SDF/SH attributes; this is
+    // an online evaluation/viewer format rather than SVRecon's checkpoint IO.
     torch::NoGradGuard ng;
     namespace fs = std::filesystem;
     if (!result_path.parent_path().empty())
@@ -4883,6 +4681,8 @@ void VoxelModel::savePly(const std::filesystem::path& result_path)
 
 bool VoxelModel::refreshDenseCoreBBFromCurrentVoxels()
 {
+    // Re-estimates the robust dense-core box used by near/far pruning.
+    // SVRecon reference: bounding_utils.main_scene_bound_pcd_heuristic.
     torch::Tensor pts_cpu;
     if (real_pcd_points_accum_cpu_.defined() &&
         real_pcd_points_accum_cpu_.numel() > 0) {

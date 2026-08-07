@@ -18,7 +18,7 @@
 
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
-#include "viewer/imgui_viewer.h"
+#include "include_voxel/viewer/voxel_imgui_viewer.h"
 
 #include <c10/cuda/CUDACachingAllocator.h>
 
@@ -249,11 +249,11 @@ int main(int argc, char **argv)
 
     // Viewer thread (imgui)
     std::thread viewer_thd;
-    std::shared_ptr<ImGuiViewer> pViewer;
+    std::shared_ptr<VoxelImGuiViewer> pViewer;
     if (use_viewer)
     {
-        pViewer = std::make_shared<ImGuiViewer>(pSLAM, pVoxelMapper);
-        viewer_thd = std::thread(&ImGuiViewer::run, pViewer.get());
+        pViewer = std::make_shared<VoxelImGuiViewer>(pSLAM, pVoxelMapper);
+        viewer_thd = std::thread(&VoxelImGuiViewer::run, pViewer.get());
     }
 
     std::vector<float> vTimesTrack(nImages);

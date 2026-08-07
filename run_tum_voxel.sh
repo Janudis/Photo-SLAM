@@ -43,13 +43,20 @@ OUT=$root_dir/results/replica_voxel/office0
 
 mkdir -p "$OUT"
 
+viewer_args=(no_viewer)
+if [[ "${VOXEL_VIEWER:-0}" == "1" ]]; then
+    viewer_args=()
+fi
+
 # Mono / Replica RGB-D runners: BIN VOC ORB_CFG VOX_CFG SEQ OUT [no_viewer]
 # TUM RGB-D runners:            BIN VOC ORB_CFG VOX_CFG SEQ ASSOC OUT [no_viewer]
 if [[ "$(basename "$BIN")" == "tum_rgbd_voxel" ]]; then
-    "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$ASSOC" "$OUT" no_viewer
+    "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$ASSOC" "$OUT" "${viewer_args[@]}"
 else
-    "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$OUT" no_viewer
+    "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$OUT" "${viewer_args[@]}"
 fi
 
 # "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$OUT"
 # echo "$BIN" "$VOC" "$ORB_CFG" "$VOX_CFG" "$SEQ" "$OUT" no_viewer #for debugging
+
+# VOXEL_VIEWER=1 ./run_tum_voxel.sh

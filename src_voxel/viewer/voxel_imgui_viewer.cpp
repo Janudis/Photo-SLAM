@@ -1,31 +1,23 @@
-/**
- * This file is part of Photo-SLAM
- *
- * Copyright (C) 2023-2024 Longwei Li and Hui Cheng, Sun Yat-sen University.
- * Copyright (C) 2023-2024 Huajian Huang and Sai-Kit Yeung, Hong Kong University of Science and Technology.
- *
- * Photo-SLAM is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Photo-SLAM is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
- * the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with Photo-SLAM.
- * If not, see <http://www.gnu.org/licenses/>.
- */
+#include "include_voxel/viewer/voxel_imgui_viewer.h"
 
-#include "imgui_viewer.h"
+#include <cmath>
+
+namespace
+{
+float focalToFov(const float focal, const float pixels)
+{
+    return 2.0f * std::atan(pixels / (2.0f * focal));
+}
+} // namespace
 
 static void glfw_error_callback(int error, const char* description)
 {
-    fprintf(stderr, "[ImGuiViewer]GLFW Error %d: %s\n", error, description);
+    fprintf(stderr, "[VoxelImGuiViewer]GLFW Error %d: %s\n", error, description);
 }
 
-ImGuiViewer::ImGuiViewer(
+VoxelImGuiViewer::VoxelImGuiViewer(
     std::shared_ptr<ORB_SLAM3::System> pSLAM,
-    std::shared_ptr<GaussianMapper> pGausMapper,
+    std::shared_ptr<VoxelMapper> pVoxelMapper,
     bool training)
     : glfw_window_width_(1600),
       glfw_window_height_(900),
@@ -37,7 +29,7 @@ ImGuiViewer::ImGuiViewer(
       training_(training)
 {
     this->pSLAM_ = pSLAM;
-    this->pGausMapper_ = pGausMapper;
+    this->pVoxelMapper_ = pVoxelMapper;
 
     cv::Size im_size;
     if (pSLAM)
@@ -56,20 +48,20 @@ ImGuiViewer::ImGuiViewer(
     }
     else
     {
-        image_height_ = pGausMapper->scene_->cameras_.begin()->second.height_;
-        image_width_ = pGausMapper->scene_->cameras_.begin()->second.width_;
-        viewpointF_ = pGausMapper->scene_->cameras_.begin()->second.params_[1];
+        image_height_ = pVoxelMapper->scene_->cameras_.begin()->second.height_;
+        image_width_ = pVoxelMapper->scene_->cameras_.begin()->second.width_;
+        viewpointF_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[1];
     }
 
-    main_fx_ = pGausMapper->scene_->cameras_.begin()->second.params_[0];
-    main_fy_ = pGausMapper->scene_->cameras_.begin()->second.params_[1];
+    main_fx_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[0];
+    main_fy_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[1];
 
-    // Gaussian Mapper settings
-    std::filesystem::path cfg_file_path = pGausMapper->config_file_path_;
+    // Voxel mapper settings
+    std::filesystem::path cfg_file_path = pVoxelMapper->config_file_path_;
     readConfigFromFile(cfg_file_path);
     SLAM_image_viewer_scale_ = static_cast<float>(rendered_image_width_) / image_width_;
 
-    float fovy = graphics_utils::focal2fov(viewpointF_, im_size.height);
+    float fovy = focalToFov(viewpointF_, static_cast<float>(image_height_));
     cam_proj_ = glm::perspective(
         fovy < M_PIf32 ? fovy : M_PIf32, (float)glfw_window_width_ / (float)glfw_window_height_, 0.01f, 100.0f);
 
@@ -86,27 +78,27 @@ ImGuiViewer::ImGuiViewer(
     {
         pSlamFrameDrawer_ = pSLAM->getFrameDrawer();
         pSlamMapDrawer_ = pSLAM->getMapDrawer();
-        pMapDrawer_ = std::make_shared<ORB_SLAM3::ImGuiMapDrawer>(
+        pMapDrawer_ = std::make_shared<ORB_SLAM3::VoxelMapDrawer>(
             pSLAM->getAtlas(), std::string(), pSLAM->getSettings());
     }
 }
 
-void ImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
+void VoxelImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
 {
     cv::FileStorage settings_file(cfg_path.string().c_str(), cv::FileStorage::READ);
     if(!settings_file.isOpened())
-       throw std::runtime_error("[ImGuiViewer]Failed to open settings file at: " + cfg_path.string());
-    std::cout << "[ImGuiViewer]Reading parameters from " << cfg_path << std::endl;
+       throw std::runtime_error("[VoxelImGuiViewer]Failed to open settings file at: " + cfg_path.string());
+    std::cout << "[VoxelImGuiViewer]Reading parameters from " << cfg_path << std::endl;
 
     glfw_window_width_ =
-        settings_file["GaussianViewer.glfw_window_width"].operator int();
+        settings_file["VoxelViewer.glfw_window_width"].operator int();
     glfw_window_height_ =
-        settings_file["GaussianViewer.glfw_window_height"].operator int();
+        settings_file["VoxelViewer.glfw_window_height"].operator int();
     main_cx_ = glfw_window_width_ / 2;
     main_cy_ = glfw_window_height_ / 2;
 
     rendered_image_viewer_scale_ =
-        settings_file["GaussianViewer.image_scale"].operator float();
+        settings_file["VoxelViewer.image_scale"].operator float();
     rendered_image_height_ = image_height_ * rendered_image_viewer_scale_;
     rendered_image_width_ = image_width_ * rendered_image_viewer_scale_;
 
@@ -114,7 +106,7 @@ void ImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
     padded_sub_image_width_ = rendered_image_width_ + 4 - (temp == 0 ? 4 : temp);
 
     rendered_image_viewer_scale_main_ =
-        settings_file["GaussianViewer.image_scale_main"].operator float();
+        settings_file["VoxelViewer.image_scale_main"].operator float();
     rendered_image_height_main_ = image_height_ * rendered_image_viewer_scale_main_;
     rendered_image_width_main_ = image_width_ * rendered_image_viewer_scale_main_;
 
@@ -122,32 +114,25 @@ void ImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
     padded_main_image_width_ = rendered_image_width_main_ + 4 - (temp == 0 ? 4 : temp); 
 
     camera_watch_dist_ =
-        settings_file["GaussianViewer.camera_watch_dist"].operator float();
+        settings_file["VoxelViewer.camera_watch_dist"].operator float();
 
-    // Initialize configurations same as the GaussianMapper
-    position_lr_init_ = pGausMapper_->positionLearningRateInit();
-    feature_lr_ = pGausMapper_->featureLearningRate();
-    opacity_lr_ = pGausMapper_->opacityLearningRate();
-    scaling_lr_ = pGausMapper_->scalingLearningRate();
-    rotation_lr_ = pGausMapper_->rotationLearningRate();
-    percent_dense_ = pGausMapper_->percentDense();
-    lambda_dssim_ = pGausMapper_->lambdaDssim();
-    opacity_reset_interval_ = pGausMapper_->opacityResetInterval();
-    densify_grad_th_ = pGausMapper_->densifyGradThreshold();
-    densify_interval_ = pGausMapper_->densifyInterval();
-    new_kf_times_of_use_ = pGausMapper_->newKeyframeTimesOfUse();
-    stable_num_iter_existence_ = pGausMapper_->stableNumIterExistence();
-
-    do_gaus_pyramid_training_ = pGausMapper_->isdoingGausPyramidTraining();
-    do_inactive_geo_densify_ = pGausMapper_->isdoingInactiveGeoDensify();
+    // Initialize configurations same as the VoxelMapper
+    geo_lr_ = pVoxelMapper_->geoLearningRateInit();
+    sh0_lr_ = pVoxelMapper_->sh0LearningRate();
+    shs_lr_ = pVoxelMapper_->shsLearningRate();
+    lambda_ssim_ = pVoxelMapper_->lambdaSsim();
+    densify_interval_ = pVoxelMapper_->densifyInterval();
+    new_kf_times_of_use_ = pVoxelMapper_->newKeyframeTimesOfUse();
+    stable_num_iter_existence_ = pVoxelMapper_->stableNumIterExistence();
+    do_gaus_pyramid_training_ = pVoxelMapper_->isdoingGausPyramidTraining();
 }
 
-void ImGuiViewer::run()
+void VoxelImGuiViewer::run()
 {
     // Initialize glfw
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
-        throw std::runtime_error("[ImGuiViewer]Fails to initialize!");
+        throw std::runtime_error("[VoxelImGuiViewer]Fails to initialize!");
 
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -157,9 +142,9 @@ void ImGuiViewer::run()
     // Create window with graphics context
     GLFWwindow* window =
         glfwCreateWindow(glfw_window_width_, glfw_window_height_,
-                         "Photo-SLAM", nullptr, nullptr);
+                         "Photo-SLAM SVRecon", nullptr, nullptr);
     if (window == nullptr)
-        throw std::runtime_error("[ImGuiViewer]Fails to create window!");
+        throw std::runtime_error("[VoxelImGuiViewer]Fails to create window!");
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync
     glEnable(GL_DEPTH_TEST); // Enable 3D Mouse handler
@@ -336,9 +321,8 @@ void ImGuiViewer::run()
                 ImGui::End();
             }
 
-            //--------------Draw current gaussian mapper frame image--------------
-            // Render gaussian mapper frame
-            cv::Mat rendered_img = pGausMapper_->renderFromPose(
+            // Draw the current voxel-mapper rendering.
+            cv::Mat rendered_img = pVoxelMapper_->renderFromPose(
                 Tcw, rendered_image_width_, rendered_image_height_, false);
             cv::Mat rendered_img_to_show = cv::Mat(rendered_image_height_, padded_sub_image_width_, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
             rendered_img.copyTo(rendered_img_to_show(image_rect_sub));
@@ -370,7 +354,7 @@ void ImGuiViewer::run()
             }
             else
             {
-                cv::Mat main_img = pGausMapper_->renderFromPose(
+                cv::Mat main_img = pVoxelMapper_->renderFromPose(
                     Tcw_main_, rendered_image_width_main_, rendered_image_height_main_, true);
                 cv::Mat main_img_to_show = cv::Mat(rendered_image_height_main_, padded_main_image_width_, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
                 main_img.copyTo(main_img_to_show(image_rect_main));
@@ -382,22 +366,16 @@ void ImGuiViewer::run()
             }
         }
         //--------------Get current parameters--------------
-        VariableParameters params_in = pGausMapper_->getVaribleParameters();
-        position_lr_init_ = params_in.position_lr_init;
-        feature_lr_ = params_in.feature_lr;
-        opacity_lr_ = params_in.opacity_lr;
-        scaling_lr_ = params_in.scaling_lr;
-        rotation_lr_ = params_in.rotation_lr;
-        percent_dense_ = params_in.percent_dense;
-        lambda_dssim_ = params_in.lambda_dssim;
-        opacity_reset_interval_ = params_in.opacity_reset_interval;
-        densify_grad_th_ = params_in.densify_grad_th;
+        VariableParameters params_in = pVoxelMapper_->getVaribleParameters();
+        geo_lr_ = params_in.geo_lr;
+        sh0_lr_ = params_in.sh0_lr;
+        shs_lr_ = params_in.shs_lr;
+        lambda_ssim_ = params_in.lambda_ssim;
         densify_interval_ = params_in.densify_interval;
         new_kf_times_of_use_ = params_in.new_kf_times_of_use;
         stable_num_iter_existence_ = params_in.stable_num_iter_existence;
         keep_training_ = params_in.keep_training;
         do_gaus_pyramid_training_ = params_in.do_gaus_pyramid_training;
-        do_inactive_geo_densify_ = params_in.do_inactive_geo_densify;
 
         //--------------Display mode panel--------------
         ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, 0), ImGuiCond_Once);
@@ -425,21 +403,15 @@ void ImGuiViewer::run()
             {
                 ImGui::Begin("Training Options");
 
-                ImGui::Text("Iteration: %d", pGausMapper_->getIteration());
+                ImGui::Text("Iteration: %d", pVoxelMapper_->getIteration());
 
                 ImGui::Checkbox("Gaussian-pyramid-based training", &do_gaus_pyramid_training_);
-                ImGui::Checkbox("Densify with inactive geometries", &do_inactive_geo_densify_);
                 ImGui::Checkbox("Keep training after stop", &keep_training_);
 
-                ImGui::SliderFloat("Position l.r.", &position_lr_init_, 0.00001f, 0.00100f, "%.5f");
-                ImGui::SliderFloat("Feature l.r.", &feature_lr_, 0.0001f, 0.0050f, "%.5f");
-                ImGui::SliderFloat("Opacity l.r.", &opacity_lr_, 0.01f, 0.10f, "%.5f");
-                ImGui::SliderFloat("Scaling l.r.", &scaling_lr_, 0.001f, 0.010f, "%.5f");
-                ImGui::SliderFloat("Rotation l.r.", &rotation_lr_, 0.0001f, 0.0100f, "%.5f");
-                ImGui::SliderFloat("Percent dense", &percent_dense_, 0.001f, 0.100f, "%.3f");
-                ImGui::SliderFloat("Lambda dssim", &lambda_dssim_, 0.01f, 0.40f, "%.2f");
-                ImGui::SliderInt("Opacity reset", &opacity_reset_interval_, 0, 6000);
-                ImGui::SliderFloat("Densify grad th.", &densify_grad_th_, 0.0001f, 0.0020f, "%.5f");
+                ImGui::SliderFloat("Geo l.r.", &geo_lr_, 0.00001f, 0.00100f, "%.5f");
+                ImGui::SliderFloat("Sh0 l.r.", &sh0_lr_, 0.0001f, 0.0050f, "%.5f");
+                ImGui::SliderFloat("Shs l.r.", &shs_lr_, 0.01f, 0.10f, "%.5f");
+                ImGui::SliderFloat("Lambda SSIM", &lambda_ssim_, 0.0f, 0.10f, "%.2f");
                 ImGui::SliderInt("Densify int.", &densify_interval_, 1, 400);
                 ImGui::SliderInt("New kf. using", &new_kf_times_of_use_, 0, 10);
                 ImGui::SliderInt("Stable iter.", &stable_num_iter_existence_, 0, 100);
@@ -448,22 +420,16 @@ void ImGuiViewer::run()
             }
         }
         VariableParameters params_out;
-        params_out.position_lr_init = position_lr_init_;
-        params_out.feature_lr = feature_lr_;
-        params_out.opacity_lr = opacity_lr_;
-        params_out.scaling_lr = scaling_lr_;
-        params_out.rotation_lr = rotation_lr_;
-        params_out.percent_dense = percent_dense_;
-        params_out.lambda_dssim = lambda_dssim_;
-        params_out.opacity_reset_interval = opacity_reset_interval_;
-        params_out.densify_grad_th = densify_grad_th_;
+        params_out.geo_lr = geo_lr_;
+        params_out.sh0_lr = sh0_lr_;
+        params_out.shs_lr = shs_lr_;
+        params_out.lambda_ssim = lambda_ssim_;
         params_out.densify_interval = densify_interval_;
         params_out.new_kf_times_of_use = new_kf_times_of_use_;
         params_out.stable_num_iter_existence = stable_num_iter_existence_;
         params_out.keep_training = keep_training_;
         params_out.do_gaus_pyramid_training = do_gaus_pyramid_training_;
-        params_out.do_inactive_geo_densify = do_inactive_geo_densify_;
-        pGausMapper_->setVaribleParameters(params_out);
+        pVoxelMapper_->setVaribleParameters(params_out);
 
         //--------------Camera view panel--------------
         ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, (training_ ? display_panel_height_ + training_panel_height_ + 16 : display_panel_height_ + 8)), ImGuiCond_Once);
@@ -504,7 +470,7 @@ void ImGuiViewer::run()
         glfwSwapBuffers(window);
         glfwPollEvents();
 
-        if (!keep_training_  && pGausMapper_->isStopped())
+        if (!keep_training_  && pVoxelMapper_->isStopped())
             signalStop();
     }
 
@@ -519,19 +485,19 @@ void ImGuiViewer::run()
     if (pSLAM_ && !pSLAM_->isShutDown())
         pSLAM_->Shutdown();
     else
-        pGausMapper_->signalStop();
+        pVoxelMapper_->signalStop();
 
-    if (pGausMapper_->isKeepingTraining())
-        pGausMapper_->setKeepTraining(false);
+    if (pVoxelMapper_->isKeepingTraining())
+        pVoxelMapper_->setKeepTraining(false);
 }
 
-bool ImGuiViewer::isStopped()
+bool VoxelImGuiViewer::isStopped()
 {
     std::unique_lock<std::mutex> lock_status(this->mutex_status_);
     return this->stopped_;
 }
 
-void ImGuiViewer::signalStop(const bool going_to_stop)
+void VoxelImGuiViewer::signalStop(const bool going_to_stop)
 {
     std::unique_lock<std::mutex> lock_status(this->mutex_status_);
     this->stopped_ = going_to_stop;
@@ -540,7 +506,7 @@ void ImGuiViewer::signalStop(const bool going_to_stop)
 /**
  * We modify Twc_main_ then Tcw_main_ (Sophus::SE3f) to handle mouse and keyboard inputs
  */
-void ImGuiViewer::handleUserInput()
+void VoxelImGuiViewer::handleUserInput()
 {
     if (tracking_vision_)
     {
@@ -567,7 +533,7 @@ void ImGuiViewer::handleUserInput()
     Tcw_main_ = Twc_main_.inverse();
 }
 
-void ImGuiViewer::mouseWheel()
+void VoxelImGuiViewer::mouseWheel()
 {
     float delta = ImGui::GetIO().MouseWheel;
 
@@ -594,7 +560,7 @@ void ImGuiViewer::mouseWheel()
     // Twc_main_.translation() += (R * translating);
 }
 
-void ImGuiViewer::mouseDrag()
+void VoxelImGuiViewer::mouseDrag()
 {
     float delta_rel_x = ImGui::GetIO().MouseDelta.x / glfw_window_width_;
     float delta_rel_y = ImGui::GetIO().MouseDelta.y / glfw_window_height_;
@@ -648,7 +614,7 @@ void ImGuiViewer::mouseDrag()
     Twc_main_.setRotationMatrix(R * rotating);
 }
 
-void ImGuiViewer::keyboardEvent()
+void VoxelImGuiViewer::keyboardEvent()
 {
     if (ImGui::GetIO().WantCaptureKeyboard)
         return;

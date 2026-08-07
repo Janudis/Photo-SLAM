@@ -1,6 +1,19 @@
 #pragma once
+
+#include <torch/torch.h>
+
 namespace sv {
-    constexpr int   MAX_OCT_LEVEL      = 7;      // == svraster_cuda.meta.MAX_NUM_LEVELS‑1
-    constexpr float MIN_VOX_SIZE       = 0.01f;  // metres – stop subdividing/prune
-    constexpr int MAX_VOXEL_LEVEL = 8;  // Same as svraster_cuda.meta.MAX_NUM_LEVELS
+
+inline constexpr float kSHC0 = 0.28209479177387814f;
+
+inline torch::Tensor rgbToShZero(const torch::Tensor& rgb)
+{
+    return (rgb - 0.5f) / kSHC0;
+}
+
+inline torch::Tensor shZeroToRgb(const torch::Tensor& sh)
+{
+    return sh * kSHC0 + 0.5f;
+}
+
 }

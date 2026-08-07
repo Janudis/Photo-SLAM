@@ -67,7 +67,7 @@ esac
 mkdir -p "$output"
 
 viewer_args=(no_viewer)
-if [[ "${SCANNET_VIEWER:-0}" == "1" ]]; then
+if [[ "${VOXEL_VIEWER:-${SCANNET_VIEWER:-0}}" == "1" ]]; then
     viewer_args=()
 fi
 

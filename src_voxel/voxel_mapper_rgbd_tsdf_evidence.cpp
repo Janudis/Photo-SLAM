@@ -74,8 +74,8 @@ void raycastGridSegment(
 }
 
 bool containsKeyframe(
-    const std::vector<camera_id_t>& keyframes,
-    const camera_id_t keyframe)
+    const std::vector<sv::camera_id_t>& keyframes,
+    const sv::camera_id_t keyframe)
 {
     return std::find(keyframes.begin(), keyframes.end(), keyframe) !=
            keyframes.end();
@@ -369,7 +369,8 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
         updated_corners.insert(key);
     }
 
-    const camera_id_t keyframe_id = static_cast<camera_id_t>(pkf->fid_);
+    const sv::camera_id_t keyframe_id =
+        static_cast<sv::camera_id_t>(pkf->fid_);
     for (const auto& item : frame_cells) {
         const auto corners = sv::rgbdTsdfCellCornerKeys(item.first);
         const bool observed = std::any_of(

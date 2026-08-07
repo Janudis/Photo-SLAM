@@ -7,7 +7,6 @@
 
 #include "include_voxel/voxel_model.h"
 #include "include_voxel/voxel_scene.h"
-#include "include/loss_utils.h"
 
 namespace sv {
 class VoxelTrainer {
@@ -32,6 +31,8 @@ public:
         const torch::Tensor& photo_loss,
         const char* photo_loss_name,
         const torch::Tensor& ssim_loss,
+        const torch::Tensor& monocular_depth_loss,
+        const torch::Tensor& monocular_normal_loss,
         float ema_total_loss,
         int64_t elapsed_time,
         sv::VoxelModel& voxels,

@@ -50,7 +50,7 @@ struct FrameFiles {
     std::optional<fs::path> ours_rgb;
     std::optional<fs::path> ours_depth;
     std::optional<fs::path> ours_normal;
-    std::optional<fs::path> ours_normal_svraster;
+    std::optional<fs::path> ours_normal_svrecon;
     std::optional<fs::path> gt_rgb;
     std::optional<fs::path> gt_depth;
     std::optional<fs::path> gt_normal;
@@ -240,9 +240,9 @@ std::map<int, FrameFiles> collectOurs(const fs::path& root) {
             frames[*id].ours_normal = path;
         }
     }
-    for (const auto& path : listFiles(root / "normals_svraster")) {
+    for (const auto& path : listFiles(root / "normals_svrecon")) {
         if (auto id = regexId(path, normal_re)) {
-            frames[*id].ours_normal_svraster = path;
+            frames[*id].ours_normal_svrecon = path;
         }
     }
     return frames;
@@ -543,7 +543,7 @@ void logMapsCompareBlueprint(rerun::RecordingStream& blueprint) {
     log_grid(depth_grid, "Depth", {depth_views.begin(), depth_views.end()});
 
     log_view(normal_views[0], "Ours Normal", "maps/normal/ours");
-    log_view(normal_views[1], "Ours SVRaster Normal", "maps/normal/ours_svraster");
+    log_view(normal_views[1], "Ours SVRecon Normal", "maps/normal/ours_svrecon");
     log_view(normal_views[2], "GT Normal", "maps/normal/gt");
     log_view(normal_views[3], "HI-SLAM2 Before Normal", "maps/normal/hislam2_before");
     log_view(normal_views[4], "HI-SLAM2 After Normal", "maps/normal/hislam2_after");
@@ -660,7 +660,7 @@ int main(int argc, char** argv) {
 
             const cv::Mat gt_normal = readRgb(files.gt_normal, shape);
             const cv::Mat ours_normal = readRgb(files.ours_normal, shape);
-            const cv::Mat ours_normal_svraster = readRgb(files.ours_normal_svraster, shape);
+            const cv::Mat ours_normal_svrecon = readRgb(files.ours_normal_svrecon, shape);
             const cv::Mat hi_normal_before = readRgb(files.hi_normal_before, shape);
             const cv::Mat hi_normal_after = readRgb(files.hi_normal_after, shape);
 
@@ -678,7 +678,7 @@ int main(int argc, char** argv) {
             logImage(rec, "maps/depth/hislam2_after", hi_depth_after);
 
             logImage(rec, "maps/normal/ours", ours_normal);
-            logImage(rec, "maps/normal/ours_svraster", ours_normal_svraster);
+            logImage(rec, "maps/normal/ours_svrecon", ours_normal_svrecon);
             logImage(rec, "maps/normal/gt", gt_normal);
             logImage(rec, "maps/normal/hislam2_before", hi_normal_before);
             logImage(rec, "maps/normal/hislam2_after", hi_normal_after);

@@ -6,11 +6,10 @@
 #include <tuple>
 #include <filesystem>
 
-#include "include/types.h"                 // camera_id_t / point3D_id_t
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_camera.h"    // sv::Camera
 #include "include_voxel/voxel_keyframe.h"  // VoxelKeyframe
-#include "include/point3d.h"
+#include "include_voxel/voxel_types.h"
 
 namespace sv {
 

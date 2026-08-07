@@ -1148,7 +1148,8 @@ void RerunVisualizerBridge::visualizeDebugPlyMesh(
     const std::string& recording_name,
     const std::string& ply_path,
     int iteration,
-    const std::string& entity_path
+    const std::string& entity_path,
+    bool static_mesh
 ) {
     ensureInitialized();
     if (!impl_) return;
@@ -1159,7 +1160,8 @@ void RerunVisualizerBridge::visualizeDebugPlyMesh(
             py::str(recording_name),
             py::str(ply_path),
             iteration,
-            py::str(entity_path)
+            py::str(entity_path),
+            static_mesh
         );
     } catch (const py::error_already_set& e) {
         std::cerr << "[RERUN] Python error in visualizeDebugPlyMesh: "
@@ -1167,106 +1169,94 @@ void RerunVisualizerBridge::visualizeDebugPlyMesh(
     }
 }
 
-void RerunVisualizerBridge::visualizeSVRasterMesh(
-    const torch::Tensor& centers,
-    const torch::Tensor& sizes,
-    const torch::Tensor& colors,
-    int iteration
-) {
+bool RerunVisualizerBridge::alignReferencePlyMesh(
+    const std::string& source_mesh_path,
+    const std::string& source_trajectory_tum_path,
+    const std::string& target_trajectory_tum_path,
+    const std::string& output_mesh_path,
+    const std::string& report_path)
+{
+    if (!enabled_) {
+        return false;
+    }
     ensureInitialized();
-    if (!impl_) return;
-    if (!centers.defined() || centers.numel() == 0) return;
+    if (!impl_) {
+        return false;
+    }
 
     py::gil_scoped_acquire gil;
+    try {
+        return impl_->visualizer.attr("align_reference_ply_mesh")(
+            py::str(source_mesh_path),
+            py::str(source_trajectory_tum_path),
+            py::str(target_trajectory_tum_path),
+            py::str(output_mesh_path),
+            py::str(report_path)).cast<bool>();
+    } catch (const py::error_already_set& e) {
+        std::cerr << "[RERUN] Python error in alignReferencePlyMesh: "
+                  << e.what() << std::endl;
+        return false;
+    }
+}
 
-    auto c_cpu = centers.contiguous().to(torch::kCPU);
-    TORCH_CHECK(c_cpu.dim() == 2 && c_cpu.size(1) == 3, "centers must be [N,3]");
-
-    // centers → numpy
-    auto c_sizes = c_cpu.sizes();
-    std::vector<ssize_t> centers_shape{c_sizes[0], c_sizes[1]};
-    std::vector<ssize_t> centers_strides{
-        static_cast<ssize_t>(sizeof(float) * c_sizes[1]),
-        static_cast<ssize_t>(sizeof(float))
-    };
-    py::array centers_np(py::buffer_info(
-        c_cpu.data_ptr<float>(),
-        sizeof(float),
-        py::format_descriptor<float>::format(),
-        2,
-        centers_shape,
-        centers_strides
-    ));
-
-    // sizes → half_sizes [N,3], then numpy
-    torch::Tensor half_sizes_cpu;
-    {
-        auto s = sizes;
-        TORCH_CHECK(s.defined(), "sizes must be defined");
-        s = s.contiguous().to(torch::kCPU);
-
-        if (s.dim() == 1) {
-            s = s.view({s.size(0), 1}).expand({s.size(0), 3});
-        } else if (s.dim() == 2 && s.size(1) == 1) {
-            s = s.expand({s.size(0), 3});
-        } else {
-            TORCH_CHECK(s.dim() == 2 && s.size(1) == 3,
-                        "sizes must be [N], [N,1], or [N,3]");
-        }
-        half_sizes_cpu = 0.5f * s;
+void RerunVisualizerBridge::visualizeDebugImage(
+    const std::string& recording_name,
+    const cv::Mat& image_rgb,
+    int iteration,
+    int keyframe_id,
+    const std::string& entity_path)
+{
+    if (!enabled_ || image_rgb.empty() || image_rgb.type() != CV_8UC3) {
+        return;
     }
 
-    auto hs_sizes = half_sizes_cpu.sizes();
-    std::vector<ssize_t> hs_shape{hs_sizes[0], hs_sizes[1]};
-    std::vector<ssize_t> hs_strides{
-        static_cast<ssize_t>(sizeof(float) * hs_sizes[1]),
-        static_cast<ssize_t>(sizeof(float))
-    };
-    py::array half_sizes_np(py::buffer_info(
-        half_sizes_cpu.data_ptr<float>(),
-        sizeof(float),
-        py::format_descriptor<float>::format(),
-        2,
-        hs_shape,
-        hs_strides
-    ));
-
-    py::object colors_np = py::none();
-    if (colors.defined() && colors.numel() > 0) {
-        auto col_cpu = colors.contiguous().to(torch::kCPU);
-        TORCH_CHECK(col_cpu.dim() == 2 && col_cpu.size(1) == 3,
-                    "colors must be [N,3]");
-
-        auto col_sizes = col_cpu.sizes();
-        std::vector<ssize_t> col_shape{col_sizes[0], col_sizes[1]};
-        std::vector<ssize_t> col_strides{
-            static_cast<ssize_t>(col_cpu.element_size() * col_sizes[1]),
-            static_cast<ssize_t>(col_cpu.element_size())
-        };
-
-        py::array tmp(py::buffer_info(
-            col_cpu.data_ptr(),
-            col_cpu.element_size(),
-            col_cpu.dtype() == torch::kUInt8
-                ? py::format_descriptor<uint8_t>::format()
-                : py::format_descriptor<float>::format(),
-            2,
-            col_shape,
-            col_strides
-        ));
-        colors_np = tmp;
+    cv::Mat image = image_rgb.clone();
+    if (deferDebugCall(
+            [this,
+             recording_name,
+             image,
+             iteration,
+             keyframe_id,
+             entity_path]() {
+                this->visualizeDebugImage(
+                    recording_name,
+                    image,
+                    iteration,
+                    keyframe_id,
+                    entity_path);
+            })) {
+        return;
     }
+
+    ensureInitialized();
+    if (!impl_) return;
+
+    py::gil_scoped_acquire gil;
+    py::array image_np(py::buffer_info(
+        image.data,
+        sizeof(uint8_t),
+        py::format_descriptor<uint8_t>::format(),
+        3,
+        {
+            static_cast<ssize_t>(image.rows),
+            static_cast<ssize_t>(image.cols),
+            static_cast<ssize_t>(3)
+        },
+        {
+            static_cast<ssize_t>(image.step),
+            static_cast<ssize_t>(3),
+            static_cast<ssize_t>(1)
+        }));
 
     try {
-        impl_->visualizer.attr("visualize_voxels_mesh")(
-            centers_np,
-            half_sizes_np,
-            colors_np,
-            20000,
-            iteration
-        );
+        impl_->visualizer.attr("visualize_image_recording")(
+            py::str(recording_name),
+            image_np,
+            py::str(entity_path),
+            iteration,
+            keyframe_id);
     } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeSVRasterMesh: "
+        std::cerr << "[RERUN] Python error in visualizeDebugImage: "
                   << e.what() << std::endl;
     }
 }
@@ -1920,161 +1910,6 @@ torch::Tensor RerunVisualizerBridge::computeGtProjectiveSdf(
                   << e.what() << std::endl;
     }
     return torch::Tensor();
-}
-
-void RerunVisualizerBridge::visualizeSdfVoxelsRecording(
-    const std::string& recording_name,
-    const torch::Tensor& centers,
-    const torch::Tensor& sizes,
-    const torch::Tensor& corner_points,
-    const torch::Tensor& computed_sdf,
-    const torch::Tensor& sdf_weights,
-    const torch::Tensor& corner_density,
-    const torch::Tensor& gt_sdf,
-    const torch::Tensor& voxel_colors,
-    const torch::Tensor& voxel_ids,
-    const torch::Tensor& source_sdf_mask,
-    const torch::Tensor& source_svraster_mask,
-    int iteration,
-    const std::string& gt_mesh_path,
-    bool align_gt_to_slam,
-    const std::string& gt_traj_path,
-    int align_min_pairs,
-    float surface_band_m,
-    float min_weight,
-    bool log_gt_mesh,
-    const std::string& entity_path)
-{
-    ensureInitialized();
-    if (!impl_) return;
-    if (!centers.defined() || centers.numel() == 0 ||
-        !sizes.defined() || sizes.numel() == 0 ||
-        !corner_points.defined() || corner_points.numel() == 0 ||
-        !computed_sdf.defined() || computed_sdf.numel() == 0 ||
-        !sdf_weights.defined() || sdf_weights.numel() == 0 ||
-        !corner_density.defined() || corner_density.numel() == 0 ||
-        !gt_sdf.defined() || gt_sdf.numel() == 0) {
-        return;
-    }
-
-    py::gil_scoped_acquire gil;
-    try {
-        struct TensorArray {
-            torch::Tensor tensor;
-            py::array array;
-        };
-        auto make_float_array = [](const torch::Tensor& tensor) -> TensorArray {
-            TensorArray out;
-            out.tensor = tensor.contiguous().to(torch::kCPU).to(torch::kFloat32);
-            std::vector<ssize_t> shape;
-            std::vector<ssize_t> strides;
-            shape.reserve(static_cast<size_t>(out.tensor.dim()));
-            strides.reserve(static_cast<size_t>(out.tensor.dim()));
-            for (int64_t d = 0; d < out.tensor.dim(); ++d) {
-                shape.push_back(static_cast<ssize_t>(out.tensor.size(d)));
-                strides.push_back(static_cast<ssize_t>(out.tensor.stride(d) * out.tensor.element_size()));
-            }
-            out.array = py::array(py::buffer_info(
-                out.tensor.data_ptr<float>(),
-                sizeof(float),
-                py::format_descriptor<float>::format(),
-                static_cast<ssize_t>(out.tensor.dim()),
-                shape,
-                strides));
-            return out;
-        };
-
-        TensorArray centers_np = make_float_array(centers);
-        TensorArray sizes_np = make_float_array(sizes);
-        TensorArray corner_points_np = make_float_array(corner_points);
-        TensorArray computed_sdf_np = make_float_array(computed_sdf);
-        TensorArray sdf_weights_np = make_float_array(sdf_weights);
-        TensorArray corner_density_np = make_float_array(corner_density);
-        TensorArray gt_sdf_np = make_float_array(gt_sdf);
-
-        py::object voxel_colors_obj = py::none();
-        TensorArray voxel_colors_np;
-        if (voxel_colors.defined() && voxel_colors.numel() > 0) {
-            voxel_colors_np = make_float_array(voxel_colors);
-            voxel_colors_obj = voxel_colors_np.array;
-        }
-
-        py::object voxel_ids_obj = py::none();
-        torch::Tensor voxel_ids_cpu;
-        py::array voxel_ids_np;
-        if (voxel_ids.defined() && voxel_ids.numel() > 0) {
-            voxel_ids_cpu = voxel_ids.contiguous().to(torch::kCPU).to(torch::kInt64).view({-1});
-            std::vector<ssize_t> shape{static_cast<ssize_t>(voxel_ids_cpu.size(0))};
-            std::vector<ssize_t> strides{static_cast<ssize_t>(voxel_ids_cpu.element_size())};
-            voxel_ids_np = py::array(py::buffer_info(
-                voxel_ids_cpu.data_ptr<int64_t>(),
-                sizeof(int64_t),
-                py::format_descriptor<int64_t>::format(),
-                1,
-                shape,
-                strides));
-            voxel_ids_obj = voxel_ids_np;
-        }
-
-        py::object source_sdf_obj = py::none();
-        py::object source_svraster_obj = py::none();
-        torch::Tensor source_sdf_cpu;
-        torch::Tensor source_svraster_cpu;
-        py::array source_sdf_np;
-        py::array source_svraster_np;
-        if (source_sdf_mask.defined() && source_sdf_mask.numel() > 0) {
-            source_sdf_cpu = source_sdf_mask.contiguous().to(torch::kCPU).to(torch::kBool).view({-1});
-            std::vector<ssize_t> shape{static_cast<ssize_t>(source_sdf_cpu.size(0))};
-            std::vector<ssize_t> strides{static_cast<ssize_t>(source_sdf_cpu.element_size())};
-            source_sdf_np = py::array(py::buffer_info(
-                source_sdf_cpu.data_ptr<bool>(),
-                sizeof(bool),
-                py::format_descriptor<bool>::format(),
-                1,
-                shape,
-                strides));
-            source_sdf_obj = source_sdf_np;
-        }
-        if (source_svraster_mask.defined() && source_svraster_mask.numel() > 0) {
-            source_svraster_cpu = source_svraster_mask.contiguous().to(torch::kCPU).to(torch::kBool).view({-1});
-            std::vector<ssize_t> shape{static_cast<ssize_t>(source_svraster_cpu.size(0))};
-            std::vector<ssize_t> strides{static_cast<ssize_t>(source_svraster_cpu.element_size())};
-            source_svraster_np = py::array(py::buffer_info(
-                source_svraster_cpu.data_ptr<bool>(),
-                sizeof(bool),
-                py::format_descriptor<bool>::format(),
-                1,
-                shape,
-                strides));
-            source_svraster_obj = source_svraster_np;
-        }
-
-        impl_->visualizer.attr("visualize_sdf_voxels_recording")(
-            py::str(recording_name),
-            centers_np.array,
-            sizes_np.array,
-            corner_points_np.array,
-            computed_sdf_np.array,
-            sdf_weights_np.array,
-            corner_density_np.array,
-            gt_sdf_np.array,
-            voxel_colors_obj,
-            voxel_ids_obj,
-            source_sdf_obj,
-            source_svraster_obj,
-            iteration,
-            py::str(gt_mesh_path),
-            align_gt_to_slam,
-            py::str(gt_traj_path),
-            align_min_pairs,
-            surface_band_m,
-            min_weight,
-            log_gt_mesh,
-            py::str(entity_path));
-    } catch (const py::error_already_set& e) {
-        std::cerr << "[RERUN] Python error in visualizeSdfVoxelsRecording: "
-                  << e.what() << std::endl;
-    }
 }
 
 } // namespace sv

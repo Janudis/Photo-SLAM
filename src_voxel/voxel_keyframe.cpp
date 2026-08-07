@@ -1,9 +1,7 @@
 #include "include_voxel/voxel_keyframe.h"
-#include "include/tensor_utils.h"              // <-- for EigenMatrix2TorchTensor
+#include "include_voxel/voxel_mapper_utils.h"
 #include <iostream>
 #include <cmath>
-
-using tensor_utils::EigenMatrix2TorchTensor;
 
 // Pose‐setter: 7‐number form
 void VoxelKeyframe::setPose(
@@ -76,8 +74,8 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     {
         float focal_length_x = static_cast<float>(camera.params_[0]);
         float focal_length_y = static_cast<float>(camera.params_[1]);
-        this->FoVx_ = graphics_utils::focal2fov(focal_length_x, camera.width_);
-        this->FoVy_ = graphics_utils::focal2fov(focal_length_y, camera.height_);
+        this->FoVx_ = sv::focalToFov(focal_length_x, camera.width_);
+        this->FoVy_ = sv::focalToFov(focal_length_y, camera.height_);
         this->set_camera_ = true;
         // std::cout << "voxel_keyframe.cpp: setCameraParams() Pinhole camera model with FoVx: "
         //           << this->FoVx_ << " and FoVy: " << this->FoVy_ << std::endl;
@@ -92,26 +90,10 @@ void VoxelKeyframe::setCameraParams(const sv::Camera& camera)
     }
 }
 
-void VoxelKeyframe::setPoints2D(const std::vector<Eigen::Vector2d>& points2D)
-{
-    this->points2D_.clear();
-    auto num_points2D = points2D.size();
-    this->points2D_.resize(num_points2D);
-    for (point2D_idx_t point2D_idx = 0; point2D_idx < num_points2D; ++point2D_idx) {
-        points2D_[point2D_idx].xy_ = points2D[point2D_idx];
-    }
-}
-void VoxelKeyframe::setPoint3DIdxForPoint2D(
-    const point2D_idx_t point2D_idx,
-    const point3D_id_t point3D_id)
-{
-    points2D_.at(point2D_idx).point3D_id_ = point3D_id;
-}
-
 void VoxelKeyframe::computeTransformTensors()
 {
     if (this->set_pose_ && this->set_camera_) {
-        this->world_view_transform_ = tensor_utils::EigenMatrix2TorchTensor(
+        this->world_view_transform_ = voxel_utils::eigenMatrixToTorchTensor(
             this->getWorld2View2(this->trans_, this->scale_),
             torch::kCUDA
         ).transpose(0, 1);
@@ -212,9 +194,9 @@ sv::MiniCam VoxelKeyframe::toMiniCam(int im_height, int im_width) const
     // pure camera pose:  Tcw_  is world→cam  ⇒  c2w = Tcw_.inverse()
     Eigen::Matrix4f w2c_eig = Tcw_.matrix().cast<float>();
     Eigen::Matrix4f c2w_eig = Tcw_.inverse().matrix().cast<float>();
-    torch::Tensor c2w = tensor_utils::EigenMatrix2TorchTensor(
+    torch::Tensor c2w = voxel_utils::eigenMatrixToTorchTensor(
                             c2w_eig, torch::kCPU);      // keep on CPU
-    torch::Tensor w2c = tensor_utils::EigenMatrix2TorchTensor(
+    torch::Tensor w2c = voxel_utils::eigenMatrixToTorchTensor(
                             w2c_eig, torch::kCPU);      // keep on CPU
     // std::cout << "voxel_keyframe.cpp: toMiniCam() FoVx_ = " << FoVx_ << std::endl;
 

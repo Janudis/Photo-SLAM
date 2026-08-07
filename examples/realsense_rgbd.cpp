@@ -38,7 +38,7 @@
 #include "ORB-SLAM3/include/System.h"
 
 #include "include/gaussian_mapper.h"
-#include "viewer/gaussian_imgui_viewer.h"
+#include "viewer/imgui_viewer.h"
 
 rs2_stream find_stream_to_align(const std::vector<rs2::stream_profile>& streams)
 {

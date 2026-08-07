@@ -7,7 +7,7 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "include/types.h"
+#include "include_voxel/voxel_types.h"
 
 namespace sv {
 

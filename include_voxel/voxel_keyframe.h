@@ -4,21 +4,27 @@
 /* -------------------------------------------------------------------------- */
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/mini_cam.h"
+#include "include_voxel/voxel_types.h"
 
 #include <torch/torch.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <string>
+#include <limits>
 #include <utility>
 #include <vector>
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 
-#include "include/types.h"
-#include "include/camera.h"
-#include "include/point2d.h"
-#include "include/general_utils.h"
-#include "include/graphics_utils.h"
-#include "include/tensor_utils.h"
+namespace sv {
+
+enum class LearnedDepthSource : std::uint8_t
+{
+    None = 0,
+    TandemMvs = 1,
+    Omnidata = 2,
+};
+
+} // namespace sv
 
 class VoxelKeyframe
 {
@@ -48,11 +54,6 @@ public:
     /* --------------------------------------------------------- camera stuff */
     void  setCameraParams(const sv::Camera& camera);
 
-    void setPoints2D(const std::vector<Eigen::Vector2d>& points2D);
-    void setPoint3DIdxForPoint2D(
-        const point2D_idx_t point2D_idx,
-        const point3D_id_t point3D_id);
-
     void computeTransformTensors();
     sv::MiniCam toMiniCam(int im_height = 480, int im_width = 640) const;
 
@@ -76,12 +77,13 @@ public:
 
     bool set_camera_ = false;
 
-    camera_id_t camera_id_;
+    sv::camera_id_t camera_id_;
     int camera_model_id_ = 0;
     sv::Camera cam_;  
 
     std::string img_filename_;
     int source_frame_id_ = -1;
+    double source_timestamp_ = std::numeric_limits<double>::quiet_NaN();
     cv::Mat img_undist_, img_auxiliary_undist_;
     torch::Tensor original_image_; ///< image
     int image_width_;              ///< image
@@ -119,7 +121,6 @@ public:
     torch::Tensor full_proj_transform_;     ///< transform tensors
     torch::Tensor camera_center_;           ///< transform tensors
 
-    std::vector<Point2D> points2D_;
     std::vector<float> kps_pixel_;
     std::vector<float> kps_point_local_;
 
@@ -132,6 +133,14 @@ public:
     std::size_t monocular_mvs_sparse_depth_count_ = 0;
     std::vector<Eigen::Vector2f> monocular_depth_anchor_pixels_;
     std::vector<float> monocular_depth_anchor_depths_;
+
+    // Accepted model depth in the ORB map gauge. MVS supplies its published
+    // confidence, while Omnidata supplies the alignment/consistency weight.
+    cv::Mat monocular_depth_prior_;
+    cv::Mat monocular_depth_confidence_;
+    sv::LearnedDepthSource monocular_depth_source_ =
+        sv::LearnedDepthSource::None;
+    int monocular_depth_prior_iteration_ = -1;
 
     bool done_inactive_geo_densify_ = false;
 };

@@ -161,11 +161,11 @@
  
      GaussianModelParams& getGaussianModelParams() { return this->model_params_; }
      void setColmapDataPath(std::filesystem::path colmap_path) { this->model_params_.source_path_ = colmap_path; }
-     void setSensorType(SystemSensorType sensor_type) { this->sensor_type_ = sensor_type; }
-     void setRuntimeFrameCount(int frame_count);
- 
+     void setSensorType(SystemSensorType sensor_type) { this->sensor_type_ = sensor_type; } 
      void loadPly(std::filesystem::path ply_path, std::filesystem::path camera_path = "");
  
+    void setRuntimeFrameCount(int frame_count);
+
  protected:
      bool hasMetInitialMappingConditions();
      bool hasMetIncrementalMappingConditions();
@@ -333,6 +333,7 @@
      bool record_rendered_image_;
      bool record_ground_truth_image_;
      bool record_loss_image_;
+     
      bool save_rendered_mesh_eval_ = false;
      float rendered_mesh_eval_voxel_size_m_ = 0.05f;
      float rendered_mesh_eval_min_weight_ = 2.0f;

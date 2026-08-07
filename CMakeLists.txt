@@ -61,22 +61,6 @@ find_package(realsense2)
 find_package(glog REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system thread)
 
-option(BUILD_NVBLOX_EXPERIMENT "Build the separate ORB-SLAM + nvblox RGB-D experiment" ON)
-if(BUILD_NVBLOX_EXPERIMENT)
-    set(NVBLOX_ROOT_DIR "${PROJECT_SOURCE_DIR}/third_party/nvblox")
-    set(NVBLOX_INCLUDE_DIR "${NVBLOX_ROOT_DIR}/nvblox/include")
-    set(NVBLOX_STDGPU_INCLUDE_DIR
-        "${NVBLOX_ROOT_DIR}/build/_deps/ext_stdgpu-src/src")
-    find_library(NVBLOX_LIB
-        NAMES nvblox_lib
-        PATHS "${NVBLOX_ROOT_DIR}/build/nvblox"
-        NO_DEFAULT_PATH)
-    if(NOT NVBLOX_LIB)
-        message(FATAL_ERROR
-            "BUILD_NVBLOX_EXPERIMENT=ON but third_party/nvblox/build/nvblox/libnvblox_lib.so was not found")
-    endif()
-endif()
-
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
@@ -248,29 +232,26 @@ target_include_directories(gaussian_mapper
 ##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-# add_library(gaussian_viewer SHARED
-#     viewer/drawer_utils.h
-#     viewer/imgui_viewer.cpp
-#     viewer/imgui_viewer.h
-#     viewer/map_drawer.cpp
-#     viewer/map_drawer.h)
-# target_link_libraries(gaussian_viewer
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-#     # gaussian_mapper
-#     voxel_core
-#     voxel_rasterizer
-#     imgui
-#     ${OpenCV_LIBRARIES}
-#     jsoncpp_lib
-#     "${TORCH_LIBRARIES}"
-#     glm::glm
-#     glfw
-#     OpenGL::GL)
+add_library(gaussian_viewer SHARED
+    viewer/drawer_utils.h
+    viewer/imgui_viewer.cpp
+    viewer/imgui_viewer.h
+    viewer/map_drawer.cpp
+    viewer/map_drawer.h)
+target_link_libraries(gaussian_viewer
+    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+    gaussian_mapper
+    imgui
+    ${OpenCV_LIBRARIES}
+    jsoncpp_lib
+    "${TORCH_LIBRARIES}"
+    glm::glm
+    glfw
+    OpenGL::GL)
 
-# target_include_directories(gaussian_viewer
-#     PUBLIC
-#     ${Python3_INCLUDE_DIRS}          # <--  add this line
-# )
+target_include_directories(gaussian_viewer
+    PUBLIC
+        ${Python3_INCLUDE_DIRS})
 ##################################################################################
 ##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
 ##################################################################################
@@ -314,7 +295,7 @@ target_link_libraries(tandem_mvsnet
             boost_thread)
 
 add_library(voxel_core
-        src/stereo_vision.cu
+        include_voxel/stereo_vision.cu
         src_voxel/laptop_precheck_profiler.cpp
         src_voxel/mapper_depth_registry.cpp
         src_voxel/voxel_trainer.cpp
@@ -326,13 +307,12 @@ add_library(voxel_core
         src_voxel/voxel_mapper_tsdf.cpp
         src_voxel/voxel_mapper_rerun.cpp
         src_voxel/voxel_mapper_utils.cpp
-        src_voxel/voxel_mapper_evaluation.cpp
+        src_voxel/voxel_mapper_supervision.cpp
         evaluation/mesh_extraction.cpp
         src_voxel/voxel_parameters.cpp
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
-        src_voxel/voxel_model_rerun.cpp
         src_voxel/voxel_svrecon_rasterizer.cpp
         src_voxel/tandem_mvs_backend.cpp
         src_voxel/omnidata_depth_backend.cpp
@@ -359,16 +339,15 @@ target_link_libraries(voxel_core
             glog::glog)
 
 add_library(voxel_viewer SHARED
-    viewer/drawer_utils.h
-    viewer/imgui_viewer.cpp
-    viewer/imgui_viewer.h
-    viewer/map_drawer.cpp
-    viewer/map_drawer.h)
+    include_voxel/viewer/voxel_drawer_utils.h
+    include_voxel/viewer/voxel_imgui_viewer.h
+    include_voxel/viewer/voxel_map_drawer.h
+    src_voxel/viewer/voxel_imgui_viewer.cpp
+    src_voxel/viewer/voxel_map_drawer.cpp)
 
 target_link_libraries(voxel_viewer
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-    voxel_core      # <-- Make sure voxel_core is linked
-    # voxel_rasterizer # <-- Ensure voxel_rasterizer is also linked
+    voxel_core
     imgui
     ${OpenCV_LIBRARIES}
     jsoncpp_lib
@@ -379,34 +358,8 @@ target_link_libraries(voxel_viewer
 
 target_include_directories(voxel_viewer
     PUBLIC
-    ${Python3_INCLUDE_DIRS}  # <-- Keep this if needed for Python integration
-)
-
-if(BUILD_NVBLOX_EXPERIMENT)
-    add_library(photoslam_nvblox STATIC
-        include_nvblox/nvblox_mapper.h
-        include_nvblox/nvblox_runner.h
-        src_nvblox/nvblox_mapper.cpp
-        src_nvblox/nvblox_runner.cpp)
-    target_include_directories(photoslam_nvblox
-        PUBLIC
-            ${PROJECT_SOURCE_DIR}
-            ${NVBLOX_INCLUDE_DIR}
-            ${NVBLOX_STDGPU_INCLUDE_DIR}
-            ${OpenCV_INCLUDE_DIRS}
-            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
-    target_link_libraries(photoslam_nvblox
-        PUBLIC
-            ${NVBLOX_LIB}
-            ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-            ${OpenCV_LIBRARIES}
-            Eigen3::Eigen
-            CUDA::cudart
-            glog::glog)
-    set_target_properties(photoslam_nvblox PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        BUILD_RPATH "${NVBLOX_ROOT_DIR}/build/nvblox")
-endif()
+        ${PROJECT_SOURCE_DIR}
+        ${Python3_INCLUDE_DIRS})
 
 ##################################################################################
 ##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
@@ -491,26 +444,6 @@ target_link_libraries(waymo_mono_voxel
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
 target_link_directories(waymo_mono_voxel PRIVATE
     /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
-
-add_executable(waymo_rgbd_voxel examples/waymo_rgbd_voxel.cpp)
-target_include_directories(waymo_rgbd_voxel PRIVATE
-    ${CMAKE_SOURCE_DIR}/include_voxel
-    pybind11::embed)
-target_link_libraries(waymo_rgbd_voxel
-    voxel_core
-    voxel_viewer
-    ${OpenCV_LIBS}
-    ${TORCH_LIBRARIES}
-    torch_python
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(waymo_rgbd_voxel PRIVATE
-    /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
-
-if(BUILD_NVBLOX_EXPERIMENT)
-    add_executable(replica_rgbd_nvblox examples/replica_rgbd_nvblox.cpp)
-    target_link_libraries(replica_rgbd_nvblox PRIVATE photoslam_nvblox)
-endif()
 
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -650,11 +583,6 @@ target_link_libraries(scannet_mono_voxel
 target_link_directories(scannet_mono_voxel PRIVATE
         /home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib)
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-if(BUILD_NVBLOX_EXPERIMENT)
-    add_executable(tum_rgbd_nvblox examples/tum_rgbd_nvblox.cpp)
-    target_link_libraries(tum_rgbd_nvblox PRIVATE photoslam_nvblox)
-endif()
 
 # Mesh evaluation utility (reconstruction mesh vs GT mesh)
 add_executable(mesh_eval

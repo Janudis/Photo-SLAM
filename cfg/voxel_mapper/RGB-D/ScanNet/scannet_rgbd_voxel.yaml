@@ -24,22 +24,21 @@ RGBD.max_depth: 10.0
 Mapper.inactive_geo_densify: 0 # optional Photo-SLAM inactive-geometry densification
 Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
-Mapper.rgbd_fill_render_holes: 0 # direct SVRaster-style alternative to TSDF-evidence completion
+Mapper.rgbd_fill_render_holes: 0 # direct alternative to TSDF-evidence completion
 Mapper.rgbd_fill_render_holes_initial_backfill: 0
 Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for each keyframe's pre-insertion hole detection
 
-Mapper.geometry_mode: "svrecon_sdf"
 Mapper.sdf_initialization_mode: "orb_prior" # nearby ORB corners use metric SDF; unsupported corners use a weak ORB-directed signed ramp
 Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance for signed nearest-point initialization
 
-# Hybrid RGB-D completion: residual holes update non-renderable nvblox-style
+# Hybrid RGB-D completion: residual holes update non-renderable projective TSDF
 # TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
 # promoted into the active SVRecon map.
 Mapper.rgbd_tsdf_evidence: 1
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
 Mapper.rgbd_tsdf_evidence_pixel_stride: 2 # match the octree-block-support hole sampling
 Mapper.rgbd_tsdf_evidence_trunc_vox: 3.0 # sample the RGB-D band [D-3v, D+3v]
-Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # nvblox TSDF maximum weight default
+Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # cap accumulated projective TSDF evidence
 Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
 Mapper.sdf_voxel_size_m: 0.05
 Mapper.sdf_init_trunc_vox: 4.0
@@ -86,6 +85,8 @@ Record.run_maps_stride: 1 # log every Nth keyframe into maps.rrd
 
 Record.rerun_rendered_mesh_eval: 0 # log the SVRecon progressive rendered-TSDF mesh to world/voxel_model_mesh/final
 Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
+Record.rerun_nvblox_mesh: 1
+Record.rerun_nvblox_mesh_path: "../../../../results/scannet_rgbd_nvblox/scene0000_00/online_orb/nvblox_color_mesh.ply"
 
 Record.save_rendered_mesh_eval: 1 # save common fixed-TSDF, SVRecon progressive-TSDF, and direct-SDF meshes
 Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
@@ -138,13 +139,9 @@ Optimization.prune_thres_final_at_target: 0.1
 Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
-Optimization.prune_surface_views_enable: 1 # pure SVRecon SDF pruning; optional multi-view refinement disabled
-Optimization.final_surface_prune_enable: 1
-Optimization.final_surface_min_views: 2
-Optimization.final_surface_depth_tolerance_vox: 1.0  # relax it if it prunes too much.
-Optimization.final_surface_min_sdf_span_vox: 0.05
-Optimization.final_surface_keep_connected: 1
-Optimization.final_surface_connected_hops: 2 # retain unsupported crossing cells only this many shared-corner hops from support
+Optimization.prune_surface_views_enable: 1
+Optimization.surface_min_views: 2
+Optimization.final_refinement_enable: 1
 # Subdivision
 Optimization.subdivide_from: 1200
 Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer

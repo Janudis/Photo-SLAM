@@ -19,7 +19,7 @@
 
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
-#include "viewer/imgui_viewer.h"
+#include "include_voxel/viewer/voxel_imgui_viewer.h"
 
 static void loadReplicaImages(
     const std::filesystem::path& image_dir,
@@ -197,11 +197,11 @@ int main(int argc, char** argv)
     std::thread training_thread(&VoxelMapper::run, voxel_mapper.get());
 
     std::thread viewer_thread;
-    std::shared_ptr<ImGuiViewer> viewer;
+    std::shared_ptr<VoxelImGuiViewer> viewer;
     if (use_viewer)
     {
-        viewer = std::make_shared<ImGuiViewer>(slam, voxel_mapper);
-        viewer_thread = std::thread(&ImGuiViewer::run, viewer.get());
+        viewer = std::make_shared<VoxelImGuiViewer>(slam, voxel_mapper);
+        viewer_thread = std::thread(&VoxelImGuiViewer::run, viewer.get());
     }
 
     const int num_images = static_cast<int>(rgb_files.size());

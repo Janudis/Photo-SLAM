@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
-"""Prepare one Waymo Open Dataset v2 segment for Photo-SLAM.
+"""Prepare one Waymo Open Dataset v2 monocular segment for Photo-SLAM.
 
-The default output is the existing monocular FRONT-camera sequence. With
-``--with-lidar-depth``, all Waymo LiDAR returns are projected into synchronized
-sparse metric depth maps for the RGB-D experiment. Vehicle poses are exported
-only for evaluation and are never fed to the SLAM system.
+Vehicle poses are exported only for evaluation and are never fed to the SLAM
+system.
 """
 
 from __future__ import annotations
@@ -43,17 +41,6 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="replace existing images and metadata in the output directory",
-    )
-    parser.add_argument(
-        "--with-lidar-depth",
-        action="store_true",
-        help="project all LiDARs into sparse FRONT-camera metric depth maps",
-    )
-    parser.add_argument(
-        "--lidar-projection-radius-px",
-        type=int,
-        default=2,
-        help="tracking-depth footprint radius at 960x640 (mapper depth remains exact)",
     )
     return parser.parse_args()
 
@@ -131,8 +118,6 @@ def write_lines(path: Path, header: List[str], lines: Iterable[str]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.lidar_projection_radius_px < 0:
-        raise ValueError("--lidar-projection-radius-px must be non-negative")
     segment_root = args.segment_root.resolve()
     output_root = args.output.resolve()
     image_root = output_root / "rgb"
@@ -219,7 +204,6 @@ def main() -> None:
     origin_from_world = np.linalg.inv(first_world_from_optical)
 
     manifest_lines: List[str] = []
-    rgbd_manifest_lines: List[str] = []
     trajectory_lines: List[str] = []
     frame_map_lines: List[str] = []
     for frame_index, row in enumerate(image_rows):
@@ -251,45 +235,11 @@ def main() -> None:
             f"{frame_index} {timestamp_micros} {relative_timestamp:.6f} rgb/{image_name}"
         )
 
-    lidar_depth_paths: Dict[int, str] = {}
-    mapper_lidar_depth_paths: Dict[int, str] = {}
-    if args.with_lidar_depth:
-        from waymo_v2_lidar import export_front_lidar_depth
-
-        lidar_depth_paths, mapper_lidar_depth_paths = export_front_lidar_depth(
-            segment_root=segment_root,
-            output_root=output_root,
-            timestamps_micros=timestamps,
-            camera=calibration,
-            world_from_vehicle=world_from_vehicle,
-            output_width=int(calibration["width"]) // 2,
-            output_height=int(calibration["height"]) // 2,
-            projection_radius_px=args.lidar_projection_radius_px,
-        )
-        for row in image_rows:
-            timestamp_micros = row["timestamp_micros"]
-            relative_timestamp = (timestamp_micros - first_timestamp) * 1.0e-6
-            frame_index = timestamps.index(timestamp_micros)
-            rgbd_manifest_lines.append(
-                f"{relative_timestamp:.6f} rgb/{frame_index:06d}.jpg "
-                f"{relative_timestamp:.6f} {lidar_depth_paths[timestamp_micros]} "
-                f"{mapper_lidar_depth_paths[timestamp_micros]}"
-            )
-
     write_lines(
         output_root / "rgb.txt",
         ["timestamp_seconds relative_image_path", "Waymo FRONT camera"],
         manifest_lines,
     )
-    if rgbd_manifest_lines:
-        write_lines(
-            output_root / "rgbd.txt",
-            [
-                "rgb_timestamp relative_rgb_path depth_timestamp tracking_depth mapper_depth",
-                "Waymo FRONT camera: dilated tracking depth and exact mapper depth in meters",
-            ],
-            rgbd_manifest_lines,
-        )
     write_lines(
         output_root / "groundtruth_camera_tum.txt",
         ["timestamp tx ty tz qx qy qz qw", "poses relative to the first optical camera"],
@@ -309,19 +259,12 @@ def main() -> None:
         "first_timestamp_micros": first_timestamp,
         "last_timestamp_micros": timestamps[-1],
         "duration_seconds": (timestamps[-1] - first_timestamp) * 1.0e-6,
-        "lidar_depth": bool(lidar_depth_paths),
-        "mapper_lidar_depth": bool(mapper_lidar_depth_paths),
-        "lidar_projection_radius_px": (
-            args.lidar_projection_radius_px if lidar_depth_paths else None
-        ),
     }
     with (output_root / "metadata.json").open("w", encoding="utf-8") as output:
         json.dump(metadata, output, indent=2)
         output.write("\n")
 
     print(f"Prepared {len(image_rows)} FRONT-camera frames in {output_root}")
-    if lidar_depth_paths:
-        print(f"Projected LiDAR depth maps: {len(lidar_depth_paths)}")
     print(f"Duration: {metadata['duration_seconds']:.3f} s")
 
 

@@ -1,8 +1,6 @@
 #include "include_voxel/voxel_mapper.h"
-#include "include/stereo_vision.h"
 #include "include_voxel/voxel_mapper_utils.h"
-#include "include/sh_utils.h"
-
+#include "include_voxel/voxel_mapper_supervision.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -126,6 +124,245 @@ void VoxelMapper::saveRerunRecordingsAtShutdown()
         sv::RerunVisualizerBridge::instance().saveDebugRecording(
             "maps",
             (rrd_dir / "maps.rrd").string());
+    }
+}
+
+void VoxelMapper::alignAndLogNvbloxReferenceMesh(
+    const std::filesystem::path& shutdown_dir)
+{
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.run_whole_run_ ||
+        !rerun_params_.rerun_nvblox_mesh_) {
+        return;
+    }
+
+    const std::filesystem::path source_mesh =
+        rerun_params_.rerun_nvblox_mesh_path_;
+    const std::filesystem::path source_trajectory =
+        source_mesh.parent_path() / "CameraTrajectory_TUM.txt";
+    if (!std::filesystem::exists(source_mesh) ||
+        !std::filesystem::exists(source_trajectory)) {
+        std::cerr << "[RERUN/nvblox] missing reference mesh or trajectory: "
+                  << source_mesh << ", " << source_trajectory << "\n";
+        return;
+    }
+
+    const std::filesystem::path rerun_dir = shutdown_dir / "rerun";
+    std::filesystem::create_directories(rerun_dir);
+    const std::filesystem::path target_trajectory =
+        rerun_dir / "monocular_keyframes_tum.txt";
+    const std::filesystem::path aligned_mesh =
+        rerun_dir / "nvblox_reference_aligned.ply";
+    const std::filesystem::path alignment_report =
+        rerun_dir / "nvblox_reference_alignment.txt";
+
+    // Use the reference run's exact frame timestamps. Replica stores integer
+    // frame IDs while ScanNet stores seconds, so deriving the convention from
+    // filenames or FPS would make the trajectory association dataset-specific.
+    std::vector<double> source_frame_timestamps;
+    {
+        std::ifstream source_poses(source_trajectory);
+        std::string line;
+        while (std::getline(source_poses, line)) {
+            if (line.empty() || line.front() == '#') {
+                continue;
+            }
+            std::istringstream fields(line);
+            double timestamp = std::numeric_limits<double>::quiet_NaN();
+            if (fields >> timestamp && std::isfinite(timestamp)) {
+                source_frame_timestamps.push_back(timestamp);
+            }
+        }
+    }
+
+    std::ofstream trajectory(target_trajectory);
+    if (!trajectory) {
+        std::cerr << "[RERUN/nvblox] cannot write target trajectory: "
+                  << target_trajectory << "\n";
+        return;
+    }
+    trajectory << std::fixed << std::setprecision(9);
+    std::size_t pose_count = 0;
+    if (scene_) {
+        for (const auto& [keyframe_id, keyframe] : scene_->keyframes()) {
+            if (!keyframe || !keyframe->set_pose_) {
+                continue;
+            }
+            double timestamp = keyframe->source_timestamp_;
+            int source_frame_id = keyframe->source_frame_id_;
+            if (source_frame_id < 0) {
+                source_frame_id = voxel_utils::parseFrameIdFromPath(
+                    keyframe->img_filename_);
+            }
+            if (source_frame_id >= 0 &&
+                source_frame_id <
+                    static_cast<int>(source_frame_timestamps.size())) {
+                timestamp = source_frame_timestamps[
+                    static_cast<std::size_t>(source_frame_id)];
+            }
+            if (!std::isfinite(timestamp)) {
+                timestamp = voxel_utils::parseFrameTimestampFromPath(
+                    keyframe->img_filename_);
+            }
+            if (!std::isfinite(timestamp)) {
+                timestamp = static_cast<double>(keyframe_id);
+            }
+
+            const Sophus::SE3d camera_to_world = keyframe->getPose().inverse();
+            const Eigen::Vector3d translation = camera_to_world.translation();
+            const Eigen::Quaterniond rotation =
+                camera_to_world.unit_quaternion().normalized();
+            trajectory << timestamp << ' '
+                       << translation.x() << ' '
+                       << translation.y() << ' '
+                       << translation.z() << ' '
+                       << rotation.x() << ' '
+                       << rotation.y() << ' '
+                       << rotation.z() << ' '
+                       << rotation.w() << '\n';
+            ++pose_count;
+        }
+    }
+    trajectory.close();
+    if (pose_count < 4) {
+        std::cerr << "[RERUN/nvblox] insufficient final keyframe poses: "
+                  << pose_count << "\n";
+        return;
+    }
+
+    sv::RerunVisualizerBridge& bridge =
+        sv::RerunVisualizerBridge::instance();
+    if (!bridge.alignReferencePlyMesh(
+            source_mesh.string(),
+            source_trajectory.string(),
+            target_trajectory.string(),
+            aligned_mesh.string(),
+            alignment_report.string())) {
+        std::cerr << "[RERUN/nvblox] Sim(3) alignment failed; reference mesh "
+                     "was not logged.\n";
+        return;
+    }
+
+    bridge.visualizeDebugPlyMesh(
+        "whole_run",
+        aligned_mesh.string(),
+        getIteration(),
+        "world/reference/nvblox_mesh",
+        /*static_mesh=*/true);
+}
+
+void VoxelMapper::logLearnedDepthMapsToWholeRunRerun()
+{
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.run_whole_run_ || !scene_) {
+        return;
+    }
+
+    struct DepthFrame
+    {
+        std::shared_ptr<VoxelKeyframe> keyframe;
+        cv::Mat gt_depth;
+    };
+    std::vector<DepthFrame> frames;
+    std::vector<std::pair<float, double>> scale_samples;
+
+    for (const auto& [keyframe_id, keyframe] : scene_->keyframes()) {
+        (void)keyframe_id;
+        if (!keyframe || keyframe->monocular_depth_prior_.empty() ||
+            keyframe->monocular_depth_source_ == sv::LearnedDepthSource::None) {
+            continue;
+        }
+
+        cv::Mat gt_depth;
+        voxel_eval::getKeyframeDepthMetersForEval(
+            keyframe,
+            keyframe->monocular_depth_prior_.rows,
+            keyframe->monocular_depth_prior_.cols,
+            gt_depth);
+        if (!gt_depth.empty()) {
+            const torch::Tensor model_depth = torch::from_blob(
+                keyframe->monocular_depth_prior_.data,
+                {keyframe->monocular_depth_prior_.rows,
+                 keyframe->monocular_depth_prior_.cols},
+                torch::TensorOptions().dtype(torch::kFloat32)).clone();
+            voxel_eval::DepthScaleFitStats stats;
+            if (voxel_eval::computeDepthScaleFitStats(
+                    model_depth,
+                    gt_depth,
+                    std::max(1.0e-8f, RGBD_min_depth_),
+                    1.0e6f,
+                    stats)) {
+                scale_samples.emplace_back(
+                    stats.scale,
+                    static_cast<double>(stats.overlap_count));
+            }
+        }
+        frames.push_back({keyframe, std::move(gt_depth)});
+    }
+    if (frames.empty()) {
+        return;
+    }
+
+    float model_to_metric_scale = 1.0f;
+    const bool has_metric_scale =
+        voxel_eval::computeWeightedMedianScale(
+            scale_samples, model_to_metric_scale);
+    std::cout << "[RERUN/depth] frames=" << frames.size()
+              << " gt_frames=" << scale_samples.size()
+              << " model_to_metric_scale="
+              << (has_metric_scale ? model_to_metric_scale : 1.0f)
+              << (has_metric_scale ? "" : " (unavailable)") << "\n";
+
+    constexpr float viz_min = 0.0f;
+    constexpr float viz_max = 6.0f;
+    const float valid_min = std::max(1.0e-8f, RGBD_min_depth_);
+    const float valid_max = std::min(RGBD_max_depth_, viz_max);
+    sv::RerunVisualizerBridge& bridge =
+        sv::RerunVisualizerBridge::instance();
+
+    for (const DepthFrame& frame : frames) {
+        const auto& keyframe = frame.keyframe;
+        cv::Mat model_depth_metric;
+        keyframe->monocular_depth_prior_.convertTo(
+            model_depth_metric,
+            CV_32FC1,
+            has_metric_scale ? model_to_metric_scale : 1.0f);
+        const cv::Mat model_rgb = voxel_eval::bgrToRgbImage(
+            voxel_eval::colorizeDepthMatJet(
+                model_depth_metric,
+                valid_min,
+                valid_max,
+                viz_min,
+                viz_max));
+        const int iteration = keyframe->monocular_depth_prior_iteration_ >= 0
+            ? keyframe->monocular_depth_prior_iteration_
+            : getIteration();
+        const char* model_entity =
+            keyframe->monocular_depth_source_ == sv::LearnedDepthSource::TandemMvs
+                ? "depth/model/mvs"
+                : "depth/model/omnidata";
+        bridge.visualizeDebugImage(
+            "whole_run",
+            model_rgb,
+            iteration,
+            static_cast<int>(keyframe->fid_),
+            model_entity);
+
+        if (!frame.gt_depth.empty()) {
+            const cv::Mat gt_rgb = voxel_eval::bgrToRgbImage(
+                voxel_eval::colorizeDepthMatJet(
+                    frame.gt_depth,
+                    valid_min,
+                    valid_max,
+                    viz_min,
+                    viz_max));
+            bridge.visualizeDebugImage(
+                "whole_run",
+                gt_rgb,
+                iteration,
+                static_cast<int>(keyframe->fid_),
+                "depth/ground_truth");
+        }
     }
 }
 
@@ -1118,24 +1355,6 @@ static bool getKeyframeDepthMetersForEval(
     return true;
 }
 
-static torch::Tensor normalizeBoolMaskOrZeros(
-    torch::Tensor mask,
-    const int64_t N,
-    const torch::Device& device)
-{
-    if (!mask.defined() || mask.numel() != N) {
-        return torch::zeros(
-            {N},
-            torch::TensorOptions().dtype(torch::kBool).device(device));
-    }
-    if (mask.dim() == 2 && mask.size(1) == 1) {
-        mask = mask.squeeze(1);
-    } else if (mask.dim() != 1) {
-        mask = mask.reshape({N});
-    }
-    return mask.to(device).to(torch::kBool).contiguous();
-}
-
 static inline torch::Tensor make_points_tensor_cpu_f32(
     const std::vector<Eigen::Vector3f>& pts)
 {
@@ -1216,7 +1435,7 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
          (live_colors.size(1) != 3 && live_colors.size(1) != 4))) {
         torch::Tensor sh0 = voxel_model_->sh0();
         if (sh0.defined() && sh0.dim() == 2 && sh0.size(0) == N) {
-            live_colors = (sh0 * sh_utils::C0 + 0.5f).clamp(0.0f, 1.0f).contiguous();
+            live_colors = (sh0 * sv::kSHC0 + 0.5f).clamp(0.0f, 1.0f).contiguous();
             // An SVRecon cell has no independent per-voxel opacity. Its rendered
             // alpha depends on ordered SDF samples along a camera ray, so the SDF
             // corner mean is not a meaningful box alpha. Display allocated cells
@@ -1255,22 +1474,22 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
             .contiguous();
 
     torch::Tensor orb_mask =
-        normalizeBoolMaskOrZeros(voxel_model_->orbVoxelMask(), N, dev);
+        voxel_utils::normalizeBoolMaskOrZeros(voxel_model_->orbVoxelMask(), N, dev);
     torch::Tensor inactive_geo_mask =
-        normalizeBoolMaskOrZeros(voxel_model_->inactiveGeoVoxelMask(), N, dev);
+        voxel_utils::normalizeBoolMaskOrZeros(voxel_model_->inactiveGeoVoxelMask(), N, dev);
     torch::Tensor rgbd_fill_mask =
-        normalizeBoolMaskOrZeros(voxel_model_->rgbdFillRenderHolesVoxelMask(), N, dev);
+        voxel_utils::normalizeBoolMaskOrZeros(voxel_model_->rgbdFillRenderHolesVoxelMask(), N, dev);
     torch::Tensor monocular_rendered_depth_mask =
-        normalizeBoolMaskOrZeros(
+        voxel_utils::normalizeBoolMaskOrZeros(
             voxel_model_->monocularRenderedDepthVoxelMask(), N, dev);
     torch::Tensor monocular_mvs_mask =
-        normalizeBoolMaskOrZeros(
+        voxel_utils::normalizeBoolMaskOrZeros(
             voxel_model_->monocularMvsVoxelMask(), N, dev);
     torch::Tensor monocular_omnidata_mask =
-        normalizeBoolMaskOrZeros(
+        voxel_utils::normalizeBoolMaskOrZeros(
             voxel_model_->monocularOmnidataVoxelMask(), N, dev);
     torch::Tensor active_mask =
-        normalizeBoolMaskOrZeros(voxel_model_->activeRenderableMask(), N, dev);
+        voxel_utils::normalizeBoolMaskOrZeros(voxel_model_->activeRenderableMask(), N, dev);
     torch::Tensor active_source_count =
         (orb_mask.to(torch::kInt32) +
          inactive_geo_mask.to(torch::kInt32) +
@@ -1337,7 +1556,7 @@ void VoxelMapper::logWholeRunLiveVoxelsToRerun(
             const std::array<float, 4>& fallback_rgba,
             bool force_log)
     {
-        torch::Tensor mask = normalizeBoolMaskOrZeros(mask_in, N, dev);
+        torch::Tensor mask = voxel_utils::normalizeBoolMaskOrZeros(mask_in, N, dev);
         torch::Tensor idx = mask.nonzero().squeeze(1);
         if ((!idx.defined() || idx.numel() <= 0) && !force_log) {
             return;
@@ -1450,7 +1669,7 @@ void VoxelMapper::logSvreconDebugVoxelMaskToRerun(
 
     const int64_t N = centers.size(0);
     const torch::Device dev = centers.device();
-    torch::Tensor mask = normalizeBoolMaskOrZeros(mask_in, N, dev);
+    torch::Tensor mask = voxel_utils::normalizeBoolMaskOrZeros(mask_in, N, dev);
     torch::Tensor idx = mask.nonzero().squeeze(1);
     const int64_t K = idx.defined() ? idx.numel() : 0;
 
@@ -1480,7 +1699,7 @@ void VoxelMapper::logSvreconDebugVoxelMaskToRerun(
         torch::Tensor sh0 = voxel_model_->sh0();
         if (sh0.defined() && sh0.dim() == 2 && sh0.size(0) == N) {
             torch::Tensor rgb =
-                (sh0.index_select(0, idx_dev) * sh_utils::C0 + 0.5f)
+                (sh0.index_select(0, idx_dev) * sv::kSHC0 + 0.5f)
                     .clamp(0.0f, 1.0f);
             selected_colors = torch::ones(
                 {K, 4}, rgb.options());
@@ -1535,9 +1754,8 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
     const torch::Tensor& pruned_by_surface_views_in,
     const torch::Tensor& pruned_by_near_camera_in,
     const torch::Tensor& pruned_by_far_in,
-    const torch::Tensor& pruned_by_final_special_near_in,
-    const torch::Tensor& pruned_by_final_surface_in,
-    const torch::Tensor& pruned_by_monocular_covisibility_in)
+    const torch::Tensor& pruned_by_monocular_covisibility_in,
+    const torch::Tensor& pruned_by_final_refinement_in)
 {
     if (!rerun_params_.enable_rerun_ ||
         (!rerun_params_.run_whole_run_ &&
@@ -1657,30 +1875,6 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 .contiguous()
                 .view({K});
     }
-    torch::Tensor final_special_near_mask = torch::zeros(
-        {K},
-        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-    if (pruned_by_final_special_near_in.defined() &&
-        pruned_by_final_special_near_in.numel() == K) {
-        final_special_near_mask =
-            pruned_by_final_special_near_in.detach()
-                .to(torch::kCPU)
-                .to(torch::kBool)
-                .contiguous()
-                .view({K});
-    }
-    torch::Tensor final_surface_mask = torch::zeros(
-        {K},
-        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-    if (pruned_by_final_surface_in.defined() &&
-        pruned_by_final_surface_in.numel() == K) {
-        final_surface_mask =
-            pruned_by_final_surface_in.detach()
-                .to(torch::kCPU)
-                .to(torch::kBool)
-                .contiguous()
-                .view({K});
-    }
     torch::Tensor monocular_covisibility_mask = torch::zeros(
         {K},
         torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
@@ -1693,8 +1887,19 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 .contiguous()
                 .view({K});
     }
-    // Keep concrete prune causes disjoint. The final-special operation is
-    // represented by its near and final-surface subcauses.
+    torch::Tensor final_refinement_mask = torch::zeros(
+        {K},
+        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+    if (pruned_by_final_refinement_in.defined() &&
+        pruned_by_final_refinement_in.numel() == K) {
+        final_refinement_mask =
+            pruned_by_final_refinement_in.detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .contiguous()
+                .view({K});
+    }
+    // Keep concrete prune causes disjoint.
     surface_views_mask =
         (surface_views_mask & (~sdf_mask)).to(torch::kBool);
     near_camera_mask =
@@ -1704,19 +1909,14 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         (far_mask & (~sdf_mask) & (~surface_views_mask) &
          (~near_camera_mask))
             .to(torch::kBool);
-    final_special_near_mask =
-        (final_special_near_mask & (~sdf_mask) & (~surface_views_mask) &
-         (~near_camera_mask) & (~far_mask))
-            .to(torch::kBool);
-    final_surface_mask =
-        (final_surface_mask & (~sdf_mask) & (~surface_views_mask) &
-         (~near_camera_mask) & (~far_mask) &
-         (~final_special_near_mask))
-            .to(torch::kBool);
     monocular_covisibility_mask =
         (monocular_covisibility_mask & (~sdf_mask) &
-         (~surface_views_mask) & (~near_camera_mask) & (~far_mask) &
-         (~final_special_near_mask) & (~final_surface_mask))
+         (~surface_views_mask) & (~near_camera_mask) & (~far_mask))
+            .to(torch::kBool);
+    final_refinement_mask =
+        (final_refinement_mask & (~sdf_mask) & (~surface_views_mask) &
+         (~near_camera_mask) & (~far_mask) &
+         (~monocular_covisibility_mask))
             .to(torch::kBool);
 
     torch::Tensor grid_origin;
@@ -1836,26 +2036,19 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         rerun_state_.whole_run_pruned_far_colors_accum_,
         "world/pruned_voxels/source/far");
     append_source(
-        final_special_near_mask,
-        rerun_state_.whole_run_pruned_near_centers_accum_,
-        rerun_state_.whole_run_pruned_near_sizes_accum_,
-        rerun_state_.whole_run_pruned_near_levels_accum_,
-        rerun_state_.whole_run_pruned_near_colors_accum_,
-        "world/pruned_voxels/source/final_special/near");
-    append_source(
-        final_surface_mask,
-        rerun_state_.whole_run_pruned_final_surface_centers_accum_,
-        rerun_state_.whole_run_pruned_final_surface_sizes_accum_,
-        rerun_state_.whole_run_pruned_final_surface_levels_accum_,
-        rerun_state_.whole_run_pruned_final_surface_colors_accum_,
-        "world/pruned_voxels/source/final_special/final_surface");
-    append_source(
         monocular_covisibility_mask,
         rerun_state_.whole_run_pruned_monocular_covis_centers_accum_,
         rerun_state_.whole_run_pruned_monocular_covis_sizes_accum_,
         rerun_state_.whole_run_pruned_monocular_covis_levels_accum_,
         rerun_state_.whole_run_pruned_monocular_covis_colors_accum_,
         "world/pruned_voxels/source/monocular_covisibility");
+    append_source(
+        final_refinement_mask,
+        rerun_state_.whole_run_pruned_final_refinement_centers_accum_,
+        rerun_state_.whole_run_pruned_final_refinement_sizes_accum_,
+        rerun_state_.whole_run_pruned_final_refinement_levels_accum_,
+        rerun_state_.whole_run_pruned_final_refinement_colors_accum_,
+        "world/pruned_voxels/source/final_refinement");
 }
 
 void VoxelMapper::logCurrentOrbMapPointsToReconstructionRerun(int iteration)

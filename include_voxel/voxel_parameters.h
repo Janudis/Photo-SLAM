@@ -47,7 +47,7 @@ public:
         float geo_lr      = 0.025f,    // cfg.optimizer.geo_lr
         float sh0_lr      = 0.010f,    // cfg.optimizer.sh0_lr
         float shs_lr      = 0.00025f,  // cfg.optimizer.shs_lr
-        // Adam hyper-params (match SVRaster)
+        // Adam hyperparameters used by the SVRecon optimizer.
         float optim_beta1 = 0.1f,
         float optim_beta2 = 0.999f,
         float optim_eps   = 1e-15f,
@@ -62,7 +62,6 @@ public:
         bool  filter_near_voxels_ = true,
         bool  prune_far_voxels_ = true,
         bool  prune_near_voxels_geometric_ = false,
-        bool  final_special_prune_enable_ = true,
         // Pruning
         int   prune_from_            = 1000,
         int   prune_until_           = 18000,
@@ -133,14 +132,9 @@ public:
     bool filter_near_voxels_;
     bool prune_far_voxels_;
     bool prune_near_voxels_geometric_;
-    bool final_special_prune_enable_;
     bool prune_surface_views_enable_ = false;
-    bool final_surface_prune_enable_ = false;
-    int final_surface_min_views_ = 1;
-    float final_surface_depth_tolerance_vox_ = 0.5f;
-    float final_surface_min_sdf_span_vox_ = 0.1f;
-    bool final_surface_keep_connected_ = true;
-    int final_surface_connected_hops_ = 2;
+    int surface_min_views_ = 4;
+    bool final_refinement_enable_ = false;
     int prune_from_;
     int prune_until_;
     float prune_thres_init_;
@@ -181,6 +175,12 @@ public:
     int   rgbd_depth_from_ = 3000;
     int   rgbd_depth_end_ = 20000;
     float rgbd_depth_end_mult_ = 0.1f;
+    float lambda_monocular_depth_ = 0.0f;
+    int   monocular_depth_from_ = 1000;
+    int   monocular_depth_end_ = 15000;
+    float monocular_depth_end_mult_ = 0.1f;
+    float monocular_depth_alpha_min_ = 0.5f;
+    float monocular_depth_confidence_min_ = 0.0f;
     float lambda_rgbd_sdf_ = 0.0f;
     int   rgbd_sdf_from_ = 0;
     int   rgbd_sdf_end_ = 15000;
@@ -218,4 +218,11 @@ public:
     float rgbd_normal_end_mult_ = 0.1f;
     int   rgbd_normal_ks_ = 3;
     float rgbd_normal_tol_deg_ = 90.0f;
+    float lambda_monocular_normal_ = 0.0f;
+    int   monocular_normal_from_ = 1000;
+    int   monocular_normal_end_ = 15000;
+    float monocular_normal_end_mult_ = 0.1f;
+    int   monocular_normal_ks_ = 3;
+    float monocular_normal_tol_deg_ = 90.0f;
+    float monocular_normal_max_depth_jump_rel_ = 0.05f;
 };

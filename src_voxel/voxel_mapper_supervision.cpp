@@ -1,4 +1,4 @@
-#include "include_voxel/voxel_mapper_evaluation.h"
+#include "include_voxel/voxel_mapper_supervision.h"
 #include "include_voxel/voxel_mapper.h"
 #include "include_voxel/voxel_mapper_utils.h"
 
@@ -19,6 +19,213 @@
 #include "ORB-SLAM3/include/System.h"
 
 namespace voxel_eval {
+namespace {
+
+torch::Tensor gaussianWindow1d(
+    const int window_size,
+    const float sigma,
+    const torch::DeviceType device_type)
+{
+    std::vector<float> values(window_size);
+    for (int x = 0; x < window_size; ++x) {
+        const int offset = x - window_size / 2;
+        values[x] = std::exp(
+            -offset * offset / (2.0f * sigma * sigma));
+    }
+    torch::Tensor gaussian = torch::tensor(
+        values, torch::TensorOptions().device(device_type));
+    return gaussian / gaussian.sum();
+}
+
+torch::Tensor createSsimWindow(
+    const int window_size,
+    const int64_t channels,
+    const torch::DeviceType device_type)
+{
+    torch::Tensor window_1d =
+        gaussianWindow1d(window_size, 1.5f, device_type).unsqueeze(1);
+    torch::Tensor window_2d =
+        window_1d.mm(window_1d.t()).to(torch::kFloat32)
+            .unsqueeze(0).unsqueeze(0);
+    return window_2d.expand(
+        {channels, 1, window_size, window_size}).contiguous();
+}
+
+torch::Tensor ssimWithWindow(
+    const torch::Tensor& image_1,
+    const torch::Tensor& image_2,
+    const torch::Tensor& window,
+    const int window_size,
+    const int64_t channels,
+    const bool size_average)
+{
+    const int padding = window_size / 2;
+    const auto options = torch::nn::functional::Conv2dFuncOptions()
+        .padding(padding).groups(channels);
+    torch::Tensor mu_1 = torch::nn::functional::conv2d(
+        image_1, window, options);
+    torch::Tensor mu_2 = torch::nn::functional::conv2d(
+        image_2, window, options);
+    torch::Tensor mu_1_sq = mu_1.square();
+    torch::Tensor mu_2_sq = mu_2.square();
+    torch::Tensor mu_1_mu_2 = mu_1 * mu_2;
+    torch::Tensor sigma_1_sq = torch::nn::functional::conv2d(
+        image_1 * image_1, window, options) - mu_1_sq;
+    torch::Tensor sigma_2_sq = torch::nn::functional::conv2d(
+        image_2 * image_2, window, options) - mu_2_sq;
+    torch::Tensor sigma_12 = torch::nn::functional::conv2d(
+        image_1 * image_2, window, options) - mu_1_mu_2;
+    constexpr double kC1 = 0.01 * 0.01;
+    constexpr double kC2 = 0.03 * 0.03;
+    torch::Tensor ssim_map =
+        ((2.0 * mu_1_mu_2 + kC1) * (2.0 * sigma_12 + kC2)) /
+        ((mu_1_sq + mu_2_sq + kC1) *
+         (sigma_1_sq + sigma_2_sq + kC2));
+    return size_average
+        ? ssim_map.mean()
+        : ssim_map.mean(1).mean(1).mean(1);
+}
+
+torch::Tensor sparseLossMap2d(
+    const torch::Tensor& input,
+    const char* name)
+{
+    torch::Tensor map = input;
+    if (map.dim() == 4 && map.size(0) == 1 && map.size(1) == 1) {
+        return map.index({0, 0});
+    }
+    if (map.dim() == 3 && (map.size(0) == 1 || map.size(0) == 3)) {
+        return map.index({0});
+    }
+    TORCH_CHECK(
+        map.dim() == 2,
+        name,
+        " must have shape [H,W], [1,H,W], [3,H,W], or [1,1,H,W]; got ",
+        map.sizes());
+    return map;
+}
+
+} // namespace
+
+torch::Tensor l1Loss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target)
+{
+    return torch::abs(prediction - target).mean();
+}
+
+torch::Tensor mseLoss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target)
+{
+    return torch::nn::functional::mse_loss(prediction, target);
+}
+
+torch::Tensor huberLoss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target,
+    const float threshold)
+{
+    torch::Tensor absolute_error = (prediction - target).abs();
+    torch::Tensor l1 = absolute_error.mean(0);
+    torch::Tensor l2 = absolute_error.square().mean(0);
+    return torch::where(
+        l1 < threshold,
+        l2,
+        2.0f * threshold * l1 - threshold * threshold).mean();
+}
+
+torch::Tensor psnr(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target)
+{
+    torch::Tensor mse = (prediction - target).square().mean();
+    return 10.0f * torch::log10(1.0f / mse);
+}
+
+torch::Tensor ssim(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target,
+    const torch::DeviceType device_type,
+    const int window_size,
+    const bool size_average)
+{
+    const int64_t channels = prediction.size(-3);
+    torch::Tensor window = createSsimWindow(
+        window_size, channels, device_type).type_as(prediction);
+    return ssimWithWindow(
+        prediction,
+        target,
+        window,
+        window_size,
+        channels,
+        size_average);
+}
+
+torch::Tensor fastSsimLoss(
+    torch::Tensor prediction,
+    torch::Tensor target)
+{
+    if (prediction.dim() == 3) {
+        prediction = prediction.unsqueeze(0);
+        target = target.unsqueeze(0);
+    }
+    const torch::DeviceType device_type =
+        prediction.is_cuda() ? torch::kCUDA : torch::kCPU;
+    return 1.0f - ssim(prediction, target, device_type);
+}
+
+torch::Tensor probabilityConcentrationLoss(const torch::Tensor& probability)
+{
+    return (probability.square() * (1.0f - probability).square()).mean();
+}
+
+torch::Tensor sparseDepthLoss(
+    const torch::Tensor& raw_transmittance,
+    const torch::Tensor& raw_depth,
+    const torch::Tensor& sparse_uv,
+    const torch::Tensor& sparse_depth)
+{
+    TORCH_CHECK(raw_transmittance.defined(), "raw transmittance is undefined");
+    TORCH_CHECK(raw_depth.defined(), "raw depth is undefined");
+    TORCH_CHECK(sparse_uv.defined(), "sparse UV coordinates are undefined");
+    TORCH_CHECK(sparse_depth.defined(), "sparse depth is undefined");
+
+    torch::Tensor depth = sparseLossMap2d(raw_depth, "raw depth");
+    torch::Tensor transmittance = sparseLossMap2d(
+        raw_transmittance, "raw transmittance");
+    depth = depth / (1.0f - transmittance).clamp_min(1.0e-4f);
+
+    TORCH_CHECK(
+        sparse_uv.dim() == 2 && sparse_uv.size(1) == 2,
+        "sparse UV coordinates must have shape [N,2], got ",
+        sparse_uv.sizes());
+    torch::Tensor target_depth = sparse_depth;
+    if (target_depth.dim() == 2 && target_depth.size(1) == 1) {
+        target_depth = target_depth.squeeze(1);
+    }
+    TORCH_CHECK(
+        target_depth.dim() == 1,
+        "sparse depth must have shape [N] or [N,1], got ",
+        sparse_depth.sizes());
+    TORCH_CHECK(
+        target_depth.size(0) == sparse_uv.size(0),
+        "sparse UV and depth counts differ: ",
+        sparse_uv.size(0), " vs ", target_depth.size(0));
+
+    torch::Tensor sampled_depth = torch::nn::functional::grid_sample(
+        depth.unsqueeze(0).unsqueeze(0),
+        sparse_uv.unsqueeze(0).unsqueeze(0),
+        torch::nn::functional::GridSampleFuncOptions()
+            .mode(torch::kBilinear)
+            .padding_mode(torch::kZeros)
+            .align_corners(false)).squeeze();
+    return torch::nn::functional::smooth_l1_loss(
+        sampled_depth,
+        target_depth,
+        torch::nn::functional::SmoothL1LossFuncOptions()
+            .reduction(torch::kMean));
+}
 
 torch::Tensor tensorToEvalMap(const torch::Tensor& tensor, int preferred_channel)
 {
@@ -83,7 +290,7 @@ torch::Tensor tensorToEvalMapExactChannel(
 torch::Tensor depthTensorToEvalMap(const torch::Tensor& depth_tensor)
 {
     // For GT-vs-render depth visualization/evaluation, prefer the surface-like
-    // median depth channel when available. This matches SVRaster mesh/fusion
+    // median depth channel when available. This matches rendered mesh/fusion
     // utilities better than the alpha-weighted mean-depth channel.
     return tensorToEvalMap(depth_tensor, /*preferred_channel=*/2);
 }
@@ -530,7 +737,7 @@ bool renderPkgToNormalForEval(
     return true;
 }
 
-torch::Tensor depth2normalSVRaster(
+torch::Tensor depthToNormal(
     const sv::MiniCam& cam,
     const torch::Tensor& depth,
     int ks,
@@ -562,18 +769,15 @@ torch::Tensor depth2normalSVRaster(
     torch::Tensor y = (vv - cam.cy) / fy;
     torch::Tensor z = torch::ones_like(x);
 
+    // SVRecon's compute_rd() keeps camera-ray z equal to one. Its rendered
+    // depth, TANDEM depth, and aligned Omnidata depth are therefore camera-Z
+    // values rather than Euclidean ray ranges.
     torch::Tensor rd_cam = torch::stack({x, y, z}, 0);
-    rd_cam = torch::nn::functional::normalize(
-        rd_cam,
-        torch::nn::functional::NormalizeFuncOptions().dim(0).eps(1.0e-12));
 
     torch::Tensor c2w = cam.c2w.to(depth.device(), depth.scalar_type());
     torch::Tensor R = c2w.index({Slice(0, 3), Slice(0, 3)});
     torch::Tensor cam_pos = c2w.index({Slice(0, 3), 3}).view({3, 1, 1});
     torch::Tensor rd_world = torch::matmul(R, rd_cam.view({3, H * W})).view({3, H, W});
-    rd_world = torch::nn::functional::normalize(
-        rd_world,
-        torch::nn::functional::NormalizeFuncOptions().dim(0).eps(1.0e-12));
 
     torch::Tensor pts = cam_pos + rd_world * depth.unsqueeze(0);
     ks = std::max(3, ks);
@@ -708,7 +912,7 @@ torch::Tensor normalDepthConsistencyLossSvrecon(
 
     constexpr float kPi = 3.14159265358979323846f;
     const float tol_cos = std::cos(tol_deg * kPi / 180.0f);
-    torch::Tensor n_mean = depth2normalSVRaster(cam, render_depth, ks, tol_cos);
+    torch::Tensor n_mean = depthToNormal(cam, render_depth, ks, tol_cos);
 
     torch::Tensor target = render_alpha.square();
     n_mean = n_mean * render_alpha.unsqueeze(0);
@@ -1285,7 +1489,8 @@ bool getKeyframeDepthMetersForEval(
         }
     } else {
         if (!voxel_utils::loadReplicaDepthFromRgbPath(pkf->img_filename_, depth_meters) &&
-            !voxel_utils::loadTumDepthFromRgbPath(pkf->img_filename_, depth_meters)) {
+            !voxel_utils::loadTumDepthFromRgbPath(pkf->img_filename_, depth_meters) &&
+            !voxel_utils::loadScanNetDepthFromRgbPath(pkf->img_filename_, depth_meters)) {
             return false;
         }
     }
@@ -1310,6 +1515,167 @@ bool getKeyframeDepthMetersForEval(
 
 } // namespace voxel_eval
 
+namespace {
+
+torch::Tensor supervisionZero(const torch::Device& device)
+{
+    return torch::zeros(
+        {1},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+}
+
+float supervisionScheduleMultiplier(
+    const int iteration,
+    const int iter_from,
+    const int iter_end,
+    const float end_multiplier)
+{
+    if (iter_end <= iter_from || end_multiplier == 1.0f) {
+        return 1.0f;
+    }
+    const float ratio = std::clamp(
+        static_cast<float>(iteration - iter_from) /
+            static_cast<float>(iter_end - iter_from),
+        0.0f,
+        1.0f);
+    return std::pow(end_multiplier, ratio);
+}
+
+torch::Tensor floatMatToTensor(
+    const cv::Mat& input,
+    const torch::Device& device)
+{
+    if (input.empty() || input.type() != CV_32FC1) {
+        return torch::Tensor();
+    }
+    const cv::Mat continuous = input.isContinuous() ? input : input.clone();
+    return torch::from_blob(
+               const_cast<float*>(continuous.ptr<float>()),
+               {continuous.rows, continuous.cols},
+               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+        .clone()
+        .to(device, torch::kFloat32)
+        .contiguous();
+}
+
+torch::Tensor resizeMapBilinear(
+    const torch::Tensor& map,
+    const int64_t height,
+    const int64_t width)
+{
+    if (!map.defined() || map.dim() != 2) {
+        return torch::Tensor();
+    }
+    if (map.size(0) == height && map.size(1) == width) {
+        return map;
+    }
+    return torch::nn::functional::interpolate(
+               map.unsqueeze(0).unsqueeze(0),
+               torch::nn::functional::InterpolateFuncOptions()
+                   .size(std::vector<int64_t>{height, width})
+                   .mode(torch::kBilinear)
+                   .align_corners(false))
+        .squeeze(0)
+        .squeeze(0);
+}
+
+torch::Tensor validDepthContinuityMask(
+    const torch::Tensor& depth,
+    const torch::Tensor& valid,
+    int kernel_size,
+    const float max_relative_jump)
+{
+    using namespace torch::indexing;
+
+    torch::Tensor support = voxel_eval::validDepthSupportMask(
+        valid, kernel_size);
+    if (max_relative_jump <= 0.0f || depth.dim() != 2 ||
+        !support.any().item<bool>()) {
+        return support;
+    }
+
+    kernel_size = std::max(3, kernel_size);
+    if ((kernel_size % 2) == 0) {
+        ++kernel_size;
+    }
+    const int64_t height = depth.size(0);
+    const int64_t width = depth.size(1);
+    const int64_t pad = kernel_size / 2;
+    if (height <= 2 * pad || width <= 2 * pad) {
+        return torch::zeros_like(
+            valid, torch::TensorOptions().dtype(torch::kBool));
+    }
+
+    const torch::Tensor center = depth.index({
+        Slice(pad, height - pad),
+        Slice(pad, width - pad)});
+    torch::Tensor continuous = support.index({
+        Slice(pad, height - pad),
+        Slice(pad, width - pad)}).clone();
+    const torch::Tensor tolerance =
+        max_relative_jump * center.abs().clamp_min(1.0e-6f);
+    for (int64_t dy = -pad; dy <= pad; ++dy) {
+        for (int64_t dx = -pad; dx <= pad; ++dx) {
+            const torch::Tensor neighbor = depth.index({
+                Slice(pad + dy, height - pad + dy),
+                Slice(pad + dx, width - pad + dx)});
+            continuous = continuous & ((neighbor - center).abs() <= tolerance);
+        }
+    }
+
+    torch::Tensor result = torch::zeros_like(
+        valid, torch::TensorOptions().dtype(torch::kBool));
+    result.index_put_({
+        Slice(pad, height - pad),
+        Slice(pad, width - pad)}, continuous);
+    return result;
+}
+
+bool learnedDepthPriorToTensors(
+    const std::shared_ptr<VoxelKeyframe>& keyframe,
+    const torch::Device& device,
+    torch::Tensor& depth,
+    torch::Tensor& confidence)
+{
+    depth = torch::Tensor();
+    confidence = torch::Tensor();
+    if (!keyframe || keyframe->monocular_depth_prior_.empty() ||
+        keyframe->monocular_depth_confidence_.empty() ||
+        keyframe->monocular_depth_prior_.size() !=
+            keyframe->monocular_depth_confidence_.size()) {
+        return false;
+    }
+    depth = floatMatToTensor(keyframe->monocular_depth_prior_, device);
+    confidence = floatMatToTensor(
+        keyframe->monocular_depth_confidence_, device);
+    return depth.defined() && confidence.defined() &&
+           depth.sizes() == confidence.sizes();
+}
+
+bool renderAlphaMap(
+    const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+    torch::Tensor& alpha)
+{
+    auto it = render_pkg.find("raw_T");
+    if (it == render_pkg.end() || !it->second.defined()) {
+        it = render_pkg.find("T");
+    }
+    if (it == render_pkg.end() || !it->second.defined()) {
+        alpha = torch::Tensor();
+        return false;
+    }
+    torch::Tensor transmittance =
+        voxel_eval::transmittanceTensorToEvalMap(it->second);
+    if (!transmittance.defined()) {
+        alpha = torch::Tensor();
+        return false;
+    }
+    alpha = (1.0f - transmittance).clamp(0.0f, 1.0f);
+    return true;
+}
+
+} // namespace
+
 bool VoxelMapper::buildSparseDepthFromMapPoints(
     const sv::MiniCam& cam,
     int image_width,
@@ -1328,7 +1694,7 @@ bool VoxelMapper::buildSparseDepthFromMapPoints(
     std::vector<float> host_pts;
     host_pts.reserve(3 * M_total);
     for (const auto& kv : pcd) {
-        const Point3D& P = kv.second;          // you already fill xyz_ in run()
+        const sv::Point3D& P = kv.second;          // you already fill xyz_ in run()
         host_pts.push_back(static_cast<float>(P.xyz_(0)));
         host_pts.push_back(static_cast<float>(P.xyz_(1)));
         host_pts.push_back(static_cast<float>(P.xyz_(2)));
@@ -1344,7 +1710,7 @@ bool VoxelMapper::buildSparseDepthFromMapPoints(
     auto opts_dev = torch::TensorOptions().dtype(torch::kFloat32).device(mDevice);
     torch::Tensor pts_world = pts_world_cpu.clone().to(mDevice);   // [M,3]
 
-    // 2) Transform world → camera using cam.w2c  (SVRaster-style)
+    // 2) Transform world to camera using cam.w2c.
     //
     // We build homogeneous coordinates [M,4] and multiply by w2c^T:
     //   X_cam = X_world_h @ w2c^T
@@ -1411,7 +1777,7 @@ bool VoxelMapper::buildSparseDepthFromMapPoints(
     torch::Tensor v_chosen = v.index_select(0, chosen_idx); // [N]
     torch::Tensor z_chosen = Z.index_select(0, chosen_idx); // [N]
 
-    // 7) Match SVRaster Camera.project(): 2 * u / W - 1, 2 * v / H - 1.
+    // 7) Match the renderer projection: 2 * u / W - 1, 2 * v / H - 1.
     torch::Tensor u_ndc =
         2.0f * (u_chosen / W) - 1.0f;                      // [N]
     torch::Tensor v_ndc =
@@ -1439,11 +1805,10 @@ torch::Tensor VoxelMapper::computeSparseDepthLoss_Points(
     if (opt_params_.lambda_sparse_depth_ <= 0.0f)
         return zero;
 
-    loss_utils::SparseDepthLoss sparse_depth_loss(opt_params_.sparse_depth_until_);
-    if (!sparse_depth_loss.isActive(iteration))
+    if (iteration > opt_params_.sparse_depth_until_)
         return zero;
 
-    // 1) Get raw_T / raw_depth (SVRaster-style)
+    // 1) Get raw_T / raw_depth from the renderer.
     auto it_T = render_pkg.find("raw_T");
     if (it_T == render_pkg.end())
         it_T = render_pkg.find("T");          // fallback
@@ -1459,7 +1824,7 @@ torch::Tensor VoxelMapper::computeSparseDepthLoss_Points(
     torch::Tensor raw_T     = it_T->second.to(mDevice);
     torch::Tensor raw_depth = it_depth->second.to(mDevice);
 
-    // 2) Build (sparse_uv, sparse_depth) from SLAM 3D points (SVRaster-style)
+    // 2) Build (sparse_uv, sparse_depth) from SLAM 3D points.
     torch::Tensor sparse_uv;     // [N,2]
     torch::Tensor sparse_depth;  // [N]
     if (!buildSparseDepthFromMapPoints(cam, image_width, image_height,
@@ -1474,9 +1839,9 @@ torch::Tensor VoxelMapper::computeSparseDepthLoss_Points(
         return zero;
     }
 
-    // 3) Low-level SparseDepthLoss (exact math as SVRaster’s __call__)
-    torch::Tensor depth_loss =
-        sparse_depth_loss(raw_T, raw_depth, sparse_uv, sparse_depth);
+    // 3) Apply the low-level sparse depth loss.
+    torch::Tensor depth_loss = voxel_eval::sparseDepthLoss(
+        raw_T, raw_depth, sparse_uv, sparse_depth);
 
     return depth_loss;
 }
@@ -1546,7 +1911,7 @@ torch::Tensor VoxelMapper::computeRgbdDepthLoss(
     cv::cuda::GpuMat depth_gpu;
     depth_gpu.upload(kf->img_auxiliary_undist_);
     torch::Tensor rgbd_depth =
-        tensor_utils::cvGpuMat2TorchTensor_Float32(depth_gpu)
+        voxel_utils::cvGpuMatToTorchTensorFloat32(depth_gpu)
             .to(mDevice, torch::kFloat32)
             .contiguous();
     if (rgbd_depth.dim() == 3 && rgbd_depth.size(0) == 1) {
@@ -1641,7 +2006,7 @@ torch::Tensor VoxelMapper::computeRgbdMaskLoss(
     cv::cuda::GpuMat depth_gpu;
     depth_gpu.upload(kf->img_auxiliary_undist_);
     torch::Tensor rgbd_depth =
-        tensor_utils::cvGpuMat2TorchTensor_Float32(depth_gpu)
+        voxel_utils::cvGpuMatToTorchTensorFloat32(depth_gpu)
             .to(mDevice, torch::kFloat32)
             .contiguous();
     if (rgbd_depth.dim() == 3 && rgbd_depth.size(0) == 1) {
@@ -2014,7 +2379,7 @@ torch::Tensor VoxelMapper::computeRgbdNormalLoss(
         cv::cuda::GpuMat depth_gpu;
         depth_gpu.upload(kf->img_auxiliary_undist_);
         torch::Tensor rgbd_depth =
-            tensor_utils::cvGpuMat2TorchTensor_Float32(depth_gpu)
+            voxel_utils::cvGpuMatToTorchTensorFloat32(depth_gpu)
                 .to(mDevice, torch::kFloat32)
                 .contiguous();
         if (rgbd_depth.dim() == 3 && rgbd_depth.size(0) == 1) {
@@ -2046,7 +2411,7 @@ torch::Tensor VoxelMapper::computeRgbdNormalLoss(
         const float tol_cos = std::cos(
             opt_params_.rgbd_normal_tol_deg_ *
             static_cast<float>(M_PI) / 180.0f);
-        target_normal = voxel_eval::depth2normalSVRaster(
+        target_normal = voxel_eval::depthToNormal(
             cam,
             rgbd_depth.clamp_min(near_depth),
             opt_params_.rgbd_normal_ks_,
@@ -2065,7 +2430,7 @@ torch::Tensor VoxelMapper::computeRgbdNormalLoss(
     torch::Tensor dot =
         (render_normal * target_normal).sum(0).clamp(-1.0f, 1.0f);
     torch::Tensor normal_angle = 1.0f - dot;
-    // L1 normal term disabled to match SVRaster/HI-SLAM2-style cosine normal supervision.
+    // L1 normal term is disabled in favor of cosine normal supervision.
     // torch::Tensor normal_l1 = (render_normal - target_normal).abs().sum(0);
     torch::Tensor mask_f = mask.to(render_normal.dtype());
     torch::Tensor denom = mask_f.sum().clamp_min(1.0f);
@@ -2085,4 +2450,215 @@ torch::Tensor VoxelMapper::computeRgbdNormalLoss(
         1.0f);
     const float mult = std::pow(opt_params_.rgbd_normal_end_mult_, ratio);
     return loss * mult;
+}
+
+torch::Tensor VoxelMapper::computeMonocularDepthLoss(
+    const std::shared_ptr<VoxelKeyframe>& keyframe,
+    const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+    const int iteration)
+{
+    torch::Tensor zero = supervisionZero(mDevice);
+    if (sensor_type_ != MONOCULAR ||
+        opt_params_.lambda_monocular_depth_ <= 0.0f ||
+        iteration < opt_params_.monocular_depth_from_ ||
+        iteration > opt_params_.monocular_depth_end_ ||
+        !keyframe ||
+        keyframe->monocular_depth_source_ ==
+            sv::LearnedDepthSource::None) {
+        return zero;
+    }
+
+    torch::Tensor target_depth;
+    torch::Tensor confidence;
+    if (!learnedDepthPriorToTensors(
+            keyframe, mDevice, target_depth, confidence)) {
+        return zero;
+    }
+
+    auto depth_it = render_pkg.find("raw_depth");
+    if (depth_it == render_pkg.end() || !depth_it->second.defined()) {
+        depth_it = render_pkg.find("depth");
+    }
+    torch::Tensor rendered_depth_numerator;
+    torch::Tensor alpha;
+    if (depth_it == render_pkg.end() || !depth_it->second.defined() ||
+        !renderAlphaMap(render_pkg, alpha)) {
+        return zero;
+    }
+    rendered_depth_numerator = voxel_eval::tensorToEvalMapExactChannel(
+        depth_it->second, 0);
+    rendered_depth_numerator = resizeMapBilinear(
+        rendered_depth_numerator,
+        target_depth.size(0),
+        target_depth.size(1));
+    alpha = resizeMapBilinear(
+        alpha, target_depth.size(0), target_depth.size(1));
+    if (!rendered_depth_numerator.defined() || !alpha.defined()) {
+        return zero;
+    }
+    // Match SVRecon's MASt3R metric-depth loss: resize accumulated depth and
+    // alpha independently, then recover the alpha-normalized camera-Z depth.
+    const torch::Tensor rendered_depth =
+        rendered_depth_numerator / alpha.clamp_min(1.0e-4f);
+
+    const float near_depth = std::max(1.0e-6f, keyframe->znear_);
+    torch::Tensor valid =
+        torch::isfinite(target_depth) &
+        torch::isfinite(rendered_depth) &
+        torch::isfinite(confidence) &
+        (target_depth > near_depth) &
+        (rendered_depth > near_depth) &
+        (confidence > opt_params_.monocular_depth_confidence_min_) &
+        (alpha.detach() > opt_params_.monocular_depth_alpha_min_);
+    if (!valid.any().item<bool>()) {
+        return zero;
+    }
+
+    // SVRecon's MASt3R regularizer uses alpha-normalized metric depth and a
+    // Cauchy residual. Confidence normalization keeps sparse accepted priors
+    // comparable across MVS and Omnidata keyframes.
+    torch::Tensor weights = confidence.clamp(0.0f, 1.0f).index({valid});
+    const torch::Tensor residual =
+        rendered_depth.index({valid}) - target_depth.index({valid});
+    torch::Tensor loss =
+        (weights * torch::log1p(residual.square())).sum() /
+        weights.sum().clamp_min(1.0e-6f);
+    return loss * supervisionScheduleMultiplier(
+        iteration,
+        opt_params_.monocular_depth_from_,
+        opt_params_.monocular_depth_end_,
+        opt_params_.monocular_depth_end_mult_);
+}
+
+torch::Tensor VoxelMapper::computeMonocularNormalLoss(
+    const std::shared_ptr<VoxelKeyframe>& keyframe,
+    const std::unordered_map<std::string, torch::Tensor>& render_pkg,
+    const int iteration)
+{
+    torch::Tensor zero = supervisionZero(mDevice);
+    if (sensor_type_ != MONOCULAR ||
+        opt_params_.lambda_monocular_normal_ <= 0.0f ||
+        iteration < opt_params_.monocular_normal_from_ ||
+        iteration > opt_params_.monocular_normal_end_ ||
+        !keyframe ||
+        keyframe->monocular_depth_source_ ==
+            sv::LearnedDepthSource::None) {
+        return zero;
+    }
+
+    torch::Tensor target_depth;
+    torch::Tensor confidence;
+    if (!learnedDepthPriorToTensors(
+            keyframe, mDevice, target_depth, confidence)) {
+        return zero;
+    }
+
+    auto normal_it = render_pkg.find("raw_normal");
+    if (normal_it == render_pkg.end() || !normal_it->second.defined()) {
+        normal_it = render_pkg.find("normal");
+    }
+    torch::Tensor alpha;
+    if (normal_it == render_pkg.end() || !normal_it->second.defined() ||
+        !renderAlphaMap(render_pkg, alpha)) {
+        return zero;
+    }
+
+    torch::Tensor rendered_normal =
+        normal_it->second.to(mDevice, torch::kFloat32).contiguous();
+    if (rendered_normal.dim() == 4 && rendered_normal.size(0) == 1) {
+        rendered_normal = rendered_normal.squeeze(0);
+    }
+    if (rendered_normal.dim() != 3 || rendered_normal.size(0) < 3) {
+        return zero;
+    }
+    if (rendered_normal.size(0) > 3) {
+        rendered_normal = rendered_normal.index({
+            torch::indexing::Slice(0, 3)}).contiguous();
+    }
+
+    const int64_t height = target_depth.size(0);
+    const int64_t width = target_depth.size(1);
+    if (rendered_normal.size(1) != height ||
+        rendered_normal.size(2) != width) {
+        rendered_normal = torch::nn::functional::interpolate(
+            rendered_normal.unsqueeze(0),
+            torch::nn::functional::InterpolateFuncOptions()
+                .size(std::vector<int64_t>{height, width})
+                .mode(torch::kBilinear)
+                .align_corners(false)).squeeze(0);
+    }
+    alpha = resizeMapBilinear(alpha, height, width);
+    if (!alpha.defined()) {
+        return zero;
+    }
+
+    torch::Tensor target_normal;
+    torch::Tensor target_valid;
+    {
+        torch::NoGradGuard no_grad;
+        const float near_depth = std::max(1.0e-6f, keyframe->znear_);
+        torch::Tensor valid_depth =
+            torch::isfinite(target_depth) &
+            torch::isfinite(confidence) &
+            (target_depth > near_depth) &
+            (confidence > opt_params_.monocular_depth_confidence_min_);
+        target_valid = validDepthContinuityMask(
+            target_depth,
+            valid_depth,
+            opt_params_.monocular_normal_ks_,
+            opt_params_.monocular_normal_max_depth_jump_rel_);
+        if (!target_valid.any().item<bool>()) {
+            return zero;
+        }
+
+        const float tolerance_cos = std::cos(
+            opt_params_.monocular_normal_tol_deg_ *
+            static_cast<float>(M_PI) / 180.0f);
+        const sv::MiniCam prior_camera = keyframe->toMiniCam(
+            static_cast<int>(height), static_cast<int>(width));
+        // SVRecon flips depth-derived normals to face the observing camera
+        // before comparing them with its differentiable rendered normals.
+        target_normal = -voxel_eval::depthToNormal(
+            prior_camera,
+            target_depth.clamp_min(near_depth),
+            opt_params_.monocular_normal_ks_,
+            tolerance_cos);
+        target_valid = target_valid & (target_normal != 0).any(0);
+    }
+
+    const torch::Tensor rendered_magnitude =
+        rendered_normal.square().sum(0).sqrt();
+    torch::Tensor valid =
+        target_valid &
+        torch::isfinite(rendered_normal).all(0) &
+        (rendered_magnitude > 1.0e-6f) &
+        (alpha.detach() > opt_params_.monocular_depth_alpha_min_);
+    if (!valid.any().item<bool>()) {
+        return zero;
+    }
+
+    rendered_normal = torch::nn::functional::normalize(
+        rendered_normal,
+        torch::nn::functional::NormalizeFuncOptions()
+            .dim(0)
+            .eps(1.0e-8));
+    target_normal = torch::nn::functional::normalize(
+        target_normal,
+        torch::nn::functional::NormalizeFuncOptions()
+            .dim(0)
+            .eps(1.0e-8));
+    const torch::Tensor cosine_error =
+        1.0f - (rendered_normal * target_normal)
+                   .sum(0)
+                   .clamp(-1.0f, 1.0f);
+    const torch::Tensor weights =
+        confidence.clamp(0.0f, 1.0f).index({valid});
+    torch::Tensor loss =
+        (weights * cosine_error.index({valid})).sum() /
+        weights.sum().clamp_min(1.0e-6f);
+    return loss * supervisionScheduleMultiplier(
+        iteration,
+        opt_params_.monocular_normal_from_,
+        opt_params_.monocular_normal_end_,
+        opt_params_.monocular_normal_end_mult_);
 }

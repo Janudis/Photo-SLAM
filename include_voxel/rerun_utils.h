@@ -20,7 +20,7 @@ namespace sv {
  *   scripts_voxel/python_rerun_bridge/visualizer_wrapper.RerunVisualizer
  *
  * It does NOT assume ownership of the Python interpreter; we just acquire
- * the GIL and import the module. You already embed Python for SVRaster.
+ * the GIL and import the module.
  */
 class RerunVisualizerBridge {
 public:
@@ -30,7 +30,7 @@ public:
     bool isEnabled() const { return enabled_; }
 
     // Initialize Python-side RerunVisualizer (no-op if already initialized).
-    void init(const std::string& app_id = "PhotoSLAM-SVRaster",
+    void init(const std::string& app_id = "PhotoSLAM-SVRecon",
               bool spawn_viewer = true);
 
     void saveRecording(const std::string& path);
@@ -162,13 +162,24 @@ public:
         const std::string& recording_name,
         const std::string& ply_path,
         int iteration,
-        const std::string& entity_path = "world/mesh/reference");
-    void visualizeSVRasterMesh(
-        const torch::Tensor& centers,   // [N,3] float
-        const torch::Tensor& sizes,     // [N] or [N,1] or [N,3] float
-        const torch::Tensor& colors,     // [N,3] float or uint8, can be undefined
-        int iteration
-    );
+        const std::string& entity_path = "world/mesh/reference",
+        bool static_mesh = false);
+
+    // Align a reference mesh from source trajectory coordinates into the
+    // target trajectory frame using timestamp-matched Umeyama Sim(3).
+    bool alignReferencePlyMesh(
+        const std::string& source_mesh_path,
+        const std::string& source_trajectory_tum_path,
+        const std::string& target_trajectory_tum_path,
+        const std::string& output_mesh_path,
+        const std::string& report_path);
+
+    void visualizeDebugImage(
+        const std::string& recording_name,
+        const cv::Mat& image_rgb,
+        int iteration,
+        int keyframe_id,
+        const std::string& entity_path);
 
     void visualizePoints3D(
     const torch::Tensor& points_xyz,     // [N,3] float32
@@ -260,29 +271,6 @@ public:
         bool align_gt_to_slam,
         const std::string& gt_traj_path,
         int align_min_pairs);
-
-    void visualizeSdfVoxelsRecording(
-        const std::string& recording_name,
-        const torch::Tensor& centers,        // [N,3] float
-        const torch::Tensor& sizes,          // [N] or [N,1] or [N,3] float, full edge length
-        const torch::Tensor& corner_points,  // [N,8,3] float
-        const torch::Tensor& computed_sdf,   // [N,8] float metric SDF
-        const torch::Tensor& sdf_weights,    // [N,8] float
-        const torch::Tensor& corner_density, // [N,8] float raw density values
-        const torch::Tensor& gt_sdf,         // [N,8] float GT mesh SDF
-        const torch::Tensor& voxel_colors,   // optional [N,3] or [N,4] colors
-        const torch::Tensor& voxel_ids,      // optional [N] int ids
-        const torch::Tensor& source_sdf_mask,      // optional [N] bool
-        const torch::Tensor& source_svraster_mask, // optional [N] bool
-        int iteration,
-        const std::string& gt_mesh_path,
-        bool align_gt_to_slam,
-        const std::string& gt_traj_path,
-        int align_min_pairs,
-        float surface_band_m,
-        float min_weight,
-        bool log_gt_mesh,
-        const std::string& entity_path = "world/voxels_sdf_pruned");
 
 private:
     RerunVisualizerBridge();

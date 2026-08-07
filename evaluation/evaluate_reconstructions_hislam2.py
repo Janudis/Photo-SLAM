@@ -35,7 +35,6 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPLICA_RESULT_ROOT = REPO_ROOT / "results/replica_rgbd_voxel/office0"
 REPLICA_PHOTO_SLAM_ROOT = REPO_ROOT / "results/replica_rgbd_original/office0"
-REPLICA_NVBLOX_ROOT = REPO_ROOT / "results/replica_rgbd_nvblox/office0/online_orb"
 REPLICA_GT_TRAJECTORY = REPO_ROOT / "scripts/data/Replica/office0/traj.txt"
 REPLICA_GT_MESH_CULLED = (
     REPO_ROOT / "third_party/ESLAM/cull_replica_mesh/office0_culled.ply"
@@ -45,9 +44,6 @@ REPLICA_GT_MESH_ORIGINAL = REPO_ROOT / "scripts/data/Replica/office0_mesh.ply"
 SCANNET_RESULT_ROOT = REPO_ROOT / "results/scannet_rgbd_voxel/scene0000_00"
 SCANNET_PHOTO_SLAM_ROOT = (
     REPO_ROOT / "results/scannet_rgbd_original/scene0000_00"
-)
-SCANNET_NVBLOX_ROOT = (
-    REPO_ROOT / "results/scannet_rgbd_nvblox/scene0000_00/online_orb"
 )
 SCANNET_DATA_ROOT = REPO_ROOT / "scripts/data/ScanNet/scans/scene0000_00"
 
@@ -109,16 +105,6 @@ REPLICA_EXPERIMENTS = (
     #     directory=REPLICA_RESULT_ROOT / "experiments_SVRECON/2376_shutdown",
     # ),
     Experiment(
-        name="svraster_5801_shutdown",
-        family="SVRaster",
-        directory=REPLICA_RESULT_ROOT / "experiments/5801_shutdown",
-    ),
-    Experiment(
-        name="svraster_6801_shutdown",
-        family="SVRaster",
-        directory=REPLICA_RESULT_ROOT / "experiments/6801_shutdown",
-    ),
-    Experiment(
         name="photoslam_3581_shutdown",
         family="Photo-SLAM",
         directory=REPLICA_PHOTO_SLAM_ROOT / "3581_shutdown",
@@ -135,13 +121,6 @@ REPLICA_EXPERIMENTS = (
         directory=REPLICA_HI_SLAM2_ROOT,
         mesh=REPLICA_HI_SLAM2_ROOT / "tsdf_mesh_after_opt_w2.0.ply",
         recon_trajectory=REPLICA_HI_SLAM2_ROOT / "traj_full.txt",
-    ),
-    Experiment(
-        name="nvblox_online",
-        family="TSDF-Fusion",
-        directory=REPLICA_NVBLOX_ROOT,
-        mesh=REPLICA_NVBLOX_ROOT / "nvblox_color_mesh.ply",
-        recon_trajectory=REPLICA_NVBLOX_ROOT / "CameraTrajectory_TUM.txt",
     ),
 )
 
@@ -167,13 +146,6 @@ SCANNET_EXPERIMENTS = (
             / "gaussian_surface_mesh.ply"
         ),
         recon_trajectory=SCANNET_PHOTO_SLAM_ROOT / "CameraTrajectory_TUM.txt",
-    ),
-    Experiment(
-        name="nvblox_online",
-        family="TSDF-Fusion",
-        directory=SCANNET_NVBLOX_ROOT,
-        mesh=SCANNET_NVBLOX_ROOT / "nvblox_color_mesh.ply",
-        recon_trajectory=SCANNET_NVBLOX_ROOT / "CameraTrajectory_TUM.txt",
     ),
     # Experiment(
     #     name="hislam2_after_refinement_w5",

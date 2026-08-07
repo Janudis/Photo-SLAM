@@ -27,10 +27,15 @@ output="$root_dir/results/euroc_voxel/$sequence_name"
 
 mkdir -p "$output"
 
+viewer_args=(no_viewer)
+if [[ "${VOXEL_VIEWER:-0}" == "1" ]]; then
+    viewer_args=()
+fi
+
 "$bin" \
     "$vocabulary" \
     "$orb_config" \
     "$voxel_config" \
     "$sequence" \
     "$output" \
-    no_viewer
+    "${viewer_args[@]}"

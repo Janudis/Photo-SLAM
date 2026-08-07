@@ -13,7 +13,7 @@ import struct
 
 class RerunVisualizer:
     """
-    Rerun visualizer for Photo-SLAM + SVRaster.
+    Rerun visualizer for Photo-SLAM + SVRecon.
 
     This is a thin mesh/voxel logging helper for Photo-SLAM Rerun recordings:
     - world/camera_0: pose, axes, image, observations
@@ -21,7 +21,7 @@ class RerunVisualizer:
     - world/mesh: color mesh (TSDF or voxel mesh)
     """
 
-    def __init__(self, app_id: str = "PhotoSLAM-SVRaster", spawn: bool = True) -> None:
+    def __init__(self, app_id: str = "PhotoSLAM-SVRecon", spawn: bool = True) -> None:
         # Parameters
         self.camera_pose_axis_scale = 0.1
         self.trajectory_length = 500
@@ -115,6 +115,35 @@ class RerunVisualizer:
             make_active=True,
         )
 
+    def _send_whole_run_blueprint(self) -> None:
+        rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+        try:
+            rr.send_blueprint(
+                rrb.Blueprint(
+                    rrb.TimePanel(state="collapsed"),
+                    rrb.Horizontal(
+                        rrb.Spatial3DView(
+                            origin="world",
+                            name="Scene 3D",
+                        ),
+                        rrb.Vertical(
+                            rrb.Spatial2DView(
+                                origin="depth/model",
+                                name="Model Depth",
+                            ),
+                            rrb.Spatial2DView(
+                                origin="depth/ground_truth",
+                                name="GT Depth",
+                            ),
+                        ),
+                        column_shares=[3, 1],
+                    ),
+                ),
+                make_active=True,
+            )
+        except Exception:
+            self._send_default_blueprint()
+
     def _send_maps_blueprint(self) -> None:
         rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
         try:
@@ -155,7 +184,7 @@ class RerunVisualizer:
         if name in self._debug_recordings:
             return self._debug_recordings[name]
         rec = rr.RecordingStream(
-            f"PhotoSLAM-SVRaster-{name}",
+            f"PhotoSLAM-SVRecon-{name}",
             recording_id=name,
             make_default=False,
             make_thread_default=False,
@@ -167,6 +196,8 @@ class RerunVisualizer:
         with rec:
             if name == "maps":
                 self._send_maps_blueprint()
+            elif name == "whole_run":
+                self._send_whole_run_blueprint()
             else:
                 self._send_default_blueprint()
         return rec
@@ -662,6 +693,7 @@ class RerunVisualizer:
         ply_path: str,
         iteration: int,
         entity_path: str = "world/sdf_mesh/live",
+        static_mesh: bool = False,
     ):
         """
         Called from C++:
@@ -676,30 +708,11 @@ class RerunVisualizer:
             print("[RERUN] visualize_ply_mesh: file does not exist")
             return
 
-        # 1) Load mesh using Open3D
-        import open3d as o3d
-
-        mesh = o3d.io.read_triangle_mesh(ply_path)
-        if mesh.is_empty():
-            print("[RERUN] visualize_ply_mesh: loaded mesh is EMPTY")
+        mesh_data = self._load_gt_triangle_mesh(ply_path)
+        if mesh_data is None:
+            print("[RERUN] visualize_ply_mesh: failed to load triangle mesh")
             return
-
-        vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        faces    = np.asarray(mesh.triangles, dtype=np.int32)
-
-        v_colors = np.asarray(mesh.vertex_colors)
-        if v_colors.size == 0:
-            colors = None
-            print("[RERUN] visualize_ply_mesh: no vertex colors in mesh")
-        else:
-            if v_colors.shape[0] != vertices.shape[0]:
-                print(
-                    "[RERUN] visualize_ply_mesh: colors/vertices mismatch, "
-                    f"vertices={vertices.shape[0]}, colors={v_colors.shape[0]} – ignoring colors"
-                )
-                colors = None
-            else:
-                colors = v_colors.astype(np.float32, copy=False)
+        vertices, faces, colors = mesh_data
 
         # 2) Time
         self._set_iter_time(iteration)
@@ -715,10 +728,13 @@ class RerunVisualizer:
         #     print("         colors   = None")
 
         # 4) Log
-        self._visualize_mesh(vertices, faces, colors, entity_path=entity_path)
-
-    def visualize_nvblox_ply(self, ply_path: str, iteration: int, entity_path: str = "world/sdf_mesh/live"):
-        self.visualize_ply_mesh(ply_path, iteration, entity_path)
+        self._visualize_mesh(
+            vertices,
+            faces,
+            colors,
+            entity_path=entity_path,
+            static=bool(static_mesh),
+        )
 
     def visualize_ply_mesh_recording(
         self,
@@ -726,21 +742,18 @@ class RerunVisualizer:
         ply_path: str,
         iteration: int,
         entity_path: str = "world/mesh/reference",
+        static_mesh: bool = False,
     ) -> None:
         rec = self._ensure_debug_recording(str(recording_name))
         if rec is None:
             return
         with rec:
-            self.visualize_ply_mesh(ply_path, iteration, entity_path)
-
-    def visualize_nvblox_ply_recording(
-        self,
-        recording_name: str,
-        ply_path: str,
-        iteration: int,
-        entity_path: str = "world/mesh/reference",
-    ) -> None:
-        self.visualize_ply_mesh_recording(recording_name, ply_path, iteration, entity_path)
+            self.visualize_ply_mesh(
+                ply_path,
+                iteration,
+                entity_path,
+                static_mesh=bool(static_mesh),
+            )
 
     def _visualize_mesh(
         self,
@@ -748,6 +761,7 @@ class RerunVisualizer:
         faces,
         colors=None,
         entity_path: str = "tsdf_mesh",
+        static: bool = False,
     ):
         """
         Visualize a triangular mesh in Rerun.
@@ -801,7 +815,44 @@ class RerunVisualizer:
             )
 
         # print("[RERUN] logging Mesh3D to", entity_path)
-        rr.log(entity_path, mesh)
+        rr.log(entity_path, mesh, static=bool(static))
+
+    def visualize_image_recording(
+        self,
+        recording_name: str,
+        image: npt.NDArray,
+        entity_path: str,
+        iteration: int,
+        keyframe_id: int,
+    ) -> None:
+        image_copy = np.asarray(image, dtype=np.uint8).copy()
+        self._submit_debug_job(
+            self._visualize_image_recording_now,
+            str(recording_name),
+            image_copy,
+            str(entity_path),
+            int(iteration),
+            int(keyframe_id),
+        )
+
+    def _visualize_image_recording_now(
+        self,
+        recording_name: str,
+        image: npt.NDArray,
+        entity_path: str,
+        iteration: int,
+        keyframe_id: int,
+    ) -> None:
+        rec = self._ensure_debug_recording(recording_name)
+        if rec is None:
+            return
+        image_rgb = np.asarray(image, dtype=np.uint8)
+        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+            return
+        with rec:
+            self._set_iter_time(iteration)
+            self._set_keyframe_time(keyframe_id)
+            rr.log(entity_path, rr.Image(np.ascontiguousarray(image_rgb)).compress())
 
     def visualize_triangle_mesh(
         self,
@@ -837,15 +888,6 @@ class RerunVisualizer:
 
         self._visualize_mesh(v, f, c, entity_path="world/sdf_mesh/live")
 
-    def visualize_nvblox(
-        self,
-        vertices: npt.NDArray,
-        colors: Optional[npt.NDArray],
-        triangles: npt.NDArray,
-        iteration: Optional[int] = None,
-    ) -> None:
-        self.visualize_triangle_mesh(vertices, colors, triangles, iteration)
-
     def visualize_triangle_mesh_recording(
         self,
         recording_name: str,
@@ -875,18 +917,6 @@ class RerunVisualizer:
                     c = None
 
             self._visualize_mesh(v, f, c, entity_path=entity_path)
-
-    def visualize_nvblox_recording(
-        self,
-        recording_name: str,
-        vertices: npt.NDArray,
-        colors: Optional[npt.NDArray],
-        triangles: npt.NDArray,
-        iteration: Optional[int] = None,
-        entity_path: str = "world/mesh",
-    ) -> None:
-        self.visualize_triangle_mesh_recording(
-            recording_name, vertices, colors, triangles, iteration, entity_path)
 
     def visualize_camera(
         self,
@@ -1028,111 +1058,7 @@ class RerunVisualizer:
             box_kwargs["labels"] = labels
         rr.log(entity_path, rr.Boxes3D(**box_kwargs))
 
-    def visualize_voxels_mesh(
-        self,
-        centers: npt.NDArray,
-        half_sizes: npt.NDArray,
-        colors: Optional[npt.NDArray] = None,
-        max_voxels: int = 500000,
-        iteration: Optional[int] = None,
-    ) -> None:
-        """
-        Turn SVRaster voxels into a triangle mesh (cubes) and log as Mesh3D.
-        """
-
-        self._set_iter_time(iteration)
-
-        centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
-        half_sizes = np.asarray(half_sizes, dtype=np.float32)
-        if half_sizes.ndim == 1:
-            half_sizes = half_sizes[:, None].repeat(3, axis=1)
-        else:
-            half_sizes = half_sizes.reshape(-1, 3)
-
-        N = centers.shape[0]
-        if N == 0:
-            print("[PY][voxels_mesh] no voxels to visualize")
-            return
-
-        # Downsample to keep mesh size reasonable
-        if N > max_voxels:
-            idx = np.linspace(0, N - 1, max_voxels, dtype=np.int64)
-            centers    = centers[idx]
-            half_sizes = half_sizes[idx]
-            if colors is not None:
-                colors = np.asarray(colors)[idx]
-            N = centers.shape[0]
-
-        # Prepare per-voxel color → per-vertex color
-        if colors is not None:
-            c = np.asarray(colors)
-            if c.dtype != np.uint8:
-                c = np.clip(c, 0.0, 1.0)
-                c = (c * 255.0).astype(np.uint8)
-            if c.shape[0] != N:
-                print("[PY][voxels_mesh] color length mismatch, ignoring colors")
-                c = None
-        else:
-            c = None
-
-        # Offsets of the 8 corners of a unit cube centered at 0
-        base_offsets = np.array([
-            [-1, -1, -1],
-            [ 1, -1, -1],
-            [ 1,  1, -1],
-            [-1,  1, -1],
-            [-1, -1,  1],
-            [ 1, -1,  1],
-            [ 1,  1,  1],
-            [-1,  1,  1],
-        ], dtype=np.float32) * 0.5  # will be scaled per-voxel
-
-        # 12 triangles (indices into the 8 corners)
-        base_faces = np.array([
-            [0, 1, 2], [0, 2, 3],  # bottom
-            [4, 5, 6], [4, 6, 7],  # top
-            [0, 1, 5], [0, 5, 4],  # front
-            [2, 3, 7], [2, 7, 6],  # back
-            [1, 2, 6], [1, 6, 5],  # right
-            [3, 0, 4], [3, 4, 7],  # left
-        ], dtype=np.int32)
-
-        all_vertices = []
-        all_faces    = []
-        all_vcolors  = [] if c is not None else None
-
-        for i in range(N):
-            center = centers[i]
-            hs     = half_sizes[i]  # (3,)
-
-            # Scale the base cube to this voxel
-            voxel_offsets = base_offsets * (2.0 * hs[None, :])
-            verts_i = center[None, :] + voxel_offsets  # (8,3)
-            all_vertices.append(verts_i)
-
-            faces_i = base_faces + 8 * i
-            all_faces.append(faces_i)
-
-            if all_vcolors is not None:
-                color_i = c[i]
-                all_vcolors.append(
-                    np.tile(color_i[None, :], (8, 1))
-                )
-
-        vertices = np.concatenate(all_vertices, axis=0)
-        faces    = np.concatenate(all_faces, axis=0)
-        vcolors  = None
-        if all_vcolors is not None and len(all_vcolors) > 0:
-            vcolors = np.concatenate(all_vcolors, axis=0)
-
-        self._visualize_mesh(
-            vertices,
-            faces,
-            vcolors,
-            entity_path="world/svraster_mesh",
-        )
-
-    #path planning   
+    # Path planning
     def visualize_points3d(
         self,
         points_xyz: npt.NDArray,
@@ -1469,456 +1395,6 @@ class RerunVisualizer:
 
         self._voxel_grid_levels[state_key] = current_levels
 
-    def visualize_sdf_voxels_recording(
-        self,
-        recording_name: str,
-        centers: npt.NDArray,
-        sizes: npt.NDArray,
-        corner_points: npt.NDArray,
-        computed_sdf: npt.NDArray,
-        sdf_weights: npt.NDArray,
-        corner_density: npt.NDArray,
-        gt_sdf: npt.NDArray,
-        voxel_colors: Optional[npt.NDArray],
-        voxel_ids: Optional[npt.NDArray],
-        source_sdf_mask: Optional[npt.NDArray],
-        source_svraster_mask: Optional[npt.NDArray],
-        iteration: int,
-        gt_mesh_path: str,
-        align_gt_to_slam: bool,
-        gt_traj_path: str,
-        align_min_pairs: int,
-        surface_band_m: float,
-        min_weight: float,
-        log_gt_mesh: bool,
-        entity_path: str = "world/voxels_sdf_pruned",
-    ) -> None:
-        rec = self._ensure_debug_recording(str(recording_name))
-        if rec is None:
-            return
-
-        with rec:
-            self._set_iter_time(iteration)
-
-            if log_gt_mesh:
-                self.visualize_gt_sdf_mesh_recording(
-                    recording_name,
-                    gt_mesh_path,
-                    align_gt_to_slam,
-                    gt_traj_path,
-                    align_min_pairs,
-                    iteration,
-                    "world/gt/mesh",
-                )
-                self._set_iter_time(iteration)
-
-            centers = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
-            sizes = np.asarray(sizes, dtype=np.float32)
-            if sizes.ndim == 1:
-                full_sizes = sizes[:, None].repeat(3, axis=1)
-            elif sizes.ndim == 2 and sizes.shape[1] == 1:
-                full_sizes = sizes.repeat(3, axis=1)
-            else:
-                full_sizes = sizes.reshape(-1, 3)
-            half_sizes = 0.5 * full_sizes
-
-            corners = np.asarray(corner_points, dtype=np.float32).reshape(-1, 8, 3)
-            comp_sdf = np.asarray(computed_sdf, dtype=np.float32).reshape(-1, 8)
-            weights = np.asarray(sdf_weights, dtype=np.float32).reshape(-1, 8)
-            density = np.asarray(corner_density, dtype=np.float32).reshape(-1, 8)
-            gt_sdf = np.asarray(gt_sdf, dtype=np.float32).reshape(-1, 8)
-            n = centers.shape[0]
-            if (
-                n == 0
-                or corners.shape[0] != n
-                or comp_sdf.shape[0] != n
-                or gt_sdf.shape[0] != n
-            ):
-                return
-
-            gt_mesh_distance_mode = False
-            if gt_mesh_path:
-                gt_corner_distance = self._compute_gt_surface_distance(
-                    corners.reshape(-1, 3),
-                    gt_mesh_path,
-                    bool(align_gt_to_slam),
-                    gt_traj_path,
-                    int(align_min_pairs),
-                )
-                if (
-                    gt_corner_distance is not None
-                    and gt_corner_distance.size == n * 8
-                ):
-                    gt_sdf = gt_corner_distance.reshape(n, 8).astype(np.float32, copy=False)
-                    gt_mesh_distance_mode = True
-
-            ids = np.arange(n, dtype=np.int64)
-            if voxel_ids is not None:
-                ids_in = np.asarray(voxel_ids).reshape(-1)
-                if ids_in.shape[0] == n:
-                    ids = ids_in.astype(np.int64, copy=False)
-
-            source_sdf = np.zeros((n,), dtype=bool)
-            if source_sdf_mask is not None:
-                mask_in = np.asarray(source_sdf_mask).reshape(-1)
-                if mask_in.shape[0] == n:
-                    source_sdf = mask_in.astype(bool, copy=False)
-            source_svraster = np.zeros((n,), dtype=bool)
-            if source_svraster_mask is not None:
-                mask_in = np.asarray(source_svraster_mask).reshape(-1)
-                if mask_in.shape[0] == n:
-                    source_svraster = mask_in.astype(bool, copy=False)
-
-            colors = None
-            if voxel_colors is not None:
-                vc = np.asarray(voxel_colors)
-                if vc.size > 0:
-                    vc = vc.reshape(n, -1)
-                    if vc.shape[0] == n and vc.shape[1] >= 3:
-                        colors = vc[:, :min(vc.shape[1], 4)].copy()
-            if colors is None:
-                colors = np.zeros((n, 4), dtype=np.uint8)
-                colors[:, 2] = 255
-                colors[:, 3] = 180
-
-            band = max(float(surface_band_m), 1.0e-6)
-            valid_comp = np.isfinite(comp_sdf) & np.isfinite(weights) & (weights >= float(min_weight))
-            valid_gt = np.isfinite(gt_sdf)
-            corner_pts = corners.reshape(-1, 3)
-
-            comp_cls = np.zeros_like(comp_sdf, dtype=np.int8)
-            gt_cls = np.zeros_like(gt_sdf, dtype=np.int8)
-            comp_cls[comp_sdf > band] = 1
-            comp_cls[np.abs(comp_sdf) <= band] = 2
-            comp_cls[comp_sdf < -band] = 3
-            if gt_mesh_distance_mode:
-                gt_cls[gt_sdf > band] = 1
-                gt_cls[gt_sdf <= band] = 2
-            else:
-                gt_cls[gt_sdf > band] = 1
-                gt_cls[np.abs(gt_sdf) <= band] = 2
-                gt_cls[gt_sdf < -band] = 3
-
-            half_diag = np.linalg.norm(half_sizes, axis=1).astype(np.float32, copy=False)
-
-            def voxel_stats(sdf: npt.NDArray, valid: npt.NDArray):
-                all_valid = np.all(valid, axis=1)
-                has_pos = np.any((sdf > 1.0e-6) & valid, axis=1)
-                has_neg = np.any((sdf < -1.0e-6) & valid, axis=1)
-                inf = np.full_like(sdf, np.inf, dtype=np.float32)
-                min_abs = np.min(np.where(valid, np.abs(sdf), inf), axis=1)
-                return all_valid, has_pos, has_neg, min_abs
-
-            def classify_voxels(sdf: npt.NDArray, valid: npt.NDArray):
-                all_valid, has_pos, has_neg, min_abs = voxel_stats(sdf, valid)
-                strong_far = min_abs > (band + half_diag)
-                free = all_valid & has_pos & (~has_neg) & strong_far
-                occupied = all_valid & has_neg & (~has_pos) & strong_far
-                surface = all_valid & (~(free | occupied))
-                return free, occupied, surface
-
-            def classify_surface_crossing(sdf: npt.NDArray, valid: npt.NDArray):
-                if gt_mesh_distance_mode:
-                    all_valid = np.all(valid, axis=1)
-                    min_corner_distance = np.min(
-                        np.where(valid, sdf, np.inf), axis=1
-                    )
-                    surface = all_valid & (min_corner_distance <= band)
-                    free = all_valid & (~surface)
-                    occupied = np.zeros_like(surface, dtype=bool)
-                    return free, occupied, surface
-                all_valid, has_pos, has_neg, min_abs = voxel_stats(sdf, valid)
-                strong_far = min_abs > (band + half_diag)
-                free = all_valid & has_pos & (~has_neg) & strong_far
-                occupied = all_valid & has_neg & (~has_pos) & strong_far
-                surface = all_valid & has_pos & has_neg
-                return free, occupied, surface
-
-            comp_voxel_free, comp_voxel_occupied, comp_voxel_surface = classify_voxels(comp_sdf, valid_comp)
-            gt_voxel_free, gt_voxel_occupied, gt_voxel_surface = classify_surface_crossing(gt_sdf, valid_gt)
-
-            wrong_sdf_free_gt_surface = (source_sdf | source_svraster) & comp_voxel_free & gt_voxel_surface
-            wrong_svraster_pruned_surface_agreement = (
-                source_svraster & comp_voxel_surface & gt_voxel_surface
-            )
-            wrong_mesh = (
-                wrong_sdf_free_gt_surface |
-                wrong_svraster_pruned_surface_agreement
-            )
-            correct_mesh = (source_sdf | source_svraster) & comp_voxel_free & gt_voxel_free
-
-            def log_voxel_subset(mask: npt.NDArray, subpath: str, override_rgba=None) -> None:
-                mask = np.asarray(mask, dtype=bool).reshape(-1)
-                subset_colors = colors[mask]
-                if override_rgba is not None:
-                    rgba = np.asarray(override_rgba, dtype=np.uint8).reshape(1, 4)
-                    subset_colors = np.repeat(rgba, int(mask.sum()), axis=0)
-                self.visualize_voxels_boxes(
-                    centers[mask],
-                    half_sizes[mask],
-                    subset_colors,
-                    entity_path=f"{entity_path}/{subpath}",
-                    max_boxes=0,
-                    iteration=iteration,
-                )
-
-            nvblox_reference_mode = str(entity_path).rstrip("/").endswith(
-                "voxels_sdf_pruned_nvblox"
-            )
-            if not nvblox_reference_mode:
-                log_voxel_subset(wrong_mesh, "wrong_voxels_mesh", [255, 140, 0, 220])
-                log_voxel_subset(
-                    wrong_sdf_free_gt_surface,
-                    "wrong_voxels_mesh/sdf_free_gt_surface",
-                    [255, 0, 0, 220],
-                )
-                log_voxel_subset(
-                    wrong_svraster_pruned_surface_agreement,
-                    "wrong_voxels_mesh/svraster_pruned_surface_agreement",
-                    [255, 180, 0, 220],
-                )
-                log_voxel_subset(correct_mesh, "correct_voxels_mesh", None)
-
-            class_names = {
-                0: "unknown",
-                1: "free_space",
-                2: "surface_band",
-                3: "occupied_side",
-            }
-
-            def voxel_class_name(vox_i: int, prefix: str) -> str:
-                if prefix == "computed":
-                    if comp_voxel_free[vox_i]:
-                        return "free_space"
-                    if comp_voxel_occupied[vox_i]:
-                        return "occupied_side"
-                    if comp_voxel_surface[vox_i]:
-                        return "surface_band"
-                    return "unknown"
-                if gt_voxel_free[vox_i]:
-                    return "free_space"
-                if gt_voxel_occupied[vox_i]:
-                    return "occupied_side"
-                if gt_voxel_surface[vox_i]:
-                    return "surface_band"
-                return "unknown"
-
-            if nvblox_reference_mode:
-                wrong_nvblox = source_sdf & comp_voxel_free & (
-                    gt_voxel_surface | gt_voxel_occupied
-                )
-                correct_nvblox = source_sdf & comp_voxel_free & gt_voxel_free
-                missed_nvblox = source_svraster & (
-                    comp_voxel_surface | comp_voxel_occupied
-                ) & gt_voxel_free
-                any_gt_known = gt_voxel_free | gt_voxel_surface | gt_voxel_occupied
-                unknown_nvblox = (source_sdf | source_svraster) & (~any_gt_known)
-
-                log_voxel_subset(
-                    wrong_nvblox,
-                    "wrong_voxels_nvblox",
-                    [255, 0, 0, 220],
-                )
-                log_voxel_subset(
-                    correct_nvblox,
-                    "correct_voxels_nvblox",
-                    None,
-                )
-                log_voxel_subset(
-                    missed_nvblox,
-                    "missed_voxels_nvblox",
-                    [255, 180, 0, 220],
-                )
-                log_voxel_subset(
-                    unknown_nvblox,
-                    "unknown_nvblox",
-                    [120, 120, 120, 180],
-                )
-
-            point_colors = np.zeros((corner_pts.shape[0], 4), dtype=np.uint8)
-            point_colors[:, 0] = 60
-            point_colors[:, 1] = 180
-            point_colors[:, 2] = 255
-            point_colors[:, 3] = 255
-            dangerous_free_corner = (
-                valid_comp
-                & valid_gt
-                & (comp_cls == 1)
-                & ((gt_cls == 2) | (gt_cls == 3))
-            )
-            dangerous_free_flat = dangerous_free_corner.reshape(-1)
-            point_colors[dangerous_free_flat, 0] = 255
-            point_colors[dangerous_free_flat, 1] = 0
-            point_colors[dangerous_free_flat, 2] = 0
-            point_colors[dangerous_free_flat, 3] = 255
-
-            labels = []
-            meta_voxel_id = []
-            meta_corner_id = []
-            meta_pruned_by_tsdf = []
-            meta_dangerous_free_corner = []
-            meta_computed_sdf_m = []
-            meta_computed_weight = []
-            meta_gt_sdf_m = []
-            meta_density_raw = []
-            meta_computed_corner_class = []
-            meta_gt_corner_class = []
-            meta_computed_voxel_class = []
-            meta_gt_voxel_class = []
-            meta_wrong_voxel_mesh = []
-            meta_wrong_sdf_free_gt_surface = []
-            meta_wrong_svraster_pruned_surface_agreement = []
-            meta_correct_voxel_mesh = []
-            meta_pruned_by_sdf = []
-            meta_pruned_by_svraster = []
-
-            for vox_i in range(n):
-                comp_voxel_name = voxel_class_name(vox_i, "computed")
-                gt_voxel_name = voxel_class_name(vox_i, "gt")
-                for c in range(8):
-                    comp_name = class_names.get(int(comp_cls[vox_i, c]), "unknown")
-                    gt_name = class_names.get(int(gt_cls[vox_i, c]), "unknown")
-                    dangerous_corner = bool(dangerous_free_corner[vox_i, c])
-                    labels.append(
-                        "voxel_id={} corner={} pruned_by_tsdf={} dangerous_free_corner={} "
-                        "computed_sdf_m={:.5f} computed_weight={:.3f} "
-                        "gt_sdf_m={:.5f} density_raw={:.5f} "
-                        "computed_corner_class={} gt_corner_class={} "
-                        "computed_voxel_class={} gt_voxel_class={} "
-                        "wrong_voxel_mesh={} wrong_sdf_free_gt_surface={} "
-                        "wrong_svraster_pruned_surface_agreement={} "
-                        "correct_voxel_mesh={} pruned_by_sdf={} pruned_by_svraster={}".format(
-                            int(ids[vox_i]),
-                            c,
-                            int(source_sdf[vox_i]),
-                            int(dangerous_corner),
-                            float(comp_sdf[vox_i, c]),
-                            float(weights[vox_i, c]),
-                            float(gt_sdf[vox_i, c]),
-                            float(density[vox_i, c]),
-                            comp_name,
-                            gt_name,
-                            comp_voxel_name,
-                            gt_voxel_name,
-                            int(wrong_mesh[vox_i]),
-                            int(wrong_sdf_free_gt_surface[vox_i]),
-                            int(wrong_svraster_pruned_surface_agreement[vox_i]),
-                            int(correct_mesh[vox_i]),
-                            int(source_sdf[vox_i]),
-                            int(source_svraster[vox_i]),
-                        )
-                    )
-                    meta_voxel_id.append(int(ids[vox_i]))
-                    meta_corner_id.append(c)
-                    meta_pruned_by_tsdf.append(bool(source_sdf[vox_i]))
-                    meta_dangerous_free_corner.append(dangerous_corner)
-                    meta_computed_sdf_m.append(float(comp_sdf[vox_i, c]))
-                    meta_computed_weight.append(float(weights[vox_i, c]))
-                    meta_gt_sdf_m.append(float(gt_sdf[vox_i, c]))
-                    meta_density_raw.append(float(density[vox_i, c]))
-                    meta_computed_corner_class.append(comp_name)
-                    meta_gt_corner_class.append(gt_name)
-                    meta_computed_voxel_class.append(comp_voxel_name)
-                    meta_gt_voxel_class.append(gt_voxel_name)
-                    meta_wrong_voxel_mesh.append(bool(wrong_mesh[vox_i]))
-                    meta_wrong_sdf_free_gt_surface.append(bool(wrong_sdf_free_gt_surface[vox_i]))
-                    meta_wrong_svraster_pruned_surface_agreement.append(
-                        bool(wrong_svraster_pruned_surface_agreement[vox_i])
-                    )
-                    meta_correct_voxel_mesh.append(bool(correct_mesh[vox_i]))
-                    meta_pruned_by_sdf.append(bool(source_sdf[vox_i]))
-                    meta_pruned_by_svraster.append(bool(source_svraster[vox_i]))
-
-            def log_corner_subset(voxel_mask: npt.NDArray, subpath: str) -> None:
-                voxel_mask = np.asarray(voxel_mask, dtype=bool).reshape(-1)
-                voxel_idx = np.flatnonzero(voxel_mask)
-                path = f"{entity_path}/{subpath}/corners"
-                if voxel_idx.size == 0:
-                    rr.log(path, rr.Points3D(np.zeros((0, 3), dtype=np.float32)))
-                    if hasattr(rr, "AnyValues"):
-                        rr.log(
-                            path,
-                            rr.AnyValues(
-                                voxel_id=np.asarray([], dtype=np.int64),
-                                corner_id=np.asarray([], dtype=np.int64),
-                                pruned_by_tsdf=np.asarray([], dtype=bool),
-                                dangerous_free_corner=np.asarray([], dtype=bool),
-                                computed_sdf_m=np.asarray([], dtype=np.float32),
-                                computed_weight=np.asarray([], dtype=np.float32),
-                                gt_sdf_m=np.asarray([], dtype=np.float32),
-                                density_raw=np.asarray([], dtype=np.float32),
-                                computed_corner_class=[],
-                                gt_corner_class=[],
-                                computed_voxel_class=[],
-                                gt_voxel_class=[],
-                                wrong_voxel_mesh=np.asarray([], dtype=bool),
-                                wrong_sdf_free_gt_surface=np.asarray([], dtype=bool),
-                                wrong_svraster_pruned_surface_agreement=np.asarray([], dtype=bool),
-                                correct_voxel_mesh=np.asarray([], dtype=bool),
-                                pruned_by_sdf=np.asarray([], dtype=bool),
-                                pruned_by_svraster=np.asarray([], dtype=bool),
-                                corner_info=[],
-                            ),
-                        )
-                    return
-
-                flat_idx = (voxel_idx[:, None] * 8 + np.arange(8, dtype=np.int64)[None, :]).reshape(-1)
-                subset_labels = [labels[int(i)] for i in flat_idx]
-                try:
-                    subset_points = rr.Points3D(
-                        corner_pts[flat_idx],
-                        colors=point_colors[flat_idx],
-                        labels=subset_labels,
-                        show_labels=False,
-                    )
-                except TypeError:
-                    subset_points = rr.Points3D(corner_pts[flat_idx], colors=point_colors[flat_idx])
-                rr.log(path, subset_points)
-
-                if hasattr(rr, "AnyValues"):
-                    rr.log(
-                        path,
-                        rr.AnyValues(
-                            voxel_id=np.asarray(meta_voxel_id, dtype=np.int64)[flat_idx],
-                            corner_id=np.asarray(meta_corner_id, dtype=np.int64)[flat_idx],
-                            pruned_by_tsdf=np.asarray(meta_pruned_by_tsdf, dtype=bool)[flat_idx],
-                            dangerous_free_corner=np.asarray(meta_dangerous_free_corner, dtype=bool)[flat_idx],
-                            computed_sdf_m=np.asarray(meta_computed_sdf_m, dtype=np.float32)[flat_idx],
-                            computed_weight=np.asarray(meta_computed_weight, dtype=np.float32)[flat_idx],
-                            gt_sdf_m=np.asarray(meta_gt_sdf_m, dtype=np.float32)[flat_idx],
-                            density_raw=np.asarray(meta_density_raw, dtype=np.float32)[flat_idx],
-                            computed_corner_class=[meta_computed_corner_class[int(i)] for i in flat_idx],
-                            gt_corner_class=[meta_gt_corner_class[int(i)] for i in flat_idx],
-                            computed_voxel_class=[meta_computed_voxel_class[int(i)] for i in flat_idx],
-                            gt_voxel_class=[meta_gt_voxel_class[int(i)] for i in flat_idx],
-                            wrong_voxel_mesh=np.asarray(meta_wrong_voxel_mesh, dtype=bool)[flat_idx],
-                            wrong_sdf_free_gt_surface=np.asarray(
-                                meta_wrong_sdf_free_gt_surface, dtype=bool
-                            )[flat_idx],
-                            wrong_svraster_pruned_surface_agreement=np.asarray(
-                                meta_wrong_svraster_pruned_surface_agreement, dtype=bool
-                            )[flat_idx],
-                            correct_voxel_mesh=np.asarray(meta_correct_voxel_mesh, dtype=bool)[flat_idx],
-                            pruned_by_sdf=np.asarray(meta_pruned_by_sdf, dtype=bool)[flat_idx],
-                            pruned_by_svraster=np.asarray(meta_pruned_by_svraster, dtype=bool)[flat_idx],
-                            corner_info=subset_labels,
-                        ),
-                    )
-
-            if nvblox_reference_mode:
-                log_corner_subset(wrong_nvblox, "wrong_voxels_nvblox")
-                log_corner_subset(correct_nvblox, "correct_voxels_nvblox")
-                log_corner_subset(missed_nvblox, "missed_voxels_nvblox")
-                log_corner_subset(unknown_nvblox, "unknown_nvblox")
-                return
-
-            log_corner_subset(wrong_sdf_free_gt_surface, "wrong_voxels_mesh/sdf_free_gt_surface")
-            log_corner_subset(
-                wrong_svraster_pruned_surface_agreement,
-                "wrong_voxels_mesh/svraster_pruned_surface_agreement",
-            )
-            log_corner_subset(correct_mesh, "correct_voxels_mesh")
-
     def _load_gt_trajectory_centers(self, traj_path: str) -> Optional[npt.NDArray]:
         if self._gt_traj_centers is not None and self._gt_traj_centers_path == traj_path:
             return self._gt_traj_centers
@@ -1970,6 +1446,188 @@ class RerunVisualizer:
             return None
         t = mu_dst - scale * (R @ mu_src)
         return scale, R, t
+
+    @staticmethod
+    def _load_tum_trajectory_with_timestamps(path: str):
+        if not path or not os.path.exists(path):
+            return None
+        timestamps = []
+        centers = []
+        with open(path, "r", encoding="utf-8") as trajectory:
+            for line in trajectory:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split()
+                if len(fields) < 8:
+                    continue
+                try:
+                    values = [float(value) for value in fields[:8]]
+                except ValueError:
+                    continue
+                if not np.all(np.isfinite(values[:4])):
+                    continue
+                timestamps.append(values[0])
+                centers.append(values[1:4])
+        if len(timestamps) < 4:
+            return None
+        order = np.argsort(np.asarray(timestamps, dtype=np.float64))
+        return (
+            np.asarray(timestamps, dtype=np.float64)[order],
+            np.asarray(centers, dtype=np.float64)[order],
+        )
+
+    @staticmethod
+    def _timestamp_matched_centers(source, target):
+        source_t, source_xyz = source
+        target_t, target_xyz = target
+        positive_steps = np.diff(source_t)
+        positive_steps = positive_steps[positive_steps > 1.0e-9]
+        median_step = (
+            float(np.median(positive_steps))
+            if positive_steps.size else 1.0
+        )
+        tolerance = max(1.0e-6, 0.51 * median_step)
+
+        source_matches = []
+        target_matches = []
+        used_source = set()
+        for timestamp, target_center in zip(target_t, target_xyz):
+            right = int(np.searchsorted(source_t, timestamp))
+            candidates = []
+            if right < source_t.size:
+                candidates.append(right)
+            if right > 0:
+                candidates.append(right - 1)
+            if not candidates:
+                continue
+            index = min(candidates, key=lambda i: abs(source_t[i] - timestamp))
+            if index in used_source or abs(source_t[index] - timestamp) > tolerance:
+                continue
+            used_source.add(index)
+            source_matches.append(source_xyz[index])
+            target_matches.append(target_center)
+
+        if len(source_matches) < 4:
+            return None
+        return (
+            np.asarray(source_matches, dtype=np.float64),
+            np.asarray(target_matches, dtype=np.float64),
+            tolerance,
+        )
+
+    @staticmethod
+    def _save_ascii_triangle_mesh(
+        path: str,
+        vertices: npt.NDArray,
+        faces: npt.NDArray,
+        colors: Optional[npt.NDArray],
+    ) -> None:
+        vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+        faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        has_colors = colors is not None and len(colors) == len(vertices)
+        if has_colors:
+            colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as mesh_file:
+            mesh_file.write("ply\nformat ascii 1.0\n")
+            mesh_file.write(f"element vertex {len(vertices)}\n")
+            mesh_file.write("property float x\nproperty float y\nproperty float z\n")
+            if has_colors:
+                mesh_file.write(
+                    "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                )
+            mesh_file.write(f"element face {len(faces)}\n")
+            mesh_file.write("property list uchar int vertex_indices\nend_header\n")
+            if has_colors:
+                for vertex, color in zip(vertices, colors):
+                    mesh_file.write(
+                        f"{vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g} "
+                        f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+                    )
+            else:
+                for vertex in vertices:
+                    mesh_file.write(
+                        f"{vertex[0]:.9g} {vertex[1]:.9g} {vertex[2]:.9g}\n"
+                    )
+            for face in faces:
+                mesh_file.write(
+                    f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n"
+                )
+
+    def align_reference_ply_mesh(
+        self,
+        source_mesh_path: str,
+        source_trajectory_tum_path: str,
+        target_trajectory_tum_path: str,
+        output_mesh_path: str,
+        report_path: str,
+    ) -> bool:
+        source_trajectory = self._load_tum_trajectory_with_timestamps(
+            source_trajectory_tum_path
+        )
+        target_trajectory = self._load_tum_trajectory_with_timestamps(
+            target_trajectory_tum_path
+        )
+        if source_trajectory is None or target_trajectory is None:
+            print("[RERUN/nvblox] missing or insufficient trajectory poses")
+            return False
+
+        matched = self._timestamp_matched_centers(
+            source_trajectory, target_trajectory
+        )
+        if matched is None:
+            print("[RERUN/nvblox] fewer than four timestamp-matched poses")
+            return False
+        source_centers, target_centers, tolerance = matched
+        similarity = self._estimate_similarity_umeyama(
+            source_centers, target_centers
+        )
+        if similarity is None:
+            print("[RERUN/nvblox] trajectory Sim(3) estimation failed")
+            return False
+        scale, rotation, translation = similarity
+
+        mesh = self._load_gt_triangle_mesh(source_mesh_path)
+        if mesh is None:
+            print(f"[RERUN/nvblox] failed to load mesh: {source_mesh_path}")
+            return False
+        vertices, faces, colors = mesh
+        aligned_vertices = (
+            scale * (np.asarray(vertices, dtype=np.float64) @ rotation.T)
+            + translation[None, :]
+        ).astype(np.float32)
+        self._save_ascii_triangle_mesh(
+            output_mesh_path, aligned_vertices, faces, colors
+        )
+
+        transformed_centers = scale * (source_centers @ rotation.T) + translation
+        residuals = np.linalg.norm(transformed_centers - target_centers, axis=1)
+        rmse = float(np.sqrt(np.mean(residuals * residuals)))
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as report:
+            report.write(f"source_mesh {source_mesh_path}\n")
+            report.write(f"source_trajectory {source_trajectory_tum_path}\n")
+            report.write(f"target_trajectory {target_trajectory_tum_path}\n")
+            report.write(f"pairs {len(source_centers)}\n")
+            report.write(f"timestamp_tolerance {tolerance:.9g}\n")
+            report.write(f"scale {scale:.12g}\n")
+            report.write("rotation\n")
+            for row in rotation:
+                report.write(" ".join(f"{value:.12g}" for value in row) + "\n")
+            report.write(
+                "translation "
+                + " ".join(f"{value:.12g}" for value in translation)
+                + "\n"
+            )
+            report.write(f"trajectory_rmse {rmse:.12g}\n")
+        print(
+            f"[RERUN/nvblox] aligned mesh: pairs={len(source_centers)} "
+            f"scale={scale:.6g} trajectory_rmse={rmse:.6g} -> "
+            f"{output_mesh_path}"
+        )
+        return True
 
     def _estimate_gt_to_slam_transform(
         self,
@@ -2173,13 +1831,94 @@ class RerunVisualizer:
             faces_np = np.asarray(faces, dtype=np.int32)
             return vertices, faces_np, colors
 
+    def _load_ascii_ply_mesh(self, mesh_path: str):
+        with open(mesh_path, "r", encoding="ascii", errors="replace") as f:
+            header_lines = []
+            while True:
+                line = f.readline()
+                if not line:
+                    return None
+                header_lines.append(line.strip())
+                if header_lines[-1] == "end_header":
+                    break
+
+            if len(header_lines) < 2 or header_lines[0] != "ply":
+                return None
+            if header_lines[1] != "format ascii 1.0":
+                return None
+
+            vertex_count = 0
+            face_count = 0
+            vertex_properties = []
+            element = None
+            for line in header_lines:
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] == "element":
+                    element = parts[1]
+                    if element == "vertex":
+                        vertex_count = int(parts[2])
+                    elif element == "face":
+                        face_count = int(parts[2])
+                elif (
+                    element == "vertex" and len(parts) == 3 and
+                    parts[0] == "property"
+                ):
+                    vertex_properties.append(parts[2])
+
+            required = ("x", "y", "z")
+            if vertex_count <= 0 or face_count <= 0 or not all(
+                name in vertex_properties for name in required
+            ):
+                return None
+
+            property_index = {
+                name: index for index, name in enumerate(vertex_properties)
+            }
+            vertices = np.empty((vertex_count, 3), dtype=np.float32)
+            has_colors = all(
+                name in property_index for name in ("red", "green", "blue")
+            )
+            colors = (
+                np.empty((vertex_count, 3), dtype=np.uint8)
+                if has_colors else None
+            )
+            for row in range(vertex_count):
+                values = f.readline().split()
+                if len(values) < len(vertex_properties):
+                    return None
+                vertices[row] = [
+                    float(values[property_index[name]]) for name in required
+                ]
+                if colors is not None:
+                    colors[row] = [
+                        int(values[property_index[name]])
+                        for name in ("red", "green", "blue")
+                    ]
+
+            faces = []
+            for _ in range(face_count):
+                values = f.readline().split()
+                if not values:
+                    return None
+                count = int(values[0])
+                if len(values) < count + 1:
+                    return None
+                indices = [int(value) for value in values[1:count + 1]]
+                for index in range(1, count - 1):
+                    faces.append((indices[0], indices[index], indices[index + 1]))
+
+            if not faces:
+                return None
+            return vertices, np.asarray(faces, dtype=np.int32), colors
+
     def _load_gt_triangle_mesh(self, mesh_path: str):
         # Replica meshes are binary PLYs with polygon faces; Open3D can reject
         # them before triangulation, so use a small local triangulating loader.
         if mesh_path.lower().endswith(".ply"):
             mesh_data = self._load_binary_little_endian_ply_mesh(mesh_path)
+            if mesh_data is None:
+                mesh_data = self._load_ascii_ply_mesh(mesh_path)
             if mesh_data is not None:
-                vertices, faces, _ = mesh_data
                 return mesh_data
 
         import open3d as o3d

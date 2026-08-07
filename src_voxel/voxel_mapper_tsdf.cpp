@@ -1,12 +1,40 @@
 #include "include_voxel/voxel_mapper.h"
+#include "include_voxel/voxel_mapper_supervision.h"
 #include "include_voxel/voxel_mapper_utils.h"
 
 #include <algorithm>
 #include <cmath>
-#include <deque>
 #include <limits>
 #include <unordered_map>
 #include <vector>
+
+namespace {
+
+torch::Tensor floatDepthMapToDevice(
+    const cv::Mat& input,
+    const torch::Device& device)
+{
+    if (input.empty() || input.channels() != 1) {
+        return torch::Tensor();
+    }
+    cv::Mat float_input;
+    if (input.type() == CV_32FC1) {
+        float_input = input;
+    } else {
+        input.convertTo(float_input, CV_32FC1);
+    }
+    const cv::Mat continuous =
+        float_input.isContinuous() ? float_input : float_input.clone();
+    return torch::from_blob(
+               const_cast<float*>(continuous.ptr<float>()),
+               {continuous.rows, continuous.cols},
+               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+        .clone()
+        .to(device, torch::kFloat32)
+        .contiguous();
+}
+
+} // namespace
 
 float VoxelMapper::sdfMetricVoxelSize() const
 {
@@ -158,7 +186,7 @@ torch::Tensor VoxelMapper::computeProjectiveSdfInitForGridPoints(
     }
 
     torch::Tensor depth =
-        tensor_utils::cvMat2TorchTensor_Float32(
+        voxel_utils::cvMatToTorchTensorFloat32(
             sdf_state_.projective_sdf_init_depth_meters_,
             device_type_)
             .to(mDevice)
@@ -203,35 +231,6 @@ torch::Tensor VoxelMapper::computeProjectiveSdfInitForGridPoints(
         sdf_init.to(mDevice)).contiguous();
 
     return sdf_init.to(grid_points_world.device()).contiguous();
-}
-
-torch::Tensor VoxelMapper::computeSdfInitForGridPoints(
-    const torch::Tensor& grid_points_world,
-    float ray_interval_m)
-{
-    TORCH_CHECK(
-        grid_points_world.defined() &&
-        grid_points_world.dim() == 2 &&
-        grid_points_world.size(1) == 3,
-        "computeSdfInitForGridPoints expects grid_points_world [N,3]");
-
-    const int64_t N = grid_points_world.size(0);
-    auto opts = torch::TensorOptions()
-                    .dtype(torch::kFloat32)
-                    .device(grid_points_world.device());
-    torch::Tensor sdf_init =
-        torch::full({N, 1}, std::numeric_limits<float>::quiet_NaN(), opts);
-    if (N == 0 || sensor_type_ != RGBD) {
-        return sdf_init;
-    }
-
-    if (sdf_state_.projective_sdf_init_context_valid_) {
-        return computeProjectiveSdfInitForGridPoints(
-            grid_points_world,
-            ray_interval_m);
-    }
-
-    return sdf_init;
 }
 
 int64_t VoxelMapper::fuseProjectiveSdfInitFromKeyframe(
@@ -314,14 +313,14 @@ int64_t VoxelMapper::fuseProjectiveSdfInitFromKeyframe(
     }
 
     torch::Tensor weights = valid.to(torch::kFloat32);
-    voxel_model_->fuseSvrasterSdfGridSamples(
+    voxel_model_->fuseProjectiveSdfGridSamples(
         measured_sdf,
         weights,
         valid,
         /*max_weight=*/100.0f);
-    torch::Tensor fused_weight = voxel_model_->svrasterSdfWeights();
+    torch::Tensor fused_weight = voxel_model_->fusedSdfWeights();
     voxel_model_->applyGeoGridRawInit(
-        voxel_model_->svrasterSdfGridPts(),
+        voxel_model_->fusedSdfGridPts(),
         targeted_hole_update ? valid : (fused_weight > 0.0f));
     return observed;
 }
@@ -389,584 +388,258 @@ torch::Tensor VoxelMapper::computeSvreconSdfPruneMask(float* sdf_threshold_out)
         .contiguous();
 }
 
-torch::Tensor VoxelMapper::computeFinalSurfaceConfidenceKeepMask(
-    bool retain_connected)
+torch::Tensor VoxelMapper::computeOnlineCovisibilityPruneMask(
+    const std::vector<sv::MiniCam>& cameras,
+    const torch::Tensor& view_count_in)
 {
-    const char* log_tag = retain_connected
-        ? "[FINAL/surface]"
-        : "[PRUNE/surface_views]";
     const int64_t voxel_count = voxel_model_ ? voxel_model_->numVoxels() : 0;
     torch::Device device = mDevice;
     if (voxel_model_ && voxel_model_->voxCenter().defined()) {
         device = voxel_model_->voxCenter().device();
     }
     auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device);
-    if (voxel_count <= 0 || !voxel_model_) {
-        return torch::empty({0}, bool_opts);
+    auto prune_none = torch::zeros({std::max<int64_t>(0, voxel_count)}, bool_opts);
+    if (!voxel_model_ || voxel_count <= 0) {
+        return prune_none;
     }
 
-    auto keep_all = torch::ones({voxel_count}, bool_opts);
-    torch::Tensor centers =
-        voxel_model_->voxCenter().to(device).to(torch::kFloat32).contiguous();
-    torch::Tensor sizes =
-        voxel_model_->voxSize().to(device).to(torch::kFloat32).reshape({voxel_count}).contiguous();
-    torch::Tensor sdf =
-        voxel_model_->voxelGeoCorners().to(device).to(torch::kFloat32).contiguous();
-    torch::Tensor vox_key =
-        voxel_model_->voxKey().to(device).to(torch::kLong).contiguous();
-    if (centers.dim() != 2 || centers.size(0) != voxel_count || centers.size(1) != 3 ||
-        sizes.numel() != voxel_count || sdf.dim() != 2 || sdf.size(0) != voxel_count ||
-        sdf.size(1) != 8 || vox_key.dim() != 2 || vox_key.size(0) != voxel_count ||
-        vox_key.size(1) != 8) {
-        std::cerr << log_tag << " skipped: inconsistent voxel tensors\n";
-        return keep_all;
+    const int min_views = std::max(1, opt_params_.surface_min_views_);
+    const int required_cameras = std::max(
+        min_views,
+        incremental_mapping_window_size_ > 0
+            ? incremental_mapping_window_size_
+            : std::max(1, max_depth_cached_));
+    if (cameras.size() < static_cast<std::size_t>(required_cameras)) {
+        std::cout << "[PRUNE/surface_views] skipped: cameras=" << cameras.size()
+                  << " required=" << required_cameras << "\n";
+        return prune_none;
+    }
+    if (!view_count_in.defined() || view_count_in.numel() != voxel_count) {
+        std::cerr << "[PRUNE/surface_views] skipped: renderer view-count shape mismatch\n";
+        return prune_none;
     }
 
-    torch::Tensor finite = torch::isfinite(sdf).all(/*dim=*/1);
-    torch::Tensor sdf_min = std::get<0>(sdf.min(/*dim=*/1));
-    torch::Tensor sdf_max = std::get<0>(sdf.max(/*dim=*/1));
-    torch::Tensor sdf_span = sdf_max - sdf_min;
-    const torch::Tensor corner_offsets = torch::tensor(
-        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
-         {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 1.0f},
-         {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 1.0f},
-         {1.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f}},
-        torch::TensorOptions().dtype(torch::kFloat32).device(device));
-    const torch::Tensor edge_begin = torch::tensor(
-        {0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6},
-        torch::TensorOptions().dtype(torch::kLong).device(device));
-    const torch::Tensor edge_end = torch::tensor(
-        {1, 2, 4, 3, 5, 3, 6, 7, 5, 6, 7, 7},
-        torch::TensorOptions().dtype(torch::kLong).device(device));
-    torch::Tensor corner_xyz =
-        centers.unsqueeze(1) +
-        (corner_offsets.unsqueeze(0) - 0.5f) * sizes.view({voxel_count, 1, 1});
-    torch::Tensor sdf_begin = sdf.index_select(1, edge_begin);
-    torch::Tensor sdf_end = sdf.index_select(1, edge_end);
-    torch::Tensor has_positive = (sdf > 0.0f).any(/*dim=*/1);
-    torch::Tensor has_negative = (sdf < 0.0f).any(/*dim=*/1);
-    torch::Tensor strict_sign_change = has_positive & has_negative;
+    torch::Tensor view_count =
+        view_count_in.to(device).to(torch::kFloat32).reshape({voxel_count});
+    torch::Tensor leaf =
+        voxel_model_->isLeaf().to(device).to(torch::kBool).reshape({voxel_count});
+    torch::Tensor eligible = leaf.clone();
 
-    // A surface edge must have endpoints on strict opposite sides of zero.
-    // Merely touching zero from one side is not a crossing.
-    torch::Tensor edge_crossing =
-        ((sdf_begin > 0.0f) & (sdf_end < 0.0f)) |
-        ((sdf_begin < 0.0f) & (sdf_end > 0.0f));
-    torch::Tensor interp =
-        sdf_begin.abs() / (sdf_begin.abs() + sdf_end.abs()).clamp_min(1.0e-8f);
-    torch::Tensor edge_xyz_begin = corner_xyz.index_select(1, edge_begin);
-    torch::Tensor edge_xyz_end = corner_xyz.index_select(1, edge_end);
-    torch::Tensor edge_xyz =
-        edge_xyz_begin + interp.unsqueeze(2) * (edge_xyz_end - edge_xyz_begin);
-    torch::Tensor crossing_count =
-        edge_crossing.to(torch::kFloat32).sum(/*dim=*/1).clamp_min(1.0f);
-    torch::Tensor crossing_points =
-        (edge_xyz * edge_crossing.unsqueeze(2).to(torch::kFloat32)).sum(/*dim=*/1) /
-        crossing_count.unsqueeze(1);
-    torch::Tensor strict_zero_crossing =
-        finite & strict_sign_change & edge_crossing.any(/*dim=*/1);
-    torch::Tensor span_pass =
-        sdf_span >= opt_params_.final_surface_min_sdf_span_vox_ * sizes;
-    torch::Tensor zero_crossing = strict_zero_crossing & span_pass;
-    crossing_points = torch::where(
-        zero_crossing.unsqueeze(1),
-        crossing_points,
-        centers);
-
-    torch::Tensor surface_views = torch::zeros(
-        {voxel_count},
-        torch::TensorOptions().dtype(torch::kInt32).device(device));
-    torch::Tensor observed_views = torch::zeros_like(surface_views);
-    int depth_keyframes = 0;
-
-    if (sensor_type_ == RGBD) {
-        const torch::Tensor depth_tolerance =
-            opt_params_.final_surface_depth_tolerance_vox_ * sizes;
-
-        std::vector<std::shared_ptr<VoxelKeyframe>> evidence_keyframes;
-        const auto& scene_keyframes = scene_->keyframes();
-        if (!retain_connected && incremental_mapping_window_size_ > 0) {
-            evidence_keyframes.reserve(std::min<std::size_t>(
-                static_cast<std::size_t>(incremental_mapping_window_size_),
-                scene_keyframes.size()));
-            for (auto it = scene_keyframes.rbegin();
-                 it != scene_keyframes.rend() &&
-                 evidence_keyframes.size() <
-                     static_cast<std::size_t>(incremental_mapping_window_size_);
-                 ++it) {
-                if (it->second) {
-                    evidence_keyframes.push_back(it->second);
-                }
-            }
+    // MonoGS performs one whole-map co-visibility pass, then limits later
+    // passes to recently inserted primitives.
+    if (surface_view_pruning_initialized_) {
+        torch::Tensor birth_kf = voxel_model_->existSinceKf();
+        if (birth_kf.defined() && birth_kf.numel() == voxel_count) {
+            const int current_kf_count =
+                scene_ ? static_cast<int>(scene_->keyframes().size()) : 0;
+            const int recent_cutoff = std::max(0, current_kf_count - 2);
+            eligible =
+                eligible &
+                (birth_kf.to(device).to(torch::kInt32).reshape({voxel_count}) >=
+                 recent_cutoff);
         } else {
-            evidence_keyframes.reserve(scene_keyframes.size());
-            for (const auto& item : scene_keyframes) {
-                if (item.second) {
-                    evidence_keyframes.push_back(item.second);
-                }
-            }
-        }
-
-        for (const auto& kf : evidence_keyframes) {
-            if (!kf || kf->img_auxiliary_undist_.empty()) {
-                continue;
-            }
-
-            cv::Mat depth_meters;
-            if (!voxel_utils::depthMatToMeters(kf->img_auxiliary_undist_, depth_meters) ||
-                depth_meters.empty()) {
-                continue;
-            }
-            if (depth_meters.channels() > 1) {
-                cv::extractChannel(depth_meters, depth_meters, 0);
-            }
-            if (depth_meters.type() != CV_32FC1) {
-                depth_meters.convertTo(depth_meters, CV_32FC1);
-            }
-            if (depth_meters.rows <= 0 || depth_meters.cols <= 0) {
-                continue;
-            }
-
-            const int height = depth_meters.rows;
-            const int width = depth_meters.cols;
-            sv::MiniCam cam = kf->toMiniCam(height, width);
-            if (!cam.w2c.defined() || cam.w2c.numel() < 16 ||
-                cam.fx <= 1.0e-6f || cam.fy <= 1.0e-6f) {
-                continue;
-            }
-
-            torch::Tensor depth = torch::from_blob(
-                                      depth_meters.data,
-                                      {height, width},
-                                      torch::TensorOptions().dtype(torch::kFloat32))
-                                      .clone()
-                                      .to(device)
-                                      .contiguous();
-            torch::Tensor w2c =
-                cam.w2c.to(device).to(torch::kFloat32).contiguous();
-            torch::Tensor rotation = w2c.index({
-                torch::indexing::Slice(0, 3),
-                torch::indexing::Slice(0, 3)});
-            torch::Tensor translation =
-                w2c.index({torch::indexing::Slice(0, 3), 3}).view({1, 3});
-            torch::Tensor camera_points =
-                torch::matmul(crossing_points, rotation.transpose(0, 1)) + translation;
-            torch::Tensor x = camera_points.index({torch::indexing::Slice(), 0});
-            torch::Tensor y = camera_points.index({torch::indexing::Slice(), 1});
-            torch::Tensor z = camera_points.index({torch::indexing::Slice(), 2});
-            torch::Tensor z_safe = z.clamp_min(1.0e-6f);
-            torch::Tensor u = cam.fx * x / z_safe + cam.cx;
-            torch::Tensor v = cam.fy * y / z_safe + cam.cy;
-            torch::Tensor in_image =
-                torch::isfinite(z) & (z > std::max(1.0e-6f, RGBD_min_depth_)) &
-                torch::isfinite(u) & torch::isfinite(v) &
-                (u >= 0.0f) & (u < static_cast<float>(width)) &
-                (v >= 0.0f) & (v < static_cast<float>(height));
-
-            torch::Tensor u_index = torch::floor(
-                torch::where(torch::isfinite(u), u, torch::zeros_like(u)))
-                                        .clamp(0.0f, static_cast<float>(width - 1))
-                                        .to(torch::kLong);
-            torch::Tensor v_index = torch::floor(
-                torch::where(torch::isfinite(v), v, torch::zeros_like(v)))
-                                        .clamp(0.0f, static_cast<float>(height - 1))
-                                        .to(torch::kLong);
-            torch::Tensor measured_depth = depth.reshape({height * width}).index_select(
-                0,
-                v_index * width + u_index);
-            torch::Tensor valid_depth =
-                in_image & torch::isfinite(measured_depth) &
-                (measured_depth > RGBD_min_depth_) &
-                (measured_depth < RGBD_max_depth_);
-            torch::Tensor surface_hit =
-                valid_depth & ((z - measured_depth).abs() <= depth_tolerance);
-            torch::Tensor observed =
-                valid_depth & (z <= (measured_depth + depth_tolerance));
-
-            surface_views += surface_hit.to(torch::kInt32);
-            observed_views += observed.to(torch::kInt32);
-            ++depth_keyframes;
+            std::cerr << "[PRUNE/surface_views] skipped: voxel birth metadata mismatch\n";
+            return prune_none;
         }
     }
+    surface_view_pruning_initialized_ = true;
 
-    torch::Tensor strong_seed;
-    torch::Tensor connected_candidate;
-    if (depth_keyframes > 0) {
-        strong_seed =
-            zero_crossing &
-            (surface_views >= opt_params_.final_surface_min_views_);
-        connected_candidate = zero_crossing.clone();
-    } else {
-        std::vector<sv::MiniCam> cameras;
-        if (!retain_connected && incremental_mapping_window_size_ > 0) {
-            cameras = incrementalMappingCameras();
-        } else {
-            cameras.reserve(scene_->keyframes().size());
-            for (const auto& item : scene_->keyframes()) {
-                if (item.second) {
-                    cameras.push_back(item.second->toMiniCam(
-                        item.second->image_height_, item.second->image_width_));
-                }
-            }
-        }
-        if (cameras.empty()) {
-            std::cerr << log_tag << " skipped: no keyframes provide confidence evidence\n";
-            return keep_all;
-        }
-        auto stat = voxel_model_->computeTrainingStat(cameras);
-        torch::Tensor view_count =
-            stat.view_cnt.to(device).to(torch::kFloat32).reshape({voxel_count});
-        observed_views = view_count.to(torch::kInt32);
-        surface_views = observed_views.clone();
-        strong_seed =
-            zero_crossing &
-            (view_count >= static_cast<float>(opt_params_.final_surface_min_views_));
-        connected_candidate = zero_crossing.clone();
-    }
-
-    const int64_t strong_count = strong_seed.sum().item<int64_t>();
-    const int64_t candidate_count = connected_candidate.sum().item<int64_t>();
-    const int64_t strict_crossing_count =
-        strict_zero_crossing.sum().item<int64_t>();
-    const int64_t span_reject_count =
-        (strict_zero_crossing & (~span_pass)).sum().item<int64_t>();
-    const int64_t no_depth_support_count =
-        (zero_crossing & (surface_views <= 0)).sum().item<int64_t>();
-    const int64_t below_min_views_count =
-        (zero_crossing & (surface_views > 0) &
-         (surface_views < opt_params_.final_surface_min_views_))
-            .sum().item<int64_t>();
-    if (strong_count <= 0) {
-        std::cerr << log_tag << " skipped destructive refinement: no strong surface seeds"
-                  << " strict_crossing=" << strict_crossing_count
-                  << " span_reject=" << span_reject_count
-                  << " zero_crossing=" << zero_crossing.sum().item<int64_t>()
-                  << " no_depth_support=" << no_depth_support_count
-                  << " below_min_views=" << below_min_views_count
-                  << " candidates=" << candidate_count
-                  << " depth_keyframes=" << depth_keyframes << "\n";
-        return keep_all;
-    }
-
-    torch::Tensor keep = strong_seed.clone();
-    if (!retain_connected && incremental_mapping_window_size_ > 0) {
-        // Online windowed pruning may reject only cells observed by the current
-        // window. Historical cells outside that window remain unchanged.
-        keep = keep | (observed_views <= 0);
-    }
-    if (retain_connected &&
-        opt_params_.final_surface_keep_connected_ &&
-        candidate_count > strong_count) {
-        torch::Tensor candidate_cpu =
-            connected_candidate.to(torch::kCPU).to(torch::kBool).contiguous();
-        torch::Tensor strong_cpu =
-            strong_seed.to(torch::kCPU).to(torch::kBool).contiguous();
-        torch::Tensor vox_key_cpu =
-            vox_key.to(torch::kCPU).to(torch::kLong).contiguous();
-        const bool* candidate_ptr = candidate_cpu.data_ptr<bool>();
-        const bool* strong_ptr = strong_cpu.data_ptr<bool>();
-        const int64_t* vox_key_ptr = vox_key_cpu.data_ptr<int64_t>();
-
-        std::vector<std::vector<int64_t>> adjacency(static_cast<size_t>(voxel_count));
-        std::unordered_map<int64_t, std::vector<int64_t>> corner_owners;
-        corner_owners.reserve(static_cast<size_t>(candidate_count) * 4);
-        for (int64_t voxel = 0; voxel < voxel_count; ++voxel) {
-            if (!candidate_ptr[voxel]) {
-                continue;
-            }
-            for (int corner = 0; corner < 8; ++corner) {
-                const int64_t key = vox_key_ptr[voxel * 8 + corner];
-                auto& owners = corner_owners[key];
-                for (const int64_t neighbor : owners) {
-                    adjacency[static_cast<size_t>(voxel)].push_back(neighbor);
-                    adjacency[static_cast<size_t>(neighbor)].push_back(voxel);
-                }
-                owners.push_back(voxel);
-            }
-        }
-
-        std::vector<int32_t> distance(static_cast<size_t>(voxel_count), -1);
-        std::deque<int64_t> frontier;
-        for (int64_t voxel = 0; voxel < voxel_count; ++voxel) {
-            if (strong_ptr[voxel]) {
-                distance[static_cast<size_t>(voxel)] = 0;
-                frontier.push_back(voxel);
-            }
-        }
-        const int max_hops = std::max(0, opt_params_.final_surface_connected_hops_);
-        while (!frontier.empty()) {
-            const int64_t voxel = frontier.front();
-            frontier.pop_front();
-            const int current_distance = distance[static_cast<size_t>(voxel)];
-            if (current_distance >= max_hops) {
-                continue;
-            }
-            for (const int64_t neighbor : adjacency[static_cast<size_t>(voxel)]) {
-                if (distance[static_cast<size_t>(neighbor)] >= 0) {
-                    continue;
-                }
-                distance[static_cast<size_t>(neighbor)] = current_distance + 1;
-                frontier.push_back(neighbor);
-            }
-        }
-
-        torch::Tensor keep_cpu = torch::zeros(
-            {voxel_count}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-        bool* keep_ptr = keep_cpu.data_ptr<bool>();
-        for (int64_t voxel = 0; voxel < voxel_count; ++voxel) {
-            keep_ptr[voxel] =
-                candidate_ptr[voxel] && distance[static_cast<size_t>(voxel)] >= 0;
-        }
-        keep = keep_cpu.to(device).to(torch::kBool).contiguous();
-    }
-
-    const int64_t keep_count = keep.sum().item<int64_t>();
-    const int64_t preserved_unobserved_count =
-        (!retain_connected && incremental_mapping_window_size_ > 0)
-            ? ((observed_views <= 0) & (~strong_seed)).sum().item<int64_t>()
-            : 0;
-    std::cout << log_tag << " total=" << voxel_count
-              << " depth_keyframes=" << depth_keyframes
-              << " observed=" << (observed_views > 0).sum().item<int64_t>()
-              << " strict_crossing=" << strict_crossing_count
-              << " span_reject=" << span_reject_count
-              << " zero_crossing=" << zero_crossing.sum().item<int64_t>()
-              << " no_depth_support=" << no_depth_support_count
-              << " below_min_views=" << below_min_views_count
-              << " candidates=" << candidate_count
-              << " strong=" << strong_count
-              << " connected_saved="
-              << std::max<int64_t>(
-                     0,
-                     keep_count - strong_count - preserved_unobserved_count)
-              << " preserved_unobserved=" << preserved_unobserved_count
-              << " keep=" << keep_count
-              << " prune=" << (voxel_count - keep_count)
+    torch::Tensor view_prune =
+        (eligible & (view_count < static_cast<float>(min_views)))
+            .to(torch::kBool)
+            .contiguous();
+    std::cout << "[PRUNE/surface_views] cameras=" << cameras.size()
+              << " eligible=" << eligible.sum().item<int64_t>()
+              << " min_views=" << min_views
+              << " prune=" << view_prune.sum().item<int64_t>()
               << "\n";
-    return keep.to(device).to(torch::kBool).contiguous();
+    return view_prune;
 }
 
-void VoxelMapper::runFinalSpecialPrune()
+void VoxelMapper::runFinalRefinement()
 {
-    if (!opt_params_.final_special_prune_enable_ &&
-        !opt_params_.final_surface_prune_enable_) {
-        std::cout << "[FINAL/prune] disabled\n";
+    if (!opt_params_.final_refinement_enable_) {
+        std::cout << "[FINAL/refinement] disabled\n";
         return;
     }
-    auto final_pruning_profile =
-        profileLaptopModule("final_pruning");
+    auto final_pruning_profile = profileLaptopModule("final_pruning");
 
-    const int before_final_special = voxel_model_->numVoxels();
-    if (before_final_special <= 0) {
+    const int before = voxel_model_ ? voxel_model_->numVoxels() : 0;
+    if (before <= 0) {
         return;
     }
 
-    auto centers = voxel_model_->voxCenter();
-    auto sizes = voxel_model_->voxSize();
-    if (sizes.defined() && sizes.dim() == 2 && sizes.size(1) == 1) {
-        sizes = sizes.squeeze(1);
-    } else if (sizes.defined() && sizes.dim() != 1) {
-        sizes = sizes.reshape({-1});
-    }
-    auto prune_mask_final_special = torch::zeros(
-        {before_final_special},
-        torch::TensorOptions().dtype(torch::kBool).device(centers.device()));
-    auto prune_mask_near_final_special = torch::zeros_like(
-        prune_mask_final_special);
-    auto prune_mask_final_surface = torch::zeros_like(
-        prune_mask_final_special);
+    torch::Tensor centers = voxel_model_->voxCenter();
+    torch::Device device = centers.device();
+    auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device);
+    torch::Tensor sdf_prune =
+        computeSvreconSdfPruneMask().to(device).to(torch::kBool);
+    torch::Tensor surface_prune = torch::zeros({before}, bool_opts);
+    torch::Tensor near_prune = torch::zeros({before}, bool_opts);
+    torch::Tensor far_prune = torch::zeros({before}, bool_opts);
+    FinalSurfacePruneStats surface_stats;
 
-    int64_t n_near_final_special = 0;
-    int64_t n_near_geom_final_special = 0;
-    bool near_valid_final_special = false;
+    surface_prune = computeRenderedTsdfSurfacePruneMask(&surface_stats);
 
-    if (opt_params_.final_special_prune_enable_) {
-        std::vector<sv::MiniCam> tr_cams;
-        tr_cams.reserve(scene_->keyframes().size());
-        for (const auto& kv : scene_->keyframes()) {
-            tr_cams.push_back(kv.second->toMiniCam(
-                kv.second->image_height_,
-                kv.second->image_width_));
+    std::vector<sv::MiniCam> cameras;
+    cameras.reserve(scene_->keyframes().size());
+    for (const auto& item : scene_->keyframes()) {
+        if (!item.second) {
+            continue;
         }
+        cameras.push_back(item.second->toMiniCam(
+            item.second->image_height_,
+            item.second->image_width_));
+    }
 
-        if (tr_cams.empty()) {
-            n_near_final_special = 0;
-            near_valid_final_special = true;
-        } else {
-            try {
-                auto octpath = voxel_model_->octPath().contiguous();
-                auto vox_center = voxel_model_->voxCenter().contiguous();
-                auto vox_size = voxel_model_->voxSize().contiguous();
+    if (!cameras.empty()) {
+        try {
+            torch::Tensor octpath = voxel_model_->octPath().contiguous();
+            torch::Tensor voxel_sizes = voxel_model_->voxSize().contiguous();
+            if (voxel_sizes.dim() == 1) {
+                voxel_sizes = voxel_sizes.view({before, 1});
+            }
+            if (opt_params_.filter_near_voxels_) {
+                near_prune = sv::markSvreconNearDirect(
+                    cameras,
+                    octpath,
+                    centers,
+                    voxel_sizes,
+                    0.2f);
+                near_prune =
+                    near_prune.to(device).to(torch::kBool).reshape({before});
+            }
 
-                TORCH_CHECK(octpath.size(0) == before_final_special,
-                            "octpath length mismatch at final special prune");
-                TORCH_CHECK(vox_center.size(0) == before_final_special,
-                            "vox_center length mismatch at final special prune");
-                TORCH_CHECK(vox_center.size(1) == 3,
-                            "vox_center must be [N,3] at final special prune");
-                if (vox_size.dim() == 1) {
-                    vox_size = vox_size.view({before_final_special, 1});
-                } else if (vox_size.dim() == 2) {
-                    TORCH_CHECK(vox_size.size(0) == before_final_special,
-                                "vox_size length mismatch at final special prune");
-                } else {
-                    TORCH_CHECK(false, "vox_size must be [N] or [N,1] at final special prune");
+            if (opt_params_.prune_near_voxels_geometric_) {
+                torch::Tensor voxel_size_1d =
+                    voxel_sizes.to(device).to(torch::kFloat32)
+                        .reshape({before});
+                torch::Tensor radius =
+                    torch::full_like(voxel_size_1d, 0.2f) +
+                    0.5f * voxel_size_1d;
+                torch::Tensor radius_sq = radius.square();
+                torch::Tensor geometric_near =
+                    torch::zeros({before}, bool_opts);
+                torch::Tensor centers_f32 =
+                    centers.to(device).to(torch::kFloat32).contiguous();
+                for (const auto& camera : cameras) {
+                    torch::Tensor camera_position =
+                        camera.position.to(device).to(torch::kFloat32)
+                            .view({1, 3});
+                    torch::Tensor distance_sq =
+                        (centers_f32 - camera_position).square().sum(/*dim=*/1);
+                    geometric_near =
+                        geometric_near | (distance_sq <= radius_sq);
                 }
-
-                const float near_thresh = 0.2f;
-                at::Tensor is_near =
-                    sv::markSvreconNearDirect(
-                        tr_cams,
-                        octpath,
-                        vox_center,
-                        vox_size,
-                        near_thresh);
-                if (is_near.dim() == 2 && is_near.size(1) == 1) {
-                    is_near = is_near.squeeze(1);
-                }
-                is_near = is_near.to(torch::kBool);
-                at::Tensor is_near_geom = torch::zeros(
-                    {before_final_special},
-                    torch::TensorOptions().dtype(torch::kBool).device(is_near.device()));
-                if (opt_params_.prune_near_voxels_geometric_) {
-                    auto vox_center_f32 =
-                        vox_center.to(is_near.device()).to(torch::kFloat32).contiguous();
-                    auto vox_size_1d =
-                        vox_size.to(is_near.device()).to(torch::kFloat32).contiguous();
-                    if (vox_size_1d.dim() == 2 && vox_size_1d.size(1) == 1) {
-                        vox_size_1d = vox_size_1d.squeeze(1);
-                    } else if (vox_size_1d.dim() != 1) {
-                        vox_size_1d = vox_size_1d.reshape({-1});
-                    }
-                    TORCH_CHECK(vox_size_1d.numel() == before_final_special,
-                                "vox_size_1d.numel() != N in final special prune geometric near filter");
-
-                    auto near_radius =
-                        (torch::full_like(vox_size_1d, near_thresh) + 0.5f * vox_size_1d)
-                            .contiguous();
-                    auto near_radius_sq = (near_radius * near_radius).contiguous();
-
-                    for (const auto& c : tr_cams) {
-                        auto cam_pos =
-                            c.position.to(is_near.device()).to(torch::kFloat32).view({1, 3});
-                        auto d2 = (vox_center_f32 - cam_pos).pow(2).sum(/*dim=*/1);
-                        is_near_geom =
-                            (is_near_geom | (d2 <= near_radius_sq)).to(torch::kBool);
-                    }
-                }
-                n_near_final_special = is_near.sum().item<int64_t>();
-                n_near_geom_final_special = is_near_geom.sum().item<int64_t>();
-                auto near_union = (is_near | is_near_geom).to(torch::kBool);
-                prune_mask_near_final_special =
-                    near_union.to(prune_mask_final_special.device())
-                        .to(torch::kBool)
-                        .contiguous();
-                prune_mask_final_special =
-                    (prune_mask_final_special |
-                     prune_mask_near_final_special).to(torch::kBool);
-                near_valid_final_special = true;
-            } catch (const std::exception& e) {
-                std::cerr << "[FINAL/special_prune] failed to compute near voxels: "
-                          << e.what() << "\n";
+                near_prune = near_prune | geometric_near;
             }
+        } catch (const std::exception& e) {
+            near_prune.zero_();
+            std::cerr << "[FINAL/refinement] near checks skipped: "
+                      << e.what() << "\n";
         }
     }
 
-    int64_t n_selected_surface_confidence = 0;
-    if (opt_params_.final_surface_prune_enable_) {
-        torch::Tensor surface_keep = computeFinalSurfaceConfidenceKeepMask();
-        if (surface_keep.defined() && surface_keep.numel() == before_final_special) {
-            torch::Tensor surface_prune =
-                (~surface_keep.to(prune_mask_final_special.device()).to(torch::kBool))
-                    .contiguous();
-            prune_mask_final_surface = surface_prune;
-            n_selected_surface_confidence = surface_prune.sum().item<int64_t>();
-            prune_mask_final_special =
-                (prune_mask_final_special | surface_prune).to(torch::kBool);
-        } else {
-            std::cerr << "[FINAL/surface] skipped: confidence mask shape mismatch\n";
+    if (opt_params_.prune_far_voxels_) {
+        try {
+            voxel_model_->refreshDenseCoreBBFromCurrentVoxels();
+            if (voxel_model_->hasDenseCoreBB()) {
+                torch::Tensor bb_min =
+                    voxel_model_->denseCoreBBMin().to(device)
+                        .to(torch::kFloat32).view({1, 3});
+                torch::Tensor bb_max =
+                    voxel_model_->denseCoreBBMax().to(device)
+                        .to(torch::kFloat32).view({1, 3});
+                torch::Tensor centers_f32 =
+                    centers.to(device).to(torch::kFloat32).contiguous();
+                torch::Tensor in_dense_core =
+                    (centers_f32 >= bb_min).all(/*dim=*/1) &
+                    (centers_f32 <= bb_max).all(/*dim=*/1);
+                far_prune = (~in_dense_core).to(torch::kBool);
+            }
+        } catch (const std::exception& e) {
+            far_prune.zero_();
+            std::cerr << "[FINAL/refinement] far check skipped: "
+                      << e.what() << "\n";
         }
     }
 
-    const int64_t n_selected_final_special =
-        prune_mask_final_special.to(torch::kBool).sum().item<int64_t>();
-    if (n_selected_final_special > 0) {
-        torch::Tensor final_idx =
-            prune_mask_final_special.to(torch::kBool).nonzero().squeeze(1);
-        if (final_idx.defined() && final_idx.numel() > 0 &&
-            centers.defined() && centers.dim() == 2 &&
-            centers.size(0) == before_final_special &&
-            sizes.defined() && sizes.numel() == before_final_special) {
-            torch::Tensor final_centers =
-                centers.index_select(0, final_idx.to(centers.device()).to(torch::kLong)).contiguous();
-            torch::Tensor sizes_for_log = sizes;
-            if (sizes_for_log.dim() == 2 && sizes_for_log.size(1) == 1) {
-                sizes_for_log = sizes_for_log.squeeze(1);
-            } else if (sizes_for_log.dim() != 1) {
-                sizes_for_log = sizes_for_log.reshape({before_final_special});
-            }
-            torch::Tensor final_sizes =
-                sizes_for_log.index_select(0, final_idx.to(sizes_for_log.device()).to(torch::kLong)).contiguous();
-            torch::Tensor final_levels;
-            torch::Tensor oct_levels = voxel_model_->octLevel();
-            if (oct_levels.defined() &&
-                oct_levels.numel() == before_final_special) {
-                final_levels =
-                    oct_levels.reshape({before_final_special, 1})
-                        .index_select(
-                            0,
-                            final_idx.to(oct_levels.device()).to(torch::kLong))
-                        .contiguous();
-            }
-            torch::Tensor final_colors;
-            torch::Tensor sh0 = voxel_model_->sh0();
-            if (sh0.defined() && sh0.dim() == 2 &&
-                sh0.size(0) == before_final_special) {
-                final_colors =
-                    (sh0.index_select(
-                         0,
-                         final_idx.to(sh0.device()).to(torch::kLong)) *
-                         sh_utils::C0 +
-                     0.5f)
-                        .clamp(0.0f, 1.0f)
-                        .contiguous();
-            }
-            torch::Tensor final_surface_mask =
-                prune_mask_final_surface
-                    .index_select(
-                        0,
-                        final_idx.to(prune_mask_final_surface.device())
-                            .to(torch::kLong))
-                    .to(final_centers.device())
-                    .to(torch::kBool)
+    torch::Tensor leaf =
+        voxel_model_->isLeaf().to(device).to(torch::kBool).reshape({before});
+    sdf_prune = sdf_prune & leaf;
+    surface_prune = surface_prune.to(device).to(torch::kBool) & leaf;
+    near_prune = near_prune.to(device).to(torch::kBool) & leaf;
+    far_prune = far_prune.to(device).to(torch::kBool) & leaf;
+    if (surface_stats.rendered_tsdf_available) {
+        // The fixed rendered-TSDF mesh is authoritative at shutdown. Protect
+        // every adaptive cell intersecting that surface from the older final
+        // SDF/near/far checks; all unsupported leaves are handled by the
+        // rendered-TSDF mask itself.
+        const torch::Tensor surface_supported = leaf & (~surface_prune);
+        sdf_prune = sdf_prune & (~surface_supported);
+        near_prune = near_prune & (~surface_supported);
+        far_prune = far_prune & (~surface_supported);
+    }
+    torch::Tensor prune_mask =
+        (sdf_prune | surface_prune | near_prune | far_prune)
+            .to(torch::kBool)
+            .contiguous();
+    // Log one source per removed voxel. Scheduled surface-view pruning has
+    // already run online; the stricter shutdown-only surface gate belongs to
+    // final_refinement.
+    const torch::Tensor reason_sdf = sdf_prune.contiguous();
+    const torch::Tensor reason_near =
+        (near_prune & (~reason_sdf)).contiguous();
+    const torch::Tensor reason_far =
+        (far_prune & (~reason_sdf) & (~reason_near)).contiguous();
+    const torch::Tensor reason_final_refinement =
+        (surface_prune & (~reason_sdf) & (~reason_near) & (~reason_far))
+            .contiguous();
+    const int64_t selected = prune_mask.sum().item<int64_t>();
+
+    if (selected > 0 &&
+        (rerun_params_.run_whole_run_ ||
+         rerun_params_.rerun_svrecon_debug_)) {
+        torch::Tensor indices = prune_mask.nonzero().squeeze(1);
+        torch::Tensor sizes = voxel_model_->voxSize();
+        torch::Tensor levels = voxel_model_->octLevel();
+        torch::Tensor colors;
+        torch::Tensor sh0 = voxel_model_->sh0();
+        if (sh0.defined() && sh0.dim() == 2 && sh0.size(0) == before) {
+            colors =
+                (sh0.index_select(0, indices.to(sh0.device())) *
+                     sv::kSHC0 +
+                 0.5f)
+                    .clamp(0.0f, 1.0f)
                     .contiguous();
-            torch::Tensor final_special_near_mask =
-                prune_mask_near_final_special
-                    .index_select(
-                        0,
-                        final_idx.to(
-                            prune_mask_near_final_special.device())
-                            .to(torch::kLong))
-                    .to(final_centers.device())
-                    .to(torch::kBool)
-                    .contiguous();
-            appendWholeRunPrunedVoxels(
-                getIteration(),
-                final_centers,
-                final_sizes,
-                final_levels,
-                final_colors,
-                torch::Tensor(),
-                torch::Tensor(),
-                torch::Tensor(),
-                torch::Tensor(),
-                final_special_near_mask,
-                final_surface_mask);
         }
+        auto select_cause = [&](const torch::Tensor& cause) {
+            return cause.index_select(
+                       0,
+                       indices.to(cause.device()).to(torch::kLong))
+                .to(centers.device())
+                .to(torch::kBool)
+                .contiguous();
+        };
+        appendWholeRunPrunedVoxels(
+            getIteration(),
+            centers.index_select(
+                0, indices.to(centers.device()).to(torch::kLong)),
+            sizes.index_select(
+                0, indices.to(sizes.device()).to(torch::kLong)),
+            levels.index_select(
+                0, indices.to(levels.device()).to(torch::kLong)),
+            colors,
+            select_cause(reason_sdf),
+            torch::Tensor(),
+            select_cause(reason_near),
+            select_cause(reason_far),
+            torch::Tensor(),
+            select_cause(reason_final_refinement));
     }
 
-    if (n_selected_final_special > 0) {
-        voxel_model_->pruning(prune_mask_final_special);
+    if (selected > 0) {
+        voxel_model_->pruning(prune_mask);
         if (rerun_params_.run_whole_run_ ||
             rerun_params_.rerun_svrecon_debug_) {
             logWholeRunLiveVoxelsToRerun(
@@ -977,12 +650,32 @@ void VoxelMapper::runFinalSpecialPrune()
         }
     }
 
-    const int after_final_special = voxel_model_->numVoxels();
-    std::cout << "[FINAL/prune] before=" << before_final_special
-              << " selected=" << n_selected_final_special
-              << " removed=" << (before_final_special - after_final_special)
-              << " surface_confidence=" << n_selected_surface_confidence
-              << " near=" << (near_valid_final_special ? std::to_string(n_near_final_special) : std::string("N/A"))
-              << " near_geom=" << (near_valid_final_special ? std::to_string(n_near_geom_final_special) : std::string("N/A"))
+    const int after = voxel_model_->numVoxels();
+    std::cout << "[FINAL/refinement] before=" << before
+              << " rendered_views=" << surface_stats.rendered_view_count
+              << " candidate_grid_points="
+              << surface_stats.candidate_grid_point_count
+              << " candidate_grid_cells="
+              << surface_stats.candidate_grid_cell_count
+              << " observed_grid_cells="
+              << surface_stats.observed_grid_cell_count
+              << " surface_grid_cells="
+              << surface_stats.surface_grid_cell_count
+              << " supported_voxels="
+              << surface_stats.supported_voxel_count
+              << " voxel_size=" << surface_stats.voxel_size
+              << " truncation=" << surface_stats.truncation
+              << " min_keyframe_weight="
+              << surface_stats.min_keyframe_weight
+              << " alpha_threshold=" << surface_stats.alpha_threshold
+              << " tsdf_available="
+              << (surface_stats.rendered_tsdf_available ? 1 : 0)
+              << " selected=" << selected
+              << " removed=" << (before - after)
+              << " sdf=" << reason_sdf.sum().item<int64_t>()
+              << " surface_support="
+              << reason_final_refinement.sum().item<int64_t>()
+              << " near=" << reason_near.sum().item<int64_t>()
+              << " far=" << reason_far.sum().item<int64_t>()
               << "\n";
 }

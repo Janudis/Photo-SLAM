@@ -17,7 +17,6 @@ def main():
     parser.add_argument("--ours-csv", required=True, type=Path)
     parser.add_argument("--photoslam-csv", required=True, type=Path)
     parser.add_argument("--hislam2-csv", required=True, type=Path)
-    parser.add_argument("--nvblox-csv", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
@@ -25,7 +24,6 @@ def main():
         ("Ours (SVRecon)", args.ours_csv, (190, 75, 225)),
         ("Original Photo-SLAM", args.photoslam_csv, (55, 95, 215)),
         ("HI-SLAM2 after refinement", args.hislam2_csv, (190, 105, 35)),
-        ("nvblox online", args.nvblox_csv, (75, 155, 80)),
     ]
 
     min_x = 5.0
@@ -95,7 +93,7 @@ def main():
     draw_text(image, "Distance from GT surface (cm)", ((left + right) // 2 - 125, bottom + 68), 0.58)
     draw_text(image, "Surface samples farther", (12, top - 14), 0.52)
 
-    legend_positions = [(left, 112), (left + 470, 112), (left, 148), (left + 470, 148)]
+    legend_positions = [(left, 112), (left + 470, 112), (left, 148)]
     for (label, _, _, color), (x, y) in zip(curves, legend_positions):
         cv2.line(image, (x, y), (x + 45, y), color, 5, cv2.LINE_AA)
         draw_text(image, label, (x + 58, y + 6), 0.55)

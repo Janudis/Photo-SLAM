@@ -70,7 +70,7 @@ sv::VoxelTrainer::VoxelTrainer()
 
 //         // 2.6) Photometric + SSIM loss
 //         auto gt = vf->original_image_.unsqueeze(0).to(device_type); // (1,3,H,W)
-//         auto Ll1 = loss_utils::l1_loss(image, gt);
+//         auto Ll1 = voxel_eval::l1Loss(image, gt);
 //         auto loss = Ll1;
 //         loss.backward();
 
@@ -92,7 +92,7 @@ sv::VoxelTrainer::VoxelTrainer()
 //                 iteration,
 //                 optParams.iterations_,
 //                 Ll1, loss, ema_loss_for_log,
-//                 loss_utils::l1_loss,
+//                 voxel_eval::l1Loss,
 //                 elapsed_ms,
 //                 *voxels, *scene,
 //                 pipeParams,    // <— pass the real pipeline params
@@ -134,6 +134,8 @@ void sv::VoxelTrainer::trainingReport(
     const torch::Tensor& photo_loss,
     const char* photo_loss_name,
     const torch::Tensor& ssim_loss,
+    const torch::Tensor& monocular_depth_loss,
+    const torch::Tensor& monocular_normal_loss,
     float ema_total_loss,
     int64_t elapsed_time,
     sv::VoxelModel& voxels,
@@ -148,6 +150,14 @@ void sv::VoxelTrainer::trainingReport(
               << ", photo_" << photo_loss_name << ": " << photo_loss.item<float>();
     if (ssim_loss.defined()) {
         std::cout << ", one_minus_SSIM: " << ssim_loss.item<float>();
+    }
+    if (monocular_depth_loss.defined()) {
+        std::cout << ", model_depth_Cauchy: "
+                  << monocular_depth_loss.item<float>();
+    }
+    if (monocular_normal_loss.defined()) {
+        std::cout << ", model_normal_cosine: "
+                  << monocular_normal_loss.item<float>();
     }
     std::cout << ", num_voxels: " << voxels.numVoxels() << std::endl;
 }

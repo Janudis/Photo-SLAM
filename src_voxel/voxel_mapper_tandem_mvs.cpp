@@ -110,7 +110,7 @@ void setMiniCamSnapshot(
     camera.fy = intrinsics(1, 1);
     camera.cx = intrinsics(0, 2);
     camera.cy = intrinsics(1, 2);
-    camera.c2w = tensor_utils::EigenMatrix2TorchTensor(
+    camera.c2w = voxel_utils::eigenMatrixToTorchTensor(
         camera_to_world, torch::kCPU).contiguous();
     camera.w2c = torch::linalg_inv(camera.c2w).contiguous();
     camera.frame_id = frame_id;
@@ -123,9 +123,9 @@ void setMiniCamSnapshot(
         camera.lookat /= lookat_norm;
     }
     camera.tanfovx = std::tan(
-        0.5f * graphics_utils::focal2fov(camera.fx, width));
+        0.5f * sv::focalToFov(camera.fx, width));
     camera.tanfovy = std::tan(
-        0.5f * graphics_utils::focal2fov(camera.fy, height));
+        0.5f * sv::focalToFov(camera.fy, height));
     camera.pix_size = 2.0f * camera.tanfovx /
                       static_cast<float>(width);
 }
@@ -531,14 +531,6 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
         cv::COLOR_BGR2RGB);
     monocular_mvs_scheduled_keyframes_.insert(reference->fid_);
 
-    std::cout
-        << "[MONO/MVS launch] kf=" << reference->fid_
-        << " sources=" << sources.size()
-        << " resolution=" << monocular_mvs_width_
-        << "x" << monocular_mvs_height_
-        << " depth_range=[" << depth_min << "," << depth_max << "]"
-        << " sparse_depths="
-        << reference->monocular_mvs_sparse_depth_count_ << "\n";
     return true;
 }
 
@@ -606,8 +598,6 @@ void VoxelMapper::pollMonocularMvsDensification(
         monocular_mvs_pending_view_c2w_.clear();
         monocular_mvs_pending_depth_min_ = 0.0f;
         monocular_mvs_pending_depth_max_ = 0.0f;
-        std::cout
-            << "[MONO/MVS discard] camera poses changed during inference\n";
         if (!wait_for_result && retry_reference) {
             refreshMonocularMvsKeyframeMetadata();
             scheduleMonocularMvsDensification(retry_reference);
@@ -626,11 +616,81 @@ void VoxelMapper::pollMonocularMvsDensification(
 void VoxelMapper::integrateMonocularMvsDepth(
     const sv::TandemMvsResult& result)
 {
+    cacheMonocularDepthPrior(
+        monocular_mvs_pending_reference_,
+        result.depth,
+        result.confidence,
+        sv::LearnedDepthSource::TandemMvs);
     integrateMonocularLearnedDepth(
         result.depth,
         "MVS",
         "world/monocular_mvs/created",
         /*clear_cuda_cache_before_insertion=*/false);
+}
+
+void VoxelMapper::cacheMonocularDepthPrior(
+    const std::shared_ptr<VoxelKeyframe>& reference,
+    const cv::Mat& depth,
+    const cv::Mat& confidence,
+    const sv::LearnedDepthSource source)
+{
+    if (!reference || depth.empty() || depth.type() != CV_32FC1) {
+        throw std::runtime_error(
+            "Cannot cache an invalid monocular depth prior");
+    }
+
+    cv::Mat confidence_float;
+    if (confidence.empty()) {
+        confidence_float = cv::Mat(
+            depth.rows, depth.cols, CV_32FC1, cv::Scalar(1.0f));
+    } else {
+        if (confidence.rows != depth.rows || confidence.cols != depth.cols ||
+            confidence.channels() != 1) {
+            throw std::runtime_error(
+                "Monocular depth confidence shape does not match depth");
+        }
+        if (confidence.type() == CV_32FC1) {
+            confidence_float = confidence.clone();
+        } else {
+            confidence.convertTo(confidence_float, CV_32FC1);
+        }
+    }
+
+    cv::Mat accepted_depth = depth.clone();
+    int64_t accepted_pixels = 0;
+    for (int y = 0; y < accepted_depth.rows; ++y) {
+        float* depth_row = accepted_depth.ptr<float>(y);
+        float* confidence_row = confidence_float.ptr<float>(y);
+        for (int x = 0; x < accepted_depth.cols; ++x) {
+            float& depth_value = depth_row[x];
+            float& confidence_value = confidence_row[x];
+            if (!std::isfinite(depth_value) || depth_value <= 1.0e-6f ||
+                !std::isfinite(confidence_value)) {
+                depth_value = 0.0f;
+                confidence_value = 0.0f;
+                continue;
+            }
+            confidence_value = std::clamp(confidence_value, 0.0f, 1.0f);
+            if (confidence_value <= 0.0f) {
+                depth_value = 0.0f;
+                continue;
+            }
+            ++accepted_pixels;
+        }
+    }
+
+    if (accepted_pixels == 0) {
+        std::cerr
+            << "[VoxelMapper] Learned depth prior has no valid pixels for "
+               "keyframe "
+            << reference->fid_ << "\n";
+        return;
+    }
+
+    reference->monocular_depth_prior_ = std::move(accepted_depth);
+    reference->monocular_depth_confidence_ = std::move(confidence_float);
+    reference->monocular_depth_source_ = source;
+    reference->monocular_depth_prior_iteration_ = getIteration();
 }
 
 void VoxelMapper::integrateMonocularLearnedDepth(
@@ -730,8 +790,6 @@ void VoxelMapper::integrateMonocularLearnedDepth(
         static_cast<std::size_t>(depth_width) *
         static_cast<std::size_t>(depth_height));
     surface_colors.reserve(surface_points.capacity());
-    int64_t valid_mvs_pixels = 0;
-    int64_t structural_holes = 0;
     for (int y = 0; y < depth_height; ++y) {
         const float* depth_row = depth_map.ptr<float>(y);
         for (int x = 0; x < depth_width; ++x) {
@@ -751,8 +809,6 @@ void VoxelMapper::integrateMonocularLearnedDepth(
                     continue;
                 }
             }
-            ++valid_mvs_pixels;
-
             const float current_depth = rendered_depth[y][x];
             const bool structural_hole =
                 contributors[y][x] <= 0 &&
@@ -760,8 +816,6 @@ void VoxelMapper::integrateMonocularLearnedDepth(
             if (!structural_hole) {
                 continue;
             }
-            ++structural_holes;
-
             const Eigen::Vector3f camera_point(
                 (static_cast<float>(x) - K(0, 2)) * depth / K(0, 0),
                 (static_cast<float>(y) - K(1, 2)) * depth / K(1, 1),
@@ -785,10 +839,6 @@ void VoxelMapper::integrateMonocularLearnedDepth(
     }
 
     if (surface_points.empty()) {
-        std::cout
-            << "[MONO/" << source_name << " integrate] kf=" << reference->fid_
-            << " valid_depth=" << valid_mvs_pixels
-            << " structural_holes=0 inserted=0\n";
         return;
     }
 
@@ -966,11 +1016,4 @@ void VoxelMapper::integrateMonocularLearnedDepth(
          rerun_params_.rerun_svrecon_debug_)) {
         rerun_state_.whole_run_live_voxels_dirty_ = true;
     }
-    std::cout
-        << "[MONO/" << source_name << " integrate] kf=" << reference->fid_
-        << " valid_depth=" << valid_mvs_pixels
-        << " structural_holes=" << structural_holes
-        << " support_cells=" << unique_cells.size()
-        << " direct_corners=" << direct_samples.size()
-        << " inserted=" << stats.new_voxels << "\n";
 }

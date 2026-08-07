@@ -20,7 +20,6 @@ Camera.z_far: 40.0
 
 # ORB points select sparse cells but are weak surface priors. TANDEM MVS depth
 # is used only to initialize new cells at residual rendering holes.
-Mapper.geometry_mode: "svrecon_sdf"
 Mapper.sdf_initialization_mode: "weak_surface_prior"
 Mapper.sdf_initialization_orb_radius_vox: 1.0
 Mapper.inactive_geo_densify: 0
@@ -96,7 +95,6 @@ Record.run_reconstruction_mesh: 0
 Record.run_maps: 0
 Record.rerun_rendered_mesh_eval: 0
 Record.rerun_gt_mesh: 0
-Record.rerun_nvblox_mesh: 0
 Record.save_rendered_mesh_eval: 1
 Record.rendered_mesh_eval_voxel_size_m: 0.03
 Record.rendered_mesh_eval_min_weight: 1.0
@@ -134,7 +132,10 @@ Optimization.prune_thres_final_at_target: 0.1
 Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
-Optimization.final_special_prune_enable: 1
+# Online MonoGS co-visibility; final filtering reuses the rendered-TSDF mesh support.
+Optimization.prune_surface_views_enable: 1
+Optimization.surface_min_views: 4
+Optimization.final_refinement_enable: 1
 Optimization.subdivide_from: 1200
 Optimization.subdivide_all_until: 0
 Optimization.subdivide_samp_thres: 0.5
@@ -173,6 +174,23 @@ Optimization.n_dmean_ks: 3
 Optimization.n_dmean_tol_deg: 90.0
 Optimization.lambda_sparse_depth: 0.0
 Optimization.sparse_depth_until: 15000
+
+# Learned-depth supervision (active only for accepted MVS/Omnidata priors).
+# Metric Cauchy depth follows SVRecon's MASt3R regularizer; normals are
+# generated from the same depth using SVRecon's camera-Z backprojection.
+Optimization.lambda_monocular_depth: 0.001
+Optimization.monocular_depth_from: 1000
+Optimization.monocular_depth_end: 15000
+Optimization.monocular_depth_end_mult: 0.1
+Optimization.monocular_depth_alpha_min: 0.5
+Optimization.monocular_depth_confidence_min: 0.0
+Optimization.lambda_monocular_normal: 0.0001
+Optimization.monocular_normal_from: 1000
+Optimization.monocular_normal_end: 15000
+Optimization.monocular_normal_end_mult: 0.1
+Optimization.monocular_normal_ks: 3
+Optimization.monocular_normal_tol_deg: 90.0
+Optimization.monocular_normal_max_depth_jump_rel: 0.05
 
 # Viewer
 VoxelViewer.glfw_window_width: 1400

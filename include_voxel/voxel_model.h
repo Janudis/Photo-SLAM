@@ -7,8 +7,6 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
-#include <functional>
-#include <limits>
 #include <torch/torch.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/extension.h>
@@ -25,19 +23,13 @@
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
 #include "third_party/simple-knn/spatial.h"
 #include "third_party/tinyply/tinyply.h"
-#include "include/types.h"
-#include "include/point3d.h"
-#include "include/operate_points.h"
-#include "include/general_utils.h"
-#include "include/sh_utils.h"
-#include "include/tensor_utils.h"
-
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_scene.h"
 #include "include_voxel/voxel_keyframe.h"
 #include "include_voxel/mini_cam.h"
 #include "include_voxel/voxel_camera.h"
 #include "include_voxel/voxel_constants.h"
+#include "include_voxel/voxel_types.h"
 #include "include_voxel/render_opts.h" 
 #include "include_voxel/voxel_svrecon_rasterizer.h"
 
@@ -72,9 +64,7 @@ public:
 
     const torch::Tensor& geoGridPts() const;
     const torch::Tensor& svreconLogS() const { return log_s_; }
-    float svreconLogSTarget() const { return svrecon_log_s_target_; }
     void refreshSvreconLogSTargetFromVoxelSize(bool initialize_current);
-    void advanceSvreconLogSTowardTarget(float max_delta);
     const torch::Tensor& sh0() const;
     const torch::Tensor& shs() const;
 
@@ -105,8 +95,6 @@ public:
     torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
     torch::Tensor voxKey() const { return this->vox_key_; }
     torch::Tensor gridPointsWorld() const;
-    std::tuple<torch::Tensor, torch::Tensor>
-    buildSvreconExtractionGrid(int max_octree_level) const;
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     buildSvreconDenseExtractionGrid(int inside_level) const;
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -122,7 +110,7 @@ public:
     torch::Tensor octPath() const;             // [N,1] int64
     torch::Tensor isLeaf() const { return is_leaf_; }
     int           numVoxels() const;           // N
-    int           maxNumLevels() const;        // from svraster_cuda.meta.MAX_NUM_LEVELS
+    int           maxNumLevels() const;        // matches SVRecon CUDA MAX_NUM_LEVELS
     torch::Tensor SceneCenter() const;  
     torch::Tensor SceneExtent() const;
     torch::Tensor InsideExtent() const;
@@ -130,9 +118,9 @@ public:
     float         insertionVoxSize() const;
     int           insertionOctreeLevel() const { return static_cast<int>(octlevel_); }
     
-    // svraster SDF helpers
-    const torch::Tensor& svrasterSdfGridPts() const;
-    const torch::Tensor& svrasterSdfWeights() const;
+    // Fused projective SDF helpers
+    const torch::Tensor& fusedSdfGridPts() const;
+    const torch::Tensor& fusedSdfWeights() const;
 
     // ───────── Optimizer setup ─────────
     void setGeoLearningRate(float geo_lr);
@@ -166,7 +154,7 @@ public:
     void schedulerLoadState(const SchedulerState& state);
     std::tuple<double,double,double> currentLearningRates() const;
 
-    // === Adaptive API (SVRaster style) ===
+    // === Adaptive octree API ===
     struct StatPkg {
         torch::Tensor max_w;             // [N,1], float32, cuda
         torch::Tensor min_samp_interval; // [N,1], float32, cuda
@@ -219,14 +207,10 @@ public:
         int64_t pending_promotions = 0;
         int64_t pending_support_updates = 0;
     };
-    using GeoGridInitCallback =
-        std::function<torch::Tensor(const torch::Tensor& grid_points_world,
-                                    float ray_interval_m)>;
-
-    bool hasSvrasterSdfField() const;
-    void ensureSvrasterSdfField();
-    void resetSvrasterSdfField();
-    void fuseSvrasterSdfGridSamples(
+    bool hasFusedSdfField() const;
+    void ensureFusedSdfField();
+    void resetFusedSdfField();
+    void fuseProjectiveSdfGridSamples(
         const torch::Tensor& tsdf_values,
         const torch::Tensor& weights,
         const torch::Tensor& valid_mask,
@@ -236,11 +220,6 @@ public:
         const torch::Tensor& valid_mask);
     std::pair<torch::Tensor, torch::Tensor> rgbdHoleSupportCellCenters(
         const torch::Tensor& surface_points_world) const;
-    int64_t applyRgbdHoleSdfEvidence(
-        const sv::MiniCam& cam,
-        const torch::Tensor& depth_meters,
-        const torch::Tensor& hole_mask,
-        float truncation_m);
     torch::Tensor makeGeoGridInitRows_(
         const torch::Tensor& grid_pts_key_new,
         int64_t begin,
@@ -309,19 +288,10 @@ public:
         sdf_initialization_orb_radius_vox_ = std::max(0.0f, radius_vox);
     }
     void setTopologySdfInitializationMode(const std::string& mode);
-    void setNextSdfInitializationSupportPoints(const torch::Tensor& points) {
-        next_sdf_init_support_points_ =
-            points.defined() && points.numel() > 0
-                ? points.detach().to(torch::kFloat32).reshape({-1, 3}).contiguous()
-                : torch::Tensor();
-    }
     void setNextSdfInitializationGridSamples(
         const torch::Tensor& grid_points_world,
         const torch::Tensor& sdf_values);
     int outsideLevel() const { return outside_level_; }
-    void setGeoGridInitCallback(GeoGridInitCallback callback) {
-        geo_grid_init_callback_ = std::move(callback);
-    }
     void setNextRealInsertionRerunEntityPath(const std::string& entity_path) {
         pending_real_insert_rr_entity_path_ = entity_path;
     }
@@ -330,15 +300,12 @@ public:
         topology_birth_iter_ = static_cast<int32_t>(iteration);
         topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
-    void logLiveOrbVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveInactiveGeoVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
-    void logLiveRgbdFillRenderHolesVoxels(const int iteration, const torch::Tensor& live_colors = torch::Tensor());
 private:
     IncreasePcdStats last_increase_pcd_stats_;
     void appendGroup_(int group_idx, const torch::Tensor& add_rows, torch::Tensor* out_member_param);
-    void setEmptySvrasterSdfField_();
+    void setEmptyFusedSdfField_();
     torch::Tensor voxelCornerScalarFromGrid_(const torch::Tensor& grid_scalar) const;
-    void rebuildSvrasterSdfFieldFromVoxelCorners_(
+    void rebuildFusedSdfFieldFromVoxelCorners_(
         const torch::Tensor& voxel_sdf_values,
         const torch::Tensor& voxel_sdf_weights);
     void appendSparseSupportPoints_(const torch::Tensor& points);
@@ -378,14 +345,12 @@ public:
     torch::Tensor grid_pts_key_;    // [M]  int64 keys identifying each grid-point
     torch::Tensor _geo_grid_pts_;    // [M]  float32 learnable density at each grid-point
     torch::Tensor log_s_;          // [1] SVRecon SDF sharpness parameter
-    float svrecon_log_s_target_ = std::numeric_limits<float>::quiet_NaN();
-    float svrecon_log_s_current_ = std::numeric_limits<float>::quiet_NaN();
     torch::Tensor vox_key_;         // [N,8] int64 indices into grid_pts_key_
     torch::Tensor vox_size_inv_;    // [N] float32 = 1.0 / size_
     torch::Tensor frozen_vox_geo_;
     
-    torch::Tensor svraster_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each SVRaster grid-point
-    torch::Tensor svraster_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
+    torch::Tensor fused_sdf_grid_pts_;    // [M,1] float32 metric signed distance at each grid point
+    torch::Tensor fused_sdf_weights_;     // [M,1] float32 accumulated projective TSDF weight
 
     std::vector<torch::Tensor>  Tensor_vec_geo_,
                                 Tensor_vec_sh0_,
@@ -394,7 +359,6 @@ public:
     torch::Tensor sparse_points_xyz_;
     torch::Tensor sparse_points_color_;
     torch::Tensor sdf_init_local_support_points_;
-    torch::Tensor next_sdf_init_support_points_;
     torch::Tensor next_sdf_init_grid_keys_;
     torch::Tensor next_sdf_init_grid_values_;
     std::vector<MiniCam> sdf_init_cams_;
@@ -447,7 +411,6 @@ public:
     bool has_dense_core_bb_ = false;
     bool filter_near_voxels_ = true;
     std::string pending_real_insert_rr_entity_path_;
-    GeoGridInitCallback geo_grid_init_callback_;
     int32_t topology_birth_iter_ = -1;
     int32_t topology_birth_kf_ = -1;
 

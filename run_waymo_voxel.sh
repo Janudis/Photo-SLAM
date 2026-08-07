@@ -32,10 +32,16 @@ printf '[INFO] Waymo dataset: %s\n' "$dataset_root"
 printf '[INFO] Waymo segment: %s\n' "$segment"
 printf '[INFO] Mapper config: %s\n' "$voxel_config"
 printf '[INFO] Output: %s\n' "$output_root"
+
+viewer_args=(no_viewer)
+if [[ "${VOXEL_VIEWER:-0}" == "1" ]]; then
+    viewer_args=()
+fi
+
 "$root_dir/bin/waymo_mono_voxel" \
     "$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt" \
     "$root_dir/cfg/ORB_SLAM3/Monocular/Waymo/waymo_front.yaml" \
     "$voxel_config" \
     "$prepared_segment" \
     "$output_root" \
-    no_viewer
+    "${viewer_args[@]}"

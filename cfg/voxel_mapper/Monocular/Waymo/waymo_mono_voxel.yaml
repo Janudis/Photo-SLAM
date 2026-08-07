@@ -23,7 +23,6 @@ RGBD.max_depth: 200.0
 
 # Mature ORB MapPoints allocate weak SVRecon candidates. Select exactly one
 # monocular densification backend below for the ablation study.
-Mapper.geometry_mode: "svrecon_sdf"
 Mapper.sdf_initialization_mode: "weak_surface_prior"
 Mapper.sdf_initialization_orb_radius_vox: 1.0
 Mapper.inactive_geo_densify: 0
@@ -143,12 +142,8 @@ Optimization.filter_near_voxels: 0
 Optimization.prune_far_voxels: 0
 Optimization.prune_near_voxels_geometric: 0
 Optimization.prune_surface_views_enable: 0
-Optimization.final_surface_prune_enable: 0
-Optimization.final_surface_min_views: 2
-Optimization.final_surface_depth_tolerance_vox: 1.0
-Optimization.final_surface_min_sdf_span_vox: 0.05
-Optimization.final_surface_keep_connected: 1
-Optimization.final_surface_connected_hops: 2
+Optimization.surface_min_views: 4
+Optimization.final_refinement_enable: 0
 Optimization.subdivide_from: 400
 Optimization.subdivide_all_until: 0
 Optimization.subdivide_samp_thres: 0.5
@@ -180,6 +175,23 @@ Optimization.huber_thres: 0.03
 # Monocular mapping uses no sensor-depth supervision.
 Optimization.lambda_sparse_depth: 0.0
 Optimization.sparse_depth_until: 15000
+
+# Learned-depth supervision (active only for accepted MVS/Omnidata priors).
+# Metric Cauchy depth follows SVRecon's MASt3R regularizer; normals are
+# generated from the same depth using SVRecon's camera-Z backprojection.
+Optimization.lambda_monocular_depth: 0.001
+Optimization.monocular_depth_from: 1000
+Optimization.monocular_depth_end: 15000
+Optimization.monocular_depth_end_mult: 0.1
+Optimization.monocular_depth_alpha_min: 0.5
+Optimization.monocular_depth_confidence_min: 0.0
+Optimization.lambda_monocular_normal: 0.0001
+Optimization.monocular_normal_from: 1000
+Optimization.monocular_normal_end: 15000
+Optimization.monocular_normal_end_mult: 0.1
+Optimization.monocular_normal_ks: 3
+Optimization.monocular_normal_tol_deg: 90.0
+Optimization.monocular_normal_max_depth_jump_rel: 0.05
 Optimization.lambda_rgbd_depth: 0.0
 Optimization.rgbd_depth_from: 0
 Optimization.rgbd_depth_end: 0

@@ -9,11 +9,17 @@
 #include <array>
 #include <vector>
 #include <cassert>
+#include <cmath>
 
-#include "include/types.h"
-#include "include/tensor_utils.h"
+#include "include_voxel/voxel_types.h"
+#include "include_voxel/voxel_mapper_utils.h"
 
 namespace sv {
+
+inline float focalToFov(const float focal, const int pixels)
+{
+    return 2.0f * std::atan(static_cast<float>(pixels) / (2.0f * focal));
+}
 
 class Camera
 {
@@ -25,14 +31,12 @@ public:
         std::size_t width,
         std::size_t height,
         std::vector<double> params,
-        int model_id = 0,
-        bool prior_focal_length = true)
+        int model_id = 0)
         : camera_id_(camera_id),
           width_(width),
           height_(height),
           params_(params),
-          model_id_(model_id),
-          prior_focal_length_(prior_focal_length)
+          model_id_(model_id)
     {}
 
     enum CameraModelType{
@@ -93,7 +97,8 @@ public:
                 cv::cuda::resize(undistort_mask_gpu, undistort_mask_gpu_resized,
                                  cv::Size(gaus_pyramid_width_[l], gaus_pyramid_height_[l]));
                 gaus_pyramid_undistort_mask_[l] =
-                    tensor_utils::cvGpuMat2TorchTensor_Float32(undistort_mask_gpu_resized);
+                    voxel_utils::cvGpuMatToTorchTensorFloat32(
+                        undistort_mask_gpu_resized);
             }
         }
     }
@@ -122,8 +127,6 @@ public:
     std::vector<std::size_t> gaus_pyramid_height_;
 
     std::vector<double> params_;
-
-    bool prior_focal_length_ = false;
 
     float stereo_bf_ = 0.0f;
 

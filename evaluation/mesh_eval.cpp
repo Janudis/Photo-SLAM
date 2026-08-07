@@ -844,6 +844,48 @@ bool loadTrajectory4x4RowMajor(const std::string& traj_path, std::vector<cv::Mat
     return true;
 }
 
+bool loadRigidTransform4x4(
+    const std::string& transform_path,
+    cv::Matx33d& R,
+    cv::Vec3d& t)
+{
+    std::ifstream in(transform_path);
+    if (!in.is_open())
+    {
+        std::cerr << "[mesh_eval] failed to open rigid transform: "
+                  << transform_path << "\n";
+        return false;
+    }
+
+    std::vector<double> values;
+    double value = 0.0;
+    while (in >> value) values.push_back(value);
+    if (values.size() != 16 ||
+        !std::all_of(values.begin(), values.end(), [](double v) { return std::isfinite(v); }))
+    {
+        std::cerr << "[mesh_eval] rigid transform must contain exactly 16 finite "
+                     "row-major values: "
+                  << transform_path << "\n";
+        return false;
+    }
+    if (std::abs(values[12]) > 1.0e-8 ||
+        std::abs(values[13]) > 1.0e-8 ||
+        std::abs(values[14]) > 1.0e-8 ||
+        std::abs(values[15] - 1.0) > 1.0e-8)
+    {
+        std::cerr << "[mesh_eval] rigid transform has an invalid homogeneous row: "
+                  << transform_path << "\n";
+        return false;
+    }
+
+    R = cv::Matx33d(
+        values[0], values[1], values[2],
+        values[4], values[5], values[6],
+        values[8], values[9], values[10]);
+    t = cv::Vec3d(values[3], values[7], values[11]);
+    return true;
+}
+
 bool loadTumTrajectoryCenters(const std::string& tum_path, std::vector<cv::Point3d>& centers)
 {
     std::ifstream in(tum_path);
@@ -3344,6 +3386,7 @@ int main(int argc, char** argv)
         "{recon_traj_tum| | reconstructed camera trajectory in TUM format }"
         "{align_stride  |1| stride for trajectory pair sampling in Sim(3) fit }"
         "{align_max_pairs|0| max pose pairs for Sim(3) fit (0=all sampled pairs) }"
+        "{post_align_transform| | optional row-major 4x4 rigid transform applied after primary alignment }"
         "{save_aligned_mesh|0| save the aligned reconstruction mesh to the output directory }"
         "{alignment_only|0| stop after alignment and full-resolution aligned-mesh export; do not compute geometry metrics }"
         "{save_precision_recall_meshes|0| save HI-SLAM2-style vertex-colored precision and recall meshes }"
@@ -3400,6 +3443,8 @@ int main(int argc, char** argv)
     const std::string recon_traj_tum_path = parser.get<std::string>("recon_traj_tum");
     const int align_stride = parser.get<int>("align_stride");
     const int align_max_pairs = parser.get<int>("align_max_pairs");
+    const std::string post_align_transform_path =
+        parser.get<std::string>("post_align_transform");
     const bool save_aligned_mesh = parser.get<int>("save_aligned_mesh") != 0;
     const bool alignment_only = parser.get<int>("alignment_only") != 0;
     const bool save_precision_recall_meshes =
@@ -3550,6 +3595,7 @@ int main(int argc, char** argv)
     }
 
     bool alignment_ok = false;
+    bool post_align_transform_applied = false;
     double align_scale = 1.0;
     cv::Matx33d align_R = cv::Matx33d::eye();
     cv::Vec3d align_t(0.0, 0.0, 0.0);
@@ -3658,6 +3704,35 @@ int main(int argc, char** argv)
         }
     }
 
+    if (!post_align_transform_path.empty())
+    {
+        cv::Matx33d post_R = cv::Matx33d::eye();
+        cv::Vec3d post_t(0.0, 0.0, 0.0);
+        if (!loadRigidTransform4x4(post_align_transform_path, post_R, post_t))
+        {
+            return 1;
+        }
+
+        applyRigidToMesh(recon_mesh, post_R, post_t);
+        if (alignment_ok)
+        {
+            align_R = post_R * align_R;
+            align_t = post_R * align_t + post_t;
+        }
+        else
+        {
+            align_scale = 1.0;
+            align_R = post_R;
+            align_t = post_t;
+            alignment_ok = true;
+        }
+        post_align_transform_applied = true;
+        std::cout << "[mesh_eval] applied post-alignment rigid transform: "
+                  << post_align_transform_path
+                  << " t=(" << post_t[0] << "," << post_t[1] << "," << post_t[2]
+                  << ")\n";
+    }
+
     if (alignment_only)
     {
         if (!alignment_ok)
@@ -3690,6 +3765,8 @@ int main(int argc, char** argv)
         root["align_t_x"] = align_t[0];
         root["align_t_y"] = align_t[1];
         root["align_t_z"] = align_t[2];
+        root["post_align_transform"] = post_align_transform_path;
+        root["post_align_transform_applied"] = post_align_transform_applied;
 
         const std::filesystem::path alignment_json = output_dir / "alignment.json";
         const std::filesystem::path alignment_txt = output_dir / "alignment.txt";
@@ -3711,6 +3788,9 @@ int main(int argc, char** argv)
             f << "align_t_x " << align_t[0] << "\n";
             f << "align_t_y " << align_t[1] << "\n";
             f << "align_t_z " << align_t[2] << "\n";
+            f << "post_align_transform " << post_align_transform_path << "\n";
+            f << "post_align_transform_applied "
+              << (post_align_transform_applied ? 1 : 0) << "\n";
         }
 
         std::error_code remove_error;
@@ -4244,6 +4324,8 @@ int main(int argc, char** argv)
     }
     root["align_recon_to_gt_enabled"] = align_recon_to_gt;
     root["align_recon_to_gt_success"] = alignment_ok;
+    root["post_align_transform"] = post_align_transform_path;
+    root["post_align_transform_applied"] = post_align_transform_applied;
     root["save_aligned_mesh"] = save_aligned_mesh;
     root["aligned_mesh_saved"] = aligned_mesh_saved;
     if (alignment_ok)
@@ -4393,6 +4475,9 @@ int main(int argc, char** argv)
         }
         f << "align_recon_to_gt_enabled " << (align_recon_to_gt ? 1 : 0) << "\n";
         f << "align_recon_to_gt_success " << (alignment_ok ? 1 : 0) << "\n";
+        f << "post_align_transform " << post_align_transform_path << "\n";
+        f << "post_align_transform_applied "
+          << (post_align_transform_applied ? 1 : 0) << "\n";
         f << "save_aligned_mesh " << (save_aligned_mesh ? 1 : 0) << "\n";
         f << "aligned_mesh_saved " << (aligned_mesh_saved ? 1 : 0) << "\n";
         if (alignment_ok)
@@ -4562,15 +4647,6 @@ int main(int argc, char** argv)
 //   --eval_gaussian_support=0 \
 //   --eval_voxel_support=0
 
-// TUM
-//   ./bin/mesh_eval \
-//   --recon=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/11_shutdown/ply/voxel_model/iteration_2241/voxel_surface_mesh.ply \
-//   --gt=results/tum_rgbd/rgbd_dataset_freiburg1_desk/nvblox/nvblox_color_mesh.ply \
-//   --out=results/tum_rgbd/rgbd_dataset_freiburg1_desk/experiments_SVRECON/11_shutdown/mesh_eval_nvblox \
-//   --tau_cm=5.0 \
-//   --recon_samples=500000 \
-//   --gt_samples=500000
-
 // Replica ESLAM culled mesh evaluation example
 // ./bin/mesh_eval \
 //   --eval_mode=current \
@@ -4692,27 +4768,6 @@ int main(int argc, char** argv)
 //   --floater_bin_cm=1.0 \
 //   --floater_max_cm=50.0
 
-// NVBLOX
-// ./bin/mesh_eval \
-//   --eval_mode=current \
-//   --recon=results/replica_rgbd_nvblox/office0/online_orb/nvblox_color_mesh.ply \
-//   --gt=scripts/data/Replica/office0_mesh.ply \
-//   --out=results/replica_rgbd_nvblox/office0/online_orb/mesh_eval_gs_sim3 \
-//   --tau_cm=5.0 \
-//   --recon_samples=500000 \
-//   --gt_samples=500000 \
-//   --seed=0 \
-//   --eval_floaters=1 \
-//   --floater_samples=500000 \
-//   --floater_bin_cm=1.0 \
-//   --floater_max_cm=50.0 \
-//   --eval_depth_mesh=1 \
-//   --align_recon_to_gt=1 \
-//   --traj=scripts/data/Replica/office0/traj.txt \
-//   --traj_mode=c2w \
-//   --recon_traj_tum=results/replica_rgbd_nvblox/office0/online_orb/CameraTrajectory_TUM.txt \
-//   --save_aligned_mesh=1
-
 // Combined Line Plot
 // python3 evaluation/plot_support_floater_comparison.py \
 //   --voxel-csv=/home/dimitris/Photo-SLAM/results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/voxel_support_eval/voxel_support_floater_count.csv \
@@ -4724,5 +4779,4 @@ int main(int argc, char** argv)
 //   --ours-csv=results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_eval_gs_sim3/surface_floater_count.csv \
 //   --photoslam-csv=results/replica_rgbd_original/office0/3581_shutdown/mesh_eval_gs_sim3/surface_floater_count.csv \
 //   --hislam2-csv=third_party/HI-SLAM2/outputs/replica/office0/mesh_eval_gs_sim3_after_opt/surface_floater_count.csv \
-//   --nvblox-csv=results/replica_rgbd_nvblox/office0/online_orb/mesh_eval_gs_sim3/surface_floater_count.csv \
 //   --out=results/replica_rgbd_voxel/office0/experiments_SVRECON/2_shutdown/mesh_surface_floater_comparison.png

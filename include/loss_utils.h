@@ -155,8 +155,6 @@ inline torch::Tensor fast_ssim_loss(torch::Tensor x, torch::Tensor y)
         y = y.unsqueeze(0);
     }
 
-    const bool is_train = x.requires_grad() || y.requires_grad();
-
     // Fallback: use your existing SSIM implementation (slower).
     // Note: your ssim() already expects 4D input [B,C,H,W].
     torch::DeviceType device_type =
@@ -169,7 +167,7 @@ inline torch::Tensor fast_ssim_loss(torch::Tensor x, torch::Tensor y)
 
 inline torch::Tensor prob_concen_loss(torch::Tensor prob)
 {
-    // SVRaster: (prob^2 * (1-prob)^2).mean()
+    // Penalize uncertain occupancy probabilities around 0.5.
     return (prob.square() * (1.0f - prob).square()).mean();
 }
 
@@ -188,7 +186,7 @@ struct SparseDepthLoss
     }
 
     /**
-     * C++ version of SVRaster's SparseDepthLoss.__call__.
+     * Sparse depth supervision used by the voxel mapper.
      *
      * Python reference:
      *
@@ -218,7 +216,7 @@ struct SparseDepthLoss
         // ---- 1) Compute per-pixel depth = raw_depth / (1 - T) -----------------------
         torch::Tensor depth = raw_depth;
 
-        // Accept [1,1,H,W], [1,H,W], [H,W], and also [3,H,W] -> use first slice (SVRaster-style [0])
+        // Accept [1,1,H,W], [1,H,W], [H,W], and [3,H,W] using the first slice.
         if (depth.dim() == 4 && depth.size(0) == 1 && depth.size(1) == 1)
         {
             // [1,1,H,W] -> [H,W]

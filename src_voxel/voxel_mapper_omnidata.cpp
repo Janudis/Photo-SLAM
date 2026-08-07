@@ -109,7 +109,7 @@ void setOmnidataCameraSnapshot(
     camera.fy = intrinsics(1, 1);
     camera.cx = intrinsics(0, 2);
     camera.cy = intrinsics(1, 2);
-    camera.c2w = tensor_utils::EigenMatrix2TorchTensor(
+    camera.c2w = voxel_utils::eigenMatrixToTorchTensor(
         camera_to_world, torch::kCPU).contiguous();
     camera.w2c = torch::linalg_inv(camera.c2w).contiguous();
     camera.frame_id = frame_id;
@@ -122,9 +122,9 @@ void setOmnidataCameraSnapshot(
         camera.lookat /= lookat_norm;
     }
     camera.tanfovx = std::tan(
-        0.5f * graphics_utils::focal2fov(camera.fx, width));
+        0.5f * sv::focalToFov(camera.fx, width));
     camera.tanfovy = std::tan(
-        0.5f * graphics_utils::focal2fov(camera.fy, height));
+        0.5f * sv::focalToFov(camera.fy, height));
     camera.pix_size = 2.0f * camera.tanfovx /
                       static_cast<float>(width);
 }
@@ -674,6 +674,24 @@ void VoxelMapper::integrateMonocularOmnidataDepth(
             << " reason=multiview_consistency\n";
         return;
     }
+
+    const float alignment_confidence = std::clamp(
+        1.0f - reference_aligned->median_relative_error /
+            std::max(
+                monocular_omnidata_max_alignment_rel_error_,
+                1.0e-6f),
+        0.0f,
+        1.0f);
+    cv::Mat supervision_confidence = cv::Mat::zeros(
+        filtered_depth.rows, filtered_depth.cols, CV_32FC1);
+    supervision_confidence.setTo(
+        alignment_confidence,
+        filtered_depth > 0.0f);
+    cacheMonocularDepthPrior(
+        reference,
+        filtered_depth,
+        supervision_confidence,
+        sv::LearnedDepthSource::Omnidata);
 
     monocular_mvs_pending_reference_ = reference;
     monocular_mvs_pending_c2w_ = reference_c2w;

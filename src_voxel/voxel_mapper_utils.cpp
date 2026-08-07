@@ -1,11 +1,14 @@
 #include "include_voxel/voxel_mapper_utils.h"
+#include "include_voxel/voxel_keyframe.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <mutex>
+#include <opencv2/core/cuda.hpp>
 #include <sstream>
 #include <unordered_map>
 
@@ -26,6 +29,8 @@ torch::Tensor squeezeRenderMap2D(torch::Tensor tensor)
     return tensor.contiguous();
 }
 
+void gpuMatNoopDeleter(void*) {}
+
 } // namespace
 
 std::string toLowerCopy(std::string s) {
@@ -36,6 +41,87 @@ std::string toLowerCopy(std::string s) {
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
+
+torch::Tensor cvMatToTorchTensorFloat32(
+    cv::Mat& mat,
+    const torch::DeviceType device_type)
+{
+    torch::Tensor mat_tensor;
+    torch::Tensor tensor;
+    if (mat.channels() == 1) {
+        mat_tensor = torch::from_blob(mat.data, {mat.rows, mat.cols});
+        tensor = mat_tensor.clone().to(device_type);
+    } else if (mat.channels() == 3) {
+        mat_tensor = torch::from_blob(
+            mat.data, {mat.rows, mat.cols, mat.channels()});
+        tensor = mat_tensor.clone().to(device_type);
+        tensor = tensor.permute({2, 0, 1});
+    } else {
+        std::cerr << "The mat has unsupported number of channels!" << std::endl;
+    }
+    return tensor.contiguous();
+}
+
+cv::Mat torchTensorToCvMatFloat32(torch::Tensor& tensor)
+{
+    cv::Mat mat;
+    torch::Tensor mat_tensor = tensor.clone();
+    if (mat_tensor.dim() == 2) {
+        mat = cv::Mat(
+            mat_tensor.size(0), mat_tensor.size(1), CV_32FC1,
+            mat_tensor.data_ptr<float>());
+    } else if (mat_tensor.dim() == 3) {
+        mat_tensor = mat_tensor.detach().permute({1, 2, 0})
+                         .to(torch::kCPU).contiguous();
+        mat = cv::Mat(
+            mat_tensor.size(0), mat_tensor.size(1), CV_32FC3,
+            mat_tensor.data_ptr<float>());
+    } else {
+        std::cerr << "The tensor has unsupported number of dimensions!" << std::endl;
+    }
+    return mat.clone();
+}
+
+torch::Tensor cvGpuMatToTorchTensorFloat32(cv::cuda::GpuMat& mat)
+{
+    const int64_t step = mat.step / sizeof(float);
+    torch::Tensor mat_tensor;
+    torch::Tensor tensor;
+    if (mat.channels() == 1) {
+        mat_tensor = torch::from_blob(
+            mat.data,
+            {mat.rows, mat.cols},
+            std::vector<int64_t>{step, 1},
+            gpuMatNoopDeleter,
+            torch::TensorOptions().device(torch::kCUDA));
+        tensor = mat_tensor.clone();
+    } else if (mat.channels() == 3) {
+        mat_tensor = torch::from_blob(
+            mat.data,
+            {mat.rows, mat.cols, mat.channels()},
+            std::vector<int64_t>{step, mat.channels(), 1},
+            gpuMatNoopDeleter,
+            torch::TensorOptions().device(torch::kCUDA));
+        tensor = mat_tensor.clone().permute({2, 0, 1});
+    } else {
+        std::cerr << "The mat has unsupported number of channels!" << std::endl;
+    }
+    return tensor.contiguous();
+}
+
+torch::Tensor eigenMatrixToTorchTensor(
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic> eigen_matrix,
+    const torch::DeviceType device_type)
+{
+    auto transposed = eigen_matrix;
+    transposed.transposeInPlace();
+    torch::Tensor tensor = torch::from_blob(
+        transposed.data(),
+        {eigen_matrix.rows(), eigen_matrix.cols()},
+        torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    return tensor.to(device_type);
+}
+
 int parseFrameIdFromPath(const std::string& path)
 {
     const std::string name = std::filesystem::path(path).stem().string();
@@ -53,6 +139,25 @@ int parseFrameIdFromPath(const std::string& path)
     } catch (...) {
         return -1;
     }
+}
+double parseFrameTimestampFromPath(const std::string& path)
+{
+    const std::string stem = std::filesystem::path(path).stem().string();
+    if (!stem.empty()) {
+        try {
+            std::size_t consumed = 0;
+            const double timestamp = std::stod(stem, &consumed);
+            if (consumed == stem.size() && std::isfinite(timestamp)) {
+                return timestamp;
+            }
+        } catch (...) {
+        }
+    }
+
+    const int frame_id = parseFrameIdFromPath(path);
+    return frame_id >= 0
+        ? static_cast<double>(frame_id)
+        : std::numeric_limits<double>::quiet_NaN();
 }
 int frameIdFromIntegerTimestamp(double timestamp)
 {
@@ -106,8 +211,9 @@ bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters)
         return true;
     }
     if (d.type() == CV_16UC1) {
-        // Handle both common 16-bit conventions:
-        // - mm depth (TUM-style): depth_m = raw / 1000
+        // Handle both common 16-bit conventions when dataset metadata is not
+        // available:
+        // - millimeter depth: depth_m = raw / 1000
         // - Replica-style uint16 encoding: depth_m = raw / 6553.5
         double max_val = 0.0;
         cv::minMaxLoc(d, nullptr, &max_val);
@@ -119,6 +225,26 @@ bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters)
     d.convertTo(depth_meters, CV_32FC1);
     return true;
 }
+
+static bool encodedDepthMatToMeters(
+    const cv::Mat& depth_in,
+    const double units_to_meters,
+    cv::Mat& depth_meters)
+{
+    if (depth_in.empty()) {
+        return false;
+    }
+    cv::Mat depth = depth_in;
+    if (depth.channels() > 1) {
+        cv::extractChannel(depth, depth, 0);
+    }
+    if (depth.type() == CV_16UC1) {
+        depth.convertTo(depth_meters, CV_32FC1, units_to_meters);
+        return true;
+    }
+    return depthMatToMeters(depth, depth_meters);
+}
+
 bool loadReplicaDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_meters)
 {
     if (rgb_filename.empty()) {
@@ -157,11 +283,13 @@ bool loadReplicaDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth
         if (depth_raw.empty()) {
             continue;
         }
-        return depthMatToMeters(depth_raw, depth_meters);
+        return encodedDepthMatToMeters(
+            depth_raw, 1.0 / 6553.5, depth_meters);
     }
 
     return false;
 }
+
 bool loadTumDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_meters)
 {
     if (rgb_filename.empty()) {
@@ -190,7 +318,8 @@ bool loadTumDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_met
     if (std::filesystem::exists(exact_depth_path)) {
         const cv::Mat depth_raw = cv::imread(exact_depth_path.string(), cv::IMREAD_UNCHANGED);
         if (!depth_raw.empty()) {
-            return depthMatToMeters(depth_raw, depth_meters);
+            return encodedDepthMatToMeters(
+                depth_raw, 1.0 / 5000.0, depth_meters);
         }
     }
 
@@ -282,7 +411,35 @@ bool loadTumDepthFromRgbPath(const std::string& rgb_filename, cv::Mat& depth_met
     if (depth_raw.empty()) {
         return false;
     }
-    return depthMatToMeters(depth_raw, depth_meters);
+    return encodedDepthMatToMeters(
+        depth_raw, 1.0 / 5000.0, depth_meters);
+}
+
+bool loadScanNetDepthFromRgbPath(
+    const std::string& rgb_filename,
+    cv::Mat& depth_meters)
+{
+    if (rgb_filename.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path rgb_path(rgb_filename);
+    if (!std::filesystem::exists(rgb_path) ||
+        rgb_path.parent_path().filename() != "color") {
+        return false;
+    }
+
+    const std::filesystem::path depth_path =
+        rgb_path.parent_path().parent_path() / "depth" /
+        (rgb_path.stem().string() + ".png");
+    if (!std::filesystem::exists(depth_path)) {
+        return false;
+    }
+
+    const cv::Mat depth_raw =
+        cv::imread(depth_path.string(), cv::IMREAD_UNCHANGED);
+    return !depth_raw.empty() && encodedDepthMatToMeters(
+        depth_raw, 1.0 / 1000.0, depth_meters);
 }
 torch::Tensor normalizeBoolMaskOrZeros(
     torch::Tensor mask,
@@ -300,17 +457,6 @@ torch::Tensor normalizeBoolMaskOrZeros(
         mask = mask.reshape({N});
     }
     return mask.to(device).to(torch::kBool).contiguous();
-}
-
-int64_t tensorRowCount(const torch::Tensor& tensor)
-{
-    if (!tensor.defined() || tensor.numel() == 0) {
-        return 0;
-    }
-    if (tensor.dim() == 0) {
-        return 1;
-    }
-    return tensor.size(0);
 }
 
 void transformPoints(torch::Tensor& points, const torch::Tensor& Twc)

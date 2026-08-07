@@ -34,7 +34,7 @@
 #include "ORB-SLAM3/include/System.h"
 
 #include "include/gaussian_mapper.h"
-#include "viewer/gaussian_imgui_viewer.h"
+#include "viewer/imgui_viewer.h"
 
 void LoadImages(const std::filesystem::path &pathImageDir, std::vector<std::string> &vstrImageFilenames,
                 const std::string &prefix);

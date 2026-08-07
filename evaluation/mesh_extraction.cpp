@@ -319,6 +319,13 @@ struct SparseTsdfKeyHash
     }
 };
 
+struct SparseRenderedTsdfGridData
+{
+    torch::Tensor grid_xyz;
+    torch::Tensor voxel_keys;
+    torch::Tensor cell_indices;
+};
+
 class SparseRenderedTsdfGrid
 {
 public:
@@ -380,7 +387,7 @@ public:
         return grid_keys_.size() > size_before;
     }
 
-    std::pair<torch::Tensor, torch::Tensor> buildGrid(
+    SparseRenderedTsdfGridData buildGrid(
         const torch::Device& device) const
     {
         std::unordered_map<SparseTsdfKey, int64_t, SparseTsdfKeyHash> point_index;
@@ -414,6 +421,8 @@ public:
 
         std::vector<int64_t> voxel_keys;
         voxel_keys.reserve(candidate_cells.size() * 8);
+        std::vector<int32_t> cell_indices;
+        cell_indices.reserve(candidate_cells.size() * 3);
         for (const auto& cell : candidate_cells) {
             std::array<int64_t, 8> corners{};
             bool complete = true;
@@ -431,14 +440,19 @@ public:
             }
             if (!complete) continue;
             voxel_keys.insert(voxel_keys.end(), corners.begin(), corners.end());
+            cell_indices.push_back(cell.x);
+            cell_indices.push_back(cell.y);
+            cell_indices.push_back(cell.z);
         }
 
         auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
         auto cpu_long = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+        auto cpu_int = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
         if (xyz.empty() || voxel_keys.empty()) {
-            return {
+            return SparseRenderedTsdfGridData{
                 torch::empty({0, 3}, cpu_float).to(device),
-                torch::empty({0, 8}, cpu_long).to(device)};
+                torch::empty({0, 8}, cpu_long).to(device),
+                torch::empty({0, 3}, cpu_int)};
         }
         auto xyz_tensor = torch::from_blob(
                               xyz.data(),
@@ -452,7 +466,15 @@ public:
                               cpu_long)
                               .clone()
                               .to(device);
-        return {xyz_tensor.contiguous(), key_tensor.contiguous()};
+        auto cell_tensor = torch::from_blob(
+                               cell_indices.data(),
+                               {static_cast<int64_t>(cell_indices.size() / 3), 3},
+                               cpu_int)
+                               .clone();
+        return SparseRenderedTsdfGridData{
+            xyz_tensor.contiguous(),
+            key_tensor.contiguous(),
+            cell_tensor.contiguous()};
     }
 
 private:
@@ -487,6 +509,21 @@ struct FusedRenderedTsdf
 {
     torch::Tensor tsdf;
     torch::Tensor keyframe_support;
+};
+
+struct RenderedTsdfSurfaceData
+{
+    torch::Tensor grid_xyz;
+    torch::Tensor voxel_keys;
+    torch::Tensor cell_indices;
+    torch::Tensor fused_tsdf;
+    torch::Tensor observed_cell_mask;
+    torch::Tensor surface_cell_mask;
+    int64_t rendered_view_count = 0;
+    float voxel_size = 0.0f;
+    float truncation = 0.0f;
+    float min_keyframe_weight = 0.0f;
+    float alpha_threshold = 0.0f;
 };
 
 FusedRenderedTsdf fuseRenderedTsdfWithSupport(
@@ -586,6 +623,215 @@ torch::Tensor fuseRenderedTsdf(
                alpha_thres,
                /*use_unit_keyframe_weight=*/false)
         .tsdf;
+}
+
+RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
+    const std::shared_ptr<sv::VoxelModel>& voxel_model,
+    const std::map<std::size_t, std::shared_ptr<VoxelKeyframe>>& keyframes,
+    const std::map<sv::camera_id_t, torch::Tensor>& undistort_masks,
+    const VoxelRerunParameters& params,
+    std::mutex& render_mutex)
+{
+    if (!voxel_model) {
+        throw std::runtime_error(
+            "buildRenderedTsdfSurfaceData: voxel model is not initialized");
+    }
+    if (keyframes.empty()) {
+        throw std::runtime_error(
+            "buildRenderedTsdfSurfaceData: no keyframes available");
+    }
+
+    torch::NoGradGuard no_grad;
+    const float voxel_length =
+        std::max(1.0e-6f, params.rendered_mesh_eval_voxel_size_m_);
+    const float min_keyframe_weight =
+        std::max(0.0f, params.rendered_mesh_eval_min_weight_);
+    const float sdf_trunc = std::max(
+        voxel_length,
+        params.rendered_mesh_eval_trunc_vox_ * voxel_length);
+    const float depth_max =
+        std::max(1.0e-6f, params.rendered_mesh_eval_depth_max_m_);
+    const float alpha_threshold =
+        std::clamp(params.svrecon_mesh_alpha_thres_, 0.0f, 1.0f);
+    SparseRenderedTsdfGrid support_grid(voxel_length, sdf_trunc);
+
+    std::unique_lock<std::mutex> render_lock(render_mutex);
+    bool froze_geo = false;
+    auto unfreeze_geo = [&]() {
+        if (froze_geo) {
+            voxel_model->unfreezeVoxGeo();
+            froze_geo = false;
+        }
+    };
+
+    try {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        voxel_model->freezeVoxGeo();
+        froze_geo = true;
+
+        std::vector<RenderedMeshView> views;
+        views.reserve(keyframes.size());
+        for (const auto& [kfid, pkf] : keyframes) {
+            if (!pkf || !pkf->set_pose_ || pkf->intr_.size() < 4 ||
+                pkf->image_height_ <= 0 || pkf->image_width_ <= 0) {
+                continue;
+            }
+            const int height = pkf->image_height_;
+            const int width = pkf->image_width_;
+            const auto cam = pkf->toMiniCam(height, width);
+
+            sv::RenderOpts render_opts;
+            render_opts.output_depth = true;
+            render_opts.output_T = true;
+            auto render_pkg = voxel_model->render(
+                cam,
+                height,
+                width,
+                torch::Tensor(),
+                nullptr,
+                false,
+                std::nullopt,
+                true,
+                false,
+                true,
+                false,
+                false,
+                render_opts);
+
+            auto depth_it = render_pkg.find("raw_depth");
+            auto transmittance_it = render_pkg.find("raw_T");
+            if (depth_it == render_pkg.end() ||
+                transmittance_it == render_pkg.end() ||
+                !depth_it->second.defined() ||
+                !transmittance_it->second.defined()) {
+                std::cout
+                    << "[mesh/rendered-TSDF-fixed] missing depth/transmittance for kf="
+                    << kfid << ", skipping.\n";
+                continue;
+            }
+
+            auto raw_depth =
+                depth_it->second.detach().to(torch::kFloat32).contiguous();
+            if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) {
+                raw_depth = raw_depth.squeeze(0);
+            }
+            if (raw_depth.dim() != 3 || raw_depth.size(0) < 3) {
+                std::cout
+                    << "[mesh/rendered-TSDF-fixed] expected SVRecon depth channels for kf="
+                    << kfid << ", got " << raw_depth.sizes()
+                    << ", skipping.\n";
+                continue;
+            }
+
+            const int64_t depth_channel =
+                params.svrecon_mesh_use_mean_depth_ ? 0 : 2;
+            auto rendered_depth =
+                raw_depth.index({depth_channel}).contiguous();
+            auto rendered_transmittance =
+                transmittance_it->second.detach()
+                    .to(torch::kFloat32)
+                    .contiguous();
+            if (rendered_transmittance.dim() == 3 &&
+                rendered_transmittance.size(0) == 1) {
+                rendered_transmittance = rendered_transmittance.squeeze(0);
+            }
+            if (rendered_transmittance.dim() != 2 ||
+                rendered_transmittance.size(0) != height ||
+                rendered_transmittance.size(1) != width) {
+                throw std::runtime_error(
+                    "buildRenderedTsdfSurfaceData: invalid transmittance shape");
+            }
+            auto rendered_alpha =
+                (1.0f - rendered_transmittance).clamp(0.0f, 1.0f);
+            const auto valid_surface =
+                torch::isfinite(rendered_depth) &
+                torch::isfinite(rendered_alpha) &
+                (rendered_depth > 0.0f) &
+                (rendered_alpha >= alpha_threshold);
+            rendered_depth = torch::where(
+                valid_surface,
+                rendered_depth,
+                torch::zeros_like(rendered_depth));
+
+            const auto mask_it = undistort_masks.find(pkf->camera_id_);
+            if (mask_it != undistort_masks.end()) {
+                auto mask = mask_it->second.to(rendered_depth.device());
+                if (mask.dim() == 3) mask = mask.index({0});
+                if (mask.dim() == 2 &&
+                    mask.size(0) == width && mask.size(1) == height) {
+                    mask = mask.transpose(0, 1);
+                }
+                if (mask.dim() != 2 || mask.size(0) != height ||
+                    mask.size(1) != width) {
+                    throw std::runtime_error(
+                        "buildRenderedTsdfSurfaceData: invalid undistortion mask shape");
+                }
+                rendered_depth = rendered_depth * mask.to(torch::kFloat32);
+            }
+
+            auto depth_cpu = rendered_depth.contiguous().to(torch::kCPU);
+            cv::Mat depth_mat(
+                height,
+                width,
+                CV_32FC1,
+                depth_cpu.data_ptr<float>());
+            support_grid.allocateFromKeyframe(
+                depth_mat,
+                pkf->intr_,
+                pkf->getPosef(),
+                depth_max);
+
+            views.push_back(RenderedMeshView{
+                cam,
+                rendered_depth,
+                rendered_alpha});
+        }
+
+        auto grid = support_grid.buildGrid(
+            voxel_model->geoGridPts().device());
+        if (grid.grid_xyz.numel() == 0 ||
+            grid.voxel_keys.numel() == 0 || views.empty()) {
+            unfreeze_geo();
+            throw std::runtime_error(
+                "buildRenderedTsdfSurfaceData: rendered depths allocated no complete TSDF cells");
+        }
+
+        auto fused = fuseRenderedTsdfWithSupport(
+            grid.grid_xyz,
+            views,
+            sdf_trunc,
+            /*crop_border=*/0.0f,
+            alpha_threshold,
+            /*use_unit_keyframe_weight=*/true);
+        auto voxel_sdf = fused.tsdf.index({grid.voxel_keys});
+        auto voxel_support =
+            fused.keyframe_support.index({grid.voxel_keys});
+        auto observed_cell_mask =
+            torch::isfinite(voxel_sdf).all(1) &
+            (std::get<0>(voxel_support.min(1)) >= min_keyframe_weight);
+        auto surface_cell_mask =
+            observed_cell_mask &
+            (std::get<0>(voxel_sdf.min(1)) < 0.0f) &
+            (std::get<0>(voxel_sdf.max(1)) > 0.0f);
+
+        RenderedTsdfSurfaceData result;
+        result.grid_xyz = std::move(grid.grid_xyz);
+        result.voxel_keys = std::move(grid.voxel_keys);
+        result.cell_indices = std::move(grid.cell_indices);
+        result.fused_tsdf = std::move(fused.tsdf);
+        result.observed_cell_mask = observed_cell_mask.contiguous();
+        result.surface_cell_mask = surface_cell_mask.contiguous();
+        result.rendered_view_count = static_cast<int64_t>(views.size());
+        result.voxel_size = voxel_length;
+        result.truncation = sdf_trunc;
+        result.min_keyframe_weight = min_keyframe_weight;
+        result.alpha_threshold = alpha_threshold;
+        unfreeze_geo();
+        return result;
+    } catch (...) {
+        unfreeze_geo();
+        throw;
+    }
 }
 
 void setMeshColors(TriangleMeshRgb& mesh, const torch::Tensor& colors)
@@ -732,7 +978,6 @@ void VoxelMapper::saveRenderedTsdfMeshPly(
     const std::filesystem::path& result_path)
 {
     namespace fs = std::filesystem;
-    torch::NoGradGuard no_grad;
     if (!voxel_model_ || !scene_) {
         std::cout << "[mesh/rendered-TSDF-fixed] skipped: mapper is not initialized.\n";
         return;
@@ -747,202 +992,247 @@ void VoxelMapper::saveRenderedTsdfMeshPly(
         fs::create_directories(result_path.parent_path());
     }
 
-    const float voxel_length =
-        std::max(1.0e-6f, rerun_params_.rendered_mesh_eval_voxel_size_m_);
-    const float min_keyframe_weight =
-        std::max(0.0f, rerun_params_.rendered_mesh_eval_min_weight_);
-    const float sdf_trunc = std::max(
-        voxel_length,
-        rerun_params_.rendered_mesh_eval_trunc_vox_ * voxel_length);
-    const float depth_max =
-        std::max(1.0e-6f, rerun_params_.rendered_mesh_eval_depth_max_m_);
-    SparseRenderedTsdfGrid support_grid(voxel_length, sdf_trunc);
+    auto surface = buildRenderedTsdfSurfaceData(
+        voxel_model_,
+        keyframes,
+        undistort_mask_,
+        rerun_params_,
+        mutex_render_);
+    auto keep_idx =
+        torch::nonzero(surface.surface_cell_mask).view({-1}).to(torch::kLong);
+    auto surface_voxel_keys =
+        surface.voxel_keys.index_select(0, keep_idx).contiguous();
+    auto [vertices, faces] = marchingCubesGrid(
+        -surface.fused_tsdf,
+        surface.grid_xyz,
+        surface_voxel_keys,
+        /*iso=*/0.0f);
+    auto mesh = meshFromTensors(vertices, faces);
+    if (mesh.vertices.empty() || mesh.faces.empty()) {
+        throw std::runtime_error(
+            "saveRenderedTsdfMeshPly: zero-crossing TSDF produced an empty mesh");
+    }
+    if (rerun_params_.svrecon_mesh_use_vert_color_) {
+        std::unique_lock<std::mutex> render_lock(mutex_render_);
+        setMeshColors(mesh, colorizeSvreconMeshVertices(vertices));
+    }
+    if (!saveTriangleMeshPly(
+            result_path,
+            mesh,
+            rerun_params_.svrecon_mesh_use_vert_color_)) {
+        throw std::runtime_error(
+            "saveRenderedTsdfMeshPly: failed to write mesh PLY");
+    }
+    std::cout << "[mesh/rendered-TSDF-fixed] wrote " << result_path
+              << " depth_source="
+              << (rerun_params_.svrecon_mesh_use_mean_depth_
+                      ? "mean_opacity"
+                      : "median_opacity")
+              << " views=" << surface.rendered_view_count
+              << " voxel_size=" << surface.voxel_size
+              << " truncation=" << surface.truncation
+              << " min_keyframe_weight=" << surface.min_keyframe_weight
+              << " alpha_threshold=" << surface.alpha_threshold
+              << " candidate_grid_points=" << surface.grid_xyz.size(0)
+              << " surface_grid_voxels=" << surface_voxel_keys.size(0)
+              << " vertices=" << mesh.vertices.size()
+              << " faces=" << mesh.faces.size() << "\n";
+}
 
-    std::unique_lock<std::mutex> render_lock(mutex_render_);
-    bool froze_geo = false;
-    auto unfreeze_geo = [&]() {
-        if (froze_geo) {
-            voxel_model_->unfreezeVoxGeo();
-            froze_geo = false;
+torch::Tensor VoxelMapper::computeRenderedTsdfSurfacePruneMask(
+    FinalSurfacePruneStats* stats_out)
+{
+    FinalSurfacePruneStats stats;
+    const int64_t voxel_count = voxel_model_ ? voxel_model_->numVoxels() : 0;
+    torch::Device device = mDevice;
+    if (voxel_model_ && voxel_model_->voxCenter().defined()) {
+        device = voxel_model_->voxCenter().device();
+    }
+    const auto bool_options =
+        torch::TensorOptions().dtype(torch::kBool).device(device);
+    const auto prune_none =
+        torch::zeros({std::max<int64_t>(0, voxel_count)}, bool_options);
+    auto finish = [&](const torch::Tensor& mask) {
+        if (mask.defined()) {
+            stats.surface_prune_count = mask.sum().item<int64_t>();
         }
+        if (stats_out) {
+            *stats_out = stats;
+        }
+        return mask;
     };
 
+    if (!voxel_model_ || !scene_ || voxel_count <= 0 ||
+        scene_->keyframes().empty()) {
+        return finish(prune_none);
+    }
+
     try {
-        c10::cuda::CUDACachingAllocator::emptyCache();
-        voxel_model_->freezeVoxGeo();
-        froze_geo = true;
+        auto surface = buildRenderedTsdfSurfaceData(
+            voxel_model_,
+            scene_->keyframes(),
+            undistort_mask_,
+            rerun_params_,
+            mutex_render_);
+        stats.rendered_view_count = surface.rendered_view_count;
+        stats.candidate_grid_point_count = surface.grid_xyz.size(0);
+        stats.candidate_grid_cell_count = surface.voxel_keys.size(0);
+        stats.observed_grid_cell_count =
+            surface.observed_cell_mask.sum().item<int64_t>();
+        stats.surface_grid_cell_count =
+            surface.surface_cell_mask.sum().item<int64_t>();
+        stats.voxel_size = surface.voxel_size;
+        stats.truncation = surface.truncation;
+        stats.min_keyframe_weight = surface.min_keyframe_weight;
+        stats.alpha_threshold = surface.alpha_threshold;
 
-        std::vector<RenderedMeshView> views;
-        views.reserve(keyframes.size());
-        for (const auto& [kfid, pkf] : keyframes) {
-            if (!pkf || !pkf->set_pose_ || pkf->intr_.size() < 4 ||
-                pkf->image_height_ <= 0 || pkf->image_width_ <= 0) {
+        if (stats.rendered_view_count <= 0 ||
+            stats.surface_grid_cell_count <= 0) {
+            return finish(prune_none);
+        }
+
+        auto surface_cell_rows =
+            torch::nonzero(surface.surface_cell_mask)
+                .view({-1})
+                .to(torch::kLong)
+                .to(torch::kCPU);
+        auto surface_cells_cpu =
+            surface.cell_indices
+                .index_select(0, surface_cell_rows)
+                .to(torch::kCPU)
+                .to(torch::kInt32)
+                .contiguous();
+
+        // A fixed TSDF surface cell supports every adaptive leaf whose actual
+        // world-space AABB intersects that cell. This is geometric overlap,
+        // not a neighboring-cell expansion or halo.
+        std::vector<SparseTsdfKey> surface_cells;
+        surface_cells.reserve(
+            static_cast<std::size_t>(surface_cells_cpu.size(0)));
+        std::unordered_set<SparseTsdfKey, SparseTsdfKeyHash> surface_cell_set;
+        surface_cell_set.reserve(
+            static_cast<std::size_t>(surface_cells_cpu.size(0) * 2));
+        auto fixed_cells = surface_cells_cpu.accessor<int32_t, 2>();
+        for (int64_t i = 0; i < surface_cells_cpu.size(0); ++i) {
+            const SparseTsdfKey key{
+                fixed_cells[i][0],
+                fixed_cells[i][1],
+                fixed_cells[i][2]};
+            surface_cells.push_back(key);
+            surface_cell_set.insert(key);
+        }
+
+        auto centers_cpu =
+            voxel_model_->voxCenter()
+                .detach()
+                .to(torch::kCPU)
+                .to(torch::kFloat32)
+                .contiguous();
+        auto sizes_cpu =
+            voxel_model_->voxSize()
+                .detach()
+                .to(torch::kCPU)
+                .to(torch::kFloat32)
+                .reshape({voxel_count})
+                .contiguous();
+        auto leaf_cpu =
+            voxel_model_->isLeaf()
+                .detach()
+                .to(torch::kCPU)
+                .to(torch::kBool)
+                .reshape({voxel_count})
+                .contiguous();
+        auto supported_cpu = torch::zeros(
+            {voxel_count},
+            torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
+        auto centers = centers_cpu.accessor<float, 2>();
+        auto sizes = sizes_cpu.accessor<float, 1>();
+        auto leaves = leaf_cpu.accessor<bool, 1>();
+        auto supported = supported_cpu.accessor<bool, 1>();
+        const double inv_voxel_size =
+            1.0 / static_cast<double>(surface.voxel_size);
+        constexpr double kBoundaryEpsilon = 1.0e-5;
+
+        for (int64_t i = 0; i < voxel_count; ++i) {
+            if (!leaves[i] || !std::isfinite(sizes[i]) || sizes[i] <= 0.0f ||
+                !std::isfinite(centers[i][0]) ||
+                !std::isfinite(centers[i][1]) ||
+                !std::isfinite(centers[i][2])) {
                 continue;
             }
-            const int height = pkf->image_height_;
-            const int width = pkf->image_width_;
-            const auto cam = pkf->toMiniCam(height, width);
 
-            sv::RenderOpts render_opts;
-            render_opts.output_depth = true;
-            render_opts.output_T = true;
-            auto render_pkg = voxel_model_->render(
-                cam,
-                height,
-                width,
-                torch::Tensor(),
-                nullptr,
-                false,
-                std::nullopt,
-                true,
-                false,
-                true,
-                false,
-                false,
-                render_opts);
-
-            auto depth_it = render_pkg.find("raw_depth");
-            auto transmittance_it = render_pkg.find("raw_T");
-            if (depth_it == render_pkg.end() || transmittance_it == render_pkg.end() ||
-                !depth_it->second.defined() || !transmittance_it->second.defined()) {
-                std::cout << "[mesh/rendered-TSDF-fixed] missing depth/transmittance for kf="
-                          << kfid << ", skipping.\n";
-                continue;
+            const double half_size = 0.5 * static_cast<double>(sizes[i]);
+            int lower[3];
+            int upper[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                const double active_min =
+                    static_cast<double>(centers[i][axis]) - half_size;
+                const double active_max =
+                    static_cast<double>(centers[i][axis]) + half_size;
+                // Fixed cell k spans [(k + 0.5)v, (k + 1.5)v].
+                lower[axis] = static_cast<int>(std::ceil(
+                    active_min * inv_voxel_size - 1.5 + kBoundaryEpsilon));
+                upper[axis] = static_cast<int>(std::floor(
+                    active_max * inv_voxel_size - 0.5 - kBoundaryEpsilon));
             }
 
-            auto raw_depth = depth_it->second.detach().to(torch::kFloat32).contiguous();
-            if (raw_depth.dim() == 4 && raw_depth.size(0) == 1) {
-                raw_depth = raw_depth.squeeze(0);
-            }
-            if (raw_depth.dim() != 3 || raw_depth.size(0) < 3) {
-                std::cout << "[mesh/rendered-TSDF-fixed] expected SVRecon depth channels for kf="
-                          << kfid << ", got " << raw_depth.sizes() << ", skipping.\n";
-                continue;
-            }
+            const int64_t count_x =
+                static_cast<int64_t>(upper[0]) - lower[0] + 1;
+            const int64_t count_y =
+                static_cast<int64_t>(upper[1]) - lower[1] + 1;
+            const int64_t count_z =
+                static_cast<int64_t>(upper[2]) - lower[2] + 1;
+            const long double lattice_query_count =
+                static_cast<long double>(std::max<int64_t>(0, count_x)) *
+                static_cast<long double>(std::max<int64_t>(0, count_y)) *
+                static_cast<long double>(std::max<int64_t>(0, count_z));
 
-            const int64_t depth_channel = rerun_params_.svrecon_mesh_use_mean_depth_
-                ? 0
-                : 2;
-            auto rendered_depth = raw_depth.index({depth_channel}).contiguous();
-            auto rendered_transmittance =
-                transmittance_it->second.detach().to(torch::kFloat32).contiguous();
-            if (rendered_transmittance.dim() == 3 &&
-                rendered_transmittance.size(0) == 1) {
-                rendered_transmittance = rendered_transmittance.squeeze(0);
-            }
-            if (rendered_transmittance.dim() != 2 ||
-                rendered_transmittance.size(0) != height ||
-                rendered_transmittance.size(1) != width) {
-                throw std::runtime_error(
-                    "saveRenderedTsdfMeshPly: invalid transmittance shape");
-            }
-            auto rendered_alpha =
-                (1.0f - rendered_transmittance).clamp(0.0f, 1.0f);
-            const auto valid_surface =
-                torch::isfinite(rendered_depth) &
-                torch::isfinite(rendered_alpha) &
-                (rendered_depth > 0.0f) &
-                (rendered_alpha >= rerun_params_.svrecon_mesh_alpha_thres_);
-            rendered_depth = torch::where(
-                valid_surface,
-                rendered_depth,
-                torch::zeros_like(rendered_depth));
-
-            const auto mask_it = undistort_mask_.find(pkf->camera_id_);
-            if (mask_it != undistort_mask_.end()) {
-                auto mask = mask_it->second.to(rendered_depth.device());
-                if (mask.dim() == 3) mask = mask.index({0});
-                if (mask.dim() == 2 &&
-                    mask.size(0) == width && mask.size(1) == height) {
-                    mask = mask.transpose(0, 1);
+            bool intersects_surface = false;
+            if (lattice_query_count <=
+                static_cast<long double>(surface_cells.size())) {
+                for (int x = lower[0];
+                     x <= upper[0] && !intersects_surface;
+                     ++x) {
+                    for (int y = lower[1];
+                         y <= upper[1] && !intersects_surface;
+                         ++y) {
+                        for (int z = lower[2]; z <= upper[2]; ++z) {
+                            if (surface_cell_set.find({x, y, z}) !=
+                                surface_cell_set.end()) {
+                                intersects_surface = true;
+                                break;
+                            }
+                        }
+                    }
                 }
-                if (mask.dim() != 2 || mask.size(0) != height || mask.size(1) != width) {
-                    throw std::runtime_error(
-                        "saveRenderedTsdfMeshPly: invalid undistortion mask shape");
+            } else {
+                for (const auto& cell : surface_cells) {
+                    if (cell.x >= lower[0] && cell.x <= upper[0] &&
+                        cell.y >= lower[1] && cell.y <= upper[1] &&
+                        cell.z >= lower[2] && cell.z <= upper[2]) {
+                        intersects_surface = true;
+                        break;
+                    }
                 }
-                rendered_depth = rendered_depth * mask.to(torch::kFloat32);
             }
-
-            auto depth_cpu = rendered_depth.contiguous().to(torch::kCPU);
-            cv::Mat depth_mat(height, width, CV_32FC1, depth_cpu.data_ptr<float>());
-            support_grid.allocateFromKeyframe(
-                depth_mat,
-                pkf->intr_,
-                pkf->getPosef(),
-                depth_max);
-
-            RenderedMeshView view;
-            view.cam = cam;
-            view.depth = rendered_depth;
-            view.alpha = rendered_alpha;
-            views.push_back(std::move(view));
+            supported[i] = intersects_surface;
         }
 
-        auto [grid_xyz, vox_key] = support_grid.buildGrid(
-            voxel_model_->geoGridPts().device());
-        if (grid_xyz.numel() == 0 || vox_key.numel() == 0 || views.empty()) {
-            unfreeze_geo();
-            throw std::runtime_error(
-                "saveRenderedTsdfMeshPly: rendered depths allocated no complete TSDF cells");
-        }
-
-        auto fused = fuseRenderedTsdfWithSupport(
-            grid_xyz,
-            views,
-            sdf_trunc,
-            /*crop_border=*/0.0f,
-            rerun_params_.svrecon_mesh_alpha_thres_,
-            /*use_unit_keyframe_weight=*/true);
-        auto vox_sdf = fused.tsdf.index({vox_key});
-        auto vox_support = fused.keyframe_support.index({vox_key});
-        auto keep_mask =
-            torch::isfinite(vox_sdf).all(1) &
-            (std::get<0>(vox_support.min(1)) >= min_keyframe_weight) &
-            (std::get<0>(vox_sdf.min(1)) < 0.0f) &
-            (std::get<0>(vox_sdf.max(1)) > 0.0f);
-        auto keep_idx = torch::nonzero(keep_mask).view({-1}).to(torch::kLong);
-        vox_key = vox_key.index_select(0, keep_idx).contiguous();
-        auto [vertices, faces] = marchingCubesGrid(
-            -fused.tsdf,
-            grid_xyz,
-            vox_key,
-            /*iso=*/0.0f);
-        auto mesh = meshFromTensors(vertices, faces);
-        if (mesh.vertices.empty() || mesh.faces.empty()) {
-            unfreeze_geo();
-            throw std::runtime_error(
-                "saveRenderedTsdfMeshPly: zero-crossing TSDF produced an empty mesh");
-        }
-        if (rerun_params_.svrecon_mesh_use_vert_color_) {
-            setMeshColors(mesh, colorizeSvreconMeshVertices(vertices));
-        }
-        if (!saveTriangleMeshPly(
-                result_path,
-                mesh,
-                rerun_params_.svrecon_mesh_use_vert_color_)) {
-            unfreeze_geo();
-            throw std::runtime_error(
-                "saveRenderedTsdfMeshPly: failed to write mesh PLY");
-        }
-        unfreeze_geo();
-        std::cout << "[mesh/rendered-TSDF-fixed] wrote " << result_path
-                  << " depth_source="
-                  << (rerun_params_.svrecon_mesh_use_mean_depth_
-                          ? "mean_opacity"
-                          : "median_opacity")
-                  << " views=" << views.size()
-                  << " voxel_size=" << voxel_length
-                  << " truncation=" << sdf_trunc
-                  << " min_keyframe_weight=" << min_keyframe_weight
-                  << " alpha_threshold="
-                  << rerun_params_.svrecon_mesh_alpha_thres_
-                  << " candidate_grid_points=" << grid_xyz.size(0)
-                  << " surface_grid_voxels=" << vox_key.size(0)
-                  << " vertices=" << mesh.vertices.size()
-                  << " faces=" << mesh.faces.size() << "\n";
-    } catch (...) {
-        unfreeze_geo();
-        throw;
+        auto supported_device =
+            supported_cpu.to(device).to(torch::kBool).contiguous();
+        auto leaf_device =
+            leaf_cpu.to(device).to(torch::kBool).contiguous();
+        stats.supported_voxel_count =
+            (supported_device & leaf_device).sum().item<int64_t>();
+        stats.rendered_tsdf_available = true;
+        return finish(
+            (leaf_device & (~supported_device)).to(torch::kBool).contiguous());
+    } catch (const std::exception& e) {
+        std::cerr
+            << "[FINAL/refinement] rendered-TSDF support unavailable; "
+               "keeping the existing final map: "
+            << e.what() << "\n";
+        return finish(prune_none);
     }
 }
 

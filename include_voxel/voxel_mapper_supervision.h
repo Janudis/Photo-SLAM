@@ -1,5 +1,7 @@
 #pragma once
 
+// Shared optimization-supervision and rendered-map utility declarations.
+
 #include "include_voxel/mini_cam.h"
 #include "include_voxel/voxel_keyframe.h"
 
@@ -16,6 +18,35 @@
 namespace ORB_SLAM3 { class System; }
 
 namespace voxel_eval {
+
+torch::Tensor l1Loss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target);
+torch::Tensor mseLoss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target);
+torch::Tensor huberLoss(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target,
+    float threshold);
+torch::Tensor psnr(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target);
+torch::Tensor ssim(
+    const torch::Tensor& prediction,
+    const torch::Tensor& target,
+    torch::DeviceType device_type,
+    int window_size = 11,
+    bool size_average = true);
+torch::Tensor fastSsimLoss(
+    torch::Tensor prediction,
+    torch::Tensor target);
+torch::Tensor probabilityConcentrationLoss(const torch::Tensor& probability);
+torch::Tensor sparseDepthLoss(
+    const torch::Tensor& raw_transmittance,
+    const torch::Tensor& raw_depth,
+    const torch::Tensor& sparse_uv,
+    const torch::Tensor& sparse_depth);
 
 struct DepthScaleFitStats
 {
@@ -56,7 +87,7 @@ cv::Mat colorizeFiniteScalarMatJet(const cv::Mat& values, float viz_min, float v
 cv::Mat appendColormapLegendBar(const cv::Mat& image_bgr, float viz_min, float viz_max, const std::string& unit_suffix, int colormap, const std::string& high_label, const std::string& low_label);
 cv::Mat appendJetLegendBar(const cv::Mat& image_bgr, float viz_min, float viz_max, const std::string& unit_suffix);
 bool renderPkgToNormalForEval(const std::unordered_map<std::string, torch::Tensor>& render_pkg, torch::Tensor& render_normal);
-torch::Tensor depth2normalSVRaster(const sv::MiniCam& cam, const torch::Tensor& depth, int ks, float tol_cos);
+torch::Tensor depthToNormal(const sv::MiniCam& cam, const torch::Tensor& depth, int ks, float tol_cos);
 torch::Tensor validDepthSupportMask(const torch::Tensor& valid, int ks);
 torch::Tensor normalDepthConsistencyLossSvrecon(const sv::MiniCam& cam, const std::unordered_map<std::string, torch::Tensor>& render_pkg, int ks, float tol_deg);
 cv::Mat colorizeNormalMapBgr(const torch::Tensor& normal_tensor);

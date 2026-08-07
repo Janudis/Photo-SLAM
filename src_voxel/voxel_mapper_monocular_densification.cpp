@@ -1,6 +1,5 @@
 #include "include_voxel/voxel_mapper.h"
 #include "include_voxel/voxel_mapper_utils.h"
-#include "include/sh_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -37,9 +36,9 @@ sv::MiniCam scaledRenderCamera(
     camera.cx /= scale;
     camera.cy /= scale;
     const float fov_x =
-        graphics_utils::focal2fov(camera.fx, render_width);
+        sv::focalToFov(camera.fx, render_width);
     const float fov_y =
-        graphics_utils::focal2fov(camera.fy, render_height);
+        sv::focalToFov(camera.fy, render_height);
     camera.tanfovx = std::tan(0.5f * fov_x);
     camera.tanfovy = std::tan(0.5f * fov_y);
     camera.pix_size =
@@ -400,7 +399,7 @@ void VoxelMapper::logMonocularCoVisibilityPrunedVoxels(
         colors =
             (sh0.index_select(
                  0, indices.to(sh0.device()).to(torch::kLong)) *
-                 sh_utils::C0 +
+                 sv::kSHC0 +
              0.5f)
                 .clamp(0.0f, 1.0f)
                 .contiguous();
@@ -422,8 +421,6 @@ void VoxelMapper::logMonocularCoVisibilityPrunedVoxels(
         levels.index_select(
             0, selected_indices.to(levels.device())).contiguous(),
         colors,
-        torch::Tensor(),
-        torch::Tensor(),
         torch::Tensor(),
         torch::Tensor(),
         torch::Tensor(),

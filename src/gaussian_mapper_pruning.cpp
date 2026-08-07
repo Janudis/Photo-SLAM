@@ -341,11 +341,15 @@ torch::Tensor GaussianMapper::denseCoreFarGaussianMask() const
 
 void GaussianMapper::runGaussianHeuristicPrune(bool final_cleanup)
 {
-    if (!gaussians_ || !gaussians_->optimizer_ ||
-        gaussians_->getXYZ().size(0) == 0) {
+    if ((!final_cleanup &&
+         !filter_near_voxels_ &&
+         !prune_far_voxels_ &&
+         !prune_near_voxels_geometric_) ||
+        (final_cleanup && !final_special_prune_enable_)) {
         return;
     }
-    if (final_cleanup && !final_special_prune_enable_) {
+    if (!gaussians_ || !gaussians_->optimizer_ ||
+        gaussians_->getXYZ().size(0) == 0) {
         return;
     }
 

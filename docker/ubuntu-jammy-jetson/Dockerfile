@@ -2,7 +2,7 @@ ARG BASE_IMAGE=ubuntu-jammy-humble-jetson:latest
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG OPENCV_VERSION=4.8.0
+ARG OPENCV_VERSION=4.13.0
 ARG OPENCV_BUILD_JOBS=4
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -61,8 +61,9 @@ RUN chmod 1777 /tmp \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100 \
     && rm -rf /var/lib/apt/lists/*
 
-# The shared Isaac/ROS image has CPU-only OpenCV 4.5.  Install OpenCV 4.8
-# with the CUDA modules required by the mapper into this derived image only.
+# The shared Isaac/ROS image has CPU-only OpenCV 4.5. Install the OpenCV
+# release selected by jetson-containers for CUDA 12.6, with only the CUDA
+# modules required by the mapper, into this derived image.
 RUN mkdir -p /tmp/opencv-src \
     && cd /tmp/opencv-src \
     && wget -q \

@@ -44,8 +44,11 @@ create_args=(
     --runtime nvidia
     --network host
     --ipc host
+    --user "$(id -u):$(id -g)"
     --ulimit memlock=-1
     --ulimit stack=67108864
+    --env "HOME=$HOME"
+    --env "USER=$USER"
     --env "DISPLAY=${DISPLAY:-:0}"
     --env NVIDIA_VISIBLE_DEVICES=all
     --env NVIDIA_DRIVER_CAPABILITIES=all

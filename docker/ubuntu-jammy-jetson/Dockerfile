@@ -2,9 +2,8 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG USER_NAME=photoslam
-ARG USER_UID=1000
-ARG USER_GID=1000
+ARG OPENCV_VERSION=4.8.0
+ARG OPENCV_BUILD_JOBS=4
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -47,8 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         pybind11-dev \
         python3-dev \
+        python3-numpy \
         python3-pip \
-        sudo \
         unzip \
         wget \
         xauth \
@@ -57,16 +56,49 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --gid "${USER_GID}" "${USER_NAME}" \
-    && useradd --uid "${USER_UID}" --gid "${USER_GID}" \
-        --create-home --shell /bin/bash "${USER_NAME}" \
-    && echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" \
-        > "/etc/sudoers.d/${USER_NAME}" \
-    && chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+# The shared Isaac/ROS image has CPU-only OpenCV 4.5.  Install OpenCV 4.8
+# with the CUDA modules required by the mapper into this derived image only.
+RUN mkdir -p /tmp/opencv-src \
+    && cd /tmp/opencv-src \
+    && wget -q \
+        "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.zip" \
+        -O opencv.zip \
+    && wget -q \
+        "https://github.com/opencv/opencv_contrib/archive/refs/tags/${OPENCV_VERSION}.zip" \
+        -O opencv_contrib.zip \
+    && unzip -q opencv.zip \
+    && unzip -q opencv_contrib.zip \
+    && cmake -S "opencv-${OPENCV_VERSION}" -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CUDA_ARCHITECTURES=87 \
+        -DOPENCV_EXTRA_MODULES_PATH="/tmp/opencv-src/opencv_contrib-${OPENCV_VERSION}/modules" \
+        -DOPENCV_GENERATE_PKGCONFIG=ON \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_PERF_TESTS=OFF \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_opencv_python3=ON \
+        -DBUILD_opencv_world=OFF \
+        -DCUDA_ARCH_BIN=8.7 \
+        -DCUDA_ARCH_PTX= \
+        -DPYTHON3_EXECUTABLE=/usr/bin/python3 \
+        -DPYTHON3_PACKAGES_PATH=/usr/local/lib/python3.10/dist-packages \
+        -DWITH_CUBLAS=ON \
+        -DWITH_CUDA=ON \
+        -DWITH_CUDNN=OFF \
+        -DWITH_FFMPEG=ON \
+        -DWITH_GTK=ON \
+        -DWITH_OPENGL=ON \
+    && cmake --build build --parallel "${OPENCV_BUILD_JOBS}" \
+    && cmake --install build \
+    && ldconfig \
+    && rm -rf /tmp/opencv-src
 
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    OpenCV_DIR=/usr/local/lib/cmake/opencv4 \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH} \
     PYTHONNOUSERSITE=1 \
     PHOTOSLAM_JETSON=1 \
     PHOTOSLAM_ENABLE_RERUN=OFF \
@@ -79,9 +111,7 @@ ENV CUDA_HOME=/usr/local/cuda \
 RUN python3 -c \
     "import torch; print('PyTorch', torch.__version__); print('Torch CMake', torch.utils.cmake_prefix_path)" \
     && python3 -c \
-    "import cv2; print('OpenCV', cv2.__version__)"
+    "import cv2,re; info=cv2.getBuildInformation(); print('OpenCV', cv2.__version__); assert re.search(r'NVIDIA CUDA:\\s+YES', info), 'OpenCV was built without CUDA'"
 
-USER ${USER_NAME}
-WORKDIR /home/${USER_NAME}
-
+WORKDIR /workspace
 CMD ["/bin/bash"]

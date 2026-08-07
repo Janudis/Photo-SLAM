@@ -8,6 +8,8 @@ ARG OPENCV_BUILD_JOBS=4
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN chmod 1777 /tmp \
+    && find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -i '/dl\.yarnpkg\.com/d' {} + \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get update \
     && apt-get install -y --no-install-recommends \

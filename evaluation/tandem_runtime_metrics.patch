@@ -1,0 +1,190 @@
+diff --git a/tandem/src/main_tandem_pangolin.cpp b/tandem/src/main_tandem_pangolin.cpp
+index 383fce5..6488114 100644
+--- a/tandem/src/main_tandem_pangolin.cpp
++++ b/tandem/src/main_tandem_pangolin.cpp
+@@ -22,12 +22,17 @@
+ */
+ 
+ #include <thread>
++#include <fstream>
++#include <iomanip>
+ #include <locale.h>
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+-#include <unistd.h>
+ #include <sys/stat.h>
++#include <unistd.h>
++
++#include <c10/cuda/CUDACachingAllocator.h>
++#include <torch/cuda.h>
+ 
+ 
+ #include "IOWrapper/Output3DWrapper.h"
+@@ -60,6 +65,88 @@ bool firstRosSpin = false;
+ 
+ using namespace dso;
+ 
++namespace {
++
++struct GpuMemoryStats {
++  double reserved_mb = 0.0;
++  double allocated_mb = 0.0;
++};
++
++GpuMemoryStats getGpuPeakMemoryStats() {
++  GpuMemoryStats stats;
++  if (!torch::cuda::is_available()) return stats;
++
++  namespace allocator = c10::cuda::CUDACachingAllocator;
++  const allocator::DeviceStats device_stats = allocator::getDeviceStats(0);
++  const int aggregate = static_cast<int>(allocator::StatType::AGGREGATE);
++  stats.reserved_mb =
++      device_stats.reserved_bytes[aggregate].peak / (1024.0 * 1024.0);
++  stats.allocated_mb =
++      device_stats.allocated_bytes[aggregate].peak / (1024.0 * 1024.0);
++  return stats;
++}
++
++double fileSizeMb(const std::string& path) {
++  struct stat file_info {};
++  if (stat(path.c_str(), &file_info) != 0) return 0.0;
++  return static_cast<double>(file_info.st_size) / (1024.0 * 1024.0);
++}
++
++size_t countWhitespaceTokens(const std::string& path) {
++  std::ifstream input(path);
++  size_t count = 0;
++  std::string token;
++  while (input >> token) ++count;
++  return count;
++}
++
++size_t countNonEmptyLines(const std::string& path) {
++  std::ifstream input(path);
++  size_t count = 0;
++  std::string line;
++  while (std::getline(input, line)) {
++    if (line.find_first_not_of(" \t\r\n") != std::string::npos) ++count;
++  }
++  return count;
++}
++
++void saveRuntimeMetrics(
++    const std::string& path,
++    int frames,
++    size_t valid_poses,
++    size_t keyframes,
++    double total_seconds,
++    size_t tracking_calls,
++    double tracking_seconds,
++    const std::string& map_path,
++    const GpuMemoryStats& gpu_stats) {
++  std::ofstream output(path, std::ios::trunc);
++  output << std::fixed << std::setprecision(6);
++  output << "{\n";
++  output << "  \"frames\": " << frames << ",\n";
++  output << "  \"valid_poses\": " << valid_poses << ",\n";
++  output << "  \"keyframes\": " << keyframes << ",\n";
++  output << "  \"primitive_type\": \"tsdf_mesh\",\n";
++  output << "  \"total_seconds\": " << total_seconds << ",\n";
++  output << "  \"fps_hz\": "
++         << (total_seconds > 0.0 ? frames / total_seconds : 0.0) << ",\n";
++  output << "  \"tracking_calls\": " << tracking_calls << ",\n";
++  output << "  \"tracking_seconds\": " << tracking_seconds << ",\n";
++  output << "  \"tracking_fps_hz\": "
++         << (tracking_seconds > 0.0 ? tracking_calls / tracking_seconds : 0.0)
++         << ",\n";
++  output << "  \"tracking_scope\": \"DSO trackNewCoarse frontend only\",\n";
++  output << "  \"runtime_scope\": \"tracking, MVS, TSDF fusion, and tail synchronization; input preload, model initialization, and final mesh export excluded\",\n";
++  output << "  \"map_path\": \"" << map_path << "\",\n";
++  output << "  \"map_size_mb\": " << fileSizeMb(map_path) << ",\n";
++  output << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb
++         << ",\n";
++  output << "  \"gpu_memory_reserved_mb\": " << gpu_stats.reserved_mb << "\n";
++  output << "}\n";
++}
++
++}  // namespace
++
+ 
+ void my_exit_handler(int s) {
+   printf("Caught signal %d\n", s);
+@@ -182,6 +269,7 @@ int main(int argc, char **argv) {
+     clock_t started = clock();
+     const auto timer_start = Timer::start();
+     double sInitializerOffset = 0;
++    int framesSubmitted = 0;
+ 
+ 
+     for (int ii = 0; ii < (int) idsToPlay.size(); ii++) {
+@@ -227,7 +315,10 @@ int main(int argc, char **argv) {
+         }
+       }
+ 
+-      if (!skipFrame) fullSystem->addActiveFrame(img, img_bgr, depth, dvo_img, i);
++      if (!skipFrame) {
++        fullSystem->addActiveFrame(img, img_bgr, depth, dvo_img, i);
++        ++framesSubmitted;
++      }
+ 
+       delete img;
+       if (rgbd_flag) {
+@@ -271,7 +362,7 @@ int main(int argc, char **argv) {
+     fullSystem->printKeyframeIndex(opt.result_folder + "keyframes_dso.txt");
+     if (dr_timing) fullSystem->printDrStatistics(opt.result_folder);
+ 
+-    int numFramesProcessed = abs(idsToPlay[0] - idsToPlay.back());
++    int numFramesProcessed = framesSubmitted;
+ 
+     printf("\nTANDEM TIMING: =================="
+            "\n%d Frames (%.1f fps)"
+@@ -303,6 +394,22 @@ int main(int argc, char **argv) {
+       printf("Mesh Saving done!\n");
+     }
+ 
++    const std::string result_path = opt.result_folder + "result.txt";
++    const std::string keyframe_path = opt.result_folder + "keyframes_dso.txt";
++    const std::string mesh_path = opt.result_folder + "mesh.obj";
++    const double tracking_seconds =
++        fullSystem->dr_timer.sum_timing_ms("dso-trackNewCoarse") / 1000.0;
++    saveRuntimeMetrics(
++        opt.result_folder + "runtime_metrics.json",
++        numFramesProcessed,
++        countNonEmptyLines(result_path),
++        countWhitespaceTokens(keyframe_path),
++        MilliSecondsTakenHRC / 1000.0,
++        fullSystem->dr_timer.count_timing("dso-trackNewCoarse"),
++        tracking_seconds,
++        mesh_path,
++        getGpuPeakMemoryStats());
++
+ 
+     if (exit_when_done)
+       exit(EXIT_SUCCESS);
+diff --git a/tandem/src/util/Timer.h b/tandem/src/util/Timer.h
+index 0e152ed..384455f 100644
+--- a/tandem/src/util/Timer.h
++++ b/tandem/src/util/Timer.h
+@@ -74,6 +74,20 @@ public:
+     return sum / (double)count;
+   };
+ 
++  size_t count_timing(string const& key) const {
++    auto const it = instances.find(key);
++    return it == instances.end() ? 0 : it->second.size();
++  };
++
++  double sum_timing_ms(string const& key) const {
++    auto const it = instances.find(key);
++    if (it == instances.end()) return 0.0;
++
++    double sum = 0.0;
++    for (auto const& inst : it->second) sum += inst.dt2ms();
++    return sum;
++  };
++
+   void write_to_file(string const& filename){
+     std::ofstream myfile;
+     myfile.open (filename);
+

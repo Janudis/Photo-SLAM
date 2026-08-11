@@ -193,6 +193,7 @@ protected:
     void captureMonocularMvsKeyframeMetadata(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         ORB_SLAM3::KeyFrame* orb_keyframe);
+    bool isMonocularMvsPipelineEnabled() const;
     void refreshMonocularMvsKeyframeMetadata();
     std::vector<std::shared_ptr<VoxelKeyframe>>
     selectMonocularMvsSourceKeyframes(
@@ -204,6 +205,17 @@ protected:
         const std::vector<std::shared_ptr<VoxelKeyframe>>& candidates);
     void pollMonocularMvsDensification(bool wait_for_result = false);
     void integrateMonocularMvsDepth(const sv::TandemMvsResult& result);
+    void integrateMonocularMvsTsdfEvidence(
+        const sv::TandemMvsResult& result);
+    void promoteMonocularMvsTsdfEvidenceCells(
+        const std::unordered_set<
+            sv::RgbdTsdfGridKey,
+            sv::RgbdTsdfGridKeyHash>& affected_cells);
+    void resetMonocularMvsTsdfEvidenceIfLayoutChanged();
+    void logMonocularMvsTsdfEvidenceCellsToRerun(
+        int iteration,
+        const std::vector<sv::RgbdTsdfGridKey>& cells,
+        const std::string& entity_path);
     void cacheMonocularDepthPrior(
         const std::shared_ptr<VoxelKeyframe>& reference,
         const cv::Mat& depth,
@@ -518,6 +530,26 @@ protected:
     float monocular_mvs_depth_max_multiplier_ = 3.0f;
     float monocular_mvs_discard_percentage_ = 10.0f;
     bool monocular_mvs_empty_cache_before_launch_ = false;
+    // Optional full-image MVS evidence. This remains separate from active
+    // SVRecon topology until a fused TSDF zero crossing is promoted.
+    bool monocular_mvs_tsdf_evidence_ = false;
+    int monocular_mvs_tsdf_evidence_pixel_stride_ = 1;
+    float monocular_mvs_tsdf_evidence_trunc_vox_ = 4.0f;
+    float monocular_mvs_tsdf_evidence_max_weight_ = 64.0f;
+    int monocular_mvs_tsdf_evidence_promote_min_views_ = 2;
+    float monocular_mvs_tsdf_evidence_promote_min_weight_ = 1.0f;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCornerEvidence,
+        sv::RgbdTsdfGridKeyHash> monocular_mvs_tsdf_corner_evidence_;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCellEvidence,
+        sv::RgbdTsdfGridKeyHash> monocular_mvs_tsdf_cell_evidence_;
+    Eigen::Vector3f monocular_mvs_tsdf_layout_scene_min_ =
+        Eigen::Vector3f::Zero();
+    float monocular_mvs_tsdf_layout_cell_size_ = 0.0f;
+    int monocular_mvs_tsdf_layout_grid_dim_ = 0;
     bool monocular_mvs_requires_inertial_ba1_ = false;
     std::shared_ptr<sv::TandemMvsBackend> monocular_mvs_backend_;
     std::shared_ptr<VoxelKeyframe> monocular_mvs_pending_reference_;

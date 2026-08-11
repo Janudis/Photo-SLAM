@@ -308,7 +308,11 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                 << "; local rendered-depth candidates with Orbeez weight "
                    "support and MonoGS co-visibility validation";
         }
-        if (monocular_mvs_densify_) {
+        if (monocular_mvs_tsdf_evidence_) {
+            std::cout
+                << "; full-image TANDEM MVS TSDF evidence promotes "
+                   "confirmed SVRecon cells";
+        } else if (monocular_mvs_densify_) {
             std::cout
                 << "; TANDEM MVS depth closes residual render holes after "
                    "ORB monocular map initialization";
@@ -427,7 +431,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         this->scene_->addCamera(camera);
     }
 
-    if (monocular_mvs_densify_ || monocular_omnidata_densify_) {
+    if (isMonocularMvsPipelineEnabled() || monocular_omnidata_densify_) {
         const ORB_SLAM3::System::eSensor slam_sensor = pSLAM->getSensorType();
         if (sensor_type_ != MONOCULAR ||
             (slam_sensor != ORB_SLAM3::System::MONOCULAR &&
@@ -444,7 +448,7 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
         }
     }
 
-    if (monocular_mvs_densify_) {
+    if (isMonocularMvsPipelineEnabled()) {
         auto model_load_profile =
             profileLaptopModule("mvs_model_load");
         std::filesystem::path model_path = resolveMapperResourcePath(
@@ -468,6 +472,17 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
             std::cout
                 << "[VoxelMapper] TANDEM will release unused cached CUDA "
                    "blocks before inference.\n";
+        }
+        if (monocular_mvs_tsdf_evidence_) {
+            std::cout
+                << "[VoxelMapper] TANDEM topology mode: full-image hidden "
+                   "TSDF evidence, stride="
+                << monocular_mvs_tsdf_evidence_pixel_stride_
+                << ", truncation="
+                << monocular_mvs_tsdf_evidence_trunc_vox_
+                << " voxels, promotion views="
+                << monocular_mvs_tsdf_evidence_promote_min_views_
+                << ".\n";
         }
     }
 
@@ -686,6 +701,41 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             settings_file["Mapper.monocular_mvs_empty_cache_before_launch"]
                 .operator int() != 0;
     }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence"].empty()) {
+        monocular_mvs_tsdf_evidence_ =
+            settings_file["Mapper.monocular_mvs_tsdf_evidence"]
+                .operator int() != 0;
+    }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence_pixel_stride"].empty()) {
+        monocular_mvs_tsdf_evidence_pixel_stride_ = std::max(
+            1,
+            settings_file["Mapper.monocular_mvs_tsdf_evidence_pixel_stride"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence_trunc_vox"].empty()) {
+        monocular_mvs_tsdf_evidence_trunc_vox_ = std::max(
+            1.0f,
+            settings_file["Mapper.monocular_mvs_tsdf_evidence_trunc_vox"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence_max_weight"].empty()) {
+        monocular_mvs_tsdf_evidence_max_weight_ = std::max(
+            1.0e-4f,
+            settings_file["Mapper.monocular_mvs_tsdf_evidence_max_weight"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence_promote_min_views"].empty()) {
+        monocular_mvs_tsdf_evidence_promote_min_views_ = std::max(
+            1,
+            settings_file["Mapper.monocular_mvs_tsdf_evidence_promote_min_views"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_mvs_tsdf_evidence_promote_min_weight"].empty()) {
+        monocular_mvs_tsdf_evidence_promote_min_weight_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_mvs_tsdf_evidence_promote_min_weight"]
+                .operator float());
+    }
     if (!settings_file["Mapper.monocular_omnidata_densify"].empty()) {
         monocular_omnidata_densify_ =
             settings_file["Mapper.monocular_omnidata_densify"].operator int() != 0;
@@ -760,11 +810,11 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             settings_file["Mapper.monocular_omnidata_empty_cache_before_launch"]
                 .operator int() != 0;
     }
-    if (monocular_mvs_densify_ && monocular_omnidata_densify_) {
+    if (isMonocularMvsPipelineEnabled() && monocular_omnidata_densify_) {
         throw std::runtime_error(
             "TANDEM MVS and Omnidata are mutually exclusive depth ablations");
     }
-    if (monocular_mvs_densify_ || monocular_omnidata_densify_) {
+    if (isMonocularMvsPipelineEnabled() || monocular_omnidata_densify_) {
         if (monocular_mvs_depth_range_mode_ != "fixed" &&
             monocular_mvs_depth_range_mode_ !=
                 "tandem_sparse_quantile") {
@@ -782,10 +832,11 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             throw std::runtime_error(
                 "Mapper.monocular_mvs_depth_max_multiplier must be positive");
         }
-        if (monocular_mvs_densify_ && monocular_mvs_model_dir_.empty()) {
+        if (isMonocularMvsPipelineEnabled() &&
+            monocular_mvs_model_dir_.empty()) {
             throw std::runtime_error(
                 "Mapper.monocular_mvs_model_dir is required when "
-                "Mapper.monocular_mvs_densify=1");
+                "TANDEM MVS densification or TSDF evidence is enabled");
         }
         if (monocular_omnidata_densify_ &&
             monocular_omnidata_model_path_.empty()) {
@@ -1482,8 +1533,11 @@ std::string VoxelMapper::laptopPrecheckPipeline() const
     if (monocular_rendered_depth_densify_) {
         modules.emplace_back("rendered_depth_densify");
     }
-    if (monocular_mvs_densify_) {
-        modules.emplace_back("tandem_mvs");
+    if (isMonocularMvsPipelineEnabled()) {
+        modules.emplace_back(
+            monocular_mvs_tsdf_evidence_
+                ? "tandem_mvs_tsdf_evidence"
+                : "tandem_mvs");
     }
     if (monocular_omnidata_densify_) {
         modules.emplace_back("omnidata");
@@ -1629,7 +1683,7 @@ void VoxelMapper::run()
                     new_kf->kps_point_local_ = std::move(pointsLocal);
                     new_kf->img_undist_ = imgRGB_undistorted;
                     new_kf->img_auxiliary_undist_ = imgAux_undistorted;
-                    if (monocular_mvs_densify_ ||
+                    if (isMonocularMvsPipelineEnabled() ||
                         monocular_omnidata_densify_) {
                         captureMonocularMvsKeyframeMetadata(new_kf, pKF);
                     }
@@ -1789,7 +1843,7 @@ void VoxelMapper::run()
             trainForOneIteration();
 
             initial_mapped_ = true;
-            if (monocular_mvs_densify_) {
+            if (isMonocularMvsPipelineEnabled()) {
                 std::vector<std::shared_ptr<VoxelKeyframe>> initial_mvs_kfs;
                 initial_mvs_kfs.reserve(scene_->keyframes().size());
                 for (const auto& item : scene_->keyframes()) {
@@ -3688,7 +3742,8 @@ void VoxelMapper::combineMappingOperations()
                     densifyMonocularFromRenderedDepth(pkf);
                 }
             }
-            if (sensor_type_ == MONOCULAR && monocular_mvs_densify_) {
+            if (sensor_type_ == MONOCULAR &&
+                isMonocularMvsPipelineEnabled()) {
                 scheduleLatestMonocularMvsKeyframe(new_densification_kfs);
             }
             if (sensor_type_ == MONOCULAR &&
@@ -3847,7 +3902,8 @@ void VoxelMapper::combineMappingOperations()
                         densifyMonocularFromRenderedDepth(pkf);
                     }
                 }
-                if (sensor_type_ == MONOCULAR && monocular_mvs_densify_) {
+                if (sensor_type_ == MONOCULAR &&
+                    isMonocularMvsPipelineEnabled()) {
                     scheduleLatestMonocularMvsKeyframe(
                         new_densification_kfs);
                 }

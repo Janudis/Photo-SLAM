@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate rendered-depth, TANDEM MVS, and Omnidata densification runs."""
+"""Evaluate monocular densification runs and the Photo-SLAM/HI-SLAM2/TANDEM baselines."""
 
 from __future__ import annotations
 
@@ -44,7 +44,23 @@ REPLICA_COMPLETE_RUN_LABELS = {
     "replica_mvs": "Ours + MVS",
     "replica_photoslam": "Photo-SLAM",
     "replica_hislam2": "HI-SLAM2 (3D GS)",
+    "replica_tandem": "TANDEM (SDF)",
 }
+REPLICA_PRESENTATION_RUN_ORDER = (
+    "replica_rendered_depth",
+    "replica_mvs",
+    "replica_photoslam",
+    "replica_hislam2",
+    "replica_tandem",
+)
+REPLICA_TABLE3_LABELS = {
+    **REPLICA_COMPLETE_RUN_LABELS,
+    "replica_photoslam": "Photo-SLAM (3D GS)",
+}
+HI_SLAM2_REPLICA_PHOTOMETRIC = REPO_ROOT / (
+    "third_party/HI-SLAM2/outputs/replica/office0/psnr/"
+    "after_opt/final_result.json"
+)
 REPLICA_DEPTH_INTRINSICS = {
     "img_w": 1200,
     "img_h": 680,
@@ -80,6 +96,7 @@ class Run:
     native_map_override: Path | None = None
     surface_mesh_override: Path | None = None
     trajectory_override: Path | None = None
+    alignment_gt_trajectory_override: Path | None = None
 
 
 RUNS = (
@@ -260,6 +277,57 @@ HI_SLAM2_REPLICA_RUN = Run(
     ),
     trajectory_override=(
         REPO_ROOT / "third_party/HI-SLAM2/outputs/replica/office0/traj_full.txt"
+    ),
+)
+
+
+TANDEM_REPLICA_QUALITY_RUN = Run(
+    key="replica_tandem",
+    method="TANDEM (SDF)",
+    dataset_key="replica",
+    dataset="Replica office0",
+    frame_count=2000,
+    directory=REPO_ROOT / "results/tandem/replica/office0_dataset",
+    evaluate_reconstruction=True,
+    expected_rendered_depth=0,
+    expected_mvs=0,
+    expected_omnidata=0,
+    representation="mesh",
+    validate_densification_config=False,
+    family="TANDEM SDF",
+    native_map_override=(
+        REPO_ROOT / "results/tandem/replica/office0_dataset/mesh.ply"
+    ),
+    surface_mesh_override=(
+        REPO_ROOT / "results/tandem/replica/office0_dataset/mesh.ply"
+    ),
+    trajectory_override=(
+        REPO_ROOT
+        / "results/tandem/replica/office0_dataset/CameraTrajectory_TUM.txt"
+    ),
+    alignment_gt_trajectory_override=(
+        REPO_ROOT
+        / "results/tandem/replica/office0_dataset/gt_trajectory_matched.txt"
+    ),
+)
+
+
+TANDEM_REPLICA_RUNTIME_RUN = Run(
+    key="replica_tandem",
+    method="TANDEM (SDF)",
+    dataset_key="replica",
+    dataset="Replica office0",
+    frame_count=2000,
+    directory=REPO_ROOT / "results/tandem/replica/office0",
+    evaluate_reconstruction=False,
+    expected_rendered_depth=0,
+    expected_mvs=0,
+    expected_omnidata=0,
+    representation="mesh",
+    validate_densification_config=False,
+    family="TANDEM SDF",
+    native_map_override=(
+        REPO_ROOT / "results/tandem/replica/office0/mesh.ply"
     ),
 )
 
@@ -726,6 +794,71 @@ def shutdown_iteration(run: Run) -> int:
     return int(match.group(1))
 
 
+def run_tracking_fps(run: Run, runtime: dict[str, Any] | None) -> float | None:
+    if runtime is not None and runtime.get("tracking_fps_hz") is not None:
+        return finite_float(
+            runtime["tracking_fps_hz"], "tracking_fps_hz",
+            run.directory / "runtime_metrics.json",
+        )
+
+    candidates = [run.directory / "TrackingTime.txt"]
+    candidates.extend(
+        parent / "TrackingTime.txt"
+        for parent in list(run.directory.parents)[:3]
+    )
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        return None
+    times = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        value = finite_float(stripped, f"tracking time line {line_number}", path)
+        if value > 0.0:
+            times.append(value)
+    if len(times) != run.frame_count:
+        raise RuntimeError(
+            f"Expected {run.frame_count} tracking times in {path}; "
+            f"found {len(times)}"
+        )
+    return len(times) / sum(times)
+
+
+def run_render_fps(run: Run) -> float | None:
+    path = run.directory / "render_time.txt"
+    if not path.is_file():
+        return None
+    render_times_ms = list(parse_keyed_metric(path).values())
+    mean_ms = statistics.fmean(render_times_ms)
+    if mean_ms <= 0.0:
+        raise RuntimeError(f"Non-positive mean render time in {path}")
+    return 1000.0 / mean_ms
+
+
+def run_gpu_peak_reserved_mb(
+    run: Run, runtime: dict[str, Any] | None
+) -> float | None:
+    path = run.directory / "GpuPeakUsageMB.txt"
+    if path.is_file():
+        match = re.search(
+            r"(?m)^Peak reserved \(MB\):\s*(\S+)\s*$",
+            path.read_text(encoding="utf-8"),
+        )
+        if match is None:
+            raise RuntimeError(f"Missing peak reserved memory in {path}")
+        return finite_float(match.group(1), "peak reserved MB", path)
+    if runtime is None or runtime.get("gpu_memory_reserved_mb") is None:
+        return None
+    return finite_float(
+        runtime["gpu_memory_reserved_mb"],
+        "gpu_memory_reserved_mb",
+        run.directory / "runtime_metrics.json",
+    )
+
+
 def computational_result(run: Run, config: Path | None) -> dict[str, Any]:
     map_path = native_map(run)
     primitive_count = ply_vertex_count(map_path)
@@ -739,15 +872,23 @@ def computational_result(run: Run, config: Path | None) -> dict[str, Any]:
                 f"Expected {run.frame_count} frames in {runtime_path}; "
                 f"found {frames}"
             )
+    iterations: int | None = None
+    if runtime is not None and runtime.get("iterations") is not None:
+        iterations = int(runtime["iterations"])
+    elif run.representation != "mesh":
+        iterations = shutdown_iteration(run)
+    keyframes = (
+        int(runtime.get("keyframes", 0))
+        if runtime is not None and runtime.get("keyframes") is not None
+        else len(keyframe_to_frame(run))
+    )
     return {
+        "run_key": run.key,
         "dataset": run.dataset,
         "method": run.method,
         "frames": run.frame_count,
-        "keyframes": len(keyframe_to_frame(run)),
-        "iterations": (
-            int(runtime["iterations"]) if runtime is not None
-            else shutdown_iteration(run)
-        ),
+        "keyframes": keyframes,
+        "iterations": iterations,
         "primitive_type": run.representation,
         "primitive_count": primitive_count,
         "runtime_seconds": (
@@ -759,6 +900,8 @@ def computational_result(run: Run, config: Path | None) -> dict[str, Any]:
             / finite_float(runtime["total_seconds"], "total_seconds", runtime_path)
             if runtime is not None else None
         ),
+        "tracking_fps_hz": run_tracking_fps(run, runtime),
+        "render_fps_hz": run_render_fps(run),
         "map_size_mb": map_path.stat().st_size / (1024.0 * 1024.0),
         "gpu_memory_allocated_mb": (
             finite_float(
@@ -768,13 +911,16 @@ def computational_result(run: Run, config: Path | None) -> dict[str, Any]:
             )
             if runtime is not None else None
         ),
-        "gpu_memory_reserved_mb": (
+        "gpu_memory_reserved_mb": run_gpu_peak_reserved_mb(run, runtime),
+        "gpu_process_peak_used_mb": (
             finite_float(
-                runtime["gpu_memory_reserved_mb"],
-                "gpu_memory_reserved_mb",
+                runtime["gpu_process_peak_used_mb"],
+                "gpu_process_peak_used_mb",
                 runtime_path,
             )
-            if runtime is not None else None
+            if runtime is not None
+            and runtime.get("gpu_process_peak_used_mb") is not None
+            else None
         ),
         "runtime_available": runtime is not None,
         "saved_config": str(config) if config is not None else None,
@@ -799,6 +945,7 @@ def hislam2_computational_result() -> dict[str, Any]:
         runtime.get("total_seconds"), "total_seconds", runtime_path
     )
     return {
+        "run_key": run.key,
         "dataset": run.dataset,
         "method": run.method,
         "frames": frames,
@@ -808,6 +955,10 @@ def hislam2_computational_result() -> dict[str, Any]:
         "primitive_count": ply_vertex_count(map_path),
         "runtime_seconds": total_seconds,
         "system_fps_hz": frames / total_seconds,
+        "tracking_fps_hz": finite_float(
+            runtime.get("tracking_fps_hz"), "tracking_fps_hz", runtime_path
+        ),
+        "render_fps_hz": None,
         "map_size_mb": map_path.stat().st_size / (1024.0 * 1024.0),
         "gpu_memory_allocated_mb": finite_float(
             after_opt.get("gpu_memory_allocated_mb"),
@@ -819,6 +970,7 @@ def hislam2_computational_result() -> dict[str, Any]:
             "after_opt.gpu_memory_reserved_mb",
             runtime_path,
         ),
+        "gpu_process_peak_used_mb": None,
         "runtime_available": True,
         "saved_config": None,
         "native_map": str(map_path),
@@ -832,6 +984,11 @@ def reconstruction_experiment(run: Run, dataset_tag: str) -> Experiment:
         else run.directory / "CameraTrajectory_TUM.txt"
     )
     require_file(trajectory, "run-local reconstruction trajectory")
+    if run.alignment_gt_trajectory_override is not None:
+        require_file(
+            run.alignment_gt_trajectory_override,
+            "frame-matched alignment GT trajectory",
+        )
     return Experiment(
         name=run.method,
         family=run.family,
@@ -841,12 +998,18 @@ def reconstruction_experiment(run: Run, dataset_tag: str) -> Experiment:
         ),
         mesh=surface_mesh(run),
         recon_trajectory=trajectory.resolve(),
+        gt_trajectory=(
+            run.alignment_gt_trajectory_override.resolve()
+            if run.alignment_gt_trajectory_override is not None
+            else None
+        ),
     )
 
 
 def reconstruction_datasets() -> tuple[Dataset, ...]:
     replica_runs = [run for run in RUNS if run.dataset_key == "replica"]
     replica_runs.append(HI_SLAM2_REPLICA_RUN)
+    replica_runs.append(TANDEM_REPLICA_QUALITY_RUN)
     scannet_runs = [run for run in RUNS if run.dataset_key == "scannet"]
     replica_gt_trajectory = REPO_ROOT / "scripts/data/Replica/office0/traj.txt"
     replica_placeholder = replica_runs[0].directory / "CameraTrajectory_TUM.txt"
@@ -902,7 +1065,10 @@ def evaluate_reconstruction() -> tuple[list[dict[str, Any]], list[dict[str, Any]
     results: list[dict[str, Any]] = []
     replica_complete: list[dict[str, Any]] = []
     completed_replica_keys: set[str] = set()
-    runs_by_key = {run.key: run for run in (*RUNS, HI_SLAM2_REPLICA_RUN)}
+    runs_by_key = {
+        run.key: run
+        for run in (*RUNS, HI_SLAM2_REPLICA_RUN, TANDEM_REPLICA_QUALITY_RUN)
+    }
     suffix = threshold_label(DISTANCE_THRESHOLD_M)
     for dataset in reconstruction_datasets():
         print(f"\n=== Reconstruction: {dataset.name} ===")
@@ -918,7 +1084,11 @@ def evaluate_reconstruction() -> tuple[list[dict[str, Any]], list[dict[str, Any]
                 experiment,
                 experiment.mesh,
                 experiment.recon_trajectory,
-                gt_trajectory,
+                (
+                    experiment.gt_trajectory
+                    if experiment.gt_trajectory is not None
+                    else gt_trajectory
+                ),
                 DISTANCE_THRESHOLD_M,
             )
             metrics, result_path = evaluate_aligned_mesh(
@@ -956,19 +1126,24 @@ def evaluate_reconstruction() -> tuple[list[dict[str, Any]], list[dict[str, Any]
                     aligned_mesh,
                     gt_trajectory,
                 )
-                primitive_extras = evaluate_replica_primitive_floaters(
-                    run,
-                    dataset,
-                    experiment,
-                    experiment.recon_trajectory,
-                    gt_trajectory,
-                    hi_icp_transform,
+                primitive_extras = (
+                    None
+                    if run.representation == "mesh"
+                    else evaluate_replica_primitive_floaters(
+                        run,
+                        dataset,
+                        experiment,
+                        experiment.recon_trajectory,
+                        gt_trajectory,
+                        hi_icp_transform,
+                    )
                 )
                 depth_l1_m = surface_extras["depth_l1_m"]
                 mesh_floater_ratio = surface_extras["mesh_floater_ratio"]
-                primitive_floater_ratio = primitive_extras[
-                    "primitive_floater_ratio"
-                ]
+                primitive_floater_ratio = (
+                    primitive_extras["primitive_floater_ratio"]
+                    if primitive_extras is not None else None
+                )
                 replica_complete.append(
                     {
                         "experiment": REPLICA_COMPLETE_RUN_LABELS[run.key],
@@ -992,14 +1167,24 @@ def evaluate_reconstruction() -> tuple[list[dict[str, Any]], list[dict[str, Any]
                         ),
                         f"primitive_floaters_{suffix}_percent": (
                             100.0 * primitive_floater_ratio
+                            if primitive_floater_ratio is not None else None
                         ),
                         "depth_frames": surface_extras["depth_frames"],
-                        "primitive_count": primitive_extras["primitive_count"],
-                        "primitive_support": primitive_extras[
-                            "primitive_support"
-                        ],
+                        "primitive_count": (
+                            primitive_extras["primitive_count"]
+                            if primitive_extras is not None else None
+                        ),
+                        "primitive_support": (
+                            primitive_extras["primitive_support"]
+                            if primitive_extras is not None
+                            else "not serialized by TANDEM"
+                        ),
                         "raw_surface_mesh": str(experiment.mesh),
-                        "native_map": primitive_extras["native_map"],
+                        "native_map": (
+                            primitive_extras["native_map"]
+                            if primitive_extras is not None
+                            else str(native_map(run))
+                        ),
                         "trajectory": str(experiment.recon_trajectory),
                         "hi_metrics_file": str(result_path),
                         "hi_precision_mesh": surface_extras[
@@ -1008,9 +1193,10 @@ def evaluate_reconstruction() -> tuple[list[dict[str, Any]], list[dict[str, Any]
                         "surface_metrics_file": surface_extras[
                             "surface_metrics_file"
                         ],
-                        "primitive_metrics_file": primitive_extras[
-                            "primitive_metrics_file"
-                        ],
+                        "primitive_metrics_file": (
+                            primitive_extras["primitive_metrics_file"]
+                            if primitive_extras is not None else None
+                        ),
                         "hi_icp_transform": str(hi_icp_transform),
                     }
                 )
@@ -1071,14 +1257,17 @@ def photometric_table(rows: list[dict[str, Any]]) -> str:
 def computational_table(rows: list[dict[str, Any]]) -> str:
     lines = [
         "| Dataset | Method | Iterations | Primitives | System FPS ↑ | "
-        "Map MB ↓ | GPU reserved MB ↓ |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "Tracking FPS ↑ | Render FPS ↑ | Map MB ↓ | GPU reserved MB ↓ |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['dataset']} | {row['method']} | {row['iterations']} | "
+            f"| {row['dataset']} | {row['method']} | "
+            f"{optional_number(row['iterations'], 0)} | "
             f"{row['primitive_count']} | "
             f"{optional_number(row['system_fps_hz'])} | "
+            f"{optional_number(row['tracking_fps_hz'])} | "
+            f"{optional_number(row['render_fps_hz'])} | "
             f"{row['map_size_mb']:.2f} | "
             f"{optional_number(row['gpu_memory_reserved_mb'])} |"
         )
@@ -1124,7 +1313,148 @@ def replica_complete_table(rows: list[dict[str, Any]]) -> str:
             f"{row[f'completion_{suffix}_percent']:.2f}% | "
             f"{row[f'fscore_{suffix}']:.4f} | "
             f"{row[f'mesh_floaters_{suffix}_percent']:.2f}% | "
-            f"{row[f'primitive_floaters_{suffix}_percent']:.2f}% |"
+            f"{optional_number(row[f'primitive_floaters_{suffix}_percent'])}"
+            f"{'%' if row[f'primitive_floaters_{suffix}_percent'] is not None else ''} |"
+        )
+    return "\n".join(lines)
+
+
+def replica_table1_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    suffix = threshold_label(DISTANCE_THRESHOLD_M)
+    by_label = {row["experiment"]: row for row in rows}
+    result = []
+    for run_key in REPLICA_PRESENTATION_RUN_ORDER:
+        label = REPLICA_COMPLETE_RUN_LABELS[run_key]
+        if label not in by_label:
+            raise RuntimeError(f"Replica Table 1 is missing {label}")
+        row = by_label[label]
+        result.append(
+            {
+                "experiment": label,
+                "accuracy_m": row["accuracy_m"],
+                "completeness_m": row["completeness_m"],
+                "depth_l1_cm": row["depth_l1_cm"],
+                f"precision_{suffix}": row[f"precision_{suffix}"],
+                f"recall_{suffix}": row[f"recall_{suffix}"],
+                f"completion_{suffix}_percent": row[
+                    f"completion_{suffix}_percent"
+                ],
+                f"fscore_{suffix}": row[f"fscore_{suffix}"],
+                f"floaters_{suffix}_percent": row[
+                    f"mesh_floaters_{suffix}_percent"
+                ],
+            }
+        )
+    return result
+
+
+def replica_table1_markdown(rows: list[dict[str, Any]]) -> str:
+    suffix = threshold_label(DISTANCE_THRESHOLD_M)
+    lines = [
+        "| Experiment | Acc ↓ | Compl. ↓ | Depth L1 (cm) ↓ | "
+        f"Prec@{suffix} ↑ | Recall@{suffix} ↑ | Completion@{suffix} ↑ | "
+        f"F@{suffix} ↑ | Floaters ↓ |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['experiment']} | {row['accuracy_m']:.4f} | "
+            f"{row['completeness_m']:.4f} | {row['depth_l1_cm']:.4f} | "
+            f"{row[f'precision_{suffix}']:.4f} | "
+            f"{row[f'recall_{suffix}']:.4f} | "
+            f"{row[f'completion_{suffix}_percent']:.2f}% | "
+            f"{row[f'fscore_{suffix}']:.4f} | "
+            f"{row[f'floaters_{suffix}_percent']:.2f}% |"
+        )
+    return "\n".join(lines)
+
+
+def replica_table2_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    replica_rows = {
+        row["method"]: row for row in rows if row["dataset"] == "Replica office0"
+    }
+    method_labels = (
+        ("Rendered-depth densification", "Ours"),
+        ("TANDEM MVS", "Ours + MVS"),
+        ("Photo-SLAM", "Photo-SLAM (3D GS)"),
+    )
+    result = []
+    for method, label in method_labels:
+        if method not in replica_rows:
+            raise RuntimeError(f"Replica Table 2 is missing {method}")
+        row = replica_rows[method]
+        result.append(
+            {
+                "experiment": label,
+                "psnr": row["psnr"],
+                "ssim": row["ssim"],
+            }
+        )
+
+    require_file(HI_SLAM2_REPLICA_PHOTOMETRIC, "HI-SLAM2 photometric result")
+    payload = json.loads(HI_SLAM2_REPLICA_PHOTOMETRIC.read_text(encoding="utf-8"))
+    psnr = float(payload["mean_psnr"])
+    ssim = float(payload["mean_ssim"])
+    if not math.isfinite(psnr) or not math.isfinite(ssim):
+        raise RuntimeError(
+            f"Non-finite HI-SLAM2 photometric result in "
+            f"{HI_SLAM2_REPLICA_PHOTOMETRIC}"
+        )
+    result.append(
+        {
+            "experiment": "HI-SLAM2 (3D GS)",
+            "psnr": psnr,
+            "ssim": ssim,
+        }
+    )
+    return result
+
+
+def replica_table2_markdown(rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "| Experiment | PSNR ↑ | SSIM ↑ |",
+        "|---|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['experiment']} | {row['psnr']:.4f} | {row['ssim']:.4f} |"
+        )
+    return "\n".join(lines)
+
+
+def replica_table3_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key = {row["run_key"]: row for row in rows}
+    result = []
+    for run_key in REPLICA_PRESENTATION_RUN_ORDER:
+        if run_key not in by_key:
+            raise RuntimeError(f"Replica Table 3 is missing {run_key}")
+        row = by_key[run_key]
+        result.append(
+            {
+                "experiment": REPLICA_TABLE3_LABELS[run_key],
+                "system_fps_hz": row["system_fps_hz"],
+                "tracking_fps_hz": row["tracking_fps_hz"],
+                "render_fps_hz": row["render_fps_hz"],
+                "map_size_mb": row["map_size_mb"],
+                "gpu_memory_reserved_mb": row["gpu_memory_reserved_mb"],
+            }
+        )
+    return result
+
+
+def replica_table3_markdown(rows: list[dict[str, Any]]) -> str:
+    lines = [
+        "| Experiment | System FPS | Tracking FPS | Render FPS | Map MB | "
+        "GPU reserved MB |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['experiment']} | {optional_number(row['system_fps_hz'])} | "
+            f"{optional_number(row['tracking_fps_hz'])} | "
+            f"{optional_number(row['render_fps_hz'])} | "
+            f"{optional_number(row['map_size_mb'])} | "
+            f"{optional_number(row['gpu_memory_reserved_mb'])} |"
         )
     return "\n".join(lines)
 
@@ -1140,18 +1470,33 @@ def main() -> int:
             validate_saved_config(run)
             if run.validate_densification_config else None
         )
+    require_directory(
+        TANDEM_REPLICA_QUALITY_RUN.directory,
+        "TANDEM Replica dataset-preset run directory",
+    )
+    require_directory(
+        TANDEM_REPLICA_RUNTIME_RUN.directory,
+        "TANDEM Replica runtime-preset run directory",
+    )
 
     photometric, photometric_per_frame = photometric_results()
     computational = [
         computational_result(run, configs[run.key]) for run in RUNS
     ]
     computational.append(hislam2_computational_result())
+    computational.append(computational_result(TANDEM_REPLICA_RUNTIME_RUN, None))
     reconstruction, replica_complete = evaluate_reconstruction()
 
     photo_md = photometric_table(photometric)
     compute_md = computational_table(computational)
     reconstruction_md = reconstruction_table(reconstruction)
     replica_complete_md = replica_complete_table(replica_complete)
+    table1 = replica_table1_rows(replica_complete)
+    table1_md = replica_table1_markdown(table1)
+    table2 = replica_table2_rows(photometric)
+    table2_md = replica_table2_markdown(table2)
+    table3 = replica_table3_rows(computational)
+    table3_md = replica_table3_markdown(table3)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     write_csv(OUTPUT_DIR / "photometric_metrics.csv", photometric)
@@ -1176,8 +1521,24 @@ def main() -> int:
         OUTPUT_DIR / "computational_metrics.json",
         {
             "system_fps": "dataset frames / recorded mapping total_seconds",
-            "map_size": "actual run-local native map PLY size",
-            "gpu_memory": "recorded PyTorch CUDA allocator value",
+            "tracking_fps": (
+                "Photo-SLAM/SVRecon use ORB TrackingTime.txt; HI-SLAM2 uses "
+                "its recorded tracker time; TANDEM uses its timed DSO "
+                "trackNewCoarse frontend"
+            ),
+            "render_fps": (
+                "mean standalone learned-map render timing when available; "
+                "N/A for TANDEM and HI-SLAM2 because no comparable saved timing exists"
+            ),
+            "map_size": (
+                "actual run-local native map PLY size; TANDEM uses the binary "
+                "PLY conversion of its only serialized map artifact, mesh.obj"
+            ),
+            "gpu_memory": "peak recorded PyTorch CUDA caching-allocator reserved memory",
+            "tandem_process_gpu_memory": (
+                "gpu_process_peak_used_mb additionally records nvidia-smi "
+                "per-process memory, including TANDEM custom CUDA TSDF buffers"
+            ),
             "missing_runtime": (
                 "TUM rendered-depth run has no runtime_metrics.json; "
                 "runtime and GPU values are null"
@@ -1230,7 +1591,8 @@ def main() -> int:
                 "fraction of representation-native primitive supports whose "
                 "maximum boundary distance exceeds 5 cm after the same final "
                 "HI-SLAM2 alignment: zero-crossing SVRecon cell cubes or "
-                "Photo-SLAM 3-sigma Gaussian ellipsoids"
+                "Photo-SLAM 3-sigma Gaussian ellipsoids; N/A for TANDEM "
+                "because it does not serialize the native TSDF cells"
             ),
             "completion_rate": "identical to recall and reported as percent",
             "surface_samples": REPLICA_SURFACE_SAMPLES,
@@ -1246,6 +1608,18 @@ def main() -> int:
     (OUTPUT_DIR / "replica_complete_metrics.md").write_text(
         replica_complete_md + "\n", encoding="utf-8"
     )
+    write_csv(OUTPUT_DIR / "replica_table1.csv", table1)
+    (OUTPUT_DIR / "replica_table1.md").write_text(
+        table1_md + "\n", encoding="utf-8"
+    )
+    write_csv(OUTPUT_DIR / "replica_table2.csv", table2)
+    (OUTPUT_DIR / "replica_table2.md").write_text(
+        table2_md + "\n", encoding="utf-8"
+    )
+    write_csv(OUTPUT_DIR / "replica_table3.csv", table3)
+    (OUTPUT_DIR / "replica_table3.md").write_text(
+        table3_md + "\n", encoding="utf-8"
+    )
 
     summary = (
         "# Monocular Densification Ablation\n\n"
@@ -1256,7 +1630,13 @@ def main() -> int:
         "## Reconstruction\n\n"
         f"{reconstruction_md}\n\n"
         "## Replica Complete Reconstruction Table (Culled GT)\n\n"
-        f"{replica_complete_md}\n"
+        f"{replica_complete_md}\n\n"
+        "## Replica Presentation Table 1\n\n"
+        f"{table1_md}\n\n"
+        "## Replica Presentation Table 2\n\n"
+        f"{table2_md}\n\n"
+        "## Replica Presentation Table 3\n\n"
+        f"{table3_md}\n"
     )
     (OUTPUT_DIR / "summary.md").write_text(summary, encoding="utf-8")
     print(f"\nSaved ablation evaluation to: {OUTPUT_DIR}")

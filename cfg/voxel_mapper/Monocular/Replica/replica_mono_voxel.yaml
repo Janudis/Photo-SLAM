@@ -28,7 +28,7 @@ Mapper.sdf_initialization_orb_radius_vox: 1.0
 # TANDEM MVS consumes ORB camera poses directly, so its depth remains in the
 # same arbitrary monocular gauge. Match TANDEM's sparse inverse-depth range.
 Mapper.monocular_rendered_depth_densify: 0
-Mapper.monocular_mvs_densify: 1
+Mapper.monocular_mvs_densify: 0
 Mapper.monocular_mvs_model_dir: "models/tandem/model.pt"
 Mapper.monocular_mvs_width: 512
 Mapper.monocular_mvs_height: 320
@@ -38,8 +38,14 @@ Mapper.monocular_mvs_depth_min_scene: 0.01
 Mapper.monocular_mvs_inverse_depth_quantile: 0.20
 Mapper.monocular_mvs_depth_max_multiplier: 3.0
 Mapper.monocular_mvs_discard_percentage: 10.0
+Mapper.monocular_mvs_tsdf_evidence: 1
+Mapper.monocular_mvs_tsdf_evidence_pixel_stride: 1
+Mapper.monocular_mvs_tsdf_evidence_trunc_vox: 4.0
+Mapper.monocular_mvs_tsdf_evidence_max_weight: 64.0
+Mapper.monocular_mvs_tsdf_evidence_promote_min_views: 2
+Mapper.monocular_mvs_tsdf_evidence_promote_min_weight: 1.0
 
-# Omnidata ablation. Enable this and disable monocular_mvs_densify above.
+# Omnidata ablation. Enable this and disable both TANDEM MVS modes above.
 # Input preprocessing and the x50 depth convention match HI-SLAM2. The 2x2
 # inverse-depth scale field is fitted to mature ORB points, then source-view
 # consistency gates depths before the shared structural-hole insertion.
@@ -177,13 +183,13 @@ Optimization.sparse_depth_until: 15000
 # Learned-depth supervision (active only for accepted MVS/Omnidata priors).
 # Metric Cauchy depth follows SVRecon's MASt3R regularizer; normals are
 # generated from the same depth using SVRecon's camera-Z backprojection.
-Optimization.lambda_monocular_depth: 0.001
+Optimization.lambda_monocular_depth: 0.00
 Optimization.monocular_depth_from: 1000
 Optimization.monocular_depth_end: 15000
 Optimization.monocular_depth_end_mult: 0.1
 Optimization.monocular_depth_alpha_min: 0.5
 Optimization.monocular_depth_confidence_min: 0.0
-Optimization.lambda_monocular_normal: 0.0001
+Optimization.lambda_monocular_normal: 0.000
 Optimization.monocular_normal_from: 1000
 Optimization.monocular_normal_end: 15000
 Optimization.monocular_normal_end_mult: 0.1

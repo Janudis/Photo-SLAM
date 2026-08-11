@@ -36,11 +36,17 @@ Mapper.monocular_mvs_depth_range_mode: "fixed"
 Mapper.monocular_mvs_depth_min_m: 0.1
 Mapper.monocular_mvs_depth_max_m: 5.0
 Mapper.monocular_mvs_discard_percentage: 10.0
+Mapper.monocular_mvs_tsdf_evidence: 0
+Mapper.monocular_mvs_tsdf_evidence_pixel_stride: 1
+Mapper.monocular_mvs_tsdf_evidence_trunc_vox: 4.0
+Mapper.monocular_mvs_tsdf_evidence_max_weight: 64.0
+Mapper.monocular_mvs_tsdf_evidence_promote_min_views: 2
+Mapper.monocular_mvs_tsdf_evidence_promote_min_weight: 1.0
 # SVRecon and TANDEM alternate different CUDA allocation shapes. Release only
 # unused cached blocks before inference to avoid fragmentation on an 8 GB GPU.
 Mapper.monocular_mvs_empty_cache_before_launch: 1
 
-# Omnidata ablation. Enable this and disable monocular_mvs_densify above.
+# Omnidata ablation. Enable this and disable both TANDEM MVS modes above.
 # Input preprocessing and the x50 depth convention match HI-SLAM2. The 2x2
 # inverse-depth scale field is fitted to mature ORB points, then source-view
 # consistency gates depths before the shared structural-hole insertion.

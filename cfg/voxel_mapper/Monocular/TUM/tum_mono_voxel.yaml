@@ -39,7 +39,16 @@ Mapper.monocular_mvs_depth_min_scene: 0.01
 Mapper.monocular_mvs_inverse_depth_quantile: 0.20
 Mapper.monocular_mvs_depth_max_multiplier: 3.0
 Mapper.monocular_mvs_discard_percentage: 10.0
-# Omnidata ablation. Enable this and disable monocular_mvs_densify above.
+# Optional alternative to the current residual-hole insertion. When enabled,
+# every valid MVS depth pixel contributes hidden TSDF evidence; only fused
+# zero-crossing cells become active SVRecon voxels.
+Mapper.monocular_mvs_tsdf_evidence: 0
+Mapper.monocular_mvs_tsdf_evidence_pixel_stride: 1
+Mapper.monocular_mvs_tsdf_evidence_trunc_vox: 4.0
+Mapper.monocular_mvs_tsdf_evidence_max_weight: 64.0
+Mapper.monocular_mvs_tsdf_evidence_promote_min_views: 2
+Mapper.monocular_mvs_tsdf_evidence_promote_min_weight: 1.0
+# Omnidata ablation. Enable this and disable both TANDEM MVS modes above.
 # Input preprocessing and the x50 depth convention match HI-SLAM2. The 2x2
 # inverse-depth scale field is fitted to mature ORB points, then source-view
 # consistency gates depths before the shared structural-hole insertion.
@@ -178,7 +187,7 @@ Optimization.sparse_depth_until: 15000
 # Metric Cauchy depth follows SVRecon's MASt3R regularizer; normals are
 # generated from the same depth using SVRecon's camera-Z backprojection.
 Optimization.lambda_monocular_depth: 0.001
-Optimization.monocular_depth_from: 1000
+Optimization.monocular_depth_from: 0
 Optimization.monocular_depth_end: 15000
 Optimization.monocular_depth_end_mult: 0.1
 Optimization.monocular_depth_alpha_min: 0.5

@@ -308,9 +308,15 @@ void VoxelMapper::captureMonocularMvsKeyframeMetadata(
     pkf->monocular_mvs_pose_ready_ = pose_ready && depth_range_ready;
 }
 
+bool VoxelMapper::isMonocularMvsPipelineEnabled() const
+{
+    return monocular_mvs_densify_ || monocular_mvs_tsdf_evidence_;
+}
+
 void VoxelMapper::refreshMonocularMvsKeyframeMetadata()
 {
-    if ((!monocular_mvs_densify_ && !monocular_omnidata_densify_) ||
+    if ((!isMonocularMvsPipelineEnabled() &&
+         !monocular_omnidata_densify_) ||
         !mpSLAM || !mpSLAM->getAtlas()) {
         return;
     }
@@ -454,7 +460,7 @@ VoxelMapper::selectMonocularMvsSourceKeyframes(
 bool VoxelMapper::scheduleMonocularMvsDensification(
     const std::shared_ptr<VoxelKeyframe>& reference)
 {
-    if (!monocular_mvs_densify_ || !monocular_mvs_backend_ ||
+    if (!isMonocularMvsPipelineEnabled() || !monocular_mvs_backend_ ||
         !reference || !reference->monocular_mvs_pose_ready_ ||
         reference->img_undist_.empty() ||
         monocular_mvs_backend_->hasPending() ||
@@ -537,7 +543,7 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
 void VoxelMapper::scheduleLatestMonocularMvsKeyframe(
     const std::vector<std::shared_ptr<VoxelKeyframe>>& candidates)
 {
-    if (!monocular_mvs_densify_ || !monocular_mvs_backend_ ||
+    if (!isMonocularMvsPipelineEnabled() || !monocular_mvs_backend_ ||
         monocular_mvs_backend_->hasPending() || candidates.empty()) {
         return;
     }
@@ -559,7 +565,7 @@ void VoxelMapper::scheduleLatestMonocularMvsKeyframe(
 void VoxelMapper::pollMonocularMvsDensification(
     const bool wait_for_result)
 {
-    if (!monocular_mvs_densify_ || !monocular_mvs_backend_ ||
+    if (!isMonocularMvsPipelineEnabled() || !monocular_mvs_backend_ ||
         !monocular_mvs_backend_->hasPending()) {
         return;
     }
@@ -621,11 +627,15 @@ void VoxelMapper::integrateMonocularMvsDepth(
         result.depth,
         result.confidence,
         sv::LearnedDepthSource::TandemMvs);
-    integrateMonocularLearnedDepth(
-        result.depth,
-        "MVS",
-        "world/monocular_mvs/created",
-        /*clear_cuda_cache_before_insertion=*/false);
+    if (monocular_mvs_tsdf_evidence_) {
+        integrateMonocularMvsTsdfEvidence(result);
+    } else {
+        integrateMonocularLearnedDepth(
+            result.depth,
+            "MVS",
+            "world/monocular_mvs/created",
+            /*clear_cuda_cache_before_insertion=*/false);
+    }
 }
 
 void VoxelMapper::cacheMonocularDepthPrior(

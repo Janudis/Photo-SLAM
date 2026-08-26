@@ -36,6 +36,12 @@ struct StreamConfiguration
     int fps = 30;
 };
 
+struct StreamRequest
+{
+    std::string name;
+    rs2::config configuration;
+};
+
 StreamConfiguration readStreamConfiguration(
     const std::filesystem::path& settings_path)
 {
@@ -60,6 +66,118 @@ StreamConfiguration readStreamConfiguration(
             "Camera.width, Camera.height, and Camera.fps must be positive");
     }
     return stream;
+}
+
+void printResolvedStreams(
+    const std::string& request_name,
+    const rs2::pipeline_profile& profile)
+{
+    std::cout << "[RealSense] selected profile=" << request_name;
+    for (const rs2::stream_profile& stream : profile.get_streams()) {
+        if (stream.stream_type() != RS2_STREAM_COLOR &&
+            stream.stream_type() != RS2_STREAM_DEPTH) {
+            continue;
+        }
+        const rs2::video_stream_profile video =
+            stream.as<rs2::video_stream_profile>();
+        std::cout << ' ' << stream.stream_name() << '='
+                  << video.width() << 'x' << video.height()
+                  << '@' << video.fps() << ':'
+                  << rs2_format_to_string(video.format());
+    }
+    std::cout << '\n';
+}
+
+rs2::pipeline_profile startCompatiblePipeline(
+    rs2::pipeline& pipeline,
+    const StreamConfiguration& preferred)
+{
+    std::vector<StreamRequest> requests;
+
+    StreamRequest exact{"configured", rs2::config()};
+    exact.configuration.enable_stream(
+        RS2_STREAM_COLOR,
+        preferred.width,
+        preferred.height,
+        RS2_FORMAT_RGB8,
+        preferred.fps);
+    exact.configuration.enable_stream(
+        RS2_STREAM_DEPTH,
+        preferred.width,
+        preferred.height,
+        RS2_FORMAT_Z16,
+        preferred.fps);
+    requests.push_back(exact);
+
+    StreamRequest flexible_depth{"configured-color/flexible-depth", rs2::config()};
+    flexible_depth.configuration.enable_stream(
+        RS2_STREAM_COLOR,
+        preferred.width,
+        preferred.height,
+        RS2_FORMAT_RGB8,
+        preferred.fps);
+    flexible_depth.configuration.enable_stream(
+        RS2_STREAM_DEPTH,
+        RS2_FORMAT_Z16,
+        preferred.fps);
+    requests.push_back(flexible_depth);
+
+    StreamRequest flexible_resolution{"flexible-resolution", rs2::config()};
+    flexible_resolution.configuration.enable_stream(
+        RS2_STREAM_COLOR,
+        RS2_FORMAT_RGB8,
+        preferred.fps);
+    flexible_resolution.configuration.enable_stream(
+        RS2_STREAM_DEPTH,
+        RS2_FORMAT_Z16,
+        preferred.fps);
+    requests.push_back(flexible_resolution);
+
+    if (preferred.fps != 15) {
+        StreamRequest usb2_15fps{"usb2-15fps", rs2::config()};
+        usb2_15fps.configuration.enable_stream(
+            RS2_STREAM_COLOR,
+            RS2_FORMAT_RGB8,
+            15);
+        usb2_15fps.configuration.enable_stream(
+            RS2_STREAM_DEPTH,
+            RS2_FORMAT_Z16,
+            15);
+        requests.push_back(usb2_15fps);
+    }
+
+    StreamRequest automatic{"automatic-rgbd", rs2::config()};
+    automatic.configuration.enable_stream(
+        RS2_STREAM_COLOR,
+        RS2_FORMAT_RGB8);
+    automatic.configuration.enable_stream(
+        RS2_STREAM_DEPTH,
+        RS2_FORMAT_Z16);
+    requests.push_back(automatic);
+
+    std::ostringstream failures;
+    for (StreamRequest& request : requests) {
+        try {
+            if (!request.configuration.can_resolve(pipeline)) {
+                failures << request.name << ": unavailable; ";
+                continue;
+            }
+            const rs2::pipeline_profile resolved =
+                request.configuration.resolve(pipeline);
+            printResolvedStreams(request.name, resolved);
+            return pipeline.start(request.configuration);
+        } catch (const rs2::error& error) {
+            failures << request.name << ": " << error.what() << "; ";
+            try {
+                pipeline.stop();
+            } catch (...) {
+            }
+        }
+    }
+
+    throw std::runtime_error(
+        "No simultaneous RGB8/Z16 RealSense profile could be started. "
+        "Tried: " + failures.str());
 }
 
 std::string scalarString(const double value)
@@ -266,26 +384,30 @@ int main(int argc, char** argv)
             readStreamConfiguration(orb_template);
 
         rs2::context context;
-        if (context.query_devices().size() == 0) {
+        const rs2::device_list devices = context.query_devices();
+        if (devices.size() == 0) {
             throw std::runtime_error("No RealSense device is connected");
         }
 
-        rs2::pipeline pipeline(context);
-        rs2::config configuration;
-        configuration.enable_stream(
-            RS2_STREAM_COLOR,
-            stream.width,
-            stream.height,
-            RS2_FORMAT_RGB8,
-            stream.fps);
-        configuration.enable_stream(
-            RS2_STREAM_DEPTH,
-            stream.width,
-            stream.height,
-            RS2_FORMAT_Z16,
-            stream.fps);
+        const rs2::device detected_device = devices.front();
+        const std::string detected_usb_type = deviceInfo(
+            detected_device,
+            RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR);
+        std::cout << "[RealSense] detected device="
+                  << deviceInfo(detected_device, RS2_CAMERA_INFO_NAME)
+                  << " serial="
+                  << deviceInfo(detected_device, RS2_CAMERA_INFO_SERIAL_NUMBER)
+                  << " usb=" << detected_usb_type << '\n';
+        if (detected_usb_type.empty() || detected_usb_type.front() != '3') {
+            std::cerr
+                << "[RealSense] WARNING: camera is not using SuperSpeed USB. "
+                   "A compatible reduced profile will be selected when possible; "
+                   "do not use it for performance measurements.\n";
+        }
 
-        rs2::pipeline_profile profile = pipeline.start(configuration);
+        rs2::pipeline pipeline(context);
+        rs2::pipeline_profile profile =
+            startCompatiblePipeline(pipeline, stream);
         const rs2::device device = profile.get_device();
         configureSensors(device);
 
@@ -298,16 +420,14 @@ int main(int argc, char** argv)
         std::cout << "[RealSense] device=" << camera_name
                   << " serial=" << serial
                   << " usb=" << usb_type << '\n';
-        if (usb_type.empty() || usb_type.front() != '3') {
-            std::cerr
-                << "[RealSense] WARNING: camera is not using SuperSpeed USB. "
-                   "Use a USB 3 cable/port for performance measurements.\n";
-        }
-
         const rs2::video_stream_profile color_profile =
             profile.get_stream(RS2_STREAM_COLOR)
                 .as<rs2::video_stream_profile>();
+        const rs2::video_stream_profile depth_profile =
+            profile.get_stream(RS2_STREAM_DEPTH)
+                .as<rs2::video_stream_profile>();
         const rs2_intrinsics intrinsics = color_profile.get_intrinsics();
+        const int active_fps = color_profile.fps();
         const rs2::depth_sensor depth_sensor =
             device.first<rs2::depth_sensor>();
         const float depth_scale = depth_sensor.get_depth_scale();
@@ -316,8 +436,10 @@ int main(int argc, char** argv)
         }
 
         std::cout << std::fixed << std::setprecision(6)
-                  << "[RealSense] stream=" << intrinsics.width << 'x'
-                  << intrinsics.height << '@' << stream.fps
+                  << "[RealSense] color=" << intrinsics.width << 'x'
+                  << intrinsics.height << '@' << active_fps
+                  << " depth=" << depth_profile.width() << 'x'
+                  << depth_profile.height() << '@' << depth_profile.fps()
                   << " fx=" << intrinsics.fx
                   << " fy=" << intrinsics.fy
                   << " cx=" << intrinsics.ppx
@@ -329,7 +451,7 @@ int main(int argc, char** argv)
                 orb_template,
                 output_directory,
                 intrinsics,
-                stream.fps);
+                active_fps);
         std::cout << "[RealSense] runtime calibration: "
                   << runtime_orb_settings << '\n';
 

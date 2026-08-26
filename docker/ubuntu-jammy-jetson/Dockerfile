@@ -127,7 +127,7 @@ RUN git clone --branch "v${LIBREALSENSE_VERSION}" --depth 1 --recursive \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DCMAKE_CUDA_ARCHITECTURES=87 \
-        -DBUILD_EXAMPLES=ON \
+        -DBUILD_EXAMPLES=OFF \
         -DBUILD_GRAPHICAL_EXAMPLES=OFF \
         -DBUILD_PYTHON_BINDINGS=OFF \
         -DBUILD_SHARED_LIBS=ON \

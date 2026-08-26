@@ -1,0 +1,48 @@
+%YAML:1.0
+
+# The live RealSense runner uses the requested resolution/FPS below, then
+# writes a run-local copy with the exact intrinsics, distortion, and metric
+# depth factor reported by the connected camera.
+
+File.version: "1.0"
+Camera.type: "PinHole"
+
+# Runtime placeholders; realsense_rgbd_voxel replaces these values.
+Camera1.fx: 318.9995
+Camera1.fy: 318.769
+Camera1.cx: 316.677
+Camera1.cy: 185.039
+Camera1.k1: -0.0552267
+Camera1.k2: 0.0614063
+Camera1.p1: 0.000578375
+Camera1.p2: -0.000419736
+Camera1.k3: -0.0191423
+
+# Conservative profile for initial payload testing, including USB 2 fallback.
+Camera.width: 640
+Camera.height: 360
+Camera.fps: 30
+Camera.RGB: 1
+
+Stereo.ThDepth: 40.0
+Stereo.b: 0.095
+
+# The runner converts Z16 depth to CV_32F metres before TrackRGBD.
+RGBD.DepthMapFactor: 1.0
+
+ORBextractor.nFeatures: 1250
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0

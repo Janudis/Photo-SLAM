@@ -42,6 +42,8 @@ DOCKER_BUILDKIT=1 "${docker_cmd[@]}" build \
     --network=host \
     --build-arg "BASE_IMAGE=$base_image" \
     --build-arg "OPENCV_BUILD_JOBS=${OPENCV_BUILD_JOBS:-4}" \
+    --build-arg "LIBREALSENSE_VERSION=${LIBREALSENSE_VERSION:-2.57.6}" \
+    --build-arg "LIBREALSENSE_BUILD_JOBS=${LIBREALSENSE_BUILD_JOBS:-4}" \
     --tag "$final_image" \
     "$script_dir"
 

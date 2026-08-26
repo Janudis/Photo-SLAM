@@ -1,0 +1,226 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Model Parameters
+#--------------------------------------------------------------------------------------------
+
+Model.sh_degree: 3 # maximum
+Model.resolution: -1.0
+Model.white_background: 0  # 0:false, 1 or other integer:true
+Model.eval: 0  # 0:false, 1 or other integer:true
+Model.outside_level: 5 # SVRecon default: scene_extent = inside_extent * 2^outside_level
+Model.global_scene_extent: 0.0 # <=0: current automatic root; set 2048.0 for a fixed 2048 m outdoor root
+
+##############################################################################
+# Pipeline-level parameters (only the ones VoxelMapper uses)
+##############################################################################
+Pipeline.convert_SHs: 0  # 0:false, 1 or other integer:true
+Camera.z_near: 0.01
+Camera.z_far: 10.0
+RGBD.min_depth: 0.0000000001
+RGBD.max_depth: 10.0
+
+Mapper.inactive_geo_densify: 0 # 0:false, 1 or other integer:true
+Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
+Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
+Mapper.rgbd_fill_render_holes: 0 # direct fill: cache one measured-surface cell for each strict rendered hole
+Mapper.rgbd_fill_render_holes_initial_backfill: 0 # run only RGB-D render-hole fill for initial keyframes after createFromPcd
+Mapper.rgbd_fill_render_holes_stride: 4 # pixel stride for each keyframe's pre-insertion hole detection
+
+Mapper.sdf_initialization_mode: "orb_prior" # nearby ORB corners use metric SDF; unsupported corners use a weak ORB-directed signed ramp
+Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance for signed nearest-point initialization
+
+# Hybrid RGB-D completion: residual holes update non-renderable projective TSDF
+# TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
+# promoted into the active SVRecon map.
+Mapper.rgbd_tsdf_evidence: 1
+Mapper.rgbd_tsdf_evidence_initial_backfill: 0
+Mapper.rgbd_tsdf_evidence_pixel_stride: 4 # match the octree-block-support hole sampling
+Mapper.rgbd_tsdf_evidence_trunc_vox: 3.0 # sample the RGB-D band [D-3v, D+3v]
+Mapper.rgbd_tsdf_evidence_max_weight: 5.0 # cap accumulated projective TSDF evidence
+Mapper.rgbd_tsdf_evidence_promote_min_views: 2 # minimum independent multi-view confirmation
+Mapper.sdf_voxel_size_m: 0.05
+Mapper.sdf_init_trunc_vox: 4.0
+Mapper.sdf_init_max_depth_m: 8.0
+
+Mapper.min_num_initial_map_kfs:        10
+Mapper.new_keyframe_times_of_use:    2
+Mapper.local_BA_increased_times_of_use: 0       
+Mapper.loop_closure_increased_times_of_use_: 2  
+Mapper.cull_keyframes:                 0
+Mapper.large_rotation_threshold: 20.0
+Mapper.large_translation_threshold: 1.0 
+
+GausPyramid.do: 1  # 0:false, 1 or other integer:true
+GausPyramid.num_sub_levels: 2
+GausPyramid.sub_level_times_of_use: 8
+
+Record.keyframe_record_interval: 0 # 0:never, 1:always, others:periodically
+Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
+Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
+Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
+Record.record_loss_image: 0 # 0:false, 1 or other integer:true
+Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
+Record.laptop_precheck: 1
+Record.laptop_precheck_sample_interval_ms: 50
+Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
+
+Record.enable_rerun: 0  # enable the reconstruction timeline below
+Record.rerun_max_keyframes: -1 # <=0:all keyframes, >0:only keyframes in [rerun_keyframe_start, start+N)
+Record.rerun_keyframe_start: 0
+Record.run_whole_run: 0 # svrecon_debug already contains the keyframes and live/pruned voxel timeline
+Record.rerun_svrecon_debug: 0 # separate optimization-debug recording; disabled for reconstruction capture
+Record.run_reconstruction_mesh: 0 # keyframes, ORB points, live preview mesh, and exact final mesh
+Record.run_reconstruction_mesh_interval: 200 # live preview interval; final mesh remains full-resolution
+Record.run_reconstruction_mesh_min_weight: 1e-4
+Record.run_reconstruction_mesh_weld_vertices: 1
+Record.run_reconstruction_mesh_max_vertices: 0 # 0:disable guard; >0:skip oversized Rerun snapshots instead of logging partial meshes
+Record.run_reconstruction_mesh_max_faces: 0 # 0:disable guard; >0:skip oversized Rerun snapshots instead of logging partial meshes
+Record.run_maps: 0 # write maps.rrd with final rendered-vs-GT RGB, depth, normal maps per keyframe
+Record.run_maps_stride: 1 # log every Nth keyframe into maps.rrd
+
+Record.rerun_rendered_mesh_eval: 0 # log the SVRecon progressive rendered-TSDF mesh to world/voxel_model_mesh/final
+Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
+Record.rerun_nvblox_mesh: 0
+Record.rerun_nvblox_mesh_path: "../../../../results/tum_rgbd_nvblox/rgbd_dataset_freiburg1_desk/online_orb/nvblox_color_mesh.ply"
+
+Record.save_rendered_mesh_eval: 1 # save common fixed-TSDF, SVRecon progressive-TSDF, and direct-SDF meshes
+Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
+Record.rendered_mesh_eval_min_weight: 1.0 # HI-SLAM2 mesh extraction weight threshold
+Record.rendered_mesh_eval_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
+Record.rendered_mesh_eval_depth_max_m: 8.0 # HI-SLAM2 TSDF integration depth limit
+Record.svrecon_mesh_init_lv: 7 # SVRecon extract_mesh.py --init_lv (progressive extraction)
+Record.svrecon_mesh_final_lv: 9 # SVRecon extract_mesh.py --final_lv; level 10 exceeds an 8 GB GPU
+Record.svrecon_mesh_trunc_lv: 10 # SVRecon extract_mesh.py --trunc_lv
+Record.svrecon_mesh_trunc_vox: 5.0 # SVRecon extract_mesh.py --trunc_vox
+Record.svrecon_mesh_pg_prune: 0.6 # SVRecon extract_mesh.py --pg_prune
+Record.svrecon_mesh_crop_border: 0.01 # SVRecon extract_mesh.py --crop_border
+Record.svrecon_mesh_alpha_thres: 0.5 # SVRecon extract_mesh.py --alpha_thres
+Record.svrecon_mesh_use_mean_depth: 0 # 0: median rendered depth, 1: mean rendered depth
+Record.svrecon_mesh_use_vert_color: 1 # SVRecon extract_mesh.py --use_vert_color
+
+##############################################################################
+# SVRecon optimisation parameters
+##############################################################################
+Optimization.max_num_iterations: 30100
+# SparseAdam param groups
+Optimization.geo_lr: 0.025 #0.1 # closes weak SDF candidates within the online optimization budget
+Optimization.sh0_lr: 0.01 #0.04 #0.01 # very important
+Optimization.shs_lr: 0.00025 #0.00025 #important
+
+# Optimizer hyper-params
+Optimization.optim_beta1: 0.1
+Optimization.optim_beta2: 0.99
+Optimization.optim_eps: 1e-15
+
+# MultiStep LR decay (like torch.optim.lr_scheduler.MultiStepLR)
+# Use a YAML sequence for OpenCV FileStorage compatibility.
+Optimization.lr_decay_ckpt: [19000] # [24]
+Optimization.lr_decay_mult: 0.1
+
+# --------------------------------------------------------------------------------------------
+# Adaptive prune/subdivide
+# --------------------------------------------------------------------------------------------
+# Optimization.adapt_from: 600
+Optimization.adapt_every: 800
+Optimization.prune_every: 800
+Optimization.subdivide_every: 800
+
+# Pruning
+Optimization.prune_from: 800
+Optimization.prune_until: 15000
+Optimization.prune_thres_init: 0.001 
+Optimization.prune_thres_final: 0.1 #0.05
+Optimization.prune_thres_final_at_target: 0.1
+Optimization.filter_near_voxels: 1
+Optimization.prune_far_voxels: 1
+Optimization.prune_near_voxels_geometric: 1
+Optimization.prune_surface_views_enable: 1
+Optimization.surface_min_views: 2
+Optimization.final_refinement_enable: 1
+# Subdivision
+Optimization.subdivide_from: 800
+Optimization.subdivide_all_until: 0 #worse probably because of re-initialization of optimizer
+Optimization.subdivide_samp_thres: 0.5 # retained for file compatibility; SVRecon SDF uses its learning band
+Optimization.subdivide_prop: 0.1 # top-priority fraction after the configured base voxel scale has been reached
+
+# SVRecon SDF regularizers
+Optimization.lambda_tv_density: 0 #1e-10
+Optimization.tv_from: 0
+Optimization.tv_until: 10000
+Optimization.lambda_ge_density: 0 #1e-8 # SVRecon global Eikonal; also derives 1e-11 fine-level local Eikonal
+Optimization.ge_from: 0
+Optimization.ge_until: 6000
+Optimization.lambda_ls_density: 0 # isolate Eikonal during mapping; the topology-frozen tail disables Eikonal
+Optimization.ls_from: 0
+Optimization.ls_until: 8000
+
+# Data augmentation
+Optimization.ss_aug_max: 0 #1.5 
+
+# Per-point rgb loss
+Optimization.lambda_R_concen: 0.00 #0.01 
+
+# Distortion loss (encourage distribution concentration on ray)
+Optimization.lambda_dist: 0.00
+Optimization.dist_from: 2500
+
+# Final transmittance should concentrate to either 0 or 1
+Optimization.lambda_T_concen: 0.0
+# Final transmittance should be 0
+Optimization.lambda_T_inside: 0.0
+
+# SSIM loss
+Optimization.lambda_ssim: 0.02
+Optimization.use_l1: 0
+Optimization.use_huber: 0
+Optimization.huber_thres: 0.03
+
+# Sparse depth loss
+Optimization.lambda_sparse_depth : 0.0
+Optimization.sparse_depth_until : 15000
+
+# Dense RGB-D depth loss
+Optimization.lambda_rgbd_depth : 0.001
+Optimization.rgbd_depth_from : 1000
+Optimization.rgbd_depth_end : 15000
+Optimization.rgbd_depth_end_mult : 0.1
+# RGB-D direct SDF/free-space supervision.
+# Positive SDF is free space in front of the measured depth; zero is the surface.
+Optimization.lambda_rgbd_sdf : 0.0
+Optimization.rgbd_sdf_from : 0
+Optimization.rgbd_sdf_end : 15000
+Optimization.rgbd_sdf_end_mult : 0.1
+Optimization.rgbd_sdf_trunc_vox : 4.0
+Optimization.rgbd_sdf_max_samples : 40000
+Optimization.rgbd_sdf_ray_pixels : 1024
+Optimization.rgbd_sdf_free_samples : 4
+Optimization.rgbd_sdf_surface_samples : 8
+Optimization.rgbd_sdf_w_fs : 5.0
+Optimization.rgbd_sdf_w_center : 20.0
+Optimization.rgbd_sdf_w_tail : 1.0
+
+# RGB-D external sensor normal loss; disabled in the SVRecon path.
+Optimization.lambda_rgbd_normal: 0.0001
+Optimization.rgbd_normal_from: 1000
+Optimization.rgbd_normal_end: 15000
+Optimization.rgbd_normal_end_mult: 0.1
+Optimization.rgbd_normal_ks: 3
+Optimization.rgbd_normal_tol_deg: 90.0
+
+# SVRecon normal-depth consistency loss: rendered normal vs expected-depth normal.
+Optimization.lambda_normal_dmean: 0.00
+Optimization.n_dmean_from: 1000
+Optimization.n_dmean_end: 15000
+Optimization.n_dmean_ks: 3
+Optimization.n_dmean_tol_deg: 90.0
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+
+VoxelViewer.glfw_window_width: 1400
+VoxelViewer.glfw_window_height: 1050
+VoxelViewer.image_scale: 0.5
+VoxelViewer.image_scale_main: 1.0
+VoxelViewer.camera_watch_dist: 0.000001

@@ -4,6 +4,8 @@ FROM ${BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 ARG OPENCV_VERSION=4.13.0
 ARG OPENCV_BUILD_JOBS=4
+ARG LIBREALSENSE_VERSION=2.57.6
+ARG LIBREALSENSE_BUILD_JOBS=4
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -105,6 +107,38 @@ RUN mkdir -p /tmp/opencv-src \
     && ldconfig \
     && rm -rf /tmp/opencv-src
 
+# Keep RealSense dependencies after the expensive OpenCV layer so an existing
+# successful OpenCV build remains reusable in Docker's cache.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libudev-dev \
+        libusb-1.0-0-dev \
+        udev \
+        usbutils \
+        v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build librealsense with its userspace USB backend. This avoids patching the
+# Jetson kernel and keeps camera support confined to this derived image.
+RUN git clone --branch "v${LIBREALSENSE_VERSION}" --depth 1 --recursive \
+        https://github.com/IntelRealSense/librealsense.git \
+        /tmp/librealsense \
+    && cmake -S /tmp/librealsense -B /tmp/librealsense/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CUDA_ARCHITECTURES=87 \
+        -DBUILD_EXAMPLES=ON \
+        -DBUILD_GRAPHICAL_EXAMPLES=OFF \
+        -DBUILD_PYTHON_BINDINGS=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_WITH_CUDA=ON \
+        -DFORCE_RSUSB_BACKEND=ON \
+    && cmake --build /tmp/librealsense/build \
+        --parallel "${LIBREALSENSE_BUILD_JOBS}" \
+    && cmake --install /tmp/librealsense/build \
+    && ldconfig \
+    && rm -rf /tmp/librealsense
+
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
@@ -115,6 +149,7 @@ ENV CUDA_HOME=/usr/local/cuda \
     PHOTOSLAM_ENABLE_RERUN=OFF \
     PHOTOSLAM_BUILD_ORIGINAL=OFF \
     PHOTOSLAM_BUILD_WAYMO=OFF \
+    PHOTOSLAM_BUILD_REALSENSE=ON \
     PHOTOSLAM_CUDA_ARCHITECTURES=87 \
     PHOTOSLAM_TORCH_CUDA_ARCH_LIST=8.7 \
     TORCH_CUDA_ARCH_LIST=8.7

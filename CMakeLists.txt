@@ -5,6 +5,8 @@ option(PHOTOSLAM_ENABLE_RERUN "Build Rerun diagnostics" ON)
 option(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM
        "Build the original Gaussian Photo-SLAM mapper and runners" ON)
 option(PHOTOSLAM_BUILD_WAYMO "Build the Waymo voxel runner" ON)
+option(PHOTOSLAM_BUILD_REALSENSE
+       "Build the live RealSense RGB-D SVRecon runner" ON)
 set(PHOTOSLAM_CUDA_ARCHITECTURES "75;86" CACHE STRING
     "Semicolon-separated CUDA architectures for project CUDA targets")
 
@@ -104,8 +106,11 @@ find_package(OpenGL REQUIRED)
 find_package(glm REQUIRED)
 find_package(glfw3 REQUIRED)
 
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-    find_package(realsense2)
+if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM OR PHOTOSLAM_BUILD_REALSENSE)
+    find_package(realsense2 CONFIG QUIET)
+    if(TARGET realsense2::realsense2 OR realsense2_FOUND)
+        set(PHOTOSLAM_REALSENSE_AVAILABLE ON)
+    endif()
 endif()
 
 find_package(glog REQUIRED)
@@ -668,13 +673,39 @@ endif()
 ##################################################################################
 
 # Intel Realsense
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM AND realsense2_FOUND)
+if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM AND PHOTOSLAM_REALSENSE_AVAILABLE)
     add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
     target_include_directories(realsense_rgbd PUBLIC
-        ${realsense_INCLUDE_DIR})
+        ${realsense2_INCLUDE_DIR})
     target_link_libraries(realsense_rgbd
         gaussian_viewer    
         gaussian_mapper
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-        ${realsense2_LIBRARY})
+        realsense2::realsense2)
+endif()
+
+# Live Intel RealSense RGB-D input for the SVRecon voxel mapper. This target is
+# independent of the original Gaussian Photo-SLAM mapper.
+if(PHOTOSLAM_BUILD_REALSENSE)
+    if(PHOTOSLAM_REALSENSE_AVAILABLE)
+        add_executable(realsense_rgbd_voxel
+            examples/realsense_rgbd_voxel.cpp)
+        target_include_directories(realsense_rgbd_voxel PUBLIC
+            ${PROJECT_SOURCE_DIR}
+            ${OpenCV_INCLUDE_DIRS}
+            ${realsense2_INCLUDE_DIR})
+        target_link_libraries(realsense_rgbd_voxel
+            voxel_viewer
+            voxel_core
+            ${OpenCV_LIBRARIES}
+            ${TORCH_LIBRARIES}
+            ${TORCH_PYTHON_LIBRARY}
+            ${Python3_LIBRARIES}
+            ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
+            realsense2::realsense2)
+    else()
+        message(WARNING
+            "PHOTOSLAM_BUILD_REALSENSE=ON, but librealsense2 was not found; "
+            "the realsense_rgbd_voxel target will not be built")
+    endif()
 endif()

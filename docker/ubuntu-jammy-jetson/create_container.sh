@@ -56,6 +56,7 @@ create_args=(
     --env PHOTOSLAM_ENABLE_RERUN=OFF
     --env PHOTOSLAM_BUILD_ORIGINAL=OFF
     --env PHOTOSLAM_BUILD_WAYMO=OFF
+    --env PHOTOSLAM_BUILD_REALSENSE=ON
     --env PHOTOSLAM_CUDA_ARCHITECTURES=87
     --env PHOTOSLAM_TORCH_CUDA_ARCH_LIST=8.7
     --env TORCH_CUDA_ARCH_LIST=8.7
@@ -78,6 +79,18 @@ if [[ -d /tmp/.X11-unix ]]; then
     create_args+=(--volume /tmp/.X11-unix:/tmp/.X11-unix:rw)
 fi
 
+if [[ -d /dev/bus/usb ]]; then
+    create_args+=(
+        --device-cgroup-rule "c 189:* rmw"
+        --volume /dev/bus/usb:/dev/bus/usb:rw
+    )
+else
+    echo "RealSense note: /dev/bus/usb is not available on the host."
+fi
+if [[ -d /run/udev ]]; then
+    create_args+=(--volume /run/udev:/run/udev:ro)
+fi
+
 xauthority="${XAUTHORITY:-$HOME/.Xauthority}"
 if [[ -f "$xauthority" ]]; then
     create_args+=(--env "XAUTHORITY=$xauthority")
@@ -86,7 +99,7 @@ else
     echo "Headless runs are unaffected; the desktop session may need to grant X access."
 fi
 
-for device_group in video render; do
+for device_group in video render plugdev; do
     if getent group "$device_group" >/dev/null; then
         create_args+=(--group-add "$(getent group "$device_group" | cut -d: -f3)")
     fi

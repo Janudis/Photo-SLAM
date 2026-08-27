@@ -138,13 +138,21 @@ include_directories(
 ##  Build the gaussian splatting component libraries to ${PROJECT_SOURCE_DIR}/lib
 ##################################################################################
 
-# add_library(simple_knn SHARED
-#     third_party/simple-knn/simple_knn.cu
-#     third_party/simple-knn/simple_knn.h
-#     third_party/simple-knn/spatial.cu
-#     third_party/simple-knn/spatial.h)
-# # target_compile_features(simple_knn PUBLIC cxx_std_17)
-# target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
+if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
+    # Build the original Photo-SLAM KNN extension for the active CUDA
+    # architecture instead of linking the repository's machine-specific .so.
+    add_library(simple_knn SHARED
+        third_party/simple-knn/simple_knn.cu
+        third_party/simple-knn/simple_knn.h
+        third_party/simple-knn/spatial.cu
+        third_party/simple-knn/spatial.h)
+    set_target_properties(simple_knn PROPERTIES
+        CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
+    target_include_directories(simple_knn PRIVATE
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+        ${TORCH_INCLUDE_DIRS})
+    target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
+endif()
 
 if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
     add_library(cuda_rasterizer SHARED
@@ -282,7 +290,7 @@ target_link_libraries(gaussian_mapper
     jsoncpp_lib
     "${TORCH_LIBRARIES}"
     Eigen3::Eigen
-    ${PROJECT_SOURCE_DIR}/lib/libsimple_knn.so
+    simple_knn
     cuda_rasterizer
     ${Python3_LIBRARIES})
 

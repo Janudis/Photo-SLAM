@@ -622,8 +622,10 @@ void VoxelMapper::pollMonocularMvsDensification(
 void VoxelMapper::integrateMonocularMvsDepth(
     const sv::TandemMvsResult& result)
 {
+    const std::shared_ptr<VoxelKeyframe> reference =
+        monocular_mvs_pending_reference_;
     cacheMonocularDepthPrior(
-        monocular_mvs_pending_reference_,
+        reference,
         result.depth,
         result.confidence,
         sv::LearnedDepthSource::TandemMvs);
@@ -635,6 +637,9 @@ void VoxelMapper::integrateMonocularMvsDepth(
             "MVS",
             "world/monocular_mvs/created",
             /*clear_cuda_cache_before_insertion=*/false);
+    }
+    if (reference) {
+        markSurfaceViewPruningPending({reference});
     }
 }
 
@@ -701,6 +706,277 @@ void VoxelMapper::cacheMonocularDepthPrior(
     reference->monocular_depth_confidence_ = std::move(confidence_float);
     reference->monocular_depth_source_ = source;
     reference->monocular_depth_prior_iteration_ = getIteration();
+}
+
+sv::MonocularMvsPruneEvidence
+VoxelMapper::computeMonocularMvsPruneEvidence(
+    const torch::Tensor& centers_world_in,
+    const torch::Tensor& sizes_world_in)
+{
+    sv::MonocularMvsPruneEvidence result;
+    if (!opt_params_.prune_mvs_consistency_enable_ || !scene_ ||
+        !centers_world_in.defined() || !sizes_world_in.defined() ||
+        centers_world_in.dim() != 2 || centers_world_in.size(1) != 3 ||
+        centers_world_in.size(0) <= 0 ||
+        sizes_world_in.size(0) != centers_world_in.size(0)) {
+        return result;
+    }
+
+    torch::NoGradGuard no_grad;
+    const int64_t voxel_count = centers_world_in.size(0);
+    const torch::Device device = centers_world_in.device();
+    const auto bool_options =
+        torch::TensorOptions().dtype(torch::kBool).device(device);
+    const auto count_options =
+        torch::TensorOptions().dtype(torch::kInt32).device(device);
+    const auto long_options =
+        torch::TensorOptions().dtype(torch::kInt64).device(device);
+
+    result.supported = torch::zeros({voxel_count}, bool_options);
+    result.free_space = torch::zeros({voxel_count}, bool_options);
+
+    torch::Tensor centers_world =
+        centers_world_in.detach().to(device).to(torch::kFloat32).contiguous();
+    torch::Tensor sizes_world =
+        sizes_world_in.detach().to(device).to(torch::kFloat32)
+            .reshape({voxel_count}).contiguous();
+    torch::Tensor support_count = torch::zeros({voxel_count}, count_options);
+    torch::Tensor contradiction_count =
+        torch::zeros({voxel_count}, count_options);
+    torch::Tensor valid_projection_count = torch::zeros({}, long_options);
+
+    const auto keyframes = scene_->getAllKeyframes();
+    const cv::Mat kernel = cv::Mat::ones(3, 3, CV_8UC1);
+    constexpr int64_t kProjectionChunkSize = 262144;
+
+    for (const auto& [keyframe_id, keyframe] : keyframes) {
+        (void)keyframe_id;
+        if (!keyframe ||
+            keyframe->monocular_depth_source_ !=
+                sv::LearnedDepthSource::TandemMvs ||
+            keyframe->monocular_depth_prior_.empty() ||
+            keyframe->monocular_depth_prior_.type() != CV_32FC1) {
+            continue;
+        }
+
+        const cv::Mat& depth = keyframe->monocular_depth_prior_;
+        const cv::Mat& confidence = keyframe->monocular_depth_confidence_;
+        if (confidence.empty() || confidence.type() != CV_32FC1 ||
+            confidence.size() != depth.size()) {
+            continue;
+        }
+
+        // A 3x3 valid, locally smooth neighborhood prevents depth edges from
+        // protecting or carving a whole octree cell.
+        cv::Mat valid(depth.rows, depth.cols, CV_8UC1, cv::Scalar(0));
+        cv::Mat depth_for_min(
+            depth.rows,
+            depth.cols,
+            CV_32FC1,
+            cv::Scalar(std::numeric_limits<float>::max()));
+        cv::Mat depth_for_max(
+            depth.rows,
+            depth.cols,
+            CV_32FC1,
+            cv::Scalar(std::numeric_limits<float>::lowest()));
+        int64_t valid_pixels = 0;
+        for (int y = 0; y < depth.rows; ++y) {
+            const float* depth_row = depth.ptr<float>(y);
+            const float* confidence_row = confidence.ptr<float>(y);
+            std::uint8_t* valid_row = valid.ptr<std::uint8_t>(y);
+            float* min_row = depth_for_min.ptr<float>(y);
+            float* max_row = depth_for_max.ptr<float>(y);
+            for (int x = 0; x < depth.cols; ++x) {
+                const float d = depth_row[x];
+                const float c = confidence_row[x];
+                if (!std::isfinite(d) || d <= 1.0e-6f ||
+                    !std::isfinite(c) ||
+                    c <= opt_params_.monocular_depth_confidence_min_) {
+                    continue;
+                }
+                valid_row[x] = 255;
+                min_row[x] = d;
+                max_row[x] = d;
+                ++valid_pixels;
+            }
+        }
+        if (valid_pixels == 0) {
+            continue;
+        }
+
+        cv::Mat neighborhood_valid;
+        cv::Mat local_min;
+        cv::Mat local_max;
+        cv::erode(
+            valid,
+            neighborhood_valid,
+            kernel,
+            cv::Point(-1, -1),
+            1,
+            cv::BORDER_CONSTANT,
+            cv::Scalar(0));
+        cv::erode(
+            depth_for_min,
+            local_min,
+            kernel,
+            cv::Point(-1, -1),
+            1,
+            cv::BORDER_CONSTANT,
+            cv::Scalar(std::numeric_limits<float>::max()));
+        cv::dilate(
+            depth_for_max,
+            local_max,
+            kernel,
+            cv::Point(-1, -1),
+            1,
+            cv::BORDER_CONSTANT,
+            cv::Scalar(std::numeric_limits<float>::lowest()));
+        cv::Mat local_span = cv::Mat::zeros(depth.size(), CV_32FC1);
+        for (int y = 0; y < depth.rows; ++y) {
+            const std::uint8_t* valid_row =
+                neighborhood_valid.ptr<std::uint8_t>(y);
+            const float* min_row = local_min.ptr<float>(y);
+            const float* max_row = local_max.ptr<float>(y);
+            float* span_row = local_span.ptr<float>(y);
+            for (int x = 0; x < depth.cols; ++x) {
+                if (valid_row[x] != 0) {
+                    span_row[x] = std::max(0.0f, max_row[x] - min_row[x]);
+                }
+            }
+        }
+
+        torch::Tensor depth_map = torch::from_blob(
+            depth.data,
+            {depth.rows, depth.cols},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                .clone()
+                .to(device)
+                .reshape({-1});
+        torch::Tensor confidence_map = torch::from_blob(
+            confidence.data,
+            {confidence.rows, confidence.cols},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                .clone()
+                .to(device)
+                .reshape({-1});
+        torch::Tensor valid_map = torch::from_blob(
+            neighborhood_valid.data,
+            {neighborhood_valid.rows, neighborhood_valid.cols},
+            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+                .clone()
+                .to(device)
+                .to(torch::kBool)
+                .reshape({-1});
+        torch::Tensor span_map = torch::from_blob(
+            local_span.data,
+            {local_span.rows, local_span.cols},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                .clone()
+                .to(device)
+                .reshape({-1});
+
+        const Eigen::Matrix4f Tcw = keyframe->getPosef().matrix();
+        Eigen::Matrix<float, 3, 4, Eigen::RowMajor> Tcw_3x4 =
+            Tcw.block<3, 4>(0, 0);
+        torch::Tensor transform = torch::from_blob(
+            Tcw_3x4.data(),
+            {3, 4},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                .clone()
+                .to(device);
+        torch::Tensor rotation = transform.index({
+            torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
+        torch::Tensor translation = transform.index({
+            torch::indexing::Slice(), 3});
+        const float camera_z_extent_scale =
+            0.5f * Tcw.block<1, 3>(2, 0).cwiseAbs().sum();
+        const Eigen::Matrix3f K =
+            resizedIntrinsics(*keyframe, depth.cols, depth.rows);
+
+        for (int64_t begin = 0; begin < voxel_count;
+             begin += kProjectionChunkSize) {
+            const int64_t end = std::min(
+                voxel_count, begin + kProjectionChunkSize);
+            const auto slice = torch::indexing::Slice(begin, end);
+            torch::Tensor camera_xyz =
+                torch::matmul(
+                    centers_world.index({slice}),
+                    rotation.transpose(0, 1)) +
+                translation;
+            torch::Tensor z = camera_xyz.index({torch::indexing::Slice(), 2});
+            torch::Tensor positive_z = z > 1.0e-6f;
+            torch::Tensor safe_z = torch::where(
+                positive_z, z, torch::ones_like(z));
+            torch::Tensor u_float =
+                K(0, 0) *
+                    camera_xyz.index({torch::indexing::Slice(), 0}) / safe_z +
+                K(0, 2);
+            torch::Tensor v_float =
+                K(1, 1) *
+                    camera_xyz.index({torch::indexing::Slice(), 1}) / safe_z +
+                K(1, 2);
+            torch::Tensor in_image =
+                positive_z & torch::isfinite(u_float) & torch::isfinite(v_float) &
+                (u_float >= 0.0f) &
+                (u_float <= static_cast<float>(depth.cols - 1)) &
+                (v_float >= 0.0f) &
+                (v_float <= static_cast<float>(depth.rows - 1));
+            torch::Tensor u =
+                u_float.round().clamp(0, depth.cols - 1).to(torch::kLong);
+            torch::Tensor v =
+                v_float.round().clamp(0, depth.rows - 1).to(torch::kLong);
+            torch::Tensor pixel_index = v * depth.cols + u;
+
+            torch::Tensor measured = depth_map.index_select(0, pixel_index);
+            torch::Tensor measured_confidence =
+                confidence_map.index_select(0, pixel_index);
+            torch::Tensor neighborhood_is_valid =
+                valid_map.index_select(0, pixel_index);
+            torch::Tensor local_depth_span =
+                span_map.index_select(0, pixel_index);
+            torch::Tensor voxel_size = sizes_world.index({slice});
+            torch::Tensor tolerance =
+                opt_params_.prune_mvs_depth_tolerance_vox_ * voxel_size;
+            torch::Tensor observation_valid =
+                in_image & neighborhood_is_valid & torch::isfinite(measured) &
+                (measured > 1.0e-6f) &
+                torch::isfinite(measured_confidence) &
+                (measured_confidence >
+                 opt_params_.monocular_depth_confidence_min_) &
+                (local_depth_span <= 2.0f * tolerance);
+
+            torch::Tensor z_radius =
+                camera_z_extent_scale * voxel_size;
+            torch::Tensor z_min = z - z_radius;
+            torch::Tensor z_max = z + z_radius;
+            torch::Tensor supports_surface =
+                observation_valid & (z_min <= measured + tolerance) &
+                (z_max >= measured - tolerance);
+            torch::Tensor contradicts_free_space =
+                observation_valid & (z_max < measured - tolerance);
+
+            support_count.index({slice}).add_(
+                supports_surface.to(torch::kInt32));
+            contradiction_count.index({slice}).add_(
+                contradicts_free_space.to(torch::kInt32));
+            valid_projection_count.add_(
+                observation_valid.to(torch::kInt64).sum());
+        }
+        ++result.depth_keyframes;
+    }
+
+    result.supported =
+        (support_count >= opt_params_.prune_mvs_min_supporting_views_)
+            .to(torch::kBool)
+            .contiguous();
+    result.free_space =
+        ((contradiction_count >=
+          opt_params_.prune_mvs_min_contradicting_views_) &
+         (support_count == 0))
+            .to(torch::kBool)
+            .contiguous();
+    result.valid_projections = valid_projection_count.item<int64_t>();
+    return result;
 }
 
 void VoxelMapper::integrateMonocularLearnedDepth(

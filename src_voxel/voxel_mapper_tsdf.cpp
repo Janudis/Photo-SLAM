@@ -403,12 +403,10 @@ torch::Tensor VoxelMapper::computeOnlineCovisibilityPruneMask(
         return prune_none;
     }
 
-    const int min_views = std::max(1, opt_params_.surface_min_views_);
+    const int min_views = std::max(4, opt_params_.surface_min_views_);
     const int required_cameras = std::max(
         min_views,
-        incremental_mapping_window_size_ > 0
-            ? incremental_mapping_window_size_
-            : std::max(1, max_depth_cached_));
+        opt_params_.surface_view_window_size_);
     if (cameras.size() < static_cast<std::size_t>(required_cameras)) {
         std::cout << "[PRUNE/surface_views] skipped: cameras=" << cameras.size()
                   << " required=" << required_cameras << "\n";
@@ -442,18 +440,139 @@ torch::Tensor VoxelMapper::computeOnlineCovisibilityPruneMask(
             return prune_none;
         }
     }
-    surface_view_pruning_initialized_ = true;
-
     torch::Tensor view_prune =
         (eligible & (view_count < static_cast<float>(min_views)))
             .to(torch::kBool)
             .contiguous();
-    std::cout << "[PRUNE/surface_views] cameras=" << cameras.size()
-              << " eligible=" << eligible.sum().item<int64_t>()
-              << " min_views=" << min_views
-              << " prune=" << view_prune.sum().item<int64_t>()
-              << "\n";
     return view_prune;
+}
+
+void VoxelMapper::runPendingSurfaceViewPruning()
+{
+    if (!surfaceViewPruningReady()) {
+        return;
+    }
+
+    auto pruning_profile = profileLaptopModule("surface_view_pruning");
+    const std::vector<sv::MiniCam> cameras = surfaceViewPruningCameras();
+    const int64_t voxel_count = voxel_model_->numVoxels();
+    if (voxel_count <= 0) {
+        surface_view_pending_keyframes_.clear();
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    const bool initial_pass = !surface_view_pruning_initialized_;
+    torch::Tensor view_count =
+        voxel_model_->computeOcclusionAwareViewCount(cameras);
+    torch::Tensor prune_mask =
+        computeOnlineCovisibilityPruneMask(cameras, view_count);
+    if (!prune_mask.defined() || prune_mask.numel() != voxel_count) {
+        std::cerr
+            << "[PRUNE/surface_views] skipped: visibility mask shape mismatch\n";
+        return;
+    }
+
+    const torch::Device device = prune_mask.device();
+    prune_mask = prune_mask.to(device).to(torch::kBool).reshape({voxel_count});
+
+    // Optional MVS consistency can protect a co-visible surface candidate,
+    // while its independent free-space candidates remain in scheduled pruning.
+    int64_t mvs_protected = 0;
+    if (opt_params_.prune_mvs_consistency_enable_) {
+        sv::MonocularMvsPruneEvidence mvs_evidence =
+            computeMonocularMvsPruneEvidence(
+                voxel_model_->voxCenter(),
+                voxel_model_->voxSize());
+        if (mvs_evidence.supported.defined() &&
+            mvs_evidence.supported.numel() == voxel_count) {
+            torch::Tensor supported =
+                mvs_evidence.supported.to(device).to(torch::kBool)
+                    .reshape({voxel_count});
+            mvs_protected = (prune_mask & supported).sum().item<int64_t>();
+            prune_mask = (prune_mask & (~supported)).contiguous();
+        }
+    }
+
+    torch::Tensor leaf =
+        voxel_model_->isLeaf().to(device).to(torch::kBool)
+            .reshape({voxel_count});
+    torch::Tensor eligible = leaf.clone();
+    if (!initial_pass) {
+        torch::Tensor birth_kf = voxel_model_->existSinceKf();
+        const int current_kf_count =
+            static_cast<int>(scene_->keyframes().size());
+        const int recent_cutoff = std::max(0, current_kf_count - 2);
+        if (birth_kf.defined() && birth_kf.numel() == voxel_count) {
+            eligible = eligible &
+                (birth_kf.to(device).to(torch::kInt32)
+                     .reshape({voxel_count}) >= recent_cutoff);
+        }
+    }
+
+    const int64_t eligible_count = eligible.sum().item<int64_t>();
+    const int64_t removed_count = prune_mask.sum().item<int64_t>();
+    const int64_t supported_count =
+        (eligible &
+         (view_count.to(device).to(torch::kFloat32)
+              .reshape({voxel_count}) >=
+          static_cast<float>(std::max(4, opt_params_.surface_min_views_))))
+            .sum()
+            .item<int64_t>();
+
+    if (removed_count > 0) {
+        torch::Tensor prune_idx =
+            torch::nonzero(prune_mask).reshape({-1}).to(torch::kLong);
+        torch::Tensor centers = voxel_model_->voxCenter();
+        torch::Tensor sizes = voxel_model_->voxSize();
+        torch::Tensor levels = voxel_model_->octLevel();
+        torch::Tensor colors;
+        torch::Tensor sh0 = voxel_model_->sh0();
+        if (sh0.defined() && sh0.dim() == 2 &&
+            sh0.size(0) == voxel_count) {
+            colors =
+                (sh0.index_select(0, prune_idx.to(sh0.device())) *
+                     sv::kSHC0 +
+                 0.5f)
+                    .clamp(0.0f, 1.0f)
+                    .contiguous();
+        }
+        torch::Tensor source_surface_views = torch::ones(
+            {removed_count},
+            torch::TensorOptions().dtype(torch::kBool).device(device));
+        appendWholeRunPrunedVoxels(
+            getIteration(),
+            centers.index_select(0, prune_idx.to(centers.device())),
+            sizes.index_select(0, prune_idx.to(sizes.device())),
+            levels.index_select(0, prune_idx.to(levels.device())),
+            colors,
+            torch::Tensor(),
+            source_surface_views);
+
+        voxel_model_->pruning(prune_mask);
+        if (rerun_params_.run_whole_run_ ||
+            rerun_params_.rerun_svrecon_debug_) {
+            rerun_state_.whole_run_live_voxels_dirty_ = true;
+        }
+    }
+
+    std::size_t trigger_keyframe = 0;
+    if (!surface_view_pending_keyframes_.empty()) {
+        trigger_keyframe = *std::max_element(
+            surface_view_pending_keyframes_.begin(),
+            surface_view_pending_keyframes_.end());
+    }
+    std::cout << "[PRUNE/surface_views] keyframe=" << trigger_keyframe
+              << " window=" << cameras.size()
+              << " initial=" << (initial_pass ? 1 : 0)
+              << " eligible=" << eligible_count
+              << " supported=" << supported_count
+              << " mvs_protected=" << mvs_protected
+              << " removed=" << removed_count
+              << "\n";
+
+    surface_view_pruning_initialized_ = true;
+    surface_view_pending_keyframes_.clear();
 }
 
 void VoxelMapper::runFinalRefinement()

@@ -82,6 +82,14 @@ class TandemMvsBackend;
 struct TandemMvsResult;
 class OmnidataDepthBackend;
 struct OmnidataDepthResult;
+
+struct MonocularMvsPruneEvidence
+{
+    torch::Tensor supported;
+    torch::Tensor free_space;
+    int64_t depth_keyframes = 0;
+    int64_t valid_projections = 0;
+};
 }
 
  struct VariableParameters
@@ -190,6 +198,15 @@ protected:
         std::vector<float>& colors);
     void densifyMonocularFromRenderedDepth(
         const std::shared_ptr<VoxelKeyframe>& pkf);
+    void resetMonocularRenderedDepthEvidenceIfLayoutChanged();
+    int64_t promoteMonocularRenderedDepthEvidenceCells(
+        const std::unordered_set<
+            sv::RgbdTsdfGridKey,
+            sv::RgbdTsdfGridKeyHash>& affected_cells);
+    void logMonocularRenderedDepthEvidenceCellsToRerun(
+        int iteration,
+        const std::vector<sv::RgbdTsdfGridKey>& cells,
+        const std::string& entity_path);
     void captureMonocularMvsKeyframeMetadata(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         ORB_SLAM3::KeyFrame* orb_keyframe);
@@ -221,6 +238,9 @@ protected:
         const cv::Mat& depth,
         const cv::Mat& confidence,
         sv::LearnedDepthSource source);
+    sv::MonocularMvsPruneEvidence computeMonocularMvsPruneEvidence(
+        const torch::Tensor& centers_world,
+        const torch::Tensor& sizes_world);
     void integrateMonocularLearnedDepth(
         const cv::Mat& depth,
         const std::string& source_name,
@@ -233,9 +253,6 @@ protected:
     void pollMonocularOmnidataDensification(bool wait_for_result = false);
     void integrateMonocularOmnidataDepth(
         const sv::OmnidataDepthResult& result);
-    void validateMonocularRenderedDepthVoxels(bool final_pass = false);
-    void logMonocularCoVisibilityPrunedVoxels(
-        const torch::Tensor& prune_mask);
     torch::Tensor detectRgbdRenderHolePixels(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         const torch::Tensor& depth,
@@ -261,6 +278,11 @@ protected:
         const std::vector<sv::RgbdTsdfGridKey>& cells,
         const std::string& entity_path);
     std::vector<sv::MiniCam> incrementalMappingCameras() const;
+    std::vector<sv::MiniCam> surfaceViewPruningCameras() const;
+    void markSurfaceViewPruningPending(
+        const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes);
+    bool surfaceViewPruningReady();
+    void runPendingSurfaceViewPruning();
 
     void recordKeyframeRendered(
         torch::Tensor &rendered,
@@ -365,7 +387,7 @@ protected:
         const torch::Tensor& pruned_by_surface_views,
         const torch::Tensor& pruned_by_near_camera = torch::Tensor(),
         const torch::Tensor& pruned_by_far = torch::Tensor(),
-        const torch::Tensor& pruned_by_monocular_covisibility = torch::Tensor(),
+        const torch::Tensor& pruned_by_mvs_free_space = torch::Tensor(),
         const torch::Tensor& pruned_by_final_refinement = torch::Tensor());
     void logSvreconDebugVoxelMaskToRerun(
         int iteration,
@@ -480,6 +502,7 @@ protected:
     bool disable_topology_changes_ = false;
     bool tail_refinement_active_ = false;
     bool surface_view_pruning_initialized_ = false;
+    std::unordered_set<std::size_t> surface_view_pending_keyframes_;
     int input_queue_max_keyframes_ = 0;
     int incremental_mapping_window_size_ = 0;
     bool loop_closure_reinsert_points_ = true;
@@ -514,9 +537,26 @@ protected:
     // monocular densification
     bool monocular_rendered_depth_densify_ = false;
     int monocular_rendered_depth_pixel_stride_ = 8;
-    int monocular_rendered_depth_window_size_ = 8;
-    int monocular_rendered_depth_min_views_ = 4;
-    float monocular_rendered_depth_min_weight_ = 0.1f;
+    int monocular_rendered_depth_evidence_samples_ = 4;
+    float monocular_rendered_depth_evidence_trunc_vox_ = 1.0f;
+    float monocular_rendered_depth_evidence_max_weight_ = 64.0f;
+    int monocular_rendered_depth_evidence_promote_min_views_ = 2;
+    float monocular_rendered_depth_evidence_promote_min_weight_ = 1.0f;
+    float monocular_rendered_depth_evidence_min_baseline_ratio_ = 0.05f;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCornerEvidence,
+        sv::RgbdTsdfGridKeyHash>
+        monocular_rendered_depth_corner_evidence_;
+    std::unordered_map<
+        sv::RgbdTsdfGridKey,
+        sv::RgbdTsdfCellEvidence,
+        sv::RgbdTsdfGridKeyHash>
+        monocular_rendered_depth_cell_evidence_;
+    Eigen::Vector3f monocular_rendered_depth_layout_scene_min_ =
+        Eigen::Vector3f::Zero();
+    float monocular_rendered_depth_layout_cell_size_ = 0.0f;
+    int monocular_rendered_depth_layout_grid_dim_ = 0;
     bool monocular_mvs_densify_ = false;
     std::filesystem::path monocular_mvs_model_dir_;
     int monocular_mvs_width_ = 512;

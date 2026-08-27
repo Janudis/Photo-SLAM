@@ -134,6 +134,11 @@ public:
     bool prune_near_voxels_geometric_;
     bool prune_surface_views_enable_ = false;
     int surface_min_views_ = 4;
+    int surface_view_window_size_ = 10;
+    bool prune_mvs_consistency_enable_ = false;
+    int prune_mvs_min_supporting_views_ = 2;
+    int prune_mvs_min_contradicting_views_ = 2;
+    float prune_mvs_depth_tolerance_vox_ = 1.5f;
     bool final_refinement_enable_ = false;
     int prune_from_;
     int prune_until_;

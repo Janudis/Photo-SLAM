@@ -3,6 +3,21 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+svrecon_patch="$root_dir/patches/SVRecon/0001-occlusion-aware-voxel-visibility.patch"
+if [[ -f "$svrecon_patch" ]]; then
+    if git -C "$root_dir/third_party/SVRecon" apply --reverse --check \
+        "$svrecon_patch" >/dev/null 2>&1; then
+        : # Patch is already present in the working tree.
+    elif git -C "$root_dir/third_party/SVRecon" apply --check \
+        "$svrecon_patch" >/dev/null 2>&1; then
+        git -C "$root_dir/third_party/SVRecon" apply "$svrecon_patch"
+    else
+        echo "SVRecon visibility patch cannot be applied cleanly." >&2
+        exit 1
+    fi
+fi
+
 is_jetson=0
 if [[ "$(uname -m)" == "aarch64" && -f /etc/nv_tegra_release ]]; then
     is_jetson=1

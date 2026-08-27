@@ -6,6 +6,7 @@ namespace sv {
 
 struct RenderOpts {
     bool        track_max_w = false;
+    bool        track_occlusion_visibility = false;
     std::optional<float> lambda_R_concen = std::nullopt;
     bool        output_T = false;
     bool        output_depth = false;

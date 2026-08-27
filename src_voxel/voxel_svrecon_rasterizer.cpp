@@ -217,6 +217,7 @@ public:
             need_distortion,
             raster_settings.need_normal,
             raster_settings.track_max_w,
+            raster_settings.track_occlusion_visibility,
             octree_paths.contiguous(),
             vox_centers.contiguous(),
             vox_lengths.contiguous(),
@@ -235,8 +236,9 @@ public:
         torch::Tensor out_normal = std::get<5>(result);
         torch::Tensor out_T = std::get<6>(result);
         torch::Tensor max_w = std::get<7>(result);
-        torch::Tensor out_sdf0 = std::get<8>(result);
-        torch::Tensor out_feat = std::get<9>(result);
+        torch::Tensor occlusion_visible = std::get<8>(result);
+        torch::Tensor out_sdf0 = std::get<9>(result);
+        torch::Tensor out_feat = std::get<10>(result);
         auto image_state = RASTER_STATE::unpack_ImageState(
             raster_settings.image_width,
             raster_settings.image_height,
@@ -276,7 +278,15 @@ public:
             s_val.contiguous(),
             out_sdf0.contiguous()});
 
-        return {out_color, out_depth, out_normal, out_T, max_w, n_contrib, out_feat};
+        return {
+            out_color,
+            out_depth,
+            out_normal,
+            out_T,
+            max_w,
+            occlusion_visible,
+            n_contrib,
+            out_feat};
     }
 
     static torch::autograd::tensor_list backward(
@@ -497,6 +507,7 @@ std::unordered_map<std::string, torch::Tensor> renderSvreconDirect(
     settings.need_depth = output_depth || other_opt.output_depth;
     settings.need_normal = output_normal || other_opt.output_normal;
     settings.track_max_w = track_max_w || other_opt.track_max_w;
+    settings.track_occlusion_visibility = other_opt.track_occlusion_visibility;
     settings.lambda_R_concen = other_opt.lambda_R_concen.value_or(0.0f);
     settings.lambda_ascending = other_opt.lambda_ascending.value_or(0.0f);
     settings.lambda_dist = other_opt.lambda_dist.value_or(0.0f);
@@ -565,8 +576,9 @@ std::unordered_map<std::string, torch::Tensor> renderSvreconDirect(
     torch::Tensor normal = result[2];
     torch::Tensor T = result[3];
     torch::Tensor max_w = result[4];
-    torch::Tensor n_contrib = result[5];
-    torch::Tensor feat = result[6];
+    torch::Tensor occlusion_visible = result[5];
+    torch::Tensor n_contrib = result[6];
+    torch::Tensor feat = result[7];
     const bool dontcare_color = (mode == "dontcare");
 
     if (!dontcare_color && rand_bg) {
@@ -588,6 +600,7 @@ std::unordered_map<std::string, torch::Tensor> renderSvreconDirect(
     insert_tensor("normal", normal, settings.need_normal);
     insert_tensor("T", T, output_T || other_opt.output_T);
     render_pkg["max_w"] = max_w;
+    render_pkg["occlusion_visible"] = occlusion_visible;
     render_pkg["n_contrib"] = n_contrib;
     render_pkg["raw_n_contrib"] = n_contrib;
     if (feat.defined() && feat.numel() > 0) {

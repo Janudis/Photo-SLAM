@@ -162,6 +162,9 @@ public:
     };
     // Compute per-voxel stats over a list of training cameras.
     StatPkg computeTrainingStat(const std::vector<MiniCam>& cams);
+    // Count views in which each voxel contributes before ray opacity reaches 0.5.
+    torch::Tensor computeOcclusionAwareViewCount(
+        const std::vector<MiniCam>& cams);
     // Topology changes.
     void pruning(const torch::Tensor& prune_mask);         // mask: [N] or [N,1] bool/byte
     void subdividing(const torch::Tensor& subdivide_mask); // mask: [N] or [N,1] bool/byte
@@ -247,20 +250,6 @@ public:
     torch::Tensor monocularOmnidataVoxelMask() const {
         return this->is_monocular_omnidata_voxel_;
     }
-    torch::Tensor monocularProvisionalVoxelMask() const {
-        return this->is_monocular_provisional_voxel_;
-    }
-    torch::Tensor monocularRenderSupportHits() const {
-        return this->monocular_render_support_hits_;
-    }
-    torch::Tensor monocularRenderOpportunities() const {
-        return this->monocular_render_opportunities_;
-    }
-    void accumulateMonocularRenderObservation(
-        const torch::Tensor& max_render_weight,
-        float min_render_weight);
-    void resolveMonocularProvisionalVoxels(
-        const torch::Tensor& resolved_mask);
     torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
     torch::Tensor activeRenderableMask() const;
@@ -397,9 +386,6 @@ public:
     torch::Tensor is_monocular_rendered_depth_voxel_; // [N] bool provenance: rendered-depth densification
     torch::Tensor is_monocular_mvs_voxel_; // [N] bool provenance: TANDEM MVS hole filling
     torch::Tensor is_monocular_omnidata_voxel_; // [N] bool provenance: aligned Omnidata hole filling
-    torch::Tensor is_monocular_provisional_voxel_; // [N] bool pending co-visibility validation
-    torch::Tensor monocular_render_support_hits_; // [N] int32 keyframes with max(T*alpha) above threshold
-    torch::Tensor monocular_render_opportunities_; // [N] int32 keyframes tested since insertion
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA

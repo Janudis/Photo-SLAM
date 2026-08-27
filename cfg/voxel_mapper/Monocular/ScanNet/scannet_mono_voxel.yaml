@@ -23,7 +23,19 @@ Mapper.depth_cache: 10
 
 Mapper.sdf_initialization_mode: "weak_surface_prior"
 Mapper.sdf_initialization_orb_radius_vox: 1.0
+# Model-free hole filling samples four points within D +/- 0.5 truncation of
+# each local rendered-depth hypothesis. Promotion requires multi-view evidence.
 Mapper.monocular_rendered_depth_densify: 0
+Mapper.monocular_rendered_depth_pixel_stride: 8
+Mapper.monocular_rendered_depth_evidence_samples: 4
+Mapper.monocular_rendered_depth_evidence_trunc_vox: 1.0
+Mapper.monocular_rendered_depth_evidence_max_weight: 64.0
+Mapper.monocular_rendered_depth_evidence_promote_min_views: 2
+Mapper.monocular_rendered_depth_evidence_promote_min_weight: 1.0
+Mapper.monocular_rendered_depth_evidence_min_baseline_ratio: 0.05
+
+# TANDEM MVS consumes ORB camera poses directly, so its depth remains in the
+# same arbitrary monocular gauge. Match TANDEM's sparse inverse-depth range.
 Mapper.monocular_mvs_densify: 1
 Mapper.monocular_mvs_model_dir: "models/tandem/model.pt"
 Mapper.monocular_mvs_width: 512
@@ -138,6 +150,13 @@ Optimization.prune_near_voxels_geometric: 1
 # Online MonoGS co-visibility; final filtering reuses the rendered-TSDF mesh support.
 Optimization.prune_surface_views_enable: 1
 Optimization.surface_min_views: 4
+Optimization.surface_view_window_size: 10
+# Detached TANDEM consistency: protect supported soft-prune candidates and
+# add candidates observed wholly in front of reliable depth in multiple views.
+Optimization.prune_mvs_consistency_enable: 0
+Optimization.prune_mvs_min_supporting_views: 2
+Optimization.prune_mvs_min_contradicting_views: 2
+Optimization.prune_mvs_depth_tolerance_vox: 1.5
 Optimization.final_refinement_enable: 1
 Optimization.subdivide_from: 1200
 Optimization.subdivide_all_until: 0

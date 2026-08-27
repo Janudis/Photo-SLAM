@@ -71,10 +71,10 @@ struct VoxelRerunState
     torch::Tensor whole_run_pruned_far_sizes_accum_;
     torch::Tensor whole_run_pruned_far_levels_accum_;
     torch::Tensor whole_run_pruned_far_colors_accum_;
-    torch::Tensor whole_run_pruned_monocular_covis_centers_accum_;
-    torch::Tensor whole_run_pruned_monocular_covis_sizes_accum_;
-    torch::Tensor whole_run_pruned_monocular_covis_levels_accum_;
-    torch::Tensor whole_run_pruned_monocular_covis_colors_accum_;
+    torch::Tensor whole_run_pruned_mvs_free_space_centers_accum_;
+    torch::Tensor whole_run_pruned_mvs_free_space_sizes_accum_;
+    torch::Tensor whole_run_pruned_mvs_free_space_levels_accum_;
+    torch::Tensor whole_run_pruned_mvs_free_space_colors_accum_;
     torch::Tensor whole_run_pruned_final_refinement_centers_accum_;
     torch::Tensor whole_run_pruned_final_refinement_sizes_accum_;
     torch::Tensor whole_run_pruned_final_refinement_levels_accum_;

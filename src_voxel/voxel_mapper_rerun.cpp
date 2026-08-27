@@ -1754,7 +1754,7 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
     const torch::Tensor& pruned_by_surface_views_in,
     const torch::Tensor& pruned_by_near_camera_in,
     const torch::Tensor& pruned_by_far_in,
-    const torch::Tensor& pruned_by_monocular_covisibility_in,
+    const torch::Tensor& pruned_by_mvs_free_space_in,
     const torch::Tensor& pruned_by_final_refinement_in)
 {
     if (!rerun_params_.enable_rerun_ ||
@@ -1875,13 +1875,13 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
                 .contiguous()
                 .view({K});
     }
-    torch::Tensor monocular_covisibility_mask = torch::zeros(
+    torch::Tensor mvs_free_space_mask = torch::zeros(
         {K},
         torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-    if (pruned_by_monocular_covisibility_in.defined() &&
-        pruned_by_monocular_covisibility_in.numel() == K) {
-        monocular_covisibility_mask =
-            pruned_by_monocular_covisibility_in.detach()
+    if (pruned_by_mvs_free_space_in.defined() &&
+        pruned_by_mvs_free_space_in.numel() == K) {
+        mvs_free_space_mask =
+            pruned_by_mvs_free_space_in.detach()
                 .to(torch::kCPU)
                 .to(torch::kBool)
                 .contiguous()
@@ -1909,14 +1909,14 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         (far_mask & (~sdf_mask) & (~surface_views_mask) &
          (~near_camera_mask))
             .to(torch::kBool);
-    monocular_covisibility_mask =
-        (monocular_covisibility_mask & (~sdf_mask) &
-         (~surface_views_mask) & (~near_camera_mask) & (~far_mask))
+    mvs_free_space_mask =
+        (mvs_free_space_mask & (~sdf_mask) & (~surface_views_mask) &
+         (~near_camera_mask) & (~far_mask))
             .to(torch::kBool);
     final_refinement_mask =
         (final_refinement_mask & (~sdf_mask) & (~surface_views_mask) &
          (~near_camera_mask) & (~far_mask) &
-         (~monocular_covisibility_mask))
+         (~mvs_free_space_mask))
             .to(torch::kBool);
 
     torch::Tensor grid_origin;
@@ -2036,12 +2036,12 @@ void VoxelMapper::appendWholeRunPrunedVoxels(
         rerun_state_.whole_run_pruned_far_colors_accum_,
         "world/pruned_voxels/source/far");
     append_source(
-        monocular_covisibility_mask,
-        rerun_state_.whole_run_pruned_monocular_covis_centers_accum_,
-        rerun_state_.whole_run_pruned_monocular_covis_sizes_accum_,
-        rerun_state_.whole_run_pruned_monocular_covis_levels_accum_,
-        rerun_state_.whole_run_pruned_monocular_covis_colors_accum_,
-        "world/pruned_voxels/source/monocular_covisibility");
+        mvs_free_space_mask,
+        rerun_state_.whole_run_pruned_mvs_free_space_centers_accum_,
+        rerun_state_.whole_run_pruned_mvs_free_space_sizes_accum_,
+        rerun_state_.whole_run_pruned_mvs_free_space_levels_accum_,
+        rerun_state_.whole_run_pruned_mvs_free_space_colors_accum_,
+        "world/pruned_voxels/source/mvs_free_space");
     append_source(
         final_refinement_mask,
         rerun_state_.whole_run_pruned_final_refinement_centers_accum_,

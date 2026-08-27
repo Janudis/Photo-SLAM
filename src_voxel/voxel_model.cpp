@@ -832,85 +832,6 @@ torch::Tensor VoxelModel::activeRenderableMask() const
     return torch::ones({N}, opts);
 }
 
-void VoxelModel::accumulateMonocularRenderObservation(
-    const torch::Tensor& max_render_weight,
-    const float min_render_weight)
-{
-    // Accumulates co-visibility opportunities and renderer-weight support for
-    // provisional monocular cells. This is a Photo-SLAM integration extension.
-    const int64_t N = center_.defined() ? center_.size(0) : 0;
-    if (N <= 0) {
-        return;
-    }
-
-    auto bool_opts =
-        torch::TensorOptions().dtype(torch::kBool).device(device_type_);
-    auto i32_opts =
-        torch::TensorOptions().dtype(torch::kInt32).device(device_type_);
-    if (!is_monocular_provisional_voxel_.defined() ||
-        is_monocular_provisional_voxel_.size(0) != N) {
-        is_monocular_provisional_voxel_ = torch::zeros({N}, bool_opts);
-    }
-    if (!monocular_render_support_hits_.defined() ||
-        monocular_render_support_hits_.size(0) != N) {
-        monocular_render_support_hits_ = torch::zeros({N}, i32_opts);
-    }
-    if (!monocular_render_opportunities_.defined() ||
-        monocular_render_opportunities_.size(0) != N) {
-        monocular_render_opportunities_ = torch::zeros({N}, i32_opts);
-    }
-
-    torch::Tensor weight = max_render_weight;
-    TORCH_CHECK(
-        weight.defined() && weight.numel() == N,
-        "accumulateMonocularRenderObservation: max weight must contain one value per voxel");
-    weight =
-        weight.to(device_type_).to(torch::kFloat32).reshape({N}).contiguous();
-    torch::Tensor provisional =
-        is_monocular_provisional_voxel_.to(device_type_)
-            .to(torch::kBool)
-            .contiguous();
-    torch::Tensor supported =
-        provisional & (weight > min_render_weight);
-
-    torch::NoGradGuard no_grad;
-    monocular_render_opportunities_ =
-        (monocular_render_opportunities_.to(device_type_).to(torch::kInt32) +
-         provisional.to(torch::kInt32))
-            .contiguous();
-    monocular_render_support_hits_ =
-        (monocular_render_support_hits_.to(device_type_).to(torch::kInt32) +
-         supported.to(torch::kInt32))
-            .contiguous();
-}
-
-void VoxelModel::resolveMonocularProvisionalVoxels(
-    const torch::Tensor& resolved_mask)
-{
-    // Removes accepted or rejected cells from the provisional state after the
-    // mapper has applied its co-visibility decision.
-    const int64_t N = center_.defined() ? center_.size(0) : 0;
-    if (N <= 0 || !resolved_mask.defined()) {
-        return;
-    }
-    TORCH_CHECK(
-        resolved_mask.numel() == N,
-        "resolveMonocularProvisionalVoxels: mask length mismatch");
-    auto bool_opts =
-        torch::TensorOptions().dtype(torch::kBool).device(device_type_);
-    if (!is_monocular_provisional_voxel_.defined() ||
-        is_monocular_provisional_voxel_.size(0) != N) {
-        is_monocular_provisional_voxel_ = torch::zeros({N}, bool_opts);
-        return;
-    }
-
-    torch::NoGradGuard no_grad;
-    is_monocular_provisional_voxel_ =
-        (is_monocular_provisional_voxel_.to(device_type_).to(torch::kBool) &
-         (~resolved_mask.to(device_type_).to(torch::kBool).reshape({N})))
-            .contiguous();
-}
-
 int VoxelModel::maxNumLevels() const {
     return max_num_levels_;
 }
@@ -2428,15 +2349,6 @@ void VoxelModel::createFromPcd(
     this->is_monocular_omnidata_voxel_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kBool).device(dev));
-    this->is_monocular_provisional_voxel_ = torch::zeros(
-        {center_.size(0)},
-        torch::TensorOptions().dtype(torch::kBool).device(dev));
-    this->monocular_render_support_hits_ = torch::zeros(
-        {center_.size(0)},
-        torch::TensorOptions().dtype(torch::kInt32).device(dev));
-    this->monocular_render_opportunities_ = torch::zeros(
-        {center_.size(0)},
-        torch::TensorOptions().dtype(torch::kInt32).device(dev));
     this->exist_since_iter_ = torch::zeros(
         {center_.size(0)},
         torch::TensorOptions().dtype(torch::kInt32).device(dev));
@@ -2550,7 +2462,9 @@ void VoxelModel::increasePcd(
         pending_real_insert_rr_entity_path_ == "world/rgbd_tsdf_evidence/promoted";
     const bool add_as_monocular_rendered_depth =
         pending_real_insert_rr_entity_path_ ==
-        "world/monocular_rendered_depth/created";
+            "world/monocular_rendered_depth/created" ||
+        pending_real_insert_rr_entity_path_ ==
+            "world/monocular_rendered_depth_evidence/promoted";
     const bool add_as_monocular_mvs =
         pending_real_insert_rr_entity_path_ ==
         "world/monocular_mvs/created";
@@ -2955,33 +2869,6 @@ void VoxelModel::increasePcd(
             is_monocular_omnidata_voxel_ =
                 is_monocular_omnidata_voxel_.to(octpath_old.device());
         }
-        if (!is_monocular_provisional_voxel_.defined() ||
-            is_monocular_provisional_voxel_.size(0) != octpath_old.size(0)) {
-            is_monocular_provisional_voxel_ =
-                torch::zeros({octpath_old.size(0)}, bool_opts);
-        } else if (is_monocular_provisional_voxel_.device() !=
-                   octpath_old.device()) {
-            is_monocular_provisional_voxel_ =
-                is_monocular_provisional_voxel_.to(octpath_old.device());
-        }
-        if (!monocular_render_support_hits_.defined() ||
-            monocular_render_support_hits_.size(0) != octpath_old.size(0)) {
-            monocular_render_support_hits_ =
-                torch::zeros({octpath_old.size(0)}, i32_opts);
-        } else if (monocular_render_support_hits_.device() !=
-                   octpath_old.device()) {
-            monocular_render_support_hits_ =
-                monocular_render_support_hits_.to(octpath_old.device());
-        }
-        if (!monocular_render_opportunities_.defined() ||
-            monocular_render_opportunities_.size(0) != octpath_old.size(0)) {
-            monocular_render_opportunities_ =
-                torch::zeros({octpath_old.size(0)}, i32_opts);
-        } else if (monocular_render_opportunities_.device() !=
-                   octpath_old.device()) {
-            monocular_render_opportunities_ =
-                monocular_render_opportunities_.to(octpath_old.device());
-        }
         if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != octpath_old.size(0)) {
             exist_since_iter_ = torch::zeros({octpath_old.size(0)}, i32_opts);
         } else if (exist_since_iter_.device() != octpath_old.device()) {
@@ -3003,10 +2890,6 @@ void VoxelModel::increasePcd(
                 torch::full({Nk}, add_as_monocular_mvs, bool_opts);
             auto monocular_omnidata_add_flag =
                 torch::full({Nk}, add_as_monocular_omnidata, bool_opts);
-            auto monocular_provisional_add_flag =
-                torch::full({Nk}, add_as_monocular_rendered_depth, bool_opts);
-            auto monocular_counter_add =
-                torch::zeros({Nk}, i32_opts);
             auto exist_since_add = torch::full(
                 {Nk}, static_cast<int32_t>(iteration), i32_opts);
             auto exist_since_kf_add = torch::full(
@@ -3030,22 +2913,6 @@ void VoxelModel::increasePcd(
                 torch::cat(
                     {is_monocular_omnidata_voxel_,
                      monocular_omnidata_add_flag},
-                    0)
-                    .contiguous();
-            is_monocular_provisional_voxel_ =
-                torch::cat(
-                    {is_monocular_provisional_voxel_,
-                     monocular_provisional_add_flag},
-                    0)
-                    .contiguous();
-            monocular_render_support_hits_ =
-                torch::cat(
-                    {monocular_render_support_hits_, monocular_counter_add},
-                    0)
-                    .contiguous();
-            monocular_render_opportunities_ =
-                torch::cat(
-                    {monocular_render_opportunities_, monocular_counter_add},
                     0)
                     .contiguous();
             exist_since_iter_ = torch::cat({exist_since_iter_, exist_since_add}, 0).contiguous();
@@ -3231,34 +3098,9 @@ void VoxelModel::increasePcd(
         }
         metadata = aligned.contiguous();
     };
-    auto align_i32_metadata = [&](torch::Tensor& metadata) {
-        if (metadata.defined() && metadata.size(0) == center_.size(0)) {
-            metadata =
-                metadata.to(dev).to(torch::kInt32).contiguous();
-            return;
-        }
-        auto i32_opts =
-            torch::TensorOptions().dtype(torch::kInt32).device(dev);
-        auto aligned = torch::zeros({center_.size(0)}, i32_opts);
-        if (metadata.defined() && metadata.numel() > 0) {
-            auto old =
-                metadata.to(dev).to(torch::kInt32).reshape({-1}).contiguous();
-            const int64_t copy_n =
-                std::min<int64_t>(old.size(0), aligned.size(0));
-            if (copy_n > 0) {
-                aligned.index_put_(
-                    {torch::indexing::Slice(0, copy_n)},
-                    old.index({torch::indexing::Slice(0, copy_n)}));
-            }
-        }
-        metadata = aligned.contiguous();
-    };
     align_bool_metadata(is_monocular_rendered_depth_voxel_);
     align_bool_metadata(is_monocular_mvs_voxel_);
     align_bool_metadata(is_monocular_omnidata_voxel_);
-    align_bool_metadata(is_monocular_provisional_voxel_);
-    align_i32_metadata(monocular_render_support_hits_);
-    align_i32_metadata(monocular_render_opportunities_);
     // Keep exist_since_iter tensor aligned with current topology size.
     if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != center_.size(0)) {
         auto i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(dev);
@@ -3504,6 +3346,59 @@ VoxelModel::computeTrainingStat(const std::vector<MiniCam>& cams) {
     return { this->max_w_.contiguous(), min_samp_interval.contiguous(), view_cnt.contiguous() };
 }
 
+torch::Tensor VoxelModel::computeOcclusionAwareViewCount(
+    const std::vector<MiniCam>& cams)
+{
+    // MonoGS co-visibility counts a primitive only while post-compositing
+    // transmittance remains above 0.5. The rasterizer reports that event once
+    // per voxel and camera; this method accumulates it over the active window.
+    freezeVoxGeo();
+
+    const int64_t voxel_count = center_.size(0);
+    auto opts = torch::TensorOptions()
+                    .dtype(torch::kFloat32)
+                    .device(device_type_);
+    torch::Tensor view_count = torch::zeros({voxel_count, 1}, opts);
+
+    try {
+        torch::NoGradGuard no_grad;
+        RenderOpts render_opts;
+        render_opts.track_occlusion_visibility = true;
+        for (const auto& cam : cams) {
+            auto pkg = render(
+                cam,
+                cam.height,
+                cam.width,
+                torch::Tensor(),
+                "dontcare",
+                false,
+                std::nullopt,
+                false,
+                false,
+                false,
+                false,
+                false,
+                render_opts);
+            auto visibility_it = pkg.find("occlusion_visible");
+            if (visibility_it == pkg.end() ||
+                !visibility_it->second.defined() ||
+                visibility_it->second.numel() != voxel_count) {
+                continue;
+            }
+            view_count += visibility_it->second
+                              .to(device_type_)
+                              .to(torch::kFloat32)
+                              .reshape({voxel_count, 1});
+        }
+    } catch (...) {
+        unfreezeVoxGeo();
+        throw;
+    }
+
+    unfreezeVoxGeo();
+    return view_count.contiguous();
+}
+
 void VoxelModel::optimizerZeroGrad() {
     // Clears gradients for the parameter groups used by the SVRecon renderer.
     // SVRecon reference: the optimizer zero_grad step in train.py.
@@ -3606,16 +3501,6 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     ensure_bool(is_monocular_rendered_depth_voxel_);
     ensure_bool(is_monocular_mvs_voxel_);
     ensure_bool(is_monocular_omnidata_voxel_);
-    ensure_bool(is_monocular_provisional_voxel_);
-    auto ensure_i32 = [&](torch::Tensor& t) {
-        if (!t.defined() || t.size(0) != N_before) {
-            t = torch::zeros({N_before}, i32_opts);
-        } else if (t.device() != mask.device()) {
-            t = t.to(mask.device());
-        }
-    };
-    ensure_i32(monocular_render_support_hits_);
-    ensure_i32(monocular_render_opportunities_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
@@ -3716,14 +3601,6 @@ void VoxelModel::pruning(const torch::Tensor& prune_mask) {
     remap_bool(is_monocular_rendered_depth_voxel_);
     remap_bool(is_monocular_mvs_voxel_);
     remap_bool(is_monocular_omnidata_voxel_);
-    remap_bool(is_monocular_provisional_voxel_);
-    auto remap_i32 = [&](torch::Tensor& t) {
-        t = t.to(mask.device()).to(torch::kInt32)
-                .index_select(0, kept_idx.to(mask.device()))
-                .contiguous();
-    };
-    remap_i32(monocular_render_support_hits_);
-    remap_i32(monocular_render_opportunities_);
     is_leaf_ = is_leaf_.index_select(0, kept_idx.to(is_leaf_.device())).contiguous();
     exist_since_iter_ =
         exist_since_iter_.to(mask.device()).to(torch::kInt32)
@@ -3760,26 +3637,12 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     ensure_bool(is_monocular_rendered_depth_voxel_);
     ensure_bool(is_monocular_mvs_voxel_);
     ensure_bool(is_monocular_omnidata_voxel_);
-    ensure_bool(is_monocular_provisional_voxel_);
-    auto ensure_i32 = [&](torch::Tensor& t) {
-        if (!t.defined() || t.size(0) != N_before) {
-            t = torch::zeros({N_before}, i32_opts);
-        } else if (t.device() != mask.device()) {
-            t = t.to(mask.device());
-        }
-    };
-    ensure_i32(monocular_render_support_hits_);
-    ensure_i32(monocular_render_opportunities_);
     if (!is_leaf_.defined() || is_leaf_.size(0) != N_before) {
         is_leaf_ = torch::ones({N_before, 1}, bool_opts);
     } else {
         is_leaf_ = is_leaf_.to(mask.device()).to(torch::kBool).reshape({N_before, 1});
     }
-    // Provisional monocular cells must first pass the MonoGS-style
-    // co-visibility gate. Subdivision would otherwise make their children
-    // indistinguishable from validated surface cells.
-    mask = mask & is_leaf_.view({-1}) &
-           (~is_monocular_provisional_voxel_.view({-1}));
+    mask = mask & is_leaf_.view({-1});
     if (!exist_since_iter_.defined() || exist_since_iter_.size(0) != N_before) {
         exist_since_iter_ = torch::zeros({N_before}, i32_opts);
     } else if (exist_since_iter_.device() != mask.device()) {
@@ -3790,10 +3653,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     } else if (exist_since_kf_.device() != mask.device()) {
         exist_since_kf_ = exist_since_kf_.to(mask.device());
     }
-    auto monocular_render_support_before =
-        monocular_render_support_hits_.to(torch::kInt32).contiguous();
-    auto monocular_render_opportunities_before =
-        monocular_render_opportunities_.to(torch::kInt32).contiguous();
     auto exist_since_before = exist_since_iter_.to(torch::kInt32).contiguous();
     auto exist_since_kf_before = exist_since_kf_.to(torch::kInt32).contiguous();
 
@@ -3953,30 +3812,6 @@ void VoxelModel::subdividing(const torch::Tensor& subdivide_mask) {
     remap_child_bool(is_monocular_rendered_depth_voxel_);
     remap_child_bool(is_monocular_mvs_voxel_);
     remap_child_bool(is_monocular_omnidata_voxel_);
-    remap_child_bool(is_monocular_provisional_voxel_);
-
-    auto remap_child_i32 = [&](torch::Tensor& t,
-                               const torch::Tensor& before) {
-        auto kept =
-            before.to(mask.device()).to(torch::kInt32)
-                .index_select(0, kept_idx.to(mask.device()))
-                .contiguous();
-        auto child =
-            before.to(mask.device()).to(torch::kInt32)
-                .index_select(0, subdiv_idx.to(mask.device()))
-                .repeat_interleave(8, 0)
-                .contiguous();
-        t = torch::cat({kept, child}, 0)
-                .to(device_type_)
-                .to(torch::kInt32)
-                .contiguous();
-    };
-    remap_child_i32(
-        monocular_render_support_hits_,
-        monocular_render_support_before);
-    remap_child_i32(
-        monocular_render_opportunities_,
-        monocular_render_opportunities_before);
 
     auto kept_exist_iter =
         exist_since_before.to(mask.device()).index_select(0, kept_idx.to(mask.device())).contiguous();

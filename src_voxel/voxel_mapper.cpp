@@ -299,14 +299,21 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
     break;
     }
 
+    if (opt_params_.prune_mvs_consistency_enable_ &&
+        (sensor_type_ != MONOCULAR || !isMonocularMvsPipelineEnabled())) {
+        throw std::runtime_error(
+            "Optimization.prune_mvs_consistency_enable requires a "
+            "monocular TANDEM MVS densification or TSDF-evidence pipeline");
+    }
+
     if (sensor_type_ == MONOCULAR) {
         std::cout
             << "[VoxelMapper] Monocular map flow: ORB-controlled poses and "
                "mature ORB MapPoints as weak SVRecon sampling support";
         if (monocular_rendered_depth_densify_) {
             std::cout
-                << "; local rendered-depth candidates with Orbeez weight "
-                   "support and MonoGS co-visibility validation";
+                << "; local rendered-depth hypotheses update hidden SDF "
+                   "evidence before multi-view promotion";
         }
         if (monocular_mvs_tsdf_evidence_) {
             std::cout
@@ -484,6 +491,18 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
                 << monocular_mvs_tsdf_evidence_promote_min_views_
                 << ".\n";
         }
+        if (opt_params_.prune_mvs_consistency_enable_) {
+            std::cout
+                << "[VoxelMapper] TANDEM MVS pruning: protect supported "
+                   "SDF/co-visibility candidates and carve multi-view "
+                   "free space; support views="
+                << opt_params_.prune_mvs_min_supporting_views_
+                << ", contradiction views="
+                << opt_params_.prune_mvs_min_contradicting_views_
+                << ", tolerance="
+                << opt_params_.prune_mvs_depth_tolerance_vox_
+                << " voxels.\n";
+        }
     }
 
     if (monocular_omnidata_densify_) {
@@ -618,27 +637,42 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             settings_file["Mapper.monocular_rendered_depth_pixel_stride"]
                 .operator int());
     }
-    if (!settings_file["Mapper.monocular_rendered_depth_window_size"].empty()) {
-        monocular_rendered_depth_window_size_ = std::max(
-            1,
-            settings_file["Mapper.monocular_rendered_depth_window_size"]
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_samples"].empty()) {
+        monocular_rendered_depth_evidence_samples_ = std::max(
+            2,
+            settings_file["Mapper.monocular_rendered_depth_evidence_samples"]
                 .operator int());
     }
-    if (!settings_file["Mapper.monocular_rendered_depth_min_views"].empty()) {
-        monocular_rendered_depth_min_views_ = std::max(
-            1,
-            settings_file["Mapper.monocular_rendered_depth_min_views"]
-                .operator int());
-    }
-    if (!settings_file["Mapper.monocular_rendered_depth_min_weight"].empty()) {
-        monocular_rendered_depth_min_weight_ = std::max(
-            0.0f,
-            settings_file["Mapper.monocular_rendered_depth_min_weight"]
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_trunc_vox"].empty()) {
+        monocular_rendered_depth_evidence_trunc_vox_ = std::max(
+            0.25f,
+            settings_file["Mapper.monocular_rendered_depth_evidence_trunc_vox"]
                 .operator float());
     }
-    monocular_rendered_depth_min_views_ = std::min(
-        monocular_rendered_depth_min_views_,
-        monocular_rendered_depth_window_size_);
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_max_weight"].empty()) {
+        monocular_rendered_depth_evidence_max_weight_ = std::max(
+            1.0f,
+            settings_file["Mapper.monocular_rendered_depth_evidence_max_weight"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_promote_min_views"].empty()) {
+        monocular_rendered_depth_evidence_promote_min_views_ = std::max(
+            2,
+            settings_file["Mapper.monocular_rendered_depth_evidence_promote_min_views"]
+                .operator int());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_promote_min_weight"].empty()) {
+        monocular_rendered_depth_evidence_promote_min_weight_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_rendered_depth_evidence_promote_min_weight"]
+                .operator float());
+    }
+    if (!settings_file["Mapper.monocular_rendered_depth_evidence_min_baseline_ratio"].empty()) {
+        monocular_rendered_depth_evidence_min_baseline_ratio_ = std::max(
+            0.0f,
+            settings_file["Mapper.monocular_rendered_depth_evidence_min_baseline_ratio"]
+                .operator float());
+    }
     if (!settings_file["Mapper.monocular_mvs_densify"].empty()) {
         monocular_mvs_densify_ =
             (settings_file["Mapper.monocular_mvs_densify"].operator int()) != 0;
@@ -1058,8 +1092,37 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     }
     if (!settings_file["Optimization.surface_min_views"].empty()) {
         opt_params_.surface_min_views_ = std::max(
-            1,
+            4,
             settings_file["Optimization.surface_min_views"].operator int());
+    }
+    if (!settings_file["Optimization.surface_view_window_size"].empty()) {
+        opt_params_.surface_view_window_size_ = std::max(
+            opt_params_.surface_min_views_,
+            settings_file["Optimization.surface_view_window_size"]
+                .operator int());
+    }
+    if (!settings_file["Optimization.prune_mvs_consistency_enable"].empty()) {
+        opt_params_.prune_mvs_consistency_enable_ =
+            settings_file["Optimization.prune_mvs_consistency_enable"]
+                .operator int() != 0;
+    }
+    if (!settings_file["Optimization.prune_mvs_min_supporting_views"].empty()) {
+        opt_params_.prune_mvs_min_supporting_views_ = std::max(
+            1,
+            settings_file["Optimization.prune_mvs_min_supporting_views"]
+                .operator int());
+    }
+    if (!settings_file["Optimization.prune_mvs_min_contradicting_views"].empty()) {
+        opt_params_.prune_mvs_min_contradicting_views_ = std::max(
+            1,
+            settings_file["Optimization.prune_mvs_min_contradicting_views"]
+                .operator int());
+    }
+    if (!settings_file["Optimization.prune_mvs_depth_tolerance_vox"].empty()) {
+        opt_params_.prune_mvs_depth_tolerance_vox_ = std::max(
+            0.0f,
+            settings_file["Optimization.prune_mvs_depth_tolerance_vox"]
+                .operator float());
     }
     if (!settings_file["Optimization.final_refinement_enable"].empty()) {
         opt_params_.final_refinement_enable_ =
@@ -1531,7 +1594,7 @@ std::string VoxelMapper::laptopPrecheckPipeline() const
         modules.emplace_back("rgbd_tsdf_evidence");
     }
     if (monocular_rendered_depth_densify_) {
-        modules.emplace_back("rendered_depth_densify");
+        modules.emplace_back("rendered_depth_evidence");
     }
     if (isMonocularMvsPipelineEnabled()) {
         modules.emplace_back(
@@ -1839,6 +1902,16 @@ void VoxelMapper::run()
                     rerun_params_.rerun_svrecon_debug_;
                 rerun_state_.whole_run_live_voxels_dirty_ = false;
             }
+            if (opt_params_.prune_surface_views_enable_) {
+                std::vector<std::shared_ptr<VoxelKeyframe>> initial_keyframes;
+                initial_keyframes.reserve(scene_->keyframes().size());
+                for (const auto& item : scene_->keyframes()) {
+                    if (item.second) {
+                        initial_keyframes.push_back(item.second);
+                    }
+                }
+                markSurfaceViewPruningPending(initial_keyframes);
+            }
             // One warm-up optimization step
             trainForOneIteration();
 
@@ -1933,7 +2006,6 @@ void VoxelMapper::run()
     }
     tail_refinement_active_ = prev_tail_refinement_active;
 
-    validateMonocularRenderedDepthVoxels(/*final_pass=*/true);
     runFinalRefinement();
 
     const double mapping_seconds =
@@ -2440,6 +2512,8 @@ void VoxelMapper::trainForOneIteration()
         voxel_model_->optimizerStep();
     }
 
+    runPendingSurfaceViewPruning();
+
     // This is a live diagnostic of the learned SDF, independent of the pruning
     // schedule. Recompute it after every optimizer step so its Rerun timeline
     // shows cells entering and leaving the current SVRecon prune set.
@@ -2530,9 +2604,13 @@ void VoxelMapper::trainForOneIteration()
                 torch::Tensor observed_layout_mask; // [N] bool, voxels observed by the pruning camera set
                 torch::Tensor prune_mask_near; // [N] bool, near-camera prune (unprotected)
                 torch::Tensor prune_mask_far; // [N] bool, outside dense-core bound prune
-                torch::Tensor prune_mask_surface_views; // [N] bool, unsupported learned-SDF crossings
-                torch::Tensor prune_mask_surface_views_extra; // [N] bool, newly selected by view confidence
+                torch::Tensor prune_mask_mvs_supported; // [N] bool, MVS-confirmed surface cells
+                torch::Tensor prune_mask_mvs_protected; // [N] bool, soft candidates preserved by MVS
+                torch::Tensor prune_mask_mvs_free_space; // [N] bool, multi-view free-space contradictions
+                torch::Tensor prune_mask_mvs_free_space_extra; // [N] bool, new MVS candidates
                 torch::Tensor prune_mask_default;         // [N] bool, default rules only
+                int64_t mvs_prune_depth_keyframes = 0;
+                int64_t mvs_prune_valid_projections = 0;
 
                 torch::Device prune_device = mDevice;
                 torch::Tensor centers_for_device = voxel_model_->voxCenter();
@@ -2889,27 +2967,93 @@ void VoxelMapper::trainForOneIteration()
                             .contiguous();
                 }
 
-                // MonoGS-style co-visibility pruning reuses the renderer statistics
-                // already computed for this adaptation step.
-                if (opt_params_.prune_surface_views_enable_ && N > 0) {
-                    torch::Tensor surface_prune =
-                        computeOnlineCovisibilityPruneMask(
-                            tr_cams,
-                            stat.view_cnt);
-                    if (surface_prune.defined() && surface_prune.numel() == N) {
-                        prune_mask_surface_views =
-                            surface_prune.to(prune_mask.device()).to(torch::kBool)
-                                .contiguous();
-                        prune_mask_surface_views_extra =
-                            (prune_mask_surface_views &
-                             (~prune_mask.to(torch::kBool)))
-                                .contiguous();
-                        prune_mask =
-                            (prune_mask.to(torch::kBool) |
-                             prune_mask_surface_views)
-                                .to(torch::kBool);
-                    } else {
-                        std::cerr << "[PRUNE/surface_views] skipped: confidence mask shape mismatch\n";
+                if (opt_params_.prune_mvs_consistency_enable_ &&
+                    sensor_type_ == MONOCULAR && N > 0) {
+                    auto mvs_pruning_profile =
+                        profileLaptopModule("mvs_pruning_consistency");
+                    try {
+                        const torch::Tensor centers_world =
+                            voxel_model_->voxCenter();
+                        const torch::Tensor sizes_world =
+                            voxel_model_->voxSize();
+                        sv::MonocularMvsPruneEvidence mvs_evidence =
+                            computeMonocularMvsPruneEvidence(
+                                centers_world, sizes_world);
+                        if (mvs_evidence.supported.defined() &&
+                            mvs_evidence.free_space.defined() &&
+                            mvs_evidence.supported.numel() == N &&
+                            mvs_evidence.free_space.numel() == N) {
+                            prune_mask_mvs_supported =
+                                mvs_evidence.supported
+                                    .to(prune_mask.device())
+                                    .to(torch::kBool)
+                                    .contiguous();
+                            prune_mask_mvs_free_space =
+                                mvs_evidence.free_space
+                                    .to(prune_mask.device())
+                                    .to(torch::kBool)
+                                    .contiguous();
+                            mvs_prune_depth_keyframes =
+                                mvs_evidence.depth_keyframes;
+                            mvs_prune_valid_projections =
+                                mvs_evidence.valid_projections;
+
+                            auto zero_mask = torch::zeros_like(
+                                prune_mask.to(torch::kBool));
+                            torch::Tensor soft_candidates = zero_mask.clone();
+                            if (sdf_prune_mask.defined() &&
+                                sdf_prune_mask.numel() == N) {
+                                soft_candidates =
+                                    soft_candidates |
+                                    sdf_prune_mask.to(prune_mask.device())
+                                        .to(torch::kBool);
+                            }
+                            torch::Tensor hard_candidates =
+                                prune_mask_base.to(prune_mask.device())
+                                    .to(torch::kBool)
+                                    .clone();
+                            if (prune_mask_near.defined() &&
+                                prune_mask_near.numel() == N) {
+                                hard_candidates =
+                                    hard_candidates |
+                                    prune_mask_near.to(prune_mask.device())
+                                        .to(torch::kBool);
+                            }
+                            if (prune_mask_far.defined() &&
+                                prune_mask_far.numel() == N) {
+                                hard_candidates =
+                                    hard_candidates |
+                                    prune_mask_far.to(prune_mask.device())
+                                        .to(torch::kBool);
+                            }
+
+                            const torch::Tensor pre_mvs_prune =
+                                prune_mask.to(torch::kBool).clone();
+                            prune_mask_mvs_protected =
+                                (soft_candidates & prune_mask_mvs_supported &
+                                 (~hard_candidates))
+                                    .to(torch::kBool)
+                                    .contiguous();
+                            prune_mask_mvs_free_space_extra =
+                                (prune_mask_mvs_free_space &
+                                 (~pre_mvs_prune))
+                                    .to(torch::kBool)
+                                    .contiguous();
+
+                            // Near/far are hard geometric filters. MVS support
+                            // can protect learned-SDF candidates; independently
+                            // confirmed free space contributes new candidates.
+                            prune_mask =
+                                (hard_candidates |
+                                 (soft_candidates &
+                                  (~prune_mask_mvs_supported)) |
+                                 prune_mask_mvs_free_space)
+                                    .to(torch::kBool)
+                                    .contiguous();
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr
+                            << "[PRUNE/mvs] skipped: " << e.what() << "\n";
                     }
                 }
 
@@ -2920,21 +3064,6 @@ void VoxelMapper::trainForOneIteration()
                     prune_mask = prune_mask.to(torch::kBool) &
                                  leaf_mask.to(prune_mask.device())
                                      .to(torch::kBool).reshape({-1});
-                }
-                if (sensor_type_ == MONOCULAR &&
-                    monocular_rendered_depth_densify_) {
-                    torch::Tensor provisional =
-                        voxel_model_->monocularProvisionalVoxelMask();
-                    if (provisional.defined() &&
-                        provisional.numel() == N) {
-                        // The source-specific eight-keyframe co-visibility
-                        // gate owns these cells until it resolves them.
-                        prune_mask =
-                            prune_mask.to(torch::kBool) &
-                            (~provisional.to(prune_mask.device())
-                                  .to(torch::kBool)
-                                  .reshape({-1}));
-                    }
                 }
                 // 4) Use the accumulated SVRecon pruning mask.
                 prune_mask_default = prune_mask.to(torch::kBool);
@@ -2996,19 +3125,32 @@ void VoxelMapper::trainForOneIteration()
                     count_pruned_by_mask(prune_mask_near);
                 const int64_t n_prune_stats_far =
                     count_pruned_by_mask(prune_mask_far);
-                const int64_t n_prune_stats_surface_views =
-                    count_pruned_by_mask(prune_mask_surface_views);
-                const int64_t n_prune_stats_surface_views_extra =
-                    count_pruned_by_mask(prune_mask_surface_views_extra);
+                const int64_t n_mvs_supported =
+                    prune_mask_mvs_supported.defined()
+                        ? prune_mask_mvs_supported.sum().item<int64_t>()
+                        : 0;
+                const int64_t n_mvs_protected =
+                    prune_mask_mvs_protected.defined()
+                        ? prune_mask_mvs_protected.sum().item<int64_t>()
+                        : 0;
+                const int64_t n_prune_stats_mvs_free_space =
+                    count_pruned_by_mask(prune_mask_mvs_free_space);
+                const int64_t n_prune_stats_mvs_free_space_extra =
+                    count_pruned_by_mask(prune_mask_mvs_free_space_extra);
                 std::cout << "[PRUNE/stats] iter=" << iter
                           << " total=" << n_prune_total_selected
                           << " sdf=" << n_prune_stats_tsdf
-                          << " surface_views_extra=" << n_prune_stats_surface_views_extra
+                          << " mvs_depth_keyframes=" << mvs_prune_depth_keyframes
+                          << " mvs_valid_projections=" << mvs_prune_valid_projections
+                          << " mvs_supported=" << n_mvs_supported
+                          << " mvs_protected=" << n_mvs_protected
+                          << " mvs_free_space_extra="
+                          << n_prune_stats_mvs_free_space_extra
+                          << " mvs_free_space_pruned="
+                          << n_prune_stats_mvs_free_space
                           << " diagnostic_overlap_visibility=" << n_prune_stats_visibility
                           << " near_camera=" << n_prune_stats_near
                           << " far=" << n_prune_stats_far
-                          << " diagnostic_overlap_surface_views="
-                          << n_prune_stats_surface_views
                           << "\n";
 
                 if (prune_mask.defined() && prune_mask.numel() == N) {
@@ -3060,59 +3202,61 @@ void VoxelMapper::trainForOneIteration()
                                         .index_select(0, prune_idx.to(torch::kLong))
                                         .contiguous();
                             }
-	                            torch::Tensor whole_run_pruned_by_surface_views;
-                            if (prune_mask_surface_views_extra.defined() &&
-                                prune_mask_surface_views_extra.numel() == N) {
-                                whole_run_pruned_by_surface_views =
-                                    prune_mask_surface_views_extra
+                            torch::Tensor whole_run_pruned_by_near;
+                            if (prune_mask_near.defined() &&
+                                prune_mask_near.numel() == N) {
+                                whole_run_pruned_by_near =
+                                    prune_mask_near
                                         .to(prune_idx.device())
                                         .to(torch::kBool)
                                         .contiguous()
-	                                        .index_select(0, prune_idx.to(torch::kLong))
-	                                        .contiguous();
-	                            }
-                                torch::Tensor whole_run_pruned_by_near;
-                                if (prune_mask_near.defined() &&
-                                    prune_mask_near.numel() == N) {
-                                    whole_run_pruned_by_near =
-                                        prune_mask_near
-                                            .to(prune_idx.device())
-                                            .to(torch::kBool)
-                                            .contiguous()
-                                            .index_select(
-                                                0,
-                                                prune_idx.to(torch::kLong))
-                                            .contiguous();
-                                }
-                                torch::Tensor whole_run_pruned_by_far;
-                                if (prune_mask_far.defined() &&
-                                    prune_mask_far.numel() == N) {
-                                    whole_run_pruned_by_far =
-                                        prune_mask_far
-                                            .to(prune_idx.device())
-                                            .to(torch::kBool)
-                                            .contiguous()
-                                            .index_select(
-                                                0,
-                                                prune_idx.to(torch::kLong))
-                                            .contiguous();
-                                }
-	                            appendWholeRunPrunedVoxels(
-	                                iter,
-	                                pruned_centers,
-	                                pruned_sizes,
-	                                pruned_levels,
-	                                    pruned_colors,
-	                                whole_run_pruned_by_tsdf,
-	                                whole_run_pruned_by_surface_views,
-                                    whole_run_pruned_by_near,
-                                    whole_run_pruned_by_far);
+                                        .index_select(
+                                            0,
+                                            prune_idx.to(torch::kLong))
+                                        .contiguous();
+                            }
+                            torch::Tensor whole_run_pruned_by_far;
+                            if (prune_mask_far.defined() &&
+                                prune_mask_far.numel() == N) {
+                                whole_run_pruned_by_far =
+                                    prune_mask_far
+                                        .to(prune_idx.device())
+                                        .to(torch::kBool)
+                                        .contiguous()
+                                        .index_select(
+                                            0,
+                                            prune_idx.to(torch::kLong))
+                                        .contiguous();
+                            }
+                            torch::Tensor whole_run_pruned_by_mvs_free_space;
+                            if (prune_mask_mvs_free_space.defined() &&
+                                prune_mask_mvs_free_space.numel() == N) {
+                                whole_run_pruned_by_mvs_free_space =
+                                    prune_mask_mvs_free_space
+                                        .to(prune_idx.device())
+                                        .to(torch::kBool)
+                                        .contiguous()
+                                        .index_select(
+                                            0,
+                                            prune_idx.to(torch::kLong))
+                                        .contiguous();
+                            }
+                            appendWholeRunPrunedVoxels(
+                                iter,
+                                pruned_centers,
+                                pruned_sizes,
+                                pruned_levels,
+                                pruned_colors,
+                                whole_run_pruned_by_tsdf,
+                                torch::Tensor(),
+                                whole_run_pruned_by_near,
+                                whole_run_pruned_by_far,
+                                whole_run_pruned_by_mvs_free_space);
+                        }
+                    }
+                }
 
-	                        }
-	                    }
-	                }
-
-	                voxel_model_->pruning(prune_mask);
+                voxel_model_->pruning(prune_mask);
                 if (rerun_params_.run_whole_run_ ||
                     rerun_params_.rerun_svrecon_debug_) {
                     rerun_state_.whole_run_live_voxels_dirty_ = true;
@@ -3209,20 +3353,6 @@ void VoxelMapper::trainForOneIteration()
                         // or render as leaves.
                         auto valid_mask_svrecon =
                             (non_finest.to(torch::kBool) & leaf_mask).to(torch::kBool);
-                        if (sensor_type_ == MONOCULAR &&
-                            monocular_rendered_depth_densify_) {
-                            torch::Tensor provisional =
-                                voxel_model_->monocularProvisionalVoxelMask();
-                            if (provisional.defined() &&
-                                provisional.numel() == M) {
-                                valid_mask_svrecon =
-                                    valid_mask_svrecon &
-                                    (~provisional
-                                          .to(valid_mask_svrecon.device())
-                                          .to(torch::kBool)
-                                          .reshape({M}));
-                            }
-                        }
                         auto normal_candidate_mask = valid_mask_svrecon.clone();
                         n_normal_candidates = normal_candidate_mask.sum().item<int64_t>();
                         torch::Tensor sdf_subdivide_candidate_mask;
@@ -3752,6 +3882,7 @@ void VoxelMapper::combineMappingOperations()
                     new_densification_kfs);
             }
             processRgbdClosureCache();
+            markSurfaceViewPruningPending(new_densification_kfs);
         }
         break;
 
@@ -3913,6 +4044,7 @@ void VoxelMapper::combineMappingOperations()
                         new_densification_kfs);
                 }
                 processRgbdClosureCache();
+                markSurfaceViewPruningPending(new_densification_kfs);
 			            // Mark this iteration
 	            loop_closure_iteration_ = true;
          }
@@ -5815,6 +5947,72 @@ std::vector<sv::MiniCam> VoxelMapper::incrementalMappingCameras() const
             it->second->image_height_, it->second->image_width_));
     }
     return cameras;
+}
+
+std::vector<sv::MiniCam> VoxelMapper::surfaceViewPruningCameras() const
+{
+    const auto& keyframes = scene_->keyframes();
+    const std::size_t limit = std::min<std::size_t>(
+        static_cast<std::size_t>(
+            std::max(1, opt_params_.surface_view_window_size_)),
+        keyframes.size());
+
+    std::vector<sv::MiniCam> cameras;
+    cameras.reserve(limit);
+    for (auto it = keyframes.rbegin();
+         it != keyframes.rend() && cameras.size() < limit;
+         ++it) {
+        if (!it->second) {
+            continue;
+        }
+        cameras.push_back(it->second->toMiniCam(
+            it->second->image_height_, it->second->image_width_));
+    }
+    return cameras;
+}
+
+void VoxelMapper::markSurfaceViewPruningPending(
+    const std::vector<std::shared_ptr<VoxelKeyframe>>& keyframes)
+{
+    if (!opt_params_.prune_surface_views_enable_) {
+        return;
+    }
+    for (const auto& keyframe : keyframes) {
+        if (keyframe) {
+            surface_view_pending_keyframes_.insert(keyframe->fid_);
+        }
+    }
+}
+
+bool VoxelMapper::surfaceViewPruningReady()
+{
+    if (!opt_params_.prune_surface_views_enable_ ||
+        disable_topology_changes_ ||
+        !scene_ ||
+        !voxel_model_ ||
+        surface_view_pending_keyframes_.empty()) {
+        return false;
+    }
+
+    for (auto it = surface_view_pending_keyframes_.begin();
+         it != surface_view_pending_keyframes_.end();) {
+        const auto keyframe_it = scene_->keyframes().find(*it);
+        if (keyframe_it == scene_->keyframes().end() || !keyframe_it->second) {
+            it = surface_view_pending_keyframes_.erase(it);
+            continue;
+        }
+        if (keyframe_it->second->remaining_times_of_use_ > 0) {
+            return false;
+        }
+        ++it;
+    }
+
+    if (surface_view_pending_keyframes_.empty()) {
+        return false;
+    }
+    return scene_->keyframes().size() >=
+        static_cast<std::size_t>(
+            std::max(1, opt_params_.surface_view_window_size_));
 }
 
 void VoxelMapper::waitForInputQueueSlot()

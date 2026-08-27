@@ -136,7 +136,8 @@ Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
 Optimization.prune_surface_views_enable: 1
-Optimization.surface_min_views: 2
+Optimization.surface_min_views: 4
+Optimization.surface_view_window_size: 8
 Optimization.final_refinement_enable: 1
 # Subdivision
 Optimization.subdivide_from: 800

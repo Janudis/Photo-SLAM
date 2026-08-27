@@ -1,0 +1,144 @@
+diff --git a/cuda/src/forward.cu b/cuda/src/forward.cu
+index ae9a95a..abde243 100755
+--- a/cuda/src/forward.cu
++++ b/cuda/src/forward.cu
+@@ -66,6 +66,7 @@ renderCUDA(
+     float* __restrict__ out_normal,
+     float* __restrict__ out_T,
+     float* __restrict__ max_w,
++    int32_t* __restrict__ occlusion_visible,
+     float* __restrict__ out_sdf0, 
+ 
+     const int feat_dim,
+@@ -434,7 +435,10 @@ renderCUDA(
+                 }
+             }
+ 
+-            T *= (1.f - alpha);
++            const float test_T = T * (1.f - alpha);
++            if (occlusion_visible != nullptr && test_T > 0.5f)
++                atomicExch(occlusion_visible + vox_id, 1);
++            T = test_T;
+             done |= (T < EARLY_STOP_T);
+ 
+             // Keep track of last range entry to update this pixel.
+@@ -666,6 +670,7 @@ void render(
+     float* out_normal,
+     float* out_T,
+     float* max_w,
++    int32_t* occlusion_visible,
+     float* out_sdf0,
+ 
+     const int feat_dim,
+@@ -718,6 +723,7 @@ void render(
+         out_normal,
+         out_T,
+         max_w,
++        occlusion_visible,
+         out_sdf0,
+ 
+         feat_dim,
+@@ -858,6 +864,7 @@ int rasterize_voxels_procedure(
+     float* out_normal,
+     float* out_T,
+     float* max_w,
++    int32_t* occlusion_visible,
+     float* out_sdf0,
+ 
+     const int feat_dim,
+@@ -969,6 +976,7 @@ int rasterize_voxels_procedure(
+         out_normal,
+         out_T,
+         max_w,
++        occlusion_visible,
+         out_sdf0,
+ 
+         feat_dim,
+@@ -983,7 +991,7 @@ int rasterize_voxels_procedure(
+ 
+ 
+ // Interface for python to run forward rasterization.
+-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ rasterize_voxels(
+     const int vox_geo_mode,
+     const int density_mode,
+@@ -998,6 +1006,7 @@ rasterize_voxels(
+     const bool need_distortion,
+     const bool need_normal,
+     const bool track_max_w,
++    const bool track_occlusion_visibility,
+ 
+     const torch::Tensor& octree_paths,
+     const torch::Tensor& vox_centers,
+@@ -1036,6 +1045,9 @@ rasterize_voxels(
+     torch::Tensor out_normal = need_normal ? torch::full({3, H, W}, 0.f, float_opts) : torch::empty({0});
+     torch::Tensor out_T = torch::full({1, H, W}, 0.f, float_opts);
+     torch::Tensor max_w = track_max_w ? torch::full({P, 1}, 0.f, float_opts) : torch::empty({0});
++    torch::Tensor occlusion_visible = track_occlusion_visibility
++        ? torch::zeros({P, 1}, vox_centers.options().dtype(torch::kInt32))
++        : torch::empty({0}, vox_centers.options().dtype(torch::kInt32));
+     torch::Tensor out_sdf0 = torch::full({H * W}, -1.f, float_opts);
+     const int feat_dim = feats.size(1);
+     torch::Tensor out_feat = torch::full({feat_dim, H, W}, 0.f, float_opts);
+@@ -1050,6 +1062,9 @@ rasterize_voxels(
+     float* max_w_pointer = nullptr;
+     if (track_max_w)
+         max_w_pointer = max_w.contiguous().data_ptr<float>();
++    int32_t* occlusion_visible_pointer = nullptr;
++    if (track_occlusion_visibility)
++        occlusion_visible_pointer = occlusion_visible.contiguous().data_ptr<int32_t>();
+ 
+     int rendered = 0;
+     if(P != 0)
+@@ -1083,6 +1098,7 @@ rasterize_voxels(
+             out_normal.contiguous().data_ptr<float>(),
+             out_T.contiguous().data_ptr<float>(),
+             max_w_pointer,
++            occlusion_visible_pointer,
+             out_sdf0.contiguous().data_ptr<float>(),
+ 
+             feat_dim,
+@@ -1092,7 +1108,18 @@ rasterize_voxels(
+             debug,
+             s_val.contiguous().data_ptr<float>());
+ 
+-    return std::make_tuple(rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w, out_sdf0, out_feat);
++    return std::make_tuple(
++        rendered,
++        binningBuffer,
++        imgBuffer,
++        out_color,
++        out_depth,
++        out_normal,
++        out_T,
++        max_w,
++        occlusion_visible,
++        out_sdf0,
++        out_feat);
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/cuda/src/forward.h b/cuda/src/forward.h
+index 05636dc..ad09ad1 100755
+--- a/cuda/src/forward.h
++++ b/cuda/src/forward.h
+@@ -16,7 +16,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
+ namespace FORWARD {
+ 
+ // Interface for python to run forward rasterization.
+-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
++std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ rasterize_voxels(
+     const int vox_geo_mode,
+     const int density_mode,
+@@ -31,6 +31,7 @@ rasterize_voxels(
+     const bool need_distortion,
+     const bool need_normal,
+     const bool track_max_w,
++    const bool track_occlusion_visibility,
+ 
+     const torch::Tensor& octree_paths,
+     const torch::Tensor& vox_centers,

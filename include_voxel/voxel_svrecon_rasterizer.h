@@ -30,6 +30,7 @@ struct SvreconRasterizationSettings {
     bool need_depth = false;
     bool need_normal = false;
     bool track_max_w = false;
+    bool track_occlusion_visibility = false;
     float lambda_R_concen = 0.0f;
     float lambda_ascending = 0.0f;
     float lambda_dist = 0.0f;

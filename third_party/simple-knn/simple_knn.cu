@@ -14,13 +14,13 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "simple_knn.h"
+#include <cfloat>
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <vector>
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
-#define __CUDACC__
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 

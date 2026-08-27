@@ -82,13 +82,13 @@ static void saveGpuPeakMemoryUsage(const std::filesystem::path &pathSave)
 
     float max_reserved_MB =
         mem_stats
-            .reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)]
+            .reserved_bytes.front()
             .peak /
         (1024.0f * 1024.0f);
 
     float max_alloc_MB =
         mem_stats
-            .allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)]
+            .allocated_bytes.front()
             .peak /
         (1024.0f * 1024.0f);
 

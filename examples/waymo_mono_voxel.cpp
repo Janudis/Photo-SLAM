@@ -69,11 +69,10 @@ void saveGpuPeakMemoryUsage(const std::filesystem::path& output_path)
 {
     namespace allocator = c10::cuda::CUDACachingAllocator;
     const allocator::DeviceStats stats = allocator::getDeviceStats(0);
-    const auto aggregate = static_cast<int>(allocator::StatType::AGGREGATE);
     const double reserved_mb =
-        stats.reserved_bytes[aggregate].peak / (1024.0 * 1024.0);
+        stats.reserved_bytes.front().peak / (1024.0 * 1024.0);
     const double allocated_mb =
-        stats.allocated_bytes[aggregate].peak / (1024.0 * 1024.0);
+        stats.allocated_bytes.front().peak / (1024.0 * 1024.0);
 
     std::ofstream output(output_path);
     output << "Peak reserved (MB): " << reserved_mb << '\n';

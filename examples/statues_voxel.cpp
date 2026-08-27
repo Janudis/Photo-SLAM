@@ -77,9 +77,9 @@ static void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
     c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
 
     float max_reserved_MB =
-        mem_stats.reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak / (1024.0 * 1024.0);
+        mem_stats.reserved_bytes.front().peak / (1024.0 * 1024.0);
     float max_alloc_MB =
-        mem_stats.allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak / (1024.0 * 1024.0);
+        mem_stats.allocated_bytes.front().peak / (1024.0 * 1024.0);
 
     std::ofstream out(pathSave);
     out << "Peak reserved (MB): " << max_reserved_MB << "\n";

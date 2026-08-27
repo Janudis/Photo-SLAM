@@ -187,12 +187,10 @@ void saveGpuPeakMemoryUsage(const std::filesystem::path& path)
         const allocator::DeviceStats stats =
             allocator::getDeviceStats(0);
         max_reserved_mb =
-            stats.reserved_bytes[
-                static_cast<int>(allocator::StatType::AGGREGATE)].peak /
+            stats.reserved_bytes.front().peak /
             (1024.0f * 1024.0f);
         max_allocated_mb =
-            stats.allocated_bytes[
-                static_cast<int>(allocator::StatType::AGGREGATE)].peak /
+            stats.allocated_bytes.front().peak /
             (1024.0f * 1024.0f);
     }
 

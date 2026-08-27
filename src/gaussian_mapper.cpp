@@ -39,10 +39,10 @@ GaussianGpuMemoryStats getGaussianGpuPeakMemoryStats()
     namespace c10Alloc = c10::cuda::CUDACachingAllocator;
     c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
     stats.reserved_mb =
-        mem_stats.reserved_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        mem_stats.reserved_bytes.front().peak /
         (1024.0f * 1024.0f);
     stats.allocated_mb =
-        mem_stats.allocated_bytes[static_cast<int>(c10Alloc::StatType::AGGREGATE)].peak /
+        mem_stats.allocated_bytes.front().peak /
         (1024.0f * 1024.0f);
     return stats;
 }

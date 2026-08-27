@@ -313,12 +313,10 @@ void saveGpuPeakMemoryUsage(const std::filesystem::path& output_path)
     namespace allocator = c10::cuda::CUDACachingAllocator;
     const allocator::DeviceStats memory = allocator::getDeviceStats(0);
     const float reserved_mb =
-        memory.reserved_bytes[
-            static_cast<int>(allocator::StatType::AGGREGATE)].peak /
+        memory.reserved_bytes.front().peak /
         (1024.0f * 1024.0f);
     const float allocated_mb =
-        memory.allocated_bytes[
-            static_cast<int>(allocator::StatType::AGGREGATE)].peak /
+        memory.allocated_bytes.front().peak /
         (1024.0f * 1024.0f);
 
     if (!output_path.parent_path().empty()) {

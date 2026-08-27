@@ -15,6 +15,31 @@
 
 #include "include/gaussian_model.h"
 
+#include <sstream>
+#include <type_traits>
+
+namespace {
+
+template <typename StateMap>
+typename StateMap::key_type optimizerStateKey(
+    const StateMap&,
+    const torch::Tensor& parameter)
+{
+    using Key = typename StateMap::key_type;
+    if constexpr (std::is_same_v<Key, std::string>) {
+        std::ostringstream key;
+        key << parameter.unsafeGetTensorImpl();
+        return key.str();
+    } else {
+        static_assert(
+            std::is_pointer_v<Key>,
+            "Unsupported LibTorch optimizer state key type");
+        return static_cast<Key>(parameter.unsafeGetTensorImpl());
+    }
+}
+
+} // namespace
+
 GaussianModel::GaussianModel(const int sh_degree)
     : active_sh_degree_(0), spatial_lr_scale_(0.0),
       lr_delay_steps_(0), lr_delay_mult_(1.0), max_steps_(1000000)
@@ -384,7 +409,7 @@ torch::Tensor GaussianModel::replaceTensorToOptimizer(torch::Tensor& tensor, int
 {
     auto& param = this->optimizer_->param_groups()[tensor_idx].params()[0];
     auto& state = optimizer_->state();
-    auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    auto key = optimizerStateKey(state, param);
     auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
     auto new_state = std::make_unique<torch::optim::AdamParamState>();
     new_state->step(stored_state.step());
@@ -394,7 +419,7 @@ torch::Tensor GaussianModel::replaceTensorToOptimizer(torch::Tensor& tensor, int
 
     state.erase(key);
     param = tensor.requires_grad_();
-    key = c10::guts::to_string(param.unsafeGetTensorImpl());
+    key = optimizerStateKey(state, param);
     state[key] = std::move(new_state);
 
     auto optimizable_tensors = param;
@@ -604,7 +629,7 @@ void GaussianModel::prunePoints(torch::Tensor& mask)
     auto& state = this->optimizer_->state();
     for (int group_idx = 0; group_idx < 6; ++group_idx) {
         auto& param = param_groups[group_idx].params()[0];
-        auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
+        auto key = optimizerStateKey(state, param);
         if (state.find(key) != state.end()) {
             auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
             auto new_state = std::make_unique<torch::optim::AdamParamState>();
@@ -615,7 +640,7 @@ void GaussianModel::prunePoints(torch::Tensor& mask)
 
             state.erase(key);
             param = param.index({valid_points_mask}).requires_grad_();
-            key = c10::guts::to_string(param.unsafeGetTensorImpl());
+            key = optimizerStateKey(state, param);
             state[key] = std::move(new_state);
             optimizable_tensors[group_idx] = param;
         }
@@ -676,18 +701,24 @@ void GaussianModel::densificationPostfix(
         assert(group.params().size() == 1);
         auto& extension_tensor = tensors_dict[group_idx];
         auto& param = group.params()[0];
-        auto key = c10::guts::to_string(param.unsafeGetTensorImpl());
+        auto key = optimizerStateKey(state, param);
         if (state.find(key) != state.end()) {
             auto& stored_state = static_cast<torch::optim::AdamParamState&>(*state[key]);
             auto new_state = std::make_unique<torch::optim::AdamParamState>();
             new_state->step(stored_state.step());
-            new_state->exp_avg(torch::cat({stored_state.exp_avg().clone(), torch::zeros_like(extension_tensor)}, /*dim=*/0));
-            new_state->exp_avg_sq(torch::cat({stored_state.exp_avg_sq().clone(), torch::zeros_like(extension_tensor)}, /*dim=*/0));
+            const std::vector<torch::Tensor> exp_avg_tensors = {
+                stored_state.exp_avg().clone(),
+                torch::zeros_like(extension_tensor)};
+            const std::vector<torch::Tensor> exp_avg_sq_tensors = {
+                stored_state.exp_avg_sq().clone(),
+                torch::zeros_like(extension_tensor)};
+            new_state->exp_avg(torch::cat(exp_avg_tensors, /*dim=*/0));
+            new_state->exp_avg_sq(torch::cat(exp_avg_sq_tensors, /*dim=*/0));
             // new_state->max_exp_avg_sq(stored_state.max_exp_avg_sq().clone());  // needed only when options.amsgrad(true), which is false by default
 
             state.erase(key);
             param = torch::cat({param, extension_tensor}, /*dim=*/0).requires_grad_();
-            key = c10::guts::to_string(param.unsafeGetTensorImpl());
+            key = optimizerStateKey(state, param);
             state[key] = std::move(new_state);
 
             optimizable_tensors[group_idx] = param;

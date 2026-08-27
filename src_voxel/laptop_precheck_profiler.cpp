@@ -332,13 +332,11 @@ LaptopPrecheckProfiler::readMemorySnapshot() const
     try {
         namespace allocator = c10::cuda::CUDACachingAllocator;
         const allocator::DeviceStats stats = allocator::getDeviceStats(0);
-        const int aggregate =
-            static_cast<int>(allocator::StatType::AGGREGATE);
         snapshot.cuda_allocated_mb =
-            static_cast<double>(stats.allocated_bytes[aggregate].current) /
+            static_cast<double>(stats.allocated_bytes.front().current) /
             kBytesPerMb;
         snapshot.cuda_reserved_mb =
-            static_cast<double>(stats.reserved_bytes[aggregate].current) /
+            static_cast<double>(stats.reserved_bytes.front().current) /
             kBytesPerMb;
     } catch (...) {
         snapshot.cuda_allocated_mb = -1.0;

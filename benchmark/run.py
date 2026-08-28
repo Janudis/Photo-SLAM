@@ -138,6 +138,20 @@ _DISABLED_LEARNED_DEPTH_MODES = {
     "Record.enable_rerun": 0,
 }
 
+MVS_TSDF_COMMON_OVERRIDES: dict[str, int | float] = {
+    "Mapper.monocular_rendered_depth_densify": 0,
+    "Mapper.monocular_mvs_densify": 0,
+    "Mapper.monocular_mvs_tsdf_evidence": 1,
+    "Mapper.monocular_mvs_tsdf_evidence_trunc_vox": 2.0,
+    "Mapper.monocular_omnidata_densify": 0,
+    "Optimization.lambda_monocular_depth": 0.001,
+    "Optimization.lambda_monocular_normal": 0.0,
+    "Optimization.prune_surface_views_enable": 0,
+    "Optimization.prune_mvs_consistency_enable": 0,
+    "Optimization.final_refinement_enable": 0,
+    "Record.enable_rerun": 0,
+}
+
 _PHOTOSLAM_REPLICA_EXPORT_OVERRIDES: dict[str, int | float] = {
     "Record.save_rendered_mesh_eval": 1,
     "Record.rendered_mesh_eval_voxel_size_m": 0.03,
@@ -169,6 +183,23 @@ METHODS: dict[str, MethodSpec] = {
         },
         requires_mvs_model=True,
     ),
+    "ours_mvs_tsdf_geometry": MethodSpec(
+        key="ours_mvs_tsdf_geometry",
+        label="Ours + MVS-TSDF (geometry)",
+        family="voxel",
+        voxel_overrides={
+            **MVS_TSDF_COMMON_OVERRIDES,
+            "Optimization.prune_mvs_consistency_enable": 1,
+        },
+        requires_mvs_model=True,
+    ),
+    "ours_mvs_tsdf_rendering": MethodSpec(
+        key="ours_mvs_tsdf_rendering",
+        label="Ours + MVS-TSDF (rendering)",
+        family="voxel",
+        voxel_overrides={**MVS_TSDF_COMMON_OVERRIDES},
+        requires_mvs_model=True,
+    ),
     "photoslam": MethodSpec(
         key="photoslam",
         label="Photo-SLAM",
@@ -176,6 +207,10 @@ METHODS: dict[str, MethodSpec] = {
         voxel_overrides={},
     ),
 }
+
+# Preserve the original three-method meaning of ``--methods all``. The
+# controlled MVS-TSDF variants must be requested explicitly.
+DEFAULT_METHODS = ("ours", "ours_mvs", "photoslam")
 
 
 @dataclass(frozen=True)
@@ -305,7 +340,7 @@ def expand_methods(values: list[str]) -> tuple[str, ...]:
     if "all" in values:
         if len(values) != 1:
             raise BenchmarkError("Use --methods all by itself")
-        return tuple(METHODS)
+        return DEFAULT_METHODS
     unknown = sorted(set(values).difference(METHODS))
     if unknown:
         raise BenchmarkError(f"Unknown method(s): {', '.join(unknown)}")
@@ -660,8 +695,8 @@ def run_job(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run isolated Ours, Ours+MVS, and original Photo-SLAM "
-            "benchmarks with fixed method presets."
+            "Run isolated native Photo-SLAM/SVRecon benchmarks with fixed "
+            "method presets."
         )
     )
     parser.add_argument(
@@ -675,7 +710,10 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["all"],
         metavar="METHOD",
-        help="ours, ours_mvs, photoslam, or all (default: all)",
+        help=(
+            "one or more methods shown by --list; all selects only the "
+            "original ours, ours_mvs, and photoslam matrix (default: all)"
+        ),
     )
     parser.add_argument(
         "--sequences",
@@ -732,7 +770,7 @@ def parse_args() -> argparse.Namespace:
 def print_coverage() -> None:
     print("Native methods:")
     for method in METHODS.values():
-        print(f"  {method.key:10s} {method.label}")
+        print(f"  {method.key:28s} {method.label}")
     print("Datasets:")
     for dataset in DATASETS.values():
         print(f"  {dataset.key:10s} {', '.join(dataset.sequences)}")

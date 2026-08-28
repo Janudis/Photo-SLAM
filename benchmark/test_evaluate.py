@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,50 @@ class EvaluateTest(unittest.TestCase):
                 benchmark_evaluate.parse_keyed_metric(path),
                 {2: 30.5, 7: 31.25},
             )
+
+    def test_load_jobs_accepts_selected_two_method_matrix(self) -> None:
+        methods = (
+            "ours_mvs_tsdf_geometry",
+            "ours_mvs_tsdf_rendering",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary)
+            jobs = []
+            for sequence in benchmark_evaluate.REPLICA_SEQUENCES:
+                for method in methods:
+                    shutdown = (
+                        run_root
+                        / "replica"
+                        / sequence
+                        / method
+                        / "trial_01"
+                        / "100_shutdown"
+                    )
+                    shutdown.mkdir(parents=True)
+                    jobs.append(
+                        {
+                            "status": "complete",
+                            "method": method,
+                            "sequence": sequence,
+                            "trial": 1,
+                            "shutdown_dir": str(shutdown),
+                        }
+                    )
+            (run_root / "run_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "dataset": "replica",
+                        "jobs": jobs,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = benchmark_evaluate.load_jobs(run_root, methods)
+
+            self.assertEqual(len(loaded), 16)
+            self.assertEqual({job.method for job in loaded}, set(methods))
 
 
 if __name__ == "__main__":

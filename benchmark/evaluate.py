@@ -26,10 +26,23 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-METHODS = ("ours", "ours_mvs", "photoslam")
+DEFAULT_METHODS = ("ours", "ours_mvs", "photoslam")
+VOXEL_METHODS = frozenset(
+    {
+        "ours",
+        "ours_mvs",
+        "ours_mvs_tsdf_geometry",
+        "ours_mvs_tsdf_rendering",
+    }
+)
+SUPPORTED_METHODS = (*sorted(VOXEL_METHODS), "photoslam")
+# Retain the historical name for callers that import the default matrix.
+METHODS = DEFAULT_METHODS
 METHOD_LABELS = {
     "ours": "Ours",
     "ours_mvs": "Ours+MVS",
+    "ours_mvs_tsdf_geometry": "Ours+MVS-TSDF (geometry)",
+    "ours_mvs_tsdf_rendering": "Ours+MVS-TSDF (rendering)",
     "photoslam": "Photo-SLAM",
 }
 REPLICA_SEQUENCES = (
@@ -132,7 +145,7 @@ def resolve_manifest_path(path_value: str, run_root: Path, job: dict[str, Any]) 
 
 def load_jobs(
     run_root: Path,
-    expected_methods: tuple[str, ...] = METHODS,
+    expected_methods: tuple[str, ...] = DEFAULT_METHODS,
 ) -> list[Job]:
     manifest = load_json(run_root / "run_manifest.json", "run manifest")
     if manifest.get("status") != "complete":
@@ -164,7 +177,8 @@ def load_jobs(
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise EvaluationError(
-            f"Expected one 24-job Replica matrix; missing={missing}, extra={extra}"
+            f"Expected one {len(expected)}-job Replica matrix; "
+            f"missing={missing}, extra={extra}"
         )
     return jobs
 
@@ -182,17 +196,19 @@ def discover_latest(pattern: str, root: Path, description: str) -> Path:
 
 
 def raw_mesh(job: Job) -> Path:
-    if job.method in {"ours", "ours_mvs"}:
+    if job.method in VOXEL_METHODS:
         return discover_latest(
             "ply/voxel_model/iteration_*/voxel_surface_mesh.ply",
             job.shutdown_dir,
             "SVRecon surface mesh",
         )
-    return discover_latest(
-        "ply/point_cloud/iteration_*/gaussian_surface_mesh.ply",
-        job.shutdown_dir,
-        "Photo-SLAM Gaussian surface mesh",
-    )
+    if job.method == "photoslam":
+        return discover_latest(
+            "ply/point_cloud/iteration_*/gaussian_surface_mesh.ply",
+            job.shutdown_dir,
+            "Photo-SLAM Gaussian surface mesh",
+        )
+    raise EvaluationError(f"Unsupported method: {job.method}")
 
 
 def parse_keyed_metric(path: Path) -> dict[int, float]:
@@ -268,9 +284,11 @@ def photoslam_keyframes(job: Job, images: list[Path]) -> dict[int, int]:
 
 
 def keyframe_map(job: Job, images: list[Path]) -> dict[int, int]:
-    if job.method in {"ours", "ours_mvs"}:
+    if job.method in VOXEL_METHODS:
         return ours_keyframes(job, len(images))
-    return photoslam_keyframes(job, images)
+    if job.method == "photoslam":
+        return photoslam_keyframes(job, images)
+    raise EvaluationError(f"Unsupported method: {job.method}")
 
 
 def metric_by_frame(job: Job, images: list[Path]) -> dict[int, dict[str, Any]]:
@@ -565,9 +583,12 @@ def mean(values: Iterable[float]) -> float:
     return float(sum(values) / len(values))
 
 
-def aggregate(results: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+def aggregate(
+    results: dict[str, dict[str, dict[str, Any]]],
+    methods: tuple[str, ...] = DEFAULT_METHODS,
+) -> dict[str, Any]:
     aggregated: dict[str, Any] = {}
-    for method in METHODS:
+    for method in methods:
         rows = [results[sequence][method] for sequence in REPLICA_SEQUENCES]
         keys = [
             "ate_rmse_cm",
@@ -593,6 +614,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("dataset", choices=("replica",))
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=SUPPORTED_METHODS,
+        default=list(DEFAULT_METHODS),
+        help=(
+            "methods expected in the run manifest "
+            "(default: ours ours_mvs photoslam)"
+        ),
+    )
     parser.add_argument(
         "--photoslam-run-id",
         help=(
@@ -630,9 +661,14 @@ def main() -> int:
     args = parse_args()
     if args.distance_threshold_m <= 0.0 or not math.isfinite(args.distance_threshold_m):
         raise EvaluationError("Distance threshold must be positive and finite")
+    methods = tuple(dict.fromkeys(args.methods))
     run_root = args.results_root / "paper_benchmark" / args.run_id
-    jobs = load_jobs(run_root)
+    jobs = load_jobs(run_root, methods)
     if args.photoslam_run_id:
+        if "photoslam" not in methods:
+            raise EvaluationError(
+                "--photoslam-run-id requires photoslam in --methods"
+            )
         photoslam_root = (
             args.results_root / "paper_benchmark" / args.photoslam_run_id
         )
@@ -652,7 +688,7 @@ def main() -> int:
         gt_mesh = require_file(args.gt_mesh_root / f"{sequence}.ply", "GT mesh")
         images = replica_images(sequence_dir)
         jobs_for_sequence = {
-            method: by_pair[(sequence, method)] for method in METHODS
+            method: by_pair[(sequence, method)] for method in methods
         }
         per_method_metrics = {
             method: metric_by_frame(job, images)
@@ -668,7 +704,7 @@ def main() -> int:
         )
         results[sequence] = {}
 
-        for method in METHODS:
+        for method in methods:
             job = jobs_for_sequence[method]
             method_output = output_root / sequence / method
             if method == "photoslam" and args.photoslam_run_id:
@@ -748,7 +784,12 @@ def main() -> int:
     summary = {
         "schema_version": 1,
         "run_id": args.run_id,
-        "photoslam_run_id": args.photoslam_run_id or args.run_id,
+        "methods": list(methods),
+        "photoslam_run_id": (
+            args.photoslam_run_id or args.run_id
+            if "photoslam" in methods
+            else None
+        ),
         "protocol": {
             "tracking": "evo_ape TUM ATE RMSE with Sim(3) alignment",
             "geometry": (
@@ -764,7 +805,7 @@ def main() -> int:
             "averaging": "arithmetic mean of the eight per-sequence metrics",
         },
         "sequences": results,
-        "average": aggregate(results),
+        "average": aggregate(results, methods),
     }
     summary_path = output_root / "replica_summary.json"
     write_json(summary_path, summary)

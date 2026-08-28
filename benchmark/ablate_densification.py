@@ -22,20 +22,9 @@ import run as benchmark_run
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEQUENCE = "office0"
 
-COMMON_OVERRIDES: dict[str, int | float] = {
-    "Mapper.monocular_rendered_depth_densify": 0,
-    "Mapper.monocular_mvs_densify": 0,
-    "Mapper.monocular_mvs_tsdf_evidence": 1,
-    "Mapper.monocular_mvs_tsdf_evidence_trunc_vox": 2.0,
-    "Mapper.monocular_omnidata_densify": 0,
-    # Keep MVS supervision fixed while isolating pruning behavior.
-    "Optimization.lambda_monocular_depth": 0.001,
-    "Optimization.lambda_monocular_normal": 0.0,
-    "Optimization.prune_surface_views_enable": 0,
-    "Optimization.prune_mvs_consistency_enable": 0,
-    "Optimization.final_refinement_enable": 0,
-    "Record.enable_rerun": 0,
-}
+# Keep MVS supervision fixed while isolating pruning behavior. The full
+# Replica presets use this same baseline after the office0 selection study.
+COMMON_OVERRIDES = dict(benchmark_run.MVS_TSDF_COMMON_OVERRIDES)
 
 
 @dataclass(frozen=True)

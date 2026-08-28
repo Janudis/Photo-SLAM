@@ -52,7 +52,16 @@ class BenchmarkLauncherTest(unittest.TestCase):
 
     def test_all_method_expansion_is_stable(self) -> None:
         self.assertEqual(
-            benchmark.expand_methods(["all"]), tuple(benchmark.METHODS)
+            benchmark.expand_methods(["all"]), benchmark.DEFAULT_METHODS
+        )
+
+    def test_final_mvs_tsdf_presets_are_explicitly_selectable(self) -> None:
+        selected = benchmark.expand_methods(
+            ["ours_mvs_tsdf_geometry", "ours_mvs_tsdf_rendering"]
+        )
+        self.assertEqual(
+            selected,
+            ("ours_mvs_tsdf_geometry", "ours_mvs_tsdf_rendering"),
         )
 
     def test_voxel_presets_differ_only_in_densification_selection(self) -> None:
@@ -70,6 +79,32 @@ class BenchmarkLauncherTest(unittest.TestCase):
                 "Mapper.monocular_mvs_densify",
             },
         )
+
+    def test_final_mvs_tsdf_presets_differ_only_in_mvs_pruning(self) -> None:
+        geometry = benchmark.METHODS[
+            "ours_mvs_tsdf_geometry"
+        ].voxel_overrides
+        rendering = benchmark.METHODS[
+            "ours_mvs_tsdf_rendering"
+        ].voxel_overrides
+        differing = {
+            key
+            for key in set(geometry) | set(rendering)
+            if geometry.get(key) != rendering.get(key)
+        }
+        self.assertEqual(
+            differing, {"Optimization.prune_mvs_consistency_enable"}
+        )
+        self.assertEqual(
+            geometry["Optimization.prune_mvs_consistency_enable"], 1
+        )
+        self.assertEqual(
+            rendering["Optimization.prune_mvs_consistency_enable"], 0
+        )
+        for key, value in benchmark.MVS_TSDF_COMMON_OVERRIDES.items():
+            if key != "Optimization.prune_mvs_consistency_enable":
+                self.assertEqual(geometry[key], value)
+            self.assertEqual(rendering[key], value)
 
 
 if __name__ == "__main__":

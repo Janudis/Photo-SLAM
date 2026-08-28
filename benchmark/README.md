@@ -95,6 +95,42 @@ python3 benchmark/run.py scannet \
 Use `--repetitions 3` when repeated trials are required. Jobs are deliberately
 run sequentially so methods do not compete for GPU memory or compute.
 
+## Full Replica MVS-TSDF configurations
+
+After selecting the pruning behavior on `office0`, run the fixed MVS-TSDF
+configuration over all eight Replica scenes with two explicit presets:
+
+- `ours_mvs_tsdf_geometry` enables MVS-consistency pruning;
+- `ours_mvs_tsdf_rendering` uses scheduled SDF/near/far pruning only.
+
+Both presets use full-image MVS-TSDF densification with a two-voxel truncation
+band and MVS depth supervision with weight `0.001`. Direct rendered-depth and
+direct MVS hole insertion, co-visibility pruning, final refinement, Omnidata,
+and Rerun are disabled. The presets differ only in MVS-consistency pruning.
+They are deliberately excluded from `--methods all` and must be named:
+
+```bash
+python3 benchmark/run.py replica \
+  --sequences all \
+  --methods ours_mvs_tsdf_geometry ours_mvs_tsdf_rendering \
+  --run-id replica-mvs-tsdf-final-v1
+```
+
+Evaluate the resulting 16-job matrix with the same consolidated Replica
+protocol used by the main benchmark:
+
+```bash
+DEPS=/tmp/photoslam-benchmark-eval
+PYTHONPATH="$DEPS" PATH="$DEPS/bin:$PATH" \
+python3 benchmark/evaluate.py replica \
+  --run-id replica-mvs-tsdf-final-v1 \
+  --methods ours_mvs_tsdf_geometry ours_mvs_tsdf_rendering
+```
+
+Use the geometry preset for the reconstruction table and the rendering preset
+for the appearance table. Report them as distinct configurations rather than
+combining their best metrics into one row.
+
 ## Replica MVS-TSDF pruning ablation
 
 `ablate_densification.py` runs only the monocular SVRecon mapper on Replica

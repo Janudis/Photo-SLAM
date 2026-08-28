@@ -39,9 +39,12 @@ RUN git clone --recursive https://github.com/muskie82/MonoGS.git /opt/MonoGS \
     && git -C /opt/MonoGS submodule update --init --recursive
 
 COPY benchmark/baselines/patches/monogs-evo.patch /tmp/monogs-evo.patch
+COPY benchmark/baselines/patches/monogs-blackwell.patch /tmp/monogs-blackwell.patch
 RUN git -C /opt/MonoGS apply --check /tmp/monogs-evo.patch \
     && git -C /opt/MonoGS apply /tmp/monogs-evo.patch \
-    && rm /tmp/monogs-evo.patch
+    && git -C /opt/MonoGS apply --check /tmp/monogs-blackwell.patch \
+    && git -C /opt/MonoGS apply /tmp/monogs-blackwell.patch \
+    && rm /tmp/monogs-evo.patch /tmp/monogs-blackwell.patch
 
 RUN python3 -m pip install --no-cache-dir \
         evo==1.31.1 \

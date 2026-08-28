@@ -1,0 +1,12 @@
+diff --git a/submodules/simple-knn/simple_knn.cu b/submodules/simple-knn/simple_knn.cu
+index c280405..4664d68 100644
+--- a/submodules/simple-knn/simple_knn.cu
++++ b/submodules/simple-knn/simple_knn.cu
+@@ -13,6 +13,7 @@
+ #include "cuda_runtime.h"
+ #include "device_launch_parameters.h"
+ #include "simple_knn.h"
++#include <cfloat>
+ #include <cub/cub.cuh>
+ #include <cub/device/device_radix_sort.cuh>
+ #include <vector>

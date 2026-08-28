@@ -1,3 +1,12 @@
 [submodule "third_party/SVRecon"]
 	path = third_party/SVRecon
 	url = https://github.com/alvin0808/SVRecon.git
+[submodule "third_party/HI-SLAM2"]
+	path = third_party/HI-SLAM2
+	url = https://github.com/Willyzw/HI-SLAM2.git
+[submodule "third_party/MonoGS"]
+	path = third_party/MonoGS
+	url = https://github.com/muskie82/MonoGS.git
+[submodule "third_party/tandem"]
+	path = third_party/tandem
+	url = https://github.com/tum-vision/tandem.git

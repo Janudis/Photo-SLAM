@@ -47,7 +47,7 @@ RUN git -C /opt/MonoGS apply --check /tmp/monogs-evo.patch \
     && rm /tmp/monogs-evo.patch /tmp/monogs-blackwell.patch
 
 RUN python3 -m pip install --no-cache-dir \
-        evo==1.31.1 \
+        evo==1.11.0 \
         glfw \
         imgviz \
         lpips \

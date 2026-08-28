@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -29,12 +30,24 @@ from scipy.spatial.transform import Rotation
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MONOGS_ROOT = REPO_ROOT / "third_party/MonoGS"
-HI_SLAM2_ROOT = REPO_ROOT / "third_party/HI-SLAM2"
-HI_SLAM2_TSDF = HI_SLAM2_ROOT / "tsdf_integrate.py"
-HI_SLAM2_PYTHON = (
-    Path.home() / "miniconda3/envs/hislam2/bin/python"
-)
+MONOGS_ROOT = Path(
+    os.environ.get("MONOGS_ROOT", REPO_ROOT / "third_party/MonoGS")
+).expanduser()
+HI_SLAM2_ROOT = Path(
+    os.environ.get("HI_SLAM2_ROOT", REPO_ROOT / "third_party/HI-SLAM2")
+).expanduser()
+HI_SLAM2_TSDF = Path(
+    os.environ.get("HI_SLAM2_TSDF", HI_SLAM2_ROOT / "tsdf_integrate.py")
+).expanduser()
+_default_hi_slam2_python = Path.home() / "miniconda3/envs/hislam2/bin/python"
+HI_SLAM2_PYTHON = Path(
+    os.environ.get(
+        "HI_SLAM2_PYTHON",
+        _default_hi_slam2_python
+        if _default_hi_slam2_python.is_file()
+        else sys.executable,
+    )
+).expanduser()
 
 VOXEL_SIZE_M = 0.03
 MIN_WEIGHT = 1.0

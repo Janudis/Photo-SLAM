@@ -1,0 +1,16 @@
+diff --git a/tsdf_integrate.py b/tsdf_integrate.py
+index 964b348..ce6b8e1 100644
+--- a/tsdf_integrate.py
++++ b/tsdf_integrate.py
+@@ -27,7 +27,10 @@ def load_intrinsic_extrinsic(result, stamps):
+
+ def integrate(depth_file_names, color_file_names, intrinsic, extrinsic, args):
+     n_files = len(depth_file_names)
+-    device = o3d.core.Device('cuda:0')
++    device = o3d.core.Device(
++        'cuda:0' if o3d.core.cuda.is_available() else 'cpu:0'
++    )
++    print(f'Using Open3D device: {device}')
+
+     vbg = o3d.t.geometry.VoxelBlockGrid(
+         attr_names=('tsdf', 'weight', 'color'),

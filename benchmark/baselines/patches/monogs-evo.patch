@@ -1,0 +1,71 @@
+diff --git a/utils/eval_utils.py b/utils/eval_utils.py
+index cf5a6b5..b5dec64 100644
+--- a/utils/eval_utils.py
++++ b/utils/eval_utils.py
+@@ -11,6 +11,7 @@ from evo.core.trajectory import PosePath3D, PoseTrajectory3D
+ from evo.tools import plot
+ from evo.tools.plot import PlotMode
+ from evo.tools.settings import SETTINGS
++from matplotlib import cm, colors
+ from matplotlib import pyplot as plt
+ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+@@ -22,6 +23,42 @@ from gaussian_splatting.utils.system_utils import mkdir_p
+ from utils.logging_utils import Log
+
+
++def traj_colormap(ax, traj, array, plot_mode, min_map, max_map):
++    """evo 1.11 trajectory coloring with an explicit Matplotlib colorbar axis."""
++    norm = colors.Normalize(vmin=min_map, vmax=max_map, clip=True)
++    mapper = cm.ScalarMappable(norm=norm, cmap=SETTINGS.plot_trajectory_cmap)
++    mapper.set_array(array)
++
++    line_colors = [mapper.to_rgba(value) for value in array]
++    line_collection = plot.colored_line_collection(
++        traj.positions_xyz, line_colors, plot_mode
++    )
++    ax.add_collection(line_collection)
++    ax.autoscale_view(True, True, True)
++
++    if plot_mode == PlotMode.xyz:
++        ax.set_zlim(
++            np.amin(traj.positions_xyz[:, 2]),
++            np.amax(traj.positions_xyz[:, 2]),
++        )
++        if SETTINGS.plot_xyz_realistic:
++            plot.set_aspect_equal_3d(ax)
++
++    midpoint = min_map + (max_map - min_map) / 2
++    cbar = ax.get_figure().colorbar(
++        mapper,
++        ax=ax,
++        ticks=[min_map, midpoint, max_map],
++    )
++    cbar.ax.set_yticklabels(
++        [
++            f"{min_map:0.3f}",
++            f"{midpoint:0.3f}",
++            f"{max_map:0.3f}",
++        ]
++    )
++
++
+ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+     ## Plot
+     traj_ref = PosePath3D(poses_se3=poses_gt)
+@@ -51,7 +88,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+     ax = evo.tools.plot.prepare_axis(fig, plot_mode)
+     ax.set_title(f"ATE RMSE: {ape_stat}")
+     evo.tools.plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
+-    evo.tools.plot.traj_colormap(
++    traj_colormap(
+         ax,
+         traj_est_aligned,
+         ape_metric.error,
+@@ -61,5 +98,6 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+     )
+     ax.legend()
+     plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)
++    plt.close(fig)
+
+     return ape_stat

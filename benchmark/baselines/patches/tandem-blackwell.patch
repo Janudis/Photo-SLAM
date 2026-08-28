@@ -1,0 +1,174 @@
+diff --git a/tandem/CMakeLists.txt b/tandem/CMakeLists.txt
+index ae1b0ff..aaae997 100644
+--- a/tandem/CMakeLists.txt
++++ b/tandem/CMakeLists.txt
+@@ -17,6 +17,12 @@ find_package(Eigen3 REQUIRED)
+ find_package(Boost COMPONENTS system thread)
+ find_package(Torch REQUIRED)
+
++if (NOT TARGET Eigen3::Eigen)
++    add_library(Eigen3::Eigen INTERFACE IMPORTED)
++    set_target_properties(Eigen3::Eigen PROPERTIES
++            INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
++endif ()
++
+ # optional libraries
+ find_package(Pangolin 0.2 QUIET)
+ find_package(OpenCV REQUIRED)
+@@ -30,7 +36,8 @@ add_subdirectory(libdr/cuda_coarse_tracker)
+
+ # flags
+ add_definitions("-DENABLE_SSE")
+-set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++0x -march=native -msse2 -msse3")
++add_definitions("-DBOOST_BIND_GLOBAL_PLACEHOLDERS")
++set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++14 -march=native -msse2 -msse3")
+
+ if (MSVC)
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
+diff --git a/tandem/cmake/FindEigen3.cmake b/tandem/cmake/FindEigen3.cmake
+index 9c546a0..43a891f 100644
+--- a/tandem/cmake/FindEigen3.cmake
++++ b/tandem/cmake/FindEigen3.cmake
+@@ -79,3 +79,4 @@ else (EIGEN3_INCLUDE_DIR)
+
+ endif(EIGEN3_INCLUDE_DIR)
+
++set(Eigen3_FOUND ${EIGEN3_FOUND})
+diff --git a/tandem/libdr/cuda_coarse_tracker/CMakeLists.txt b/tandem/libdr/cuda_coarse_tracker/CMakeLists.txt
+index c553d8b..404436d 100644
+--- a/tandem/libdr/cuda_coarse_tracker/CMakeLists.txt
++++ b/tandem/libdr/cuda_coarse_tracker/CMakeLists.txt
+@@ -29,7 +29,7 @@ add_library(cuda_coarse_tracker STATIC src/cuda_coarse_tracker.cpp src/cuda_coar
+ target_include_directories(cuda_coarse_tracker PRIVATE include/private)
+ target_include_directories(cuda_coarse_tracker PUBLIC include/public ${CUDA_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+
+-target_link_libraries(cuda_coarse_tracker ${CUDA_LIBRARIES} ${CUDA_cudadevrt_LIBRARY} CUDA::cublas cnpy)
++target_link_libraries(cuda_coarse_tracker ${CUDA_LIBRARIES} ${CUDA_cudadevrt_LIBRARY} CUDA::cublas)
+
+ #add_executable(main
+ #        src/main.cu
+diff --git a/tandem/libdr/cuda_coarse_tracker/src/cuda_coarse_tracker.cpp b/tandem/libdr/cuda_coarse_tracker/src/cuda_coarse_tracker.cpp
+index d8c3e47..29f1431 100644
+--- a/tandem/libdr/cuda_coarse_tracker/src/cuda_coarse_tracker.cpp
++++ b/tandem/libdr/cuda_coarse_tracker/src/cuda_coarse_tracker.cpp
+@@ -3,10 +3,8 @@
+ #include "cuda_coarse_tracker.h"
+ #include "runtime_utils.h"
+ #include <stdexcept>
+-#include <sophus/se3.hpp>
+ #include "cuda_coarse_tracker_private.h"
+ #include <nvToolsExtCudaRt.h>
+-#include "cnpy.h"
+
+
+ #define SCALE_IDEPTH 1.0f    // scales internal value to idepth.
+@@ -25,9 +23,6 @@ typedef Eigen::Matrix<double, 2, 1> Vec2;
+ typedef Eigen::Matrix<double, 6, 1> Vec6;
+ typedef Eigen::Matrix<double, 8, 1> Vec8;
+ typedef Eigen::Matrix<double, 8, 8> Mat88;
+-typedef Sophus::SE3<double> SE3;
+-
+-
+ // transforms points from one frame to another.
+ struct AffLight {
+   AffLight(Vec2 const &v) : a(v(0)), b(v(1)) {};
+@@ -212,38 +207,6 @@ Vec6 CudaCoarseTracker::calcRes(Eigen::Matrix<double, 4, 4> const &refToNew, con
+
+   float maxEnergy = 2 * setting_huberTH * cutoffTH - setting_huberTH * setting_huberTH;  // energy for r=setting_coarseCutoffTH.
+
+-  bool save = false;
+-  if (save) {
+-    float nfxfyaffLLb[6] = {(float) n, fx, fy, affLL.x, affLL.y, (float) ref_aff_g2l.y()};
+-    cnpy::npy_save("cct_data/nfxfyaffLLb.npy", nfxfyaffLLb, {6});
+-
+-    float setting_huberTH_maxEnergy_cutoffTH[3] = {setting_huberTH, maxEnergy, cutoffTH};
+-    cnpy::npy_save("cct_data/setting_huberTH_maxEnergy_cutoffTH.npy", nfxfyaffLLb, {3});
+-
+-    cnpy::npy_save("cct_data/refToNew_Ki_host.npy", refToNew_Ki_host, {16 + 9});
+-
+-    float *buf = (float *) malloc(sizeof(float) * n);
+-    cudaMemcpy(buf, pc_u, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/pc_u.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, pc_v, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/pc_v.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, pc_idepth, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/pc_idepth.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, pc_color, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/pc_color.npy", buf, {(unsigned long) n});
+-
+-    ::free(buf);
+-    buf = (float *) malloc(sizeof(float) * 3 * w * h);
+-    cudaMemcpy(buf, dInew, sizeof(float) * 3 * w * h, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/dInew.npy", buf, {(unsigned long) 3 * w * h});
+-
+-    if (n > 0.5 * 640 * 480)
+-      exit(EXIT_SUCCESS);
+-  }
+-
+   callCalcResKernel(
+       128, stream,
+       setting_huberTH,
+@@ -284,40 +247,6 @@ void CudaCoarseTracker::calcG(Eigen::Matrix<double, 8, 8> &H_out, Eigen::Matrix<
+   affLL.x = (float) affLL_double.x();
+   affLL.y = (float) affLL_double.y();
+
+-  bool save = false;
+-  if (save) {
+-    float nfxfyaffLLb[6] = {(float) n, fx, fy, affLL.x, affLL.y, (float) ref_aff_g2l.y()};
+-    cnpy::npy_save("cct_data/nfxfyaffLLb.npy", nfxfyaffLLb, {6});
+-    float *buf = (float *) malloc(sizeof(float) * n);
+-
+-    cudaMemcpy(buf, pc_color, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/pc_color.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_u, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_u.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_v, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_v.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_dx, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_dx.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_dy, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_dy.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_idepth, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_idepth.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_residual, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_residual.npy", buf, {(unsigned long) n});
+-
+-    cudaMemcpy(buf, warped_weight, sizeof(float) * n, cudaMemcpyDeviceToHost);
+-    cnpy::npy_save("cct_data/warped_weight.npy", buf, {(unsigned long) n});
+-
+-    if (n > 0.5 * 640 * 480)
+-      exit(EXIT_SUCCESS);
+-  }
+-
+   callCalcGKernel(
+       128, stream,
+       fx, fy,
+diff --git a/tandem/libdr/dr_fusion/CMakeLists.txt b/tandem/libdr/dr_fusion/CMakeLists.txt
+index dc85691..69dbfa4 100644
+--- a/tandem/libdr/dr_fusion/CMakeLists.txt
++++ b/tandem/libdr/dr_fusion/CMakeLists.txt
+@@ -14,13 +14,8 @@ find_package(OpenCV REQUIRED)
+ set(CUDA_SEPARABLE_COMPILATION ON)
+ set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};--std=c++14;-O3)
+
+-# See: http://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-arch=sm_60)
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_60,code=sm_60)
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_61,code=sm_61)
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_70,code=sm_70)
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_75,code=sm_75)
+-set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_75,code=compute_75)
++# FindCUDA does not consume CMAKE_CUDA_ARCHITECTURES for cuda_add_library.
++set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-gencode=arch=compute_120,code=sm_120)
+ set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-lineinfo)
+
+ cuda_add_library(dr-fusion STATIC

@@ -30,6 +30,15 @@ class BenchmarkLauncherTest(unittest.TestCase):
         with self.assertRaises(benchmark.BenchmarkError):
             benchmark.apply_yaml_overrides("%YAML:1.0\n", {"Missing": 1})
 
+    def test_yaml_override_can_append_evaluation_output_key(self) -> None:
+        result = benchmark.apply_yaml_overrides(
+            "%YAML:1.0\nRecord.record_rendered_image: 1\n",
+            {"Record.save_rendered_mesh_eval": 1},
+            append_missing=True,
+        )
+        self.assertEqual(result.count("Record.save_rendered_mesh_eval"), 1)
+        self.assertTrue(result.endswith("Record.save_rendered_mesh_eval: 1\n"))
+
     def test_data_resolution_accepts_replica_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

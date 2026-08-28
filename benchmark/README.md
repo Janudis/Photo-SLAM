@@ -60,6 +60,24 @@ python3 benchmark/run.py replica \
   --run-id replica-office0-smoke
 ```
 
+After the complete 24-job Replica matrix finishes, evaluate all three native
+methods with one command:
+
+```bash
+python3 benchmark/evaluate.py replica --run-id replica-main
+```
+
+The evaluator uses `evo_ape` with Sim(3) alignment for tracking, aligns each
+mesh through `mesh_eval`, and then invokes the official HI-SLAM2 3D
+reconstruction evaluator at 5 cm. PSNR, SSIM, and AlexNet LPIPS are averaged
+over all keyframes rendered by each completed mapping run; the evaluated frame
+IDs and counts are stored with the results.
+Its consolidated output is written to:
+
+```text
+<results-root>/paper_benchmark/<run-id>/evaluation/replica_summary.json
+```
+
 Equivalent TUM and ScanNet commands are:
 
 ```bash
@@ -76,6 +94,66 @@ python3 benchmark/run.py scannet \
 
 Use `--repetitions 3` when repeated trials are required. Jobs are deliberately
 run sequentially so methods do not compete for GPU memory or compute.
+
+## Replica MVS-TSDF pruning ablation
+
+`ablate_densification.py` runs only the monocular SVRecon mapper on Replica
+`office0`. Every variant uses full-image MVS-TSDF densification, a two-voxel
+TSDF truncation band, and MVS depth regularization with weight `0.001`. Direct
+rendered-depth and direct MVS hole insertion remain disabled. The variants
+change only pruning behavior, leaving the MVS depth and densification settings
+fixed.
+
+This is intentionally different from the `ours_mvs` method used by the main
+Replica table. That benchmark enabled direct MVS insertion at rendered holes,
+disabled MVS-TSDF evidence, and used zero weights for learned-depth and normal
+supervision. Its pruning used co-visibility and final refinement, while MVS
+consistency pruning was disabled. The `surface_views_final` ablation below
+reuses those pruning switches, but retains the fixed MVS-TSDF and depth-loss
+settings of this study.
+
+The six configurations compare scheduled SVRecon SDF/near/far pruning,
+renderer co-visibility, MVS support/free-space consistency, the shutdown
+refinement switches used by the table experiments, and the combined online
+pruning methods with and without final refinement.
+
+Inside the benchmark container, inspect the complete matrix without creating
+outputs:
+
+```bash
+python3 benchmark/ablate_densification.py \
+  --run-id replica-office0-mvs-tsdf-pruning-v1 \
+  --dry-run
+```
+
+Run all configurations and immediately evaluate reconstruction and rendering:
+
+```bash
+DEPS=/tmp/photoslam-benchmark-eval
+PYTHONPATH="$DEPS" PATH="$DEPS/bin:$PATH" \
+python3 benchmark/ablate_densification.py \
+  --run-id replica-office0-mvs-tsdf-pruning-v1
+```
+
+The default `core` suite runs all six configurations. For a paper ablation,
+`--repetitions 3` reports the mean and population standard deviation across
+independent SLAM runs. If evaluation is interrupted after mapping has completed,
+rerun only that stage with:
+
+```bash
+DEPS=/tmp/photoslam-benchmark-eval
+PYTHONPATH="$DEPS" PATH="$DEPS/bin:$PATH" \
+python3 benchmark/ablate_densification.py \
+  --run-id replica-office0-mvs-tsdf-pruning-v1 \
+  --evaluate-only
+```
+
+Each trial retains its effective YAML, run log, normal shutdown output, and
+evaluation cache. The single consolidated result is:
+
+```text
+<results-root>/densification_ablation/<run-id>/evaluation/summary.json
+```
 
 ## Scope
 

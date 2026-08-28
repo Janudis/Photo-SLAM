@@ -55,7 +55,7 @@ class MethodSpec:
     key: str
     label: str
     family: str
-    voxel_overrides: dict[str, int]
+    voxel_overrides: dict[str, int | float]
     requires_mvs_model: bool = False
 
 
@@ -136,6 +136,15 @@ _DISABLED_LEARNED_DEPTH_MODES = {
     "Mapper.monocular_mvs_tsdf_evidence": 0,
     "Mapper.monocular_omnidata_densify": 0,
     "Record.enable_rerun": 0,
+}
+
+_PHOTOSLAM_REPLICA_EXPORT_OVERRIDES: dict[str, int | float] = {
+    "Record.save_rendered_mesh_eval": 1,
+    "Record.rendered_mesh_eval_voxel_size_m": 0.03,
+    "Record.rendered_mesh_eval_min_weight": 1.0,
+    "Record.rendered_mesh_eval_trunc_vox": 8.0,
+    "Record.rendered_mesh_eval_depth_max_m": 40.0,
+    "Record.rendered_mesh_eval_alpha_thres": 0.5,
 }
 
 METHODS: dict[str, MethodSpec] = {
@@ -241,7 +250,12 @@ def snapshot_file(source: Path, destination: Path) -> None:
     destination.write_bytes(source.read_bytes())
 
 
-def apply_yaml_overrides(text: str, overrides: dict[str, int]) -> str:
+def apply_yaml_overrides(
+    text: str,
+    overrides: dict[str, int | float],
+    *,
+    append_missing: bool = False,
+) -> str:
     result = text
     for key, value in overrides.items():
         pattern = re.compile(
@@ -249,6 +263,11 @@ def apply_yaml_overrides(text: str, overrides: dict[str, int]) -> str:
             re.MULTILINE,
         )
         result, count = pattern.subn(rf"\g<indent>{key}: {value}", result)
+        if count == 0 and append_missing:
+            if result and not result.endswith("\n"):
+                result += "\n"
+            result += f"{key}: {value}\n"
+            continue
         if count != 1:
             raise BenchmarkError(
                 f"Expected exactly one YAML key {key!r}; found {count}"
@@ -487,7 +506,15 @@ def prepare_job(job: Job) -> tuple[list[str], dict[str, str]]:
     else:
         assert job.photoslam_config is not None
         mapper_snapshot = config_dir / "gaussian_mapper.yaml"
-        snapshot_file(job.photoslam_config, mapper_snapshot)
+        mapper_text = job.photoslam_config.read_text(encoding="utf-8")
+        if job.dataset.key == "replica":
+            mapper_text = apply_yaml_overrides(
+                mapper_text,
+                _PHOTOSLAM_REPLICA_EXPORT_OVERRIDES,
+                append_missing=True,
+            )
+        mapper_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        mapper_snapshot.write_text(mapper_text, encoding="utf-8")
         config_hashes["gaussian_mapper.yaml"] = sha256(mapper_snapshot)
         command = [
             str(job.binary),

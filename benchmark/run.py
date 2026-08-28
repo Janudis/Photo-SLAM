@@ -139,6 +139,7 @@ _DISABLED_LEARNED_DEPTH_MODES = {
 }
 
 MVS_TSDF_COMMON_OVERRIDES: dict[str, int | float] = {
+    "Model.global_scene_extent": 256.0,
     "Mapper.monocular_rendered_depth_densify": 0,
     "Mapper.monocular_mvs_densify": 0,
     "Mapper.monocular_mvs_tsdf_evidence": 1,

@@ -103,6 +103,10 @@ configuration over all eight Replica scenes with two explicit presets:
 - `ours_mvs_tsdf_geometry` enables MVS-consistency pruning;
 - `ours_mvs_tsdf_rendering` uses scheduled SDF/near/far pruning only.
 
+Both final MVS-TSDF presets use a 256 m fixed octree root. With
+`Model.outside_level=5`, this provides 8 m of initial inside extent for all
+Replica scenes while retaining the configured insertion voxel size.
+
 Both presets use full-image MVS-TSDF densification with a two-voxel truncation
 band and MVS depth supervision with weight `0.001`. Direct rendered-depth and
 direct MVS hole insertion, co-visibility pruning, final refinement, Omnidata,

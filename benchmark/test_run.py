@@ -106,6 +106,14 @@ class BenchmarkLauncherTest(unittest.TestCase):
                 self.assertEqual(geometry[key], value)
             self.assertEqual(rendering[key], value)
 
+    def test_final_mvs_tsdf_presets_cover_all_replica_scene_extents(self) -> None:
+        self.assertEqual(
+            benchmark.MVS_TSDF_COMMON_OVERRIDES[
+                "Model.global_scene_extent"
+            ],
+            256.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,11 @@ Run an office0 smoke test without opening an interactive shell:
     --run-id replica-monogs-office0-smoke
 ```
 
+The launcher prints an immediate job header followed by elapsed time and GPU
+usage every 30 seconds. Full native output is written to the trial's
+`console.log`. An interactive `Ctrl+C` terminates the native process group;
+using an already-active run ID is rejected.
+
 After the smoke test succeeds, run all eight Replica scenes:
 
 ```bash

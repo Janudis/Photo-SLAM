@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -84,6 +86,20 @@ def write_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def acquire_run_lock(path: Path):
+    handle = path.open("w", encoding="ascii")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise BaselineError(
+            f"Benchmark run is already active: {path.parent.name}"
+        ) from error
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def require_file(path: Path, description: str) -> Path:
@@ -555,12 +571,39 @@ def run_monitored(command: list[str], cwd: Path, log_path: Path) -> dict[str, fl
             stderr=subprocess.STDOUT,
             text=True,
             env={**os.environ, "WANDB_MODE": "disabled"},
+            start_new_session=True,
         )
-        while process.poll() is None:
-            used = gpu_memory_used_mb()
-            if used is not None and (peak is None or used > peak):
-                peak = used
-            time.sleep(0.2)
+        next_report = start + 10.0
+        try:
+            while process.poll() is None:
+                used = gpu_memory_used_mb()
+                if used is not None and (peak is None or used > peak):
+                    peak = used
+                now = time.perf_counter()
+                if now >= next_report:
+                    gpu_text = "unavailable" if used is None else f"{used:.0f} MiB"
+                    print(
+                        f"[running] elapsed={now - start:.0f}s "
+                        f"GPU={gpu_text} log={log_path}",
+                        flush=True,
+                    )
+                    next_report = now + 30.0
+                time.sleep(0.2)
+        except BaseException:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+            raise
         return_code = process.wait()
     elapsed = time.perf_counter() - start
     return {
@@ -738,17 +781,18 @@ def main() -> int:
         for trial in range(1, args.repetitions + 1)
     ]
 
-    print(f"Method: {args.method} @ {SOURCE_COMMITS[args.method]}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Sequences: {', '.join(sequences)}")
+    print(f"Method: {args.method} @ {SOURCE_COMMITS[args.method]}", flush=True)
+    print(f"Dataset: {args.dataset}", flush=True)
+    print(f"Sequences: {', '.join(sequences)}", flush=True)
     if args.method == "tandem":
-        print(f"TANDEM preset: {args.tandem_preset}")
+        print(f"TANDEM preset: {args.tandem_preset}", flush=True)
     if args.dry_run:
         for sequence, trial in jobs:
             print(f"  {sequence} trial {trial:02d}")
         return 0
 
     run_root.mkdir(parents=True, exist_ok=True)
+    _run_lock = acquire_run_lock(run_root / ".run.lock")
     manifest: dict[str, object] = {
         "schema_version": 1,
         "status": "running",
@@ -779,7 +823,10 @@ def main() -> int:
         }
         manifest["jobs"].append(job)
         write_json(manifest_path, manifest)
-        print(f"\n=== {args.method} | {args.dataset}/{sequence} | trial {trial:02d} ===")
+        print(
+            f"\n=== {args.method} | {args.dataset}/{sequence} | trial {trial:02d} ===",
+            flush=True,
+        )
 
         try:
             prepared = prepare_input(args.dataset, args.data_root, sequence, workspace)
@@ -808,6 +855,7 @@ def main() -> int:
                     "created_at": utc_now(),
                 },
             )
+            print(f"Native log: {output / 'console.log'}", flush=True)
             runtime = run_monitored(command, source_root, output / "console.log")
             runtime["frames"] = prepared.frame_count
             runtime["wall_fps_hz"] = (
@@ -832,7 +880,7 @@ def main() -> int:
             job["finished_at"] = utc_now()
             job["error"] = str(error)
             write_json(manifest_path, manifest)
-            print(f"ERROR: {error}", file=sys.stderr)
+            print(f"ERROR: {error}", file=sys.stderr, flush=True)
             if not args.continue_on_error:
                 manifest["status"] = "failed"
                 manifest["finished_at"] = utc_now()
@@ -843,7 +891,7 @@ def main() -> int:
     manifest["status"] = "complete_with_errors" if any_failure else "complete"
     manifest["finished_at"] = utc_now()
     write_json(manifest_path, manifest)
-    print(f"\nBenchmark manifest: {manifest_path}")
+    print(f"\nBenchmark manifest: {manifest_path}", flush=True)
     return 1 if any_failure else 0
 
 

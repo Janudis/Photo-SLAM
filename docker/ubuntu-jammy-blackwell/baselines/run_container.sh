@@ -49,4 +49,10 @@ if [[ $# -eq 0 ]]; then
     exec "${docker_cmd[@]}" exec -it --workdir "$workdir" "$container" /bin/bash
 fi
 
-exec "${docker_cmd[@]}" exec --workdir "$workdir" "$container" "$@"
+terminal_args=()
+if [[ -t 0 && -t 1 ]]; then
+    terminal_args=(-it)
+fi
+
+exec "${docker_cmd[@]}" exec "${terminal_args[@]}" \
+    --workdir "$workdir" "$container" "$@"

@@ -94,6 +94,21 @@ class BaselineLauncherTest(unittest.TestCase):
             self.assertIn("preset=dataset", command)
             self.assertIn("mesh_extraction_freq=0", command)
 
+    def test_run_lock_rejects_duplicate_active_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / ".run.lock"
+            first = baseline.acquire_run_lock(lock_path)
+            try:
+                with self.assertRaisesRegex(
+                    baseline.BaselineError, "already active"
+                ):
+                    baseline.acquire_run_lock(lock_path)
+            finally:
+                first.close()
+
+            reopened = baseline.acquire_run_lock(lock_path)
+            reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

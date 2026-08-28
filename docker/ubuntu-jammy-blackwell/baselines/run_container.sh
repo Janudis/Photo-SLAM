@@ -16,7 +16,7 @@ shift
 
 case "$method" in
     monogs)
-        default_name="dimitris-monogs-benchmark"
+        default_name="dimitris-monogs-benchmark-r2"
         workdir="/opt/MonoGS"
         ;;
     hislam2)

@@ -557,6 +557,33 @@ def gpu_memory_used_mb() -> float | None:
         return None
 
 
+def terminate_process_group(process: subprocess.Popen, timeout: float = 10.0) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if process.poll() is None:
+        process.wait()
+
+
 def run_monitored(command: list[str], cwd: Path, log_path: Path) -> dict[str, float | int | None]:
     baseline = gpu_memory_used_mb()
     peak = baseline
@@ -570,10 +597,17 @@ def run_monitored(command: list[str], cwd: Path, log_path: Path) -> dict[str, fl
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
-            env={**os.environ, "WANDB_MODE": "disabled"},
+            env={
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+                "WANDB_MODE": "disabled",
+            },
             start_new_session=True,
         )
         next_report = start + 10.0
+        next_log_check = start + 1.0
+        log_offset = 0
+        native_traceback = False
         try:
             while process.poll() is None:
                 used = gpu_memory_used_mb()
@@ -588,23 +622,30 @@ def run_monitored(command: list[str], cwd: Path, log_path: Path) -> dict[str, fl
                         flush=True,
                     )
                     next_report = now + 30.0
+                if now >= next_log_check:
+                    log.flush()
+                    with log_path.open("rb") as reader:
+                        reader.seek(log_offset)
+                        output = reader.read()
+                        log_offset = reader.tell()
+                    if b"Traceback (most recent call last):" in output:
+                        native_traceback = True
+                        print(
+                            "[failed] Native traceback detected; terminating "
+                            f"process group. See {log_path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        terminate_process_group(process)
+                        break
+                    next_log_check = now + 1.0
                 time.sleep(0.2)
         except BaseException:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=10.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
+            terminate_process_group(process)
             raise
         return_code = process.wait()
+        if native_traceback and return_code == 0:
+            return_code = 1
     elapsed = time.perf_counter() - start
     return {
         "return_code": return_code,
@@ -874,6 +915,14 @@ def main() -> int:
             job.update(find_outputs(args.method, output, args.tandem_preset))
             job["status"] = "complete"
             job["finished_at"] = utc_now()
+        except KeyboardInterrupt:
+            job["status"] = "interrupted"
+            job["finished_at"] = utc_now()
+            manifest["status"] = "interrupted"
+            manifest["finished_at"] = utc_now()
+            write_json(manifest_path, manifest)
+            print("\nBenchmark interrupted; native processes stopped.", flush=True)
+            return 130
         except Exception as error:
             any_failure = True
             job["status"] = "failed"

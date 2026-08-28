@@ -109,6 +109,25 @@ class BaselineLauncherTest(unittest.TestCase):
             reopened = baseline.acquire_run_lock(lock_path)
             reopened.close()
 
+    def test_monitor_terminates_native_process_after_traceback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metrics = baseline.run_monitored(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import time; "
+                        "print('Traceback (most recent call last):', flush=True); "
+                        "time.sleep(30)"
+                    ),
+                ],
+                root,
+                root / "console.log",
+            )
+            self.assertNotEqual(metrics["return_code"], 0)
+            self.assertLess(metrics["wall_seconds"], 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

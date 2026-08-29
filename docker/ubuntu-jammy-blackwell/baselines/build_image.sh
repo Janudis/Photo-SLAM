@@ -17,7 +17,7 @@ fi
 method="$1"
 case "$method" in
     monogs)
-        default_image="dimitris-monogs-blackwell:cu128-r2"
+        default_image="dimitris-monogs-blackwell:cu128-r3"
         commit="6c9254c319d8bff5caeef65259e6bb0941a9b9f6"
         ;;
     hislam2)

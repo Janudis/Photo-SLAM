@@ -4,8 +4,9 @@ These images isolate the incompatible native dependencies of MonoGS,
 HI-SLAM2, and TANDEM from Photo-SLAM. Each image clones a fixed upstream
 revision and targets CUDA 12.8 / `sm_120` for the RTX 5080.
 
-MonoGS uses its upstream-pinned `evo==1.11.0`; the `cu128-r2` image tag
-distinguishes this corrected environment from the incompatible initial build.
+MonoGS uses its upstream-pinned `evo==1.11.0` with headless Matplotlib
+rendering; the `cu128-r3` image tag distinguishes this corrected environment
+from the incompatible initial builds.
 
 The compatibility changes are limited to newer compiler, CUDA, PyTorch, and
 headless-output support. Dataset and result paths are mounted at `/datasets`

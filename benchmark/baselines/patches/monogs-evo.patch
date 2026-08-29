@@ -2,15 +2,22 @@ diff --git a/utils/eval_utils.py b/utils/eval_utils.py
 index cf5a6b5..b5dec64 100644
 --- a/utils/eval_utils.py
 +++ b/utils/eval_utils.py
-@@ -11,6 +11,7 @@ from evo.core.trajectory import PosePath3D, PoseTrajectory3D
- from evo.tools import plot
+@@ -8,9 +8,13 @@ import torch
+ from evo.core import metrics, trajectory
+ from evo.core.metrics import PoseRelation, Unit
+ from evo.core.trajectory import PosePath3D, PoseTrajectory3D
+-from evo.tools import plot
  from evo.tools.plot import PlotMode
  from evo.tools.settings import SETTINGS
++
++SETTINGS.plot_backend = "Agg"
++
++from evo.tools import plot
 +from matplotlib import cm, colors
  from matplotlib import pyplot as plt
  from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-@@ -22,6 +23,42 @@ from gaussian_splatting.utils.system_utils import mkdir_p
+@@ -22,6 +26,42 @@ from gaussian_splatting.utils.system_utils import mkdir_p
  from utils.logging_utils import Log
 
 
@@ -53,7 +60,7 @@ index cf5a6b5..b5dec64 100644
  def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
      ## Plot
      traj_ref = PosePath3D(poses_se3=poses_gt)
-@@ -51,7 +88,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+@@ -51,7 +91,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
      ax = evo.tools.plot.prepare_axis(fig, plot_mode)
      ax.set_title(f"ATE RMSE: {ape_stat}")
      evo.tools.plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
@@ -62,7 +69,7 @@ index cf5a6b5..b5dec64 100644
          ax,
          traj_est_aligned,
          ape_metric.error,
-@@ -61,5 +98,6 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
+@@ -61,5 +101,6 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
      )
      ax.legend()
      plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)

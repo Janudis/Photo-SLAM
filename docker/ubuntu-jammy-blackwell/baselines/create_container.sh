@@ -16,8 +16,8 @@ fi
 method="$1"
 case "$method" in
     monogs)
-        default_image="dimitris-monogs-blackwell:cu128-r2"
-        default_name="dimitris-monogs-benchmark-r2"
+        default_image="dimitris-monogs-blackwell:cu128-r3"
+        default_name="dimitris-monogs-benchmark-r3"
         ;;
     hislam2)
         default_image="dimitris-hislam2-blackwell:cu128"

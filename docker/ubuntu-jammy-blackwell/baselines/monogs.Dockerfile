@@ -82,7 +82,8 @@ RUN python3 -m pip install --no-cache-dir --no-build-isolation \
     && python3 -m pip install --no-cache-dir --no-build-isolation \
         /opt/MonoGS/submodules/diff-gaussian-rasterization
 
-RUN python3 -c "import torch; import diff_gaussian_rasterization; import simple_knn._C; print(torch.__version__, torch.version.cuda)"
+RUN cd /opt/MonoGS \
+    && python3 -c "import torch; import diff_gaussian_rasterization; import simple_knn._C; from evo.core import trajectory; assert hasattr(trajectory, 'align_trajectory'); from utils import eval_utils; assert eval_utils.plt.get_backend().lower() == 'agg'; fig = eval_utils.plt.figure(); eval_utils.plt.close(fig); print(torch.__version__, torch.version.cuda, eval_utils.plt.get_backend())"
 
 COPY benchmark/baselines /opt/photoslam-benchmark
 COPY evaluation/export_monogs_reconstruction.py /opt/photoslam-benchmark/export_monogs_reconstruction.py

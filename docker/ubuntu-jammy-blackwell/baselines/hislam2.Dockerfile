@@ -29,7 +29,8 @@ RUN apt-get update \
 
 RUN mkdir -p /tmp/baseline-home && chmod 1777 /tmp/baseline-home
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+RUN python3 -m pip install --no-cache-dir --upgrade pip wheel \
+    && python3 -m pip install --no-cache-dir setuptools==69.5.1 \
     && python3 -m pip install --no-cache-dir \
         torch==2.7.1 \
         torchvision==0.22.1 \
@@ -81,7 +82,7 @@ ENV CUDA_HOME=/usr/local/cuda \
 # TORCH_CUDA_ARCH_LIST select only the Blackwell architecture instead.
 RUN sed -i '/-gencode=arch=compute_/d' /opt/HI-SLAM2/setup.py \
     && cd /opt/HI-SLAM2 \
-    && python3 -m pip install --no-cache-dir --no-build-isolation . \
+    && python3 setup.py install \
     && python3 -m pip install --no-cache-dir --no-build-isolation \
         thirdparty/simple-knn \
     && python3 -m pip install --no-cache-dir --no-build-isolation \

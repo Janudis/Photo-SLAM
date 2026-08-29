@@ -95,10 +95,15 @@ ENV CUDA_HOME=/usr/local/cuda \
     MPLBACKEND=Agg \
     PYTHONNOUSERSITE=1
 
+COPY benchmark/baselines/patches/hislam2-torch27.patch /tmp/hislam2-torch27.patch
+
 # The upstream setup hard-codes pre-Ampere gencode flags. Let PyTorch's
 # TORCH_CUDA_ARCH_LIST select only the Blackwell architecture instead. Newer
 # PyTorch dispatch macros require Tensor.scalar_type() rather than Tensor.type().
-RUN python3 -m pip install --no-cache-dir setuptools==69.5.1 \
+RUN git -C /opt/HI-SLAM2 apply --check /tmp/hislam2-torch27.patch \
+    && git -C /opt/HI-SLAM2 apply /tmp/hislam2-torch27.patch \
+    && rm /tmp/hislam2-torch27.patch \
+    && python3 -m pip install --no-cache-dir setuptools==69.5.1 \
     && sed -i '/-gencode=arch=compute_/d' /opt/HI-SLAM2/setup.py \
     && sed -i -E 's/([[:alnum:]_]+)\.type\(\)/\1.scalar_type()/g' \
         /opt/HI-SLAM2/thirdparty/lietorch/lietorch/src/lietorch_cpu.cpp \

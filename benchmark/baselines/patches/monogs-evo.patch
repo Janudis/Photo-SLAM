@@ -7,12 +7,13 @@ index cf5a6b5..b5dec64 100644
  from evo.core.metrics import PoseRelation, Unit
  from evo.core.trajectory import PosePath3D, PoseTrajectory3D
 -from evo.tools import plot
- from evo.tools.plot import PlotMode
+-from evo.tools.plot import PlotMode
  from evo.tools.settings import SETTINGS
 +
 +SETTINGS.plot_backend = "Agg"
 +
 +from evo.tools import plot
++from evo.tools.plot import PlotMode
 +from matplotlib import cm, colors
  from matplotlib import pyplot as plt
  from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity

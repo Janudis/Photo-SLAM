@@ -36,9 +36,27 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
         torchaudio==2.7.1 \
         --index-url https://download.pytorch.org/whl/cu128
 
-RUN git clone --recursive https://github.com/Willyzw/HI-SLAM2.git /opt/HI-SLAM2 \
-    && git -C /opt/HI-SLAM2 checkout "${SOURCE_COMMIT}" \
-    && git -C /opt/HI-SLAM2 submodule update --init --recursive
+RUN git init /opt/HI-SLAM2 \
+    && git -C /opt/HI-SLAM2 remote add origin \
+        https://github.com/Willyzw/HI-SLAM2.git \
+    && for attempt in 1 2 3; do \
+        if git -C /opt/HI-SLAM2 -c http.version=HTTP/1.1 fetch \
+            --depth 1 origin "${SOURCE_COMMIT}"; then \
+            break; \
+        fi; \
+        if [[ "${attempt}" == 3 ]]; then exit 1; fi; \
+        sleep "$((attempt * 5))"; \
+    done \
+    && git -C /opt/HI-SLAM2 checkout --detach FETCH_HEAD \
+    && git -C /opt/HI-SLAM2 submodule sync --recursive \
+    && for attempt in 1 2 3; do \
+        if git -C /opt/HI-SLAM2 -c http.version=HTTP/1.1 submodule update \
+            --init --recursive --depth 1 --jobs 1; then \
+            break; \
+        fi; \
+        if [[ "${attempt}" == 3 ]]; then exit 1; fi; \
+        sleep "$((attempt * 5))"; \
+    done
 
 COPY benchmark/baselines/patches/hislam2-output.patch /tmp/hislam2-output.patch
 RUN git -C /opt/HI-SLAM2 apply --check /tmp/hislam2-output.patch \

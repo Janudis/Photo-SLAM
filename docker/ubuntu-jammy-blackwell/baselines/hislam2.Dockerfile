@@ -96,9 +96,13 @@ ENV CUDA_HOME=/usr/local/cuda \
     PYTHONNOUSERSITE=1
 
 # The upstream setup hard-codes pre-Ampere gencode flags. Let PyTorch's
-# TORCH_CUDA_ARCH_LIST select only the Blackwell architecture instead.
+# TORCH_CUDA_ARCH_LIST select only the Blackwell architecture instead. Newer
+# PyTorch dispatch macros require Tensor.scalar_type() rather than Tensor.type().
 RUN python3 -m pip install --no-cache-dir setuptools==69.5.1 \
     && sed -i '/-gencode=arch=compute_/d' /opt/HI-SLAM2/setup.py \
+    && sed -i -E 's/([[:alnum:]_]+)\.type\(\)/\1.scalar_type()/g' \
+        /opt/HI-SLAM2/thirdparty/lietorch/lietorch/src/lietorch_cpu.cpp \
+        /opt/HI-SLAM2/thirdparty/lietorch/lietorch/src/lietorch_gpu.cu \
     && cd /opt/HI-SLAM2 \
     && python3 setup.py install \
     && python3 -m pip install --no-cache-dir --no-build-isolation \

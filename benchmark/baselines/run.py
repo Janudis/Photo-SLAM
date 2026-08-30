@@ -38,6 +38,12 @@ SCANNET_SEQUENCES = (
     "scene0207_00",
 )
 
+TUM_SEQUENCES = (
+    "rgbd_dataset_freiburg1_desk",
+    "rgbd_dataset_freiburg2_xyz",
+    "rgbd_dataset_freiburg3_long_office_household",
+)
+
 SOURCE_COMMITS = {
     "monogs": "6c9254c319d8bff5caeef65259e6bb0941a9b9f6",
     "hislam2": "76c833c7d8ed474f0f3ba18056c1803e032a537f",
@@ -254,8 +260,8 @@ def load_scannet_calibration(scene: Path, image: Path) -> CameraCalibration:
 
 
 def tum_calibration(sequence: str) -> CameraCalibration:
-    if sequence == "rgbd_dataset_freiburg1_desk":
-        return CameraCalibration(
+    calibrations = {
+        "rgbd_dataset_freiburg1_desk": CameraCalibration(
             517.306408,
             516.469215,
             318.643040,
@@ -263,7 +269,27 @@ def tum_calibration(sequence: str) -> CameraCalibration:
             640,
             480,
             (0.262383, -0.953104, -0.005358, 0.002628, 1.163314),
-        )
+        ),
+        "rgbd_dataset_freiburg2_xyz": CameraCalibration(
+            520.908620,
+            521.007327,
+            325.141442,
+            249.701764,
+            640,
+            480,
+            (0.231222, -0.784899, -0.003257, -0.000105, 0.917205),
+        ),
+        "rgbd_dataset_freiburg3_long_office_household": CameraCalibration(
+            535.4,
+            539.2,
+            320.1,
+            247.6,
+            640,
+            480,
+        ),
+    }
+    if sequence in calibrations:
+        return calibrations[sequence]
     raise BaselineError(
         f"No reviewed calibration is registered for TUM sequence {sequence}"
     )
@@ -775,13 +801,6 @@ def postprocess_hislam2(dataset: str, output: Path) -> None:
         )
 
 
-def available_tum_sequences(data_root: Path) -> tuple[str, ...]:
-    root = data_root / "TUM"
-    if not root.is_dir():
-        return ()
-    return tuple(sorted(path.name for path in root.iterdir() if (path / "rgb.txt").is_file()))
-
-
 def expand_sequences(dataset: str, values: list[str], data_root: Path) -> tuple[str, ...]:
     if values != ["all"]:
         return tuple(values)
@@ -789,10 +808,7 @@ def expand_sequences(dataset: str, values: list[str], data_root: Path) -> tuple[
         return REPLICA_SEQUENCES
     if dataset == "scannet":
         return SCANNET_SEQUENCES
-    sequences = available_tum_sequences(data_root)
-    if not sequences:
-        raise BaselineError(f"No TUM sequences found below {data_root / 'TUM'}")
-    return sequences
+    return TUM_SEQUENCES
 
 
 def parse_args() -> argparse.Namespace:

@@ -33,6 +33,27 @@ class BaselineLauncherTest(unittest.TestCase):
         self.assertEqual(sequences, baseline.SCANNET_SEQUENCES)
         self.assertEqual(len(sequences), 6)
 
+    def test_tum_sequence_set_matches_rendering_table(self):
+        sequences = baseline.expand_sequences(
+            "tum", ["all"], Path("/unused")
+        )
+        self.assertEqual(sequences, baseline.TUM_SEQUENCES)
+        self.assertEqual(len(sequences), 3)
+
+    def test_tum_calibrations_match_orb_slam_configs(self):
+        fr1 = baseline.tum_calibration("rgbd_dataset_freiburg1_desk")
+        fr2 = baseline.tum_calibration("rgbd_dataset_freiburg2_xyz")
+        fr3 = baseline.tum_calibration(
+            "rgbd_dataset_freiburg3_long_office_household"
+        )
+
+        self.assertEqual((fr1.fx, fr1.fy), (517.306408, 516.469215))
+        self.assertEqual((fr2.fx, fr2.fy), (520.908620, 521.007327))
+        self.assertEqual((fr3.fx, fr3.fy), (535.4, 539.2))
+        self.assertEqual(len(fr1.distortion), 5)
+        self.assertEqual(len(fr2.distortion), 5)
+        self.assertEqual(fr3.distortion, ())
+
     def test_monogs_config_uses_read_only_prepared_input(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -50,6 +50,23 @@ class BenchmarkLauncherTest(unittest.TestCase):
             )
             self.assertEqual(actual, sequence)
 
+    def test_tum_sequence_resolves_existing_config_names(self) -> None:
+        dataset = benchmark.DATASETS["tum"]
+        sequence = "rgbd_dataset_freiburg2_xyz"
+        self.assertEqual(
+            benchmark.relative_config_path(dataset.orb_config, sequence),
+            Path("cfg/ORB_SLAM3/Monocular/TUM/tum_freiburg2_xyz.yaml"),
+        )
+        self.assertEqual(
+            benchmark.relative_config_path(
+                dataset.photoslam_config or "", sequence
+            ),
+            Path(
+                "cfg/gaussian_mapper/Monocular/TUM/"
+                "tum_freiburg2_xyz.yaml"
+            ),
+        )
+
     def test_all_method_expansion_is_stable(self) -> None:
         self.assertEqual(
             benchmark.expand_methods(["all"]), benchmark.DEFAULT_METHODS

@@ -102,9 +102,9 @@ DATASETS: dict[str, DatasetSpec] = {
         voxel_config_sha256=(
             "9e9806a110f8e4c8b225a2e7bb2625ac5a635d18e0d43f57cc73d24f5ae6b599"
         ),
-        orb_config="cfg/ORB_SLAM3/Monocular/TUM/{tum_config}.yaml",
+        orb_config="cfg/ORB_SLAM3/Monocular/TUM/tum_{tum_config}.yaml",
         photoslam_config=(
-            "cfg/gaussian_mapper/Monocular/TUM/{tum_config}.yaml"
+            "cfg/gaussian_mapper/Monocular/TUM/tum_{tum_config}.yaml"
         ),
     ),
     "scannet": DatasetSpec(

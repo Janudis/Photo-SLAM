@@ -78,14 +78,47 @@ Its consolidated output is written to:
 <results-root>/paper_benchmark/<run-id>/evaluation/replica_summary.json
 ```
 
-Equivalent TUM and ScanNet commands are:
+The TUM appearance table uses the fixed sequence set
+`fr1/desk`, `fr2/xyz`, and `fr3/office`. Run Ours and Ours+MVS in the main
+benchmark container with:
 
 ```bash
 python3 benchmark/run.py tum \
   --sequences all \
-  --methods all \
-  --run-id tum-main
+  --methods ours ours_mvs \
+  --run-id tum-ours-main
+```
 
+Run HI-SLAM2 in its baseline container with the same sequence set:
+
+```bash
+python3 -u /opt/photoslam-benchmark/run.py hislam2 tum \
+  --sequences all \
+  --run-id tum-hislam2-main \
+  --continue-on-error
+```
+
+After both manifests report `complete`, collect the three table rows in the
+main benchmark container:
+
+```bash
+DEPS=/tmp/photoslam-benchmark-eval
+PYTHONPATH="$DEPS" PATH="$DEPS/bin:$PATH" \
+python3 benchmark/evaluate_tum.py \
+  --ours-run-id tum-ours-main \
+  --hislam2-run-id tum-hislam2-main
+```
+
+The evaluator compares Ours and Ours+MVS on their common mapper keyframes and
+computes LPIPS against each mapper's saved, undistorted ground-truth image.
+HI-SLAM2 is reported from its native post-optimization appearance summary.
+The JSON summary is saved as
+`<results-root>/paper_benchmark/tum-ours-main/evaluation/tum_summary.json`, and
+the corresponding LaTeX rows are printed to the terminal.
+
+The equivalent ScanNet launcher command is:
+
+```bash
 python3 benchmark/run.py scannet \
   --sequences scene0000_00 \
   --methods all \

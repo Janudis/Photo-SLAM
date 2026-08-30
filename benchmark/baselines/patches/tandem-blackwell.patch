@@ -15,12 +15,11 @@ index ae1b0ff..aaae997 100644
  # optional libraries
  find_package(Pangolin 0.2 QUIET)
  find_package(OpenCV REQUIRED)
-@@ -30,7 +36,8 @@ add_subdirectory(libdr/cuda_coarse_tracker)
+@@ -30,7 +36,7 @@ add_subdirectory(libdr/cuda_coarse_tracker)
 
  # flags
  add_definitions("-DENABLE_SSE")
 -set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++0x -march=native -msse2 -msse3")
-+add_definitions("-DBOOST_BIND_GLOBAL_PLACEHOLDERS")
 +set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++14 -march=native -msse2 -msse3")
 
  if (MSVC)
@@ -172,3 +171,20 @@ index dc85691..69dbfa4 100644
  set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS};-lineinfo)
 
  cuda_add_library(dr-fusion STATIC
+diff --git a/tandem/src/util/IndexThreadReduce.h b/tandem/src/util/IndexThreadReduce.h
+--- a/tandem/src/util/IndexThreadReduce.h
++++ b/tandem/src/util/IndexThreadReduce.h
+@@ -27,2 +27,3 @@
+ #include "util/settings.h"
++#include <boost/bind/bind.hpp>
+ #include "boost/thread.hpp"
+@@ -34,4 +35,8 @@
+ namespace dso
+ {
+-
++using boost::placeholders::_1;
++using boost::placeholders::_2;
++using boost::placeholders::_3;
++using boost::placeholders::_4;
++
+ template<typename Running>

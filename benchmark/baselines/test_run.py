@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).with_name("run.py")
+PATCH_PATH = Path(__file__).with_name("patches") / "tandem-blackwell.patch"
 SPEC = importlib.util.spec_from_file_location("baseline_run", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 baseline = importlib.util.module_from_spec(SPEC)
@@ -93,6 +94,12 @@ class BaselineLauncherTest(unittest.TestCase):
             )
             self.assertIn("preset=dataset", command)
             self.assertIn("mesh_extraction_freq=0", command)
+
+    def test_tandem_patch_uses_scoped_boost_placeholders(self):
+        contents = PATCH_PATH.read_text(encoding="utf-8")
+        self.assertIn("boost::placeholders::_1", contents)
+        self.assertIn("boost::placeholders::_4", contents)
+        self.assertNotIn("BOOST_BIND_GLOBAL_PLACEHOLDERS", contents)
 
     def test_run_lock_rejects_duplicate_active_run(self):
         with tempfile.TemporaryDirectory() as temporary:

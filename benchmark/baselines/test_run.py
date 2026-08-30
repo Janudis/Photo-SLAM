@@ -109,6 +109,16 @@ class BaselineLauncherTest(unittest.TestCase):
         self.assertIn("#ifdef HAS_PANGOLIN", contents)
         self.assertIn("CUDA::nvToolsExt", contents)
 
+    def test_tandem_patch_repairs_backend_lifecycle(self):
+        contents = PATCH_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "fullSystem->dr_mvsnet_view_num = dr_mvsnet_view_num;",
+            contents,
+        )
+        self.assertIn("fullSystem->initDr();", contents)
+        self.assertIn("delete tandem_backend;", contents)
+        self.assertIn("worker_thread.join();", contents)
+
     def test_run_lock_rejects_duplicate_active_run(self):
         with tempfile.TemporaryDirectory() as temporary:
             lock_path = Path(temporary) / ".run.lock"

@@ -212,6 +212,13 @@ diff --git a/tandem/libdr/dr_mvsnet/CMakeLists.txt b/tandem/libdr/dr_mvsnet/CMak
 +
  add_executable(dr_mvsnet_test src/dr_mvsnet_test.cpp)
  target_link_libraries(dr_mvsnet_test dr-mvsnet)
+diff --git a/tandem/src/FullSystem/FullSystem.cpp b/tandem/src/FullSystem/FullSystem.cpp
+--- a/tandem/src/FullSystem/FullSystem.cpp
++++ b/tandem/src/FullSystem/FullSystem.cpp
+@@ -222,2 +222,3 @@ FullSystem::~FullSystem() {
+   if (mvsnet_flag) {
++    delete tandem_backend;
+     delete mvsnet;
 diff --git a/tandem/src/main_tandem_pangolin.cpp b/tandem/src/main_tandem_pangolin.cpp
 --- a/tandem/src/main_tandem_pangolin.cpp
 +++ b/tandem/src/main_tandem_pangolin.cpp
@@ -246,3 +253,33 @@ diff --git a/tandem/src/main_tandem_pangolin.cpp b/tandem/src/main_tandem_pangol
 -
 +
    runthread.join();
+diff --git a/tandem/src/main_tandem_pangolin.cpp b/tandem/src/main_tandem_pangolin.cpp
+--- a/tandem/src/main_tandem_pangolin.cpp
++++ b/tandem/src/main_tandem_pangolin.cpp
+@@ -250,5 +250,8 @@ int main(int argc, char **argv) {
+           fullSystem->result_folder = std::string(opt.result_folder);
+-
+-          fullSystem->outputWrapper = wraps;
+-
++          fullSystem->outputWrapper = wraps;
++          fullSystem->dr_mvsnet_view_num = dr_mvsnet_view_num;
++          fullSystem->dr_width = reader->getWidth();
++          fullSystem->dr_height = reader->getHeight();
++          fullSystem->initDr();
++
+           setting_fullResetRequested = false;
+diff --git a/tandem/src/tandem/tandem_backend.cpp b/tandem/src/tandem/tandem_backend.cpp
+--- a/tandem/src/tandem/tandem_backend.cpp
++++ b/tandem/src/tandem/tandem_backend.cpp
+@@ -25,2 +25,11 @@ public:
+   ~TandemBackendImpl() {
++    {
++      boost::unique_lock<boost::mutex> lock(mut);
++      while (unprocessed_data) {
++        dataProcessedSignal.wait(lock);
++      }
++      running = false;
++      newInputSignal.notify_all();
++    }
++    worker_thread.join();
+     delete coarse_tracker_depth_map_B;

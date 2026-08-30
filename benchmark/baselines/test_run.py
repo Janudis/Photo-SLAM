@@ -107,6 +107,7 @@ class BaselineLauncherTest(unittest.TestCase):
         )
         self.assertIn("PRIVATE HAS_PANGOLIN", contents)
         self.assertIn("#ifdef HAS_PANGOLIN", contents)
+        self.assertIn("CUDA::nvToolsExt", contents)
 
     def test_run_lock_rejects_duplicate_active_run(self):
         with tempfile.TemporaryDirectory() as temporary:

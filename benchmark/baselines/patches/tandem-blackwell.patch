@@ -53,7 +53,7 @@ index c553d8b..404436d 100644
  target_include_directories(cuda_coarse_tracker PUBLIC include/public ${CUDA_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
 
 -target_link_libraries(cuda_coarse_tracker ${CUDA_LIBRARIES} ${CUDA_cudadevrt_LIBRARY} CUDA::cublas cnpy)
-+target_link_libraries(cuda_coarse_tracker ${CUDA_LIBRARIES} ${CUDA_cudadevrt_LIBRARY} CUDA::cublas)
++target_link_libraries(cuda_coarse_tracker ${CUDA_LIBRARIES} ${CUDA_cudadevrt_LIBRARY} CUDA::cublas CUDA::nvToolsExt)
 
  #add_executable(main
  #        src/main.cu

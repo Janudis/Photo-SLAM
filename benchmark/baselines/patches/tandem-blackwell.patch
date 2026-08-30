@@ -24,6 +24,17 @@ index ae1b0ff..aaae997 100644
 
  if (MSVC)
      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
+@@ -129,7 +135,10 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin") # OSX
+ # build main executable (only if we have both OpenCV and Pangolin)
+ message("--- compiling tandem_dataset.")
+ add_executable(tandem_dataset ${PROJECT_SOURCE_DIR}/src/main_tandem_pangolin.cpp)
+ target_link_libraries(tandem_dataset tandem boost_system cxsparse ${BOOST_THREAD_LIBRARY} ${LIBZIP_LIBRARY} ${Pangolin_LIBRARIES} ${OpenCV_LIBS})
++if (Pangolin_FOUND)
++    target_compile_definitions(tandem_dataset PRIVATE HAS_PANGOLIN)
++endif ()
+ if (MVSNET)
+     target_link_libraries(tandem_dataset dr-mvsnet)
+     target_link_libraries(tandem_dataset dr-fusion)
 diff --git a/tandem/cmake/FindEigen3.cmake b/tandem/cmake/FindEigen3.cmake
 index 9c546a0..43a891f 100644
 --- a/tandem/cmake/FindEigen3.cmake
@@ -201,3 +212,37 @@ diff --git a/tandem/libdr/dr_mvsnet/CMakeLists.txt b/tandem/libdr/dr_mvsnet/CMak
 +
  add_executable(dr_mvsnet_test src/dr_mvsnet_test.cpp)
  target_link_libraries(dr_mvsnet_test dr-mvsnet)
+diff --git a/tandem/src/main_tandem_pangolin.cpp b/tandem/src/main_tandem_pangolin.cpp
+--- a/tandem/src/main_tandem_pangolin.cpp
++++ b/tandem/src/main_tandem_pangolin.cpp
+@@ -50,2 +50,4 @@
++#ifdef HAS_PANGOLIN
+ #include "IOWrapper/Pangolin/PangolinDSOViewer.h"
++#endif
+ #include "IOWrapper/OutputWrapper/SampleOutputWrapper.h"
+@@ -129,11 +131,10 @@ int main(int argc, char **argv) {
+   }
+-
+-
++#ifdef HAS_PANGOLIN
+   IOWrap::PangolinDSOViewer *viewer = 0;
+   if (!disableAllDisplay) {
+     viewer = new IOWrap::PangolinDSOViewer(wG[0], hG[0], false);
+     fullSystem->outputWrapper.push_back(viewer);
+   }
++#endif
+-
+-
++
+   if (opt.useSampleOutput)
+@@ -310,7 +311,7 @@ int main(int argc, char **argv) {
+   });
+-
+-
++#ifdef HAS_PANGOLIN
+   if (viewer != 0)
+     viewer->run();
++#endif
+-
++
+   runthread.join();

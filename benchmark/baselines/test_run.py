@@ -105,6 +105,8 @@ class BaselineLauncherTest(unittest.TestCase):
             "set_property(TARGET dr-mvsnet PROPERTY CXX_STANDARD 17)",
             contents,
         )
+        self.assertIn("PRIVATE HAS_PANGOLIN", contents)
+        self.assertIn("#ifdef HAS_PANGOLIN", contents)
 
     def test_run_lock_rejects_duplicate_active_run(self):
         with tempfile.TemporaryDirectory() as temporary:

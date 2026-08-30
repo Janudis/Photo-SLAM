@@ -100,6 +100,11 @@ class BaselineLauncherTest(unittest.TestCase):
         self.assertIn("boost::placeholders::_1", contents)
         self.assertIn("boost::placeholders::_4", contents)
         self.assertNotIn("BOOST_BIND_GLOBAL_PLACEHOLDERS", contents)
+        self.assertIn("-std=c++17", contents)
+        self.assertIn(
+            "set_property(TARGET dr-mvsnet PROPERTY CXX_STANDARD 17)",
+            contents,
+        )
 
     def test_run_lock_rejects_duplicate_active_run(self):
         with tempfile.TemporaryDirectory() as temporary:

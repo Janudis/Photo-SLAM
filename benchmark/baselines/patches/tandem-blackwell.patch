@@ -20,7 +20,7 @@ index ae1b0ff..aaae997 100644
  # flags
  add_definitions("-DENABLE_SSE")
 -set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++0x -march=native -msse2 -msse3")
-+set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++14 -march=native -msse2 -msse3")
++set(CMAKE_CXX_FLAGS "${SSE_FLAGS} -O3 -g -std=c++17 -march=native -msse2 -msse3")
 
  if (MSVC)
      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
@@ -188,3 +188,16 @@ diff --git a/tandem/src/util/IndexThreadReduce.h b/tandem/src/util/IndexThreadRe
 +using boost::placeholders::_4;
 +
  template<typename Running>
+diff --git a/tandem/libdr/dr_mvsnet/CMakeLists.txt b/tandem/libdr/dr_mvsnet/CMakeLists.txt
+--- a/tandem/libdr/dr_mvsnet/CMakeLists.txt
++++ b/tandem/libdr/dr_mvsnet/CMakeLists.txt
+@@ -11,6 +11,7 @@ add_library(dr-mvsnet STATIC src/dr_mvsnet.cpp)
+ target_include_directories(dr-mvsnet PUBLIC src/dr_mvsnet)
+ target_link_libraries(dr-mvsnet LINK_PRIVATE "${TORCH_LIBRARIES}" boost_system boost_thread)
+-set_property(TARGET dr-mvsnet PROPERTY CXX_STANDARD 14)
++set_property(TARGET dr-mvsnet PROPERTY CXX_STANDARD 17)
++set_property(TARGET dr-mvsnet PROPERTY CXX_STANDARD_REQUIRED ON)
+-
++
+ add_executable(dr_mvsnet_test src/dr_mvsnet_test.cpp)
+ target_link_libraries(dr_mvsnet_test dr-mvsnet)

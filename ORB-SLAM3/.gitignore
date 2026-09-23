@@ -89,3 +89,9 @@ my_settings.txt
 borrar/*
 
 */ExecMean.txt
+
+# Not part of the SVR-SLAM demo branch
+Calibration_Tutorial.pdf
+Changelog.md
+Dependencies.md
+evaluation/

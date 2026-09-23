@@ -36,8 +36,28 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
-#include "cuda_rasterizer/operate_points.h"
-#include "cuda_rasterizer/stereo_vision.h"
+__forceinline__ __device__ float3 reproject_depth_pinhole(
+    const int u,
+    const int v,
+    const float depth,
+    const float fx,
+    const float fy,
+    const float cx,
+    const float cy)
+{
+    return {(u - cx) * depth / fx, (v - cy) * depth / fy, depth};
+}
+
+__forceinline__ __device__ void insert_point_to_pcd(
+    int idx,
+    const float3& point,
+    float* pcd)
+{
+    int ptidx = 3 * idx;
+    pcd[ptidx] = point.x;
+    pcd[ptidx + 1] = point.y;
+    pcd[ptidx + 2] = point.z;
+}
 
 __global__ void reproject_depths_pinhole(
     int P,

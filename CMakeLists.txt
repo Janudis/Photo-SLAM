@@ -1,72 +1,44 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
-project(photo-slam LANGUAGES CXX CUDA)
+project(svr_slam LANGUAGES CXX CUDA)
 
 option(PHOTOSLAM_ENABLE_RERUN "Build Rerun diagnostics" ON)
-option(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM
-       "Build the original Gaussian Photo-SLAM mapper and runners" OFF)
-option(PHOTOSLAM_BUILD_REALSENSE
-       "Build the live RealSense RGB-D SVRecon runner" ON)
-set(PHOTOSLAM_CUDA_ARCHITECTURES "75;86" CACHE STRING
-    "Semicolon-separated CUDA architectures for project CUDA targets")
+option(PHOTOSLAM_BUILD_REALSENSE "Build the live RealSense RGB-D runner" ON)
+set(PHOTOSLAM_CUDA_ARCHITECTURES "75;86" CACHE STRING "CUDA architectures for project targets")
+set(CMAKE_CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
 
 if(NOT CMAKE_BUILD_TYPE)
-    # set(CMAKE_BUILD_TYPE Debug)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-if(PHOTOSLAM_ENABLE_RERUN)
-    include(FetchContent)
-    FetchContent_Declare(rerun_sdk URL
-        https://github.com/rerun-io/rerun/releases/download/0.34.1/rerun_cpp_sdk.zip)
-    FetchContent_MakeAvailable(rerun_sdk)
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
-# set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+set(CAFFE2_USE_CUDNN ON)
 
-set(CAFFE2_USE_CUDNN on)
-
-# Uncomment the following line if you want to solve CMake Warning "Failed to compute shorthash for libnvrtc.so"
-# set(PYTHON_EXECUTABLE "/usr/bin/python3")
-
-# ------------------------------------------------------------ Python
-# 1.  Tell CMake where to look **before** the first find_package().
-#    (Conda installs everything under $CONDA_PREFIX.)
 if(DEFINED ENV{CONDA_PREFIX})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
 endif()
 
-# 2.  Now ask for the interpreter **and** the dev files
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(pybind11 REQUIRED)
 add_definitions(-DPYBIND11_DETAILED_ERROR_MESSAGES)
 
-# Use an explicit LibTorch installation when supplied. On Jetson, the PyTorch
-# wheel exposes its CMake package through torch.utils.cmake_prefix_path.
 set(LIBTORCH_ROOT "" CACHE PATH "Root of an unpacked LibTorch distribution")
 if(NOT LIBTORCH_ROOT AND DEFINED ENV{LIBTORCH_ROOT})
     set(LIBTORCH_ROOT "$ENV{LIBTORCH_ROOT}")
 endif()
 if(LIBTORCH_ROOT)
     if(NOT EXISTS "${LIBTORCH_ROOT}/share/cmake/Torch/TorchConfig.cmake")
-        message(FATAL_ERROR
-            "LIBTORCH_ROOT does not contain share/cmake/Torch/TorchConfig.cmake: "
-            "${LIBTORCH_ROOT}")
+        message(FATAL_ERROR "Invalid LIBTORCH_ROOT: ${LIBTORCH_ROOT}")
     endif()
     list(PREPEND CMAKE_PREFIX_PATH "${LIBTORCH_ROOT}")
-    set(Torch_DIR "${LIBTORCH_ROOT}/share/cmake/Torch" CACHE PATH
-        "Path to TorchConfig.cmake" FORCE)
+    set(Torch_DIR "${LIBTORCH_ROOT}/share/cmake/Torch" CACHE PATH "Path to TorchConfig.cmake" FORCE)
 endif()
-
 if(NOT Torch_DIR)
     execute_process(
-        COMMAND "${Python3_EXECUTABLE}" -c
-                "import torch; print(torch.utils.cmake_prefix_path)"
+        COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
         RESULT_VARIABLE PHOTOSLAM_TORCH_PREFIX_RESULT
         OUTPUT_VARIABLE PHOTOSLAM_TORCH_PREFIX
         ERROR_QUIET
@@ -87,41 +59,29 @@ if(Torch_DIR)
     get_filename_component(PHOTOSLAM_TORCH_ROOT "${Torch_DIR}/../../.." ABSOLUTE)
     list(APPEND PHOTOSLAM_TORCH_LIBRARY_HINTS "${PHOTOSLAM_TORCH_ROOT}/lib")
 endif()
-find_library(TORCH_PYTHON_LIBRARY
-    NAMES torch_python
-    HINTS ${PHOTOSLAM_TORCH_LIBRARY_HINTS}
-    REQUIRED)
-
-# set(ENV{CUDA_LAUNCH_BLOCKING} 1)
-# set(ENV{TORCH_USE_CUDA_DSA} 1)
+find_library(TORCH_PYTHON_LIBRARY NAMES torch_python HINTS ${PHOTOSLAM_TORCH_LIBRARY_HINTS} REQUIRED)
 
 find_package(CUDA REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV 4 REQUIRED)
 find_package(jsoncpp REQUIRED)
-
 find_package(OpenGL REQUIRED)
 find_package(glm REQUIRED)
 find_package(glfw3 REQUIRED)
+find_package(glog REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
 
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM OR PHOTOSLAM_BUILD_REALSENSE)
+if(PHOTOSLAM_BUILD_REALSENSE)
     find_package(realsense2 CONFIG QUIET)
     if(TARGET realsense2::realsense2 OR realsense2_FOUND)
         set(PHOTOSLAM_REALSENSE_AVAILABLE ON)
     endif()
 endif()
 
-find_package(glog REQUIRED)
-find_package(Boost REQUIRED COMPONENTS system thread)
-
 set(ORB_SLAM3_SOURCE_DIR "${PROJECT_SOURCE_DIR}/ORB-SLAM3")
-if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
-endif()
-if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
-endif()
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/lib")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
 
 include_directories(
     ${PROJECT_SOURCE_DIR}
@@ -132,55 +92,6 @@ include_directories(
     ${EIGEN3_INCLUDE_DIR}
     ${OPENGL_INCLUDE_DIR}
     ${TORCH_INCLUDE_DIRS})
-
-##################################################################################
-##  Build the gaussian splatting component libraries to ${PROJECT_SOURCE_DIR}/lib
-##################################################################################
-
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-    # Build the original Photo-SLAM KNN extension for the active CUDA
-    # architecture instead of linking the repository's machine-specific .so.
-    add_library(simple_knn SHARED
-        third_party/simple-knn/simple_knn.cu
-        third_party/simple-knn/simple_knn.h
-        third_party/simple-knn/spatial.cu
-        third_party/simple-knn/spatial.h)
-    set_target_properties(simple_knn PROPERTIES
-        CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
-    target_include_directories(simple_knn PRIVATE
-        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-        ${TORCH_INCLUDE_DIRS})
-    target_link_libraries(simple_knn "${TORCH_LIBRARIES}")
-endif()
-
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-    add_library(cuda_rasterizer SHARED
-        include/operate_points.h
-        src/operate_points.cu
-        include/rasterize_points.h
-        src/rasterize_points.cu
-        include/stereo_vision.h
-        src/stereo_vision.cu
-        cuda_rasterizer/auxiliary.h
-        cuda_rasterizer/backward.cu
-        cuda_rasterizer/backward.h
-        cuda_rasterizer/config.h
-        cuda_rasterizer/forward.cu
-        cuda_rasterizer/forward.h
-        cuda_rasterizer/operate_points.h
-        cuda_rasterizer/rasterizer.h
-        cuda_rasterizer/rasterizer_impl.cu
-        cuda_rasterizer/rasterizer_impl.h
-        cuda_rasterizer/stereo_vision.h)
-    set_target_properties(cuda_rasterizer PROPERTIES
-        CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
-    target_include_directories(cuda_rasterizer PRIVATE
-        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(cuda_rasterizer
-        glm::glm
-        "${TORCH_LIBRARIES}"
-        Eigen3::Eigen)
-endif()
 
 set(SVRECON_NAMESPACE_REMAP
     PREPROCESS=SVRECON_PREPROCESS
@@ -211,22 +122,13 @@ add_library(svrecon_cuda_core STATIC
     third_party/SVRecon/cuda/src/pl_compute.cu
     third_party/SVRecon/cuda/src/utils.cu
     third_party/SVRecon/cuda/src/adam_step.cu)
-set_target_properties(svrecon_cuda_core PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
-    CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
+set_target_properties(svrecon_cuda_core PROPERTIES CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
 target_compile_definitions(svrecon_cuda_core PRIVATE ${SVRECON_NAMESPACE_REMAP})
-target_include_directories(svrecon_cuda_core
-    PUBLIC
-        ${PROJECT_SOURCE_DIR}/third_party/SVRecon/cuda
-        ${TORCH_INCLUDE_DIRS}
-        ${Python3_INCLUDE_DIRS})
-target_link_libraries(svrecon_cuda_core
-    PUBLIC
-        "${TORCH_LIBRARIES}")
-
-##################################################################################
-##  Build the ImGui library to ${PROJECT_SOURCE_DIR}/lib
-##################################################################################
+target_include_directories(svrecon_cuda_core PUBLIC
+    ${PROJECT_SOURCE_DIR}/third_party/SVRecon/cuda
+    ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS})
+target_link_libraries(svrecon_cuda_core PUBLIC "${TORCH_LIBRARIES}")
 
 add_library(imgui SHARED
     viewer/imgui/imconfig.h
@@ -247,191 +149,73 @@ add_library(imgui SHARED
     viewer/imgui/imstb_truetype.h)
 target_link_libraries(imgui glfw OpenGL::GL)
 
-##################################################################################
-##  Build the gaussian mapper library to ${PROJECT_SOURCE_DIR}/lib
-##################################################################################
-
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-add_library(gaussian_mapper SHARED
-    third_party/tinyply/tinyply.h
-    third_party/tinyply/tinyply.cpp
-    include/gaussian_keyframe.h
-    include/gaussian_model.h
-    include/gaussian_parameters.h
-    include/gaussian_rasterizer.h
-    include/gaussian_renderer.h
-    include/gaussian_scene.h
-    include/gaussian_trainer.h
-    include/gaussian_mapper.h
-    include/general_utils.h
-    include/graphics_utils.h
-    include/loss_utils.h
-    include/sh_utils.h
-    include/tensor_utils.h
-    include/camera.h
-    include/point_cloud.h
-    include/point2d.h
-    include/point3d.h
-    include/types.h
-    src/gaussian_keyframe.cpp
-    src/gaussian_model.cpp
-    src/gaussian_parameters.cpp
-    src/gaussian_rasterizer.cpp
-    src/gaussian_renderer.cpp
-    src/gaussian_scene.cpp
-    src/gaussian_trainer.cpp
-    src/gaussian_mapper.cpp
-    src/gaussian_mapper_pruning.cpp
-    evaluation/gaussian_mesh_extraction.cpp)
-target_link_libraries(gaussian_mapper
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-    ${OpenCV_LIBRARIES}
-    jsoncpp_lib
-    "${TORCH_LIBRARIES}"
-    Eigen3::Eigen
-    simple_knn
-    cuda_rasterizer
-    ${Python3_LIBRARIES})
-
-target_include_directories(gaussian_mapper
-    PRIVATE
-        ${Python3_INCLUDE_DIRS}
-)
-
-##################################################################################
-##  Build the viewer library to ${PROJECT_SOURCE_DIR}/lib
-##################################################################################
-
-add_library(gaussian_viewer SHARED
-    viewer/drawer_utils.h
-    viewer/imgui_viewer.cpp
-    viewer/imgui_viewer.h
-    viewer/map_drawer.cpp
-    viewer/map_drawer.h)
-target_link_libraries(gaussian_viewer
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-    gaussian_mapper
-    imgui
-    ${OpenCV_LIBRARIES}
-    jsoncpp_lib
-    "${TORCH_LIBRARIES}"
-    glm::glm
-    glfw
-    OpenGL::GL)
-
-target_include_directories(gaussian_viewer
-    PUBLIC
-        ${Python3_INCLUDE_DIRS})
-endif()
-##################################################################################
-##  Build the test examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# This is a C++ libtorch implementation of gaussian-splatting (https://github.com/graphdeco-inria/gaussian-splatting)
-# add_executable(train_colmap examples/train_colmap.cpp)
-# target_link_libraries(train_colmap
-#     gaussian_viewer
-#     gaussian_mapper)
-
-# add_executable(view_result examples/view_result.cpp)
-# target_link_libraries(view_result
-#     gaussian_viewer
-#     gaussian_mapper)
-
-###############################################################################<
-# 3.  🧱 SPARSE‑VOXEL  – new code
-###############################################################################
-
-# ### 3.1  CUDA rasteriser  --------------------------------------------
-# file (GLOB VX_SRCS cuda_voxel_rasterizer/*.cu cuda_voxel_rasterizer/*.cpp)
-# add_library (voxel_rasterizer SHARED ${VX_SRCS})
-# set_target_properties (voxel_rasterizer PROPERTIES CUDA_ARCHITECTURES "70;75;86;89")
-# target_include_directories (voxel_rasterizer
-#         PRIVATE
-#             ${TORCH_INCLUDE_DIRS}
-#             ${Python3_INCLUDE_DIRS})
-# target_link_libraries (voxel_rasterizer "${TORCH_LIBRARIES}")
-
-### 3.2  C++ core / optimiser  ---------------------------------------
 add_library(tandem_mvs_runtime STATIC
-        include_voxel/tandem_mvs_runtime.h
-        src_voxel/tandem_mvs_runtime.cpp)
-target_include_directories(tandem_mvs_runtime
-        PUBLIC
-            ${PROJECT_SOURCE_DIR}
-            ${PROJECT_SOURCE_DIR}/include_voxel)
-target_link_libraries(tandem_mvs_runtime
-        PRIVATE
-            "${TORCH_LIBRARIES}"
-            boost_system
-            boost_thread)
+    include_voxel/tandem_mvs_runtime.h
+    src_voxel/tandem_mvs_runtime.cpp)
+target_include_directories(tandem_mvs_runtime PUBLIC ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include_voxel)
+target_link_libraries(tandem_mvs_runtime PRIVATE "${TORCH_LIBRARIES}" boost_system boost_thread)
 
 add_library(voxel_core
-        include_voxel/monocular_densification.cu
-        src_voxel/mapper_depth_registry.cpp
-        src_voxel/voxel_trainer.cpp
-        src_voxel/voxel_mapper.cpp
-        src_voxel/voxel_mapper_config.cpp
-        src_voxel/voxel_mapper_run.cpp
-        src_voxel/voxel_mapper_training.cpp
-        src_voxel/voxel_mapper_mapping.cpp
-        src_voxel/voxel_mapper_rgbd.cpp
-        src_voxel/voxel_mapper_io.cpp
-        src_voxel/voxel_mapper_state.cpp
-        src_voxel/voxel_mapper_topology_pruning.cpp
-        src_voxel/voxel_mapper_topology_subdivision.cpp
-        src_voxel/voxel_mapper_monocular_densification.cpp
-        src_voxel/voxel_mapper_tandem_mvs.cpp
-        src_voxel/voxel_mapper_tandem_mvs_evidence.cpp
-        src_voxel/voxel_mapper_monocular_mvs_tsdf_evidence.cpp
-        src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
-        src_voxel/voxel_mapper_tsdf.cpp
-        src_voxel/voxel_mapper_rerun.cpp
-        src_voxel/voxel_mapper_rerun_voxels.cpp
-        src_voxel/voxel_mapper_rerun_map.cpp
-        src_voxel/voxel_mapper_utils.cpp
-        src_voxel/voxel_mapper_supervision.cpp
-        src_voxel/voxel_mapper_supervision_visualization.cpp
-        src_voxel/voxel_mapper_supervision_rgbd.cpp
-        src_voxel/voxel_mapper_supervision_monocular.cpp
-        evaluation/mesh_extraction.cpp
-        src_voxel/voxel_parameters.cpp
-        src_voxel/voxel_scene.cpp
-        src_voxel/voxel_keyframe.cpp
-        src_voxel/voxel_model.cpp
-        src_voxel/voxel_model_sdf.cpp
-        src_voxel/voxel_model_creation.cpp
-        src_voxel/voxel_model_insertion.cpp
-        src_voxel/voxel_model_optimization.cpp
-        src_voxel/voxel_model_regularization.cpp
-        src_voxel/voxel_model_io.cpp
-        src_voxel/voxel_svrecon_rasterizer.cpp
-        src_voxel/tandem_mvs_backend.cpp
-        src_voxel/rerun_utils.cpp
-        src_voxel/rerun_utils_mesh.cpp
-        src_voxel/rerun_utils_debug.cpp
-        third_party/tinyply/tinyply.h
-        third_party/tinyply/tinyply.cpp)
-        
-target_include_directories(voxel_core
-        PUBLIC
-            include_voxel
-            ${Python3_INCLUDE_DIRS}
-            ${OpenCV_INCLUDE_DIRS}
-            ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus )
-target_link_libraries(voxel_core
-        PUBLIC
-            # voxel_rasterizer           # call kernels directly if needed
-            svrecon_cuda_core
-            "${TORCH_LIBRARIES}"
-            Python3::Python
-            pybind11::embed
-            ${OpenCV_LIBRARIES}
-            tandem_mvs_runtime
-            glog::glog)
-target_compile_definitions(voxel_core
-        PUBLIC
-            PHOTOSLAM_ENABLE_RERUN=$<BOOL:${PHOTOSLAM_ENABLE_RERUN}>)
+    include_voxel/monocular_densification.cu
+    src_voxel/mapper_depth_registry.cpp
+    src_voxel/mesh_extraction.cpp
+    src_voxel/rerun_utils.cpp
+    src_voxel/rerun_utils_debug.cpp
+    src_voxel/rerun_utils_mesh.cpp
+    src_voxel/tandem_mvs_backend.cpp
+    src_voxel/voxel_keyframe.cpp
+    src_voxel/voxel_mapper.cpp
+    src_voxel/voxel_mapper_config.cpp
+    src_voxel/voxel_mapper_io.cpp
+    src_voxel/voxel_mapper_mapping.cpp
+    src_voxel/voxel_mapper_monocular_densification.cpp
+    src_voxel/voxel_mapper_monocular_mvs_tsdf_evidence.cpp
+    src_voxel/voxel_mapper_rerun.cpp
+    src_voxel/voxel_mapper_rerun_map.cpp
+    src_voxel/voxel_mapper_rerun_voxels.cpp
+    src_voxel/voxel_mapper_rgbd.cpp
+    src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
+    src_voxel/voxel_mapper_run.cpp
+    src_voxel/voxel_mapper_state.cpp
+    src_voxel/voxel_mapper_supervision.cpp
+    src_voxel/voxel_mapper_supervision_monocular.cpp
+    src_voxel/voxel_mapper_supervision_rgbd.cpp
+    src_voxel/voxel_mapper_supervision_visualization.cpp
+    src_voxel/voxel_mapper_tandem_mvs.cpp
+    src_voxel/voxel_mapper_tandem_mvs_evidence.cpp
+    src_voxel/voxel_mapper_topology_pruning.cpp
+    src_voxel/voxel_mapper_topology_subdivision.cpp
+    src_voxel/voxel_mapper_training.cpp
+    src_voxel/voxel_mapper_tsdf.cpp
+    src_voxel/voxel_mapper_utils.cpp
+    src_voxel/voxel_model.cpp
+    src_voxel/voxel_model_creation.cpp
+    src_voxel/voxel_model_insertion.cpp
+    src_voxel/voxel_model_io.cpp
+    src_voxel/voxel_model_optimization.cpp
+    src_voxel/voxel_model_regularization.cpp
+    src_voxel/voxel_model_sdf.cpp
+    src_voxel/voxel_parameters.cpp
+    src_voxel/voxel_scene.cpp
+    src_voxel/voxel_svrecon_rasterizer.cpp
+    src_voxel/voxel_trainer.cpp
+    third_party/tinyply/tinyply.cpp
+    third_party/tinyply/tinyply.h)
+set_target_properties(voxel_core PROPERTIES CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
+target_include_directories(voxel_core PUBLIC
+    include_voxel
+    ${Python3_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+    ${ORB_SLAM3_SOURCE_DIR}/Thirdparty/Sophus)
+target_link_libraries(voxel_core PUBLIC
+    svrecon_cuda_core
+    "${TORCH_LIBRARIES}"
+    Python3::Python
+    pybind11::embed
+    ${OpenCV_LIBRARIES}
+    tandem_mvs_runtime
+    glog::glog)
+target_compile_definitions(voxel_core PUBLIC PHOTOSLAM_ENABLE_RERUN=$<BOOL:${PHOTOSLAM_ENABLE_RERUN}>)
 
 add_library(voxel_viewer SHARED
     include_voxel/viewer/voxel_drawer_utils.h
@@ -439,7 +223,7 @@ add_library(voxel_viewer SHARED
     include_voxel/viewer/voxel_map_drawer.h
     src_voxel/viewer/voxel_imgui_viewer.cpp
     src_voxel/viewer/voxel_map_drawer.cpp)
-
+target_include_directories(voxel_viewer PUBLIC ${PROJECT_SOURCE_DIR} ${Python3_INCLUDE_DIRS})
 target_link_libraries(voxel_viewer
     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
     voxel_core
@@ -451,234 +235,32 @@ target_link_libraries(voxel_viewer
     glfw
     OpenGL::GL)
 
-target_include_directories(voxel_viewer
-    PUBLIC
-        ${PROJECT_SOURCE_DIR}
-        ${Python3_INCLUDE_DIRS})
-
-##################################################################################
-##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# Replica Monocular (original Photo-SLAM Gaussian mapper)
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-add_executable(replica_mono examples/replica_mono.cpp)
-target_include_directories(replica_mono PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})
-target_link_libraries(replica_mono
-    gaussian_viewer
-    gaussian_mapper
-    ${OpenCV_LIBRARIES}
-    "${TORCH_LIBRARIES}"
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(replica_mono PRIVATE
-    ${PROJECT_SOURCE_DIR}/lib)
-
-# Replica RGB-D (original Photo-SLAM Gaussian mapper)
-add_executable(replica_rgbd examples/replica_rgbd.cpp)
-target_include_directories(replica_rgbd PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})
-target_link_libraries(replica_rgbd
-    gaussian_viewer
-    gaussian_mapper
-    ${OpenCV_LIBRARIES}
-    "${TORCH_LIBRARIES}"
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(replica_rgbd PRIVATE
-    ${PROJECT_SOURCE_DIR}/lib)
-endif()
-
-add_executable(replica_rgbd_voxel examples/replica_rgbd_voxel.cpp)
-target_include_directories(replica_rgbd_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        pybind11::embed
-)
-target_link_libraries(replica_rgbd_voxel
+function(add_voxel_runner target source)
+    add_executable(${target} ${source})
+    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include_voxel pybind11::embed)
+    target_link_libraries(${target}
         voxel_core
         voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
+        ${OpenCV_LIBRARIES}
+        "${TORCH_LIBRARIES}"
         ${TORCH_PYTHON_LIBRARY}
         ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
+        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
+endfunction()
 
-add_executable(replica_mono_voxel examples/replica_mono_voxel.cpp)
-target_include_directories(replica_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        pybind11::embed
-)
-target_link_libraries(replica_mono_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_voxel_runner(replica_mono_voxel examples/replica_mono_voxel.cpp)
+add_voxel_runner(replica_rgbd_voxel examples/replica_rgbd_voxel.cpp)
+add_voxel_runner(tum_mono_voxel examples/tum_mono_voxel.cpp)
+add_voxel_runner(tum_rgbd_voxel examples/tum_rgbd_voxel.cpp)
+add_voxel_runner(scannet_mono_voxel examples/tum_mono_voxel.cpp)
+add_voxel_runner(scannet_rgbd_voxel examples/tum_rgbd_voxel.cpp)
 
-# TUM Monocular (original Photo-SLAM Gaussian mapper)
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM)
-add_executable(tum_mono examples/tum_mono.cpp)
-target_include_directories(tum_mono PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})
-target_link_libraries(tum_mono
-    gaussian_viewer
-    gaussian_mapper
-    ${OpenCV_LIBRARIES}
-    "${TORCH_LIBRARIES}"
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(tum_mono PRIVATE
-    ${PROJECT_SOURCE_DIR}/lib)
-
-# ScanNet uses the generic timestamp/RGB loader from the TUM monocular runner.
-add_executable(scannet_mono examples/tum_mono.cpp)
-target_include_directories(scannet_mono PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})
-target_link_libraries(scannet_mono
-    gaussian_viewer
-    gaussian_mapper
-    ${OpenCV_LIBRARIES}
-    "${TORCH_LIBRARIES}"
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(scannet_mono PRIVATE
-    ${PROJECT_SOURCE_DIR}/lib)
-
-# TUM RGBD
-add_executable(tum_rgbd examples/tum_rgbd.cpp)
-target_include_directories(tum_rgbd PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS})
-target_link_libraries(tum_rgbd
-    gaussian_viewer    
-    gaussian_mapper
-    ${OpenCV_LIBRARIES}
-    "${TORCH_LIBRARIES}"
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-target_link_directories(tum_rgbd PRIVATE
-    ${PROJECT_SOURCE_DIR}/lib)
-endif()
-
-
-# set_target_properties(simple_knn PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# set_target_properties(cuda_rasterizer PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# TUM RGBD
-add_executable(tum_rgbd_voxel examples/tum_rgbd_voxel.cpp)
-target_link_libraries(tum_rgbd_voxel
-        voxel_core          # lib that implements LiveVoxelTrainer
-        voxel_viewer
-        # gaussian_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-
-add_executable(tum_mono_voxel examples/tum_mono_voxel.cpp)
-target_include_directories(tum_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        pybind11::embed
-)
-target_link_libraries(tum_mono_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-
-# ScanNet uses the same generic timestamp/RGB/depth association runner as TUM,
-# but has a separate executable, generated camera calibration, and mapper YAML.
-add_executable(scannet_rgbd_voxel examples/tum_rgbd_voxel.cpp)
-target_link_libraries(scannet_rgbd_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-
-# The monocular TUM loader also accepts ScanNet's association.txt and ignores
-# its depth columns.
-add_executable(scannet_mono_voxel examples/tum_mono_voxel.cpp)
-target_include_directories(scannet_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        pybind11::embed
-)
-target_link_libraries(scannet_mono_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-
-set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# # EuRoC Stereo
-# add_executable(euroc_stereo examples/euroc_stereo.cpp)
-# target_link_libraries(euroc_stereo
-#     gaussian_viewer    
-#     gaussian_mapper
-#     ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-
-##################################################################################
-##  Build the mapping examples to ${PROJECT_SOURCE_DIR}/bin
-##################################################################################
-
-# Intel Realsense
-if(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM AND PHOTOSLAM_REALSENSE_AVAILABLE)
-    add_executable(realsense_rgbd examples/realsense_rgbd.cpp)
-    target_include_directories(realsense_rgbd PUBLIC
-        ${realsense2_INCLUDE_DIR})
-    target_link_libraries(realsense_rgbd
-        gaussian_viewer    
-        gaussian_mapper
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-        realsense2::realsense2)
-endif()
-
-# Live Intel RealSense RGB-D input for the SVRecon voxel mapper. This target is
-# independent of the original Gaussian Photo-SLAM mapper.
 if(PHOTOSLAM_BUILD_REALSENSE)
     if(PHOTOSLAM_REALSENSE_AVAILABLE)
-        add_executable(realsense_rgbd_voxel
-            examples/realsense_rgbd_voxel.cpp)
-        target_include_directories(realsense_rgbd_voxel PUBLIC
-            ${PROJECT_SOURCE_DIR}
-            ${OpenCV_INCLUDE_DIRS}
-            ${realsense2_INCLUDE_DIR})
-        target_link_libraries(realsense_rgbd_voxel
-            voxel_viewer
-            voxel_core
-            ${OpenCV_LIBRARIES}
-            ${TORCH_LIBRARIES}
-            ${TORCH_PYTHON_LIBRARY}
-            ${Python3_LIBRARIES}
-            ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-            realsense2::realsense2)
+        add_voxel_runner(realsense_rgbd_voxel examples/realsense_rgbd_voxel.cpp)
+        target_include_directories(realsense_rgbd_voxel PUBLIC ${realsense2_INCLUDE_DIR})
+        target_link_libraries(realsense_rgbd_voxel realsense2::realsense2)
     else()
-        message(WARNING
-            "PHOTOSLAM_BUILD_REALSENSE=ON, but librealsense2 was not found; "
-            "the realsense_rgbd_voxel target will not be built")
+        message(WARNING "librealsense2 was not found; realsense_rgbd_voxel will not be built")
     endif()
 endif()

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tum_data_root="${TUM_DATA_ROOT:-/media/dimitris/v4rl_rog_2t/Dimitris/Datasets_indoor/TUM}"
 sequence_name="${1:-${TUM_SEQUENCE:-rgbd_dataset_freiburg1_desk}}"
 
 unset PYTHONNOUSERSITE
-export LD_LIBRARY_PATH="/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib:$LD_LIBRARY_PATH"
-export PYTHONPATH="$root_dir/third_party/simple-knn:$PYTHONPATH"
+export LD_LIBRARY_PATH="/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="$root_dir:${PYTHONPATH:-}"
 
 if ! /usr/bin/python3.10 -c \
     'import rerun; import rerun.blueprint' >/dev/null 2>&1; then

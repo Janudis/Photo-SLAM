@@ -4,10 +4,6 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 default_replica_root="/media/dimitris/v4rl_rog_2t/Dimitris/Datasets_indoor/Replica"
-local_replica_root="$root_dir/third_party/HI-SLAM2/data/Replica"
-if [[ ! -d "$default_replica_root" && -d "$local_replica_root" ]]; then
-    default_replica_root="$local_replica_root"
-fi
 replica_root="${REPLICA_ROOT:-$default_replica_root}"
 sequence_name="${1:-${REPLICA_SEQUENCE:-office0}}"
 sensor_mode="${REPLICA_SENSOR_MODE:-rgbd}"
@@ -17,7 +13,7 @@ if [[ "${VOXEL_VIEWER:-${REPLICA_VIEWER:-1}}" == "0" ]]; then
 fi
 
 export LD_LIBRARY_PATH="/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$root_dir:$root_dir/third_party/simple-knn:${PYTHONPATH:-}"
+export PYTHONPATH="$root_dir:${PYTHONPATH:-}"
 
 case "$sequence_name" in
     office0|office1|office2|office3|office4|room0|room1|room2)

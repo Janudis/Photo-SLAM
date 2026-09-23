@@ -4,7 +4,7 @@ set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="/home/dimitris/opt/libtorch_2.0.1_cu118/libtorch/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$root_dir/third_party/simple-knn:${PYTHONPATH:-}"
+export PYTHONPATH="$root_dir:${PYTHONPATH:-}"
 
 SCANNET_ROOT="${SCANNET_ROOT:-/media/dimitris/v4rl_rog_2t/Dimitris/Datasets_indoor/ScanNet}"
 SCANNET_SCENE="${1:-${SCANNET_SCENE:-scene0000_00}}"
@@ -32,9 +32,6 @@ if [[ ! -f "$sens_path" ]]; then
     printf '[ERROR] Missing ScanNet sensor stream: %s\n' "$sens_path" >&2
     printf 'Download it after accepting the ScanNet Terms of Use:\n' >&2
     printf '  python3 %q -o %q --id %q --type .sens\n' \
-        "$root_dir/scripts/download-scannet.py" "$SCANNET_ROOT" "$SCANNET_SCENE" >&2
-    printf 'For reconstruction evaluation, also download the cleaned mesh:\n' >&2
-    printf '  python3 %q -o %q --id %q --type _vh_clean_2.ply\n' \
         "$root_dir/scripts/download-scannet.py" "$SCANNET_ROOT" "$SCANNET_SCENE" >&2
     exit 1
 fi

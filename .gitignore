@@ -1,3 +1,5 @@
+.codex
+
 # Prerequisites
 *.d
 
@@ -45,6 +47,7 @@ __pycache__/
 
 # results
 /results/
+/results
 
 # Local third-party checkouts / submodules
 /third_party/
@@ -56,5 +59,87 @@ __pycache__/
 /loss*.csv
 
 # ImGui .ini
-*imgui.iniscripts/data/
-scripts/data/
+/imgui.ini
+/scripts/data/
+/data/
+
+# Local research artifacts excluded from the demo branch
+/benchmark/
+/evaluation/
+/figures/
+/video/
+/paper/
+/cfg/nvblox_mapper/
+/include_nvblox/
+/src_nvblox/
+/cuda_rasterizer/
+/include/
+/src/
+/docker/ubuntu-jammy-blackwell/
+/cfg/colmap/
+/cfg/gaussian_mapper/
+/cfg/view_only/
+/cfg/ORB_SLAM3/Monocular-Inertial/
+/cfg/ORB_SLAM3/Stereo/
+/cfg/ORB_SLAM3/Monocular/EuRoC/
+/cfg/ORB_SLAM3/Monocular/SplatNav/
+/cfg/ORB_SLAM3/Monocular/Waymo/
+/cfg/voxel_mapper/Monocular/EuRoC/
+/cfg/voxel_mapper/Monocular/Waymo/
+/scripts_voxel/eval/
+/run_euroc_voxel.sh
+/run_waymo_voxel.sh
+/examples/euroc_mono_voxel.cpp
+/examples/euroc_stereo.cpp
+/examples/realsense_rgbd.cpp
+/examples/replica_mono.cpp
+/examples/replica_rgbd.cpp
+/examples/statues_voxel.cpp
+/examples/train_colmap.cpp
+/examples/tum_mono.cpp
+/examples/tum_rgbd.cpp
+/examples/view_result.cpp
+/examples/waymo_mono_voxel.cpp
+/scripts/all.sh
+/scripts/colmap.sh
+/scripts/download_euroc.py
+/scripts/download_euroc.sh
+/scripts/euroc_stereo.sh
+/scripts/export_omnidata_depth_torchscript.py
+/scripts/prepare_waymo_v2.py
+/scripts/realsense_d455.sh
+/scripts/replica_mono.sh
+/scripts/replica_rgbd.sh
+/scripts/tum_mono.sh
+/scripts/tum_rgbd.sh
+/viewer/README.md
+/viewer/drawer_utils.h
+/viewer/imgui_viewer.cpp
+/viewer/imgui_viewer.h
+/viewer/map_drawer.cpp
+/viewer/map_drawer.h
+/ORB-SLAM3/Calibration_Tutorial.pdf
+/ORB-SLAM3/Changelog.md
+/ORB-SLAM3/Dependencies.md
+/ORB-SLAM3/evaluation/
+
+# Local experiment variants and recording utilities
+/cfg/ORB_SLAM3/Monocular/ScanNet/scene*_*.yaml
+!/cfg/ORB_SLAM3/Monocular/ScanNet/scene0000_00.yaml
+/cfg/voxel_mapper/Monocular/RealCamera/
+/cfg/voxel_mapper/Monocular/Replica/replica_mono_voxel_geometry_*.yaml
+/cfg/voxel_mapper/Monocular/Replica/replica_mono_voxel_rendering_*.yaml
+/cfg/voxel_mapper/RGB-D/Replica/replica_rgbd_geometry_*.yaml
+/cfg/voxel_mapper/RGB-D/Replica/replica_rgbd_maps_*.yaml
+/examples/render_voxel_trajectory.cpp
+/examples/scannet_mono_orb.cpp
+/include_voxel/rgbd_dataset_recorder.h
+/run_recorded_mono_voxel.sh
+/run_recorded_rgbd_voxel.sh
+/run_replica_voxel_all.sh
+/scripts/crop_mesh_region.py
+/scripts/recorded_mono.md
+/scripts/recorded_rgbd.md
+/scripts/recover_rgbd_dataset.py
+/scripts/test_*.cpp
+/scripts/test_*.py

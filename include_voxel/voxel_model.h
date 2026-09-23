@@ -21,7 +21,6 @@
 #include <unordered_map>
 
 #include "ORB-SLAM3/Thirdparty/Sophus/sophus/se3.hpp"
-#include "third_party/simple-knn/spatial.h"
 #include "third_party/tinyply/tinyply.h"
 #include "include_voxel/voxel_parameters.h"
 #include "include_voxel/voxel_scene.h"

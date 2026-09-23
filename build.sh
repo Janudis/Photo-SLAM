@@ -28,16 +28,12 @@ if (( is_jetson )); then
     cuda_architectures="${PHOTOSLAM_CUDA_ARCHITECTURES:-87}"
     torch_cuda_arch_list="${PHOTOSLAM_TORCH_CUDA_ARCH_LIST:-8.7}"
     enable_rerun="${PHOTOSLAM_ENABLE_RERUN:-OFF}"
-    build_original="${PHOTOSLAM_BUILD_ORIGINAL:-OFF}"
-    build_waymo="${PHOTOSLAM_BUILD_WAYMO:-OFF}"
     build_realsense="${PHOTOSLAM_BUILD_REALSENSE:-ON}"
 else
     jobs="${PHOTOSLAM_BUILD_JOBS:-8}"
     cuda_architectures="${PHOTOSLAM_CUDA_ARCHITECTURES:-75;86}"
     torch_cuda_arch_list="${PHOTOSLAM_TORCH_CUDA_ARCH_LIST:-8.9}"
     enable_rerun="${PHOTOSLAM_ENABLE_RERUN:-ON}"
-    build_original="${PHOTOSLAM_BUILD_ORIGINAL:-ON}"
-    build_waymo="${PHOTOSLAM_BUILD_WAYMO:-ON}"
     build_realsense="${PHOTOSLAM_BUILD_REALSENSE:-ON}"
 fi
 
@@ -81,8 +77,6 @@ echo "Building Photo-SLAM SVRecon targets ..."
 photoslam_cmake_args=(
     "-DPHOTOSLAM_CUDA_ARCHITECTURES=$cuda_architectures"
     "-DPHOTOSLAM_ENABLE_RERUN=$enable_rerun"
-    "-DPHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM=$build_original"
-    "-DPHOTOSLAM_BUILD_WAYMO=$build_waymo"
     "-DPHOTOSLAM_BUILD_REALSENSE=$build_realsense"
 )
 if (( ! is_jetson )) && [[ -x /usr/bin/python3.10 ]]; then

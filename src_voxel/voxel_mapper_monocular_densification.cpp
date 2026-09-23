@@ -153,24 +153,20 @@ void VoxelMapper::resetMonocularRenderedDepthEvidenceIfLayoutChanged()
 void VoxelMapper::densifyMonocularFromRenderedDepth(
     const std::shared_ptr<VoxelKeyframe>& pkf)
 {
-    if (!monocular_rendered_depth_densify_ ||
+    if (!sv::kMonocularRenderedDepthDensify ||
         sensor_type_ != MONOCULAR || !pkf || !voxel_model_ ||
         voxel_model_->numVoxels() <= 0 || pkf->img_undist_.empty() ||
         pkf->intr_.size() < 4 || pkf->image_height_ <= 0 ||
         pkf->image_width_ <= 0) {
         return;
     }
-    auto densification_profile =
-        profileLaptopModule("monocular_rendered_depth_evidence_fusion");
-
     resetMonocularRenderedDepthEvidenceIfLayoutChanged();
     if (!(monocular_rendered_depth_layout_cell_size_ > 0.0f) ||
         monocular_rendered_depth_layout_grid_dim_ <= 0) {
         return;
     }
 
-    const int stride =
-        std::max(1, monocular_rendered_depth_pixel_stride_);
+    const int stride = sv::kMonocularRenderedDepthPixelStride;
     int render_height = 0;
     int render_width = 0;
     const sv::MiniCam render_camera =
@@ -247,25 +243,19 @@ void VoxelMapper::densifyMonocularFromRenderedDepth(
     const float cell_size = monocular_rendered_depth_layout_cell_size_;
     const float truncation = std::max(
         cell_size,
-        monocular_rendered_depth_evidence_trunc_vox_ * cell_size);
+        sv::kMonocularRenderedDepthEvidenceTruncVox * cell_size);
     const float half_sampling_band = 0.5f * truncation;
-    const int evidence_samples =
-        std::max(2, monocular_rendered_depth_evidence_samples_);
+    const int evidence_samples = sv::kMonocularRenderedDepthEvidenceSamples;
 
     std::unordered_map<
         sv::RgbdTsdfGridKey,
         RenderedDepthFrameCellObservation,
         sv::RgbdTsdfGridKeyHash> frame_cells;
-    int64_t structural_holes = 0;
-    int64_t sampled_holes = 0;
-    int64_t generated_samples = 0;
     for (int render_y = 0; render_y < render_height; ++render_y) {
         for (int render_x = 0; render_x < render_width; ++render_x) {
             if (n_contrib[render_y][render_x] > 0) {
                 continue;
             }
-            ++structural_holes;
-
             std::vector<float> neighboring_depths;
             neighboring_depths.reserve(8);
             for (int dy = -1; dy <= 1; ++dy) {
@@ -326,8 +316,6 @@ void VoxelMapper::densifyMonocularFromRenderedDepth(
                     sample_depth <= z_near_ || sample_depth >= z_far_) {
                     continue;
                 }
-                ++generated_samples;
-
                 const Eigen::Vector3f camera_point(
                     x_normalized * sample_depth,
                     y_normalized * sample_depth,
@@ -354,8 +342,6 @@ void VoxelMapper::densifyMonocularFromRenderedDepth(
             if (gap_cells.empty()) {
                 continue;
             }
-            ++sampled_holes;
-
             for (const auto& key : gap_cells) {
                 RenderedDepthFrameCellObservation& observation =
                     frame_cells[key];
@@ -474,7 +460,7 @@ void VoxelMapper::densifyMonocularFromRenderedDepth(
             monocular_rendered_depth_corner_evidence_[item.first];
         const float new_weight = std::min(
             evidence.weight + 1.0f,
-            monocular_rendered_depth_evidence_max_weight_);
+            sv::kMonocularRenderedDepthEvidenceMaxWeight);
         const float retained_weight = std::max(0.0f, new_weight - 1.0f);
         evidence.distance = retained_weight > 0.0f
             ? (evidence.distance * retained_weight + sample) / new_weight
@@ -540,18 +526,7 @@ void VoxelMapper::densifyMonocularFromRenderedDepth(
         }
     }
 
-    const int64_t promoted =
-        promoteMonocularRenderedDepthEvidenceCells(affected_cells);
-    std::cout
-        << "[MONO/rendered_evidence] kf=" << pkf->fid_
-        << " structural_holes=" << structural_holes
-        << " sampled_holes=" << sampled_holes
-        << " ray_samples=" << generated_samples
-        << " frame_cells=" << frame_cells.size()
-        << " pending_cells="
-        << monocular_rendered_depth_cell_evidence_.size()
-        << " promoted=" << promoted
-        << "\n";
+    promoteMonocularRenderedDepthEvidenceCells(affected_cells);
 }
 
 void VoxelMapper::logMonocularRenderedDepthEvidenceCellsToRerun(
@@ -603,14 +578,11 @@ int64_t VoxelMapper::promoteMonocularRenderedDepthEvidenceCells(
         sv::RgbdTsdfGridKey,
         sv::RgbdTsdfGridKeyHash>& affected_cells)
 {
-    if (!monocular_rendered_depth_densify_ || !voxel_model_ ||
+    if (!sv::kMonocularRenderedDepthDensify || !voxel_model_ ||
         monocular_rendered_depth_cell_evidence_.empty() ||
         affected_cells.empty()) {
         return 0;
     }
-    auto promotion_profile =
-        profileLaptopModule("monocular_rendered_depth_evidence_promotion");
-
     const int iteration = getIteration();
     const bool log_evidence_snapshot =
         rerun_params_.enable_rerun_ &&
@@ -663,7 +635,7 @@ int64_t VoxelMapper::promoteMonocularRenderedDepthEvidenceCells(
                 monocular_rendered_depth_corner_evidence_.find(corner_key);
             if (corner == monocular_rendered_depth_corner_evidence_.end() ||
                 corner->second.weight <
-                    monocular_rendered_depth_evidence_promote_min_weight_ ||
+                    sv::kMonocularRenderedDepthEvidencePromoteMinWeight ||
                 !std::isfinite(corner->second.distance)) {
                 continue;
             }
@@ -680,7 +652,7 @@ int64_t VoxelMapper::promoteMonocularRenderedDepthEvidenceCells(
         }
         if (static_cast<int>(
                 cell_item->second.observed_keyframes.size()) <
-            monocular_rendered_depth_evidence_promote_min_views_) {
+            sv::kMonocularRenderedDepthEvidencePromoteMinViews) {
             if (log_evidence_snapshot) {
                 waiting_view_cells.push_back(key);
             }
@@ -722,7 +694,7 @@ int64_t VoxelMapper::promoteMonocularRenderedDepthEvidenceCells(
                 if (std::isfinite(baseline) &&
                     std::isfinite(mean_depth) && mean_depth > 1.0e-6f &&
                     baseline >=
-                        monocular_rendered_depth_evidence_min_baseline_ratio_ *
+                        sv::kMonocularRenderedDepthEvidenceMinBaselineRatio *
                             mean_depth) {
                     sufficient_baseline = true;
                     break;
@@ -769,7 +741,7 @@ int64_t VoxelMapper::promoteMonocularRenderedDepthEvidenceCells(
                 monocular_rendered_depth_corner_evidence_.find(corner_key);
             if (corner == monocular_rendered_depth_corner_evidence_.end() ||
                 corner->second.weight <
-                    monocular_rendered_depth_evidence_promote_min_weight_ ||
+                    sv::kMonocularRenderedDepthEvidencePromoteMinWeight ||
                 !std::isfinite(corner->second.distance) ||
                 !direct_corner_keys.insert(corner_key).second) {
                 continue;

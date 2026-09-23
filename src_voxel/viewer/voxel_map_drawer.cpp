@@ -143,7 +143,7 @@ void VoxelMapDrawer::DrawMapPoints()
 
     glPointSize(mPointSize);
     glBegin(GL_POINTS);
-    glColor3f(0.0,0.0,0.0);
+    glColor3f(0.85f,0.85f,0.85f);
 
     for(size_t i=0, iend=vpMPs.size(); i<iend;i++)
     {
@@ -177,12 +177,12 @@ void VoxelMapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, co
     const float z = w*0.6;
 
     Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if(!pActiveMap)
+        return;
+
     // DEBUG LBA
     std::set<long unsigned int> sOptKFs = pActiveMap->msOptKFs;
     std::set<long unsigned int> sFixedKFs = pActiveMap->msFixedKFs;
-
-    if(!pActiveMap)
-        return;
 
     const vector<KeyFrame*> vpKFs = pActiveMap->GetAllKeyFrames();
 
@@ -192,42 +192,32 @@ void VoxelMapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, co
         {
             KeyFrame* pKF = vpKFs[i];
             Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
-            unsigned int index_color = pKF->mnOriginMapId;
 
             glPushMatrix();
 
             glMultMatrixf((GLfloat*)Twc.data());
 
-            if(!pKF->GetParent()) // It is the first KF in the map
+            glLineWidth(mKeyFrameLineWidth);
+            if (bDrawOptLba)
             {
-                glLineWidth(mKeyFrameLineWidth*5);
-                glColor3f(1.0f,0.0f,0.0f);
-                glBegin(GL_LINES);
-            }
-            else
-            {
-                //cout << "Child KF: " << vpKFs[i]->mnId << endl;
-                glLineWidth(mKeyFrameLineWidth);
-                if (bDrawOptLba) {
-                    if(sOptKFs.find(pKF->mnId) != sOptKFs.end())
-                    {
-                        glColor3f(0.0f,1.0f,0.0f); // Green -> Opt KFs
-                    }
-                    else if(sFixedKFs.find(pKF->mnId) != sFixedKFs.end())
-                    {
-                        glColor3f(1.0f,0.0f,0.0f); // Red -> Fixed KFs
-                    }
-                    else
-                    {
-                        glColor3f(0.0f,0.0f,1.0f); // Basic color
-                    }
+                if(sOptKFs.find(pKF->mnId) != sOptKFs.end())
+                {
+                    glColor3f(0.0f,1.0f,0.0f); // Green -> Opt KFs
+                }
+                else if(sFixedKFs.find(pKF->mnId) != sFixedKFs.end())
+                {
+                    glColor3f(1.0f,0.0f,0.0f); // Red -> Fixed KFs
                 }
                 else
                 {
                     glColor3f(0.0f,0.0f,1.0f); // Basic color
                 }
-                glBegin(GL_LINES);
             }
+            else
+            {
+                glColor3f(0.0f,0.0f,1.0f); // Basic color
+            }
+            glBegin(GL_LINES);
 
             glVertex3f(0,0,0);
             glVertex3f(w,h,z);
@@ -252,8 +242,6 @@ void VoxelMapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, co
             glEnd();
 
             glPopMatrix();
-
-            glEnd();
         }
     }
 
@@ -343,24 +331,13 @@ void VoxelMapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, co
             {
                 KeyFrame* pKF = vpKFs[i];
                 Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
-                unsigned int index_color = pKF->mnOriginMapId;
-
                 glPushMatrix();
 
                 glMultMatrixf((GLfloat*)Twc.data());
 
-                if(!vpKFs[i]->GetParent()) // It is the first KF in the map
-                {
-                    glLineWidth(mKeyFrameLineWidth*5);
-                    glColor3f(1.0f,0.0f,0.0f);
-                    glBegin(GL_LINES);
-                }
-                else
-                {
-                    glLineWidth(mKeyFrameLineWidth);
-                    glColor3f(mfFrameColors[index_color][0],mfFrameColors[index_color][1],mfFrameColors[index_color][2]);
-                    glBegin(GL_LINES);
-                }
+                glLineWidth(mKeyFrameLineWidth);
+                glColor3f(0.0f,0.0f,1.0f);
+                glBegin(GL_LINES);
 
                 glVertex3f(0,0,0);
                 glVertex3f(w,h,z);
@@ -388,6 +365,30 @@ void VoxelMapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, co
             }
         }
     }
+}
+
+void VoxelMapDrawer::DrawKeyFrameTrajectory()
+{
+    Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if (!pActiveMap)
+        return;
+
+    glLineWidth(std::max(2.0f, mGraphLineWidth * 1.5f));
+    glColor3f(1.0f, 0.0f, 0.0f);
+    glBegin(GL_LINES);
+    for (KeyFrame* keyframe : pActiveMap->GetAllKeyFrames())
+    {
+        if (!keyframe || keyframe->isBad() || !keyframe->mNextKF ||
+            keyframe->mNextKF->isBad())
+            continue;
+
+        const Eigen::Vector3f center = keyframe->GetCameraCenter();
+        const Eigen::Vector3f next_center =
+            keyframe->mNextKF->GetCameraCenter();
+        glVertex3f(center.x(), center.y(), center.z());
+        glVertex3f(next_center.x(), next_center.y(), next_center.z());
+    }
+    glEnd();
 }
 
 void VoxelMapDrawer::DrawCurrentCamera(glm::mat4 &Twc)

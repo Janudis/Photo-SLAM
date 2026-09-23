@@ -144,7 +144,13 @@ void sv::VoxelTrainer::trainingReport(
     torch::Tensor& background
 ) {
     std::cout << std::fixed << std::setprecision(8)
-              << "Training iteration " << iteration << "/" << num_iterations
+              << "Training iteration " << iteration;
+    if (num_iterations > 0) {
+        std::cout << "/" << num_iterations;
+    } else {
+        std::cout << "/unlimited";
+    }
+    std::cout
               << ", time elapsed: " << (elapsed_time / 1000.0f) << "s"
               << ", ema_total_loss: " << ema_total_loss
               << ", photo_" << photo_loss_name << ": " << photo_loss.item<float>();

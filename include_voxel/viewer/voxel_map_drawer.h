@@ -54,6 +54,7 @@ public:
 
     void DrawMapPoints();
     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba);
+    void DrawKeyFrameTrajectory();
     void DrawCurrentCamera(glm::mat4 &Twc);
     void SetCurrentCameraTwc(const Sophus::SE3f &Twc);
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);

@@ -93,25 +93,13 @@ public:
         float lambda_ssim = 0.02f,
         float lambda_sparse_depth = 0.0f,
         int   sparse_depth_until = 1000,
-        bool  enable_da2_uncertainty = true,
-        int   level_uncertainty_from = 0,
-        float power_level_uncertainty = 1.0f,
         float lambda_ascending = 0.0f,
         int   ascending_from = 0,
         float lambda_rectify = 1e-6f,
         int   rectifiy_from = 0,
         float lambda_scaling_penalty = 1e-6f,
         int   scaling_penalty_from = 0,
-        int   scaling_penalty_end = 20000,
-        int   multi_view_weight_from_iter = 1000000000,
-        int   multi_view_interval = 1,
-        float multi_view_anneal_scale = 0.0f,
-        float multi_view_ncc_weight = 0.05f,
-        float multi_view_geo_weight = 0.01f,
-        int   multi_view_patch_size = 3,
-        int   multi_view_sample_num = 10240000,
-        float multi_view_pixel_noise_th = 1.0f,
-        float voxel_dropout_min = 0.5f
+        int   scaling_penalty_end = 20000
     );
 
 public:
@@ -133,12 +121,7 @@ public:
     bool prune_far_voxels_;
     bool prune_near_voxels_geometric_;
     bool prune_surface_views_enable_ = false;
-    int surface_min_views_ = 4;
-    int surface_view_window_size_ = 10;
     bool prune_mvs_consistency_enable_ = false;
-    int prune_mvs_min_supporting_views_ = 2;
-    int prune_mvs_min_contradicting_views_ = 2;
-    float prune_mvs_depth_tolerance_vox_ = 1.5f;
     bool final_refinement_enable_ = false;
     int prune_from_;
     int prune_until_;
@@ -183,9 +166,6 @@ public:
     float lambda_monocular_depth_ = 0.0f;
     int   monocular_depth_from_ = 1000;
     int   monocular_depth_end_ = 15000;
-    float monocular_depth_end_mult_ = 0.1f;
-    float monocular_depth_alpha_min_ = 0.5f;
-    float monocular_depth_confidence_min_ = 0.0f;
     float lambda_rgbd_sdf_ = 0.0f;
     int   rgbd_sdf_from_ = 0;
     int   rgbd_sdf_end_ = 15000;
@@ -198,9 +178,6 @@ public:
     float rgbd_sdf_w_fs_ = 5.0f;
     float rgbd_sdf_w_center_ = 20.0f;
     float rgbd_sdf_w_tail_ = 1.0f;
-    bool  enable_da2_uncertainty_;
-    int   level_uncertainty_from_;
-    float power_level_uncertainty_;
     float lambda_ascending_;
     int   ascending_from_;
     float lambda_rectify_;
@@ -208,26 +185,10 @@ public:
     float lambda_scaling_penalty_;
     int   scaling_penalty_from_;
     int   scaling_penalty_end_;
-    int   multi_view_weight_from_iter_;
-    int   multi_view_interval_;
-    float multi_view_anneal_scale_;
-    float multi_view_ncc_weight_;
-    float multi_view_geo_weight_;
-    int   multi_view_patch_size_;
-    int   multi_view_sample_num_;
-    float multi_view_pixel_noise_th_;
-    float voxel_dropout_min_;
     float lambda_rgbd_normal_ = 0.0f;
     int   rgbd_normal_from_ = 3000;
     int   rgbd_normal_end_ = 20000;
     float rgbd_normal_end_mult_ = 0.1f;
     int   rgbd_normal_ks_ = 3;
     float rgbd_normal_tol_deg_ = 90.0f;
-    float lambda_monocular_normal_ = 0.0f;
-    int   monocular_normal_from_ = 1000;
-    int   monocular_normal_end_ = 15000;
-    float monocular_normal_end_mult_ = 0.1f;
-    int   monocular_normal_ks_ = 3;
-    float monocular_normal_tol_deg_ = 90.0f;
-    float monocular_normal_max_depth_jump_rel_ = 0.05f;
 };

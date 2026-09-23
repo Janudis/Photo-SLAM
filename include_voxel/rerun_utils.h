@@ -165,15 +165,6 @@ public:
         const std::string& entity_path = "world/mesh/reference",
         bool static_mesh = false);
 
-    // Align a reference mesh from source trajectory coordinates into the
-    // target trajectory frame using timestamp-matched Umeyama Sim(3).
-    bool alignReferencePlyMesh(
-        const std::string& source_mesh_path,
-        const std::string& source_trajectory_tum_path,
-        const std::string& target_trajectory_tum_path,
-        const std::string& output_mesh_path,
-        const std::string& report_path);
-
     void visualizeDebugImage(
         const std::string& recording_name,
         const cv::Mat& image_rgb,
@@ -215,26 +206,6 @@ public:
         double value,
         int iteration,
         const std::string& entity_path);
-
-    void visualizeMapsFrameRecording(
-        const std::string& recording_name,
-        int keyframe_id,
-        int iteration,
-        const cv::Mat& gt_rgb,
-        const cv::Mat& rendered_rgb,
-        const cv::Mat& rgb_error,
-        const cv::Mat& gt_depth_rgb,
-        const cv::Mat& rendered_depth_rgb,
-        const cv::Mat& depth_error_rgb,
-        const cv::Mat& depth_gap_rgb,
-        const cv::Mat& gt_normal_rgb,
-        const cv::Mat& rendered_normal_rgb,
-        const cv::Mat& normal_error_rgb,
-        double psnr,
-        double ssim,
-        double depth_l1_m,
-        double depth_gap_percent,
-        double normal_mean_deg);
 
     void visualizeDebugGtSdfMesh(
         const std::string& recording_name,

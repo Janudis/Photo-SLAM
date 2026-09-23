@@ -15,6 +15,9 @@ struct TandemMvsResult
     // Depth uses the same coordinate units as the supplied camera poses.
     cv::Mat depth;
     cv::Mat confidence;
+    // TANDEM preserves the pre-edge-filter depth for visualization while the
+    // filtered tensors above remain the inputs to geometric fusion.
+    cv::Mat depth_dense;
 };
 
 // Ownership and input-validation layer around the project-local copy of
@@ -29,7 +32,6 @@ public:
     TandemMvsBackend& operator=(const TandemMvsBackend&) = delete;
 
     bool hasPending() const;
-    bool resultReady() const;
 
     void launch(
         const std::vector<cv::Mat>& bgr_images,

@@ -9,7 +9,6 @@ VOC="$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt"
 ORB_CFG="$root_dir/cfg/ORB_SLAM3/RGB-D/RealCamera/realsense_d455f_rgbd_640x360.yaml"
 VOX_CFG="$root_dir/cfg/voxel_mapper/RGB-D/RealCamera/realsense_rgbd_voxel.yaml"
 RESULTS_ROOT="${PHOTOSLAM_RESULTS_ROOT:-$root_dir/results}"
-OUT="${REALSENSE_OUTPUT:-$RESULTS_ROOT/realsense_rgbd_voxel/d455f/$(date +%Y%m%d-%H%M%S)}"
 
 if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "no_viewer" ) ]]; then
     echo "Usage: $0 [no_viewer]" >&2
@@ -21,6 +20,16 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+if [[ -n "${REALSENSE_OUTPUT:-}" ]]; then
+    OUT="$REALSENSE_OUTPUT"
+else
+    mkdir -p "$RESULTS_ROOT/realsense_rgbd_voxel/d455f"
+    OUT="$(mktemp -d "$RESULTS_ROOT/realsense_rgbd_voxel/d455f/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+fi
+if [[ -d "$OUT" ]] && [[ -n "$(ls -A "$OUT")" ]]; then
+    echo "Refusing to reuse non-empty output directory: $OUT" >&2
+    exit 1
+fi
 mkdir -p "$OUT"
 echo "[RealSense] Output: $OUT"
 

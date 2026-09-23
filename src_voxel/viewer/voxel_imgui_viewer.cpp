@@ -1,12 +1,19 @@
 #include "include_voxel/viewer/voxel_imgui_viewer.h"
+#include "include_voxel/viewer/voxel_camera_navigation.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 
 namespace
 {
-float focalToFov(const float focal, const float pixels)
+glm::mat4 cameraViewFromTcw(const Sophus::SE3f& Tcw)
 {
-    return 2.0f * std::atan(pixels / (2.0f * focal));
+    glm::mat4 cv_to_opengl(1.0f);
+    cv_to_opengl[1][1] = -1.0f;
+    cv_to_opengl[2][2] = -1.0f;
+    return cv_to_opengl * trans4x4Eigen2glm(Tcw.matrix());
 }
 } // namespace
 
@@ -22,9 +29,7 @@ VoxelImGuiViewer::VoxelImGuiViewer(
     : glfw_window_width_(1600),
       glfw_window_height_(900),
       panel_width_(372),
-      display_panel_height_(144),
-      training_panel_height_(440),
-      camera_panel_height_(144),
+      display_panel_height_(232),
       SLAM_image_viewer_scale_(1.0f),
       training_(training)
 {
@@ -55,15 +60,48 @@ VoxelImGuiViewer::VoxelImGuiViewer(
 
     main_fx_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[0];
     main_fy_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[1];
+    main_cx_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[2];
+    main_cy_ = pVoxelMapper->scene_->cameras_.begin()->second.params_[3];
 
     // Voxel mapper settings
     std::filesystem::path cfg_file_path = pVoxelMapper->config_file_path_;
     readConfigFromFile(cfg_file_path);
+    if (const char* preset = std::getenv("VOXEL_VIEWER_PRESET"))
+    {
+        const std::string name(preset);
+        if (name != "default" && name != "orb" && name != "voxel" &&
+            name != "tracking" && name != "reconstruction" && name != "realworld")
+            throw std::invalid_argument(
+                "VOXEL_VIEWER_PRESET must be default, orb, voxel, tracking, or realworld");
+        applyRecordingPreset(name == "orb" ? 1 : name == "voxel" ? 2 :
+                             name == "tracking" ? 3 : name == "realworld" ? 4 :
+                             name == "reconstruction" ? 5 : 0);
+        if (recording_preset_)
+        {
+            glfw_window_width_ = 1600;
+            glfw_window_height_ = 900;
+        }
+        std::cout << "[VoxelImGuiViewer] Recording preset: " << name << std::endl;
+    }
     SLAM_image_viewer_scale_ = static_cast<float>(rendered_image_width_) / image_width_;
 
-    float fovy = focalToFov(viewpointF_, static_cast<float>(image_height_));
-    cam_proj_ = glm::perspective(
-        fovy < M_PIf32 ? fovy : M_PIf32, (float)glfw_window_width_ / (float)glfw_window_height_, 0.01f, 100.0f);
+    constexpr float near_plane = 0.01f;
+    constexpr float far_plane = 1000.0f;
+    const float left = -main_cx_ * near_plane / main_fx_;
+    const float right =
+        (static_cast<float>(image_width_) - main_cx_) *
+        near_plane / main_fx_;
+    const float top = main_cy_ * near_plane / main_fy_;
+    const float bottom =
+        -(static_cast<float>(image_height_) - main_cy_) *
+        near_plane / main_fy_;
+    cam_proj_ = glm::frustum(
+        left,
+        right,
+        bottom,
+        top,
+        near_plane,
+        far_plane);
 
     up_ = glm::vec3(0.0f, -1.0f, 0.0f);
     up_aligned_ = glm::vec4(up_, 1.0f);
@@ -94,9 +132,6 @@ void VoxelImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
         settings_file["VoxelViewer.glfw_window_width"].operator int();
     glfw_window_height_ =
         settings_file["VoxelViewer.glfw_window_height"].operator int();
-    main_cx_ = glfw_window_width_ / 2;
-    main_cy_ = glfw_window_height_ / 2;
-
     rendered_image_viewer_scale_ =
         settings_file["VoxelViewer.image_scale"].operator float();
     rendered_image_height_ = image_height_ * rendered_image_viewer_scale_;
@@ -127,6 +162,23 @@ void VoxelImGuiViewer::readConfigFromFile(std::filesystem::path cfg_path)
     do_gaus_pyramid_training_ = pVoxelMapper_->isdoingGausPyramidTraining();
 }
 
+void VoxelImGuiViewer::applyRecordingPreset(int preset)
+{
+    recording_preset_ = preset;
+    fit_zoom_ = preset == 4 ? 1.2f : 1.0f;
+    auto_fit_reconstruction_ = preset == 1 || preset == 2 || preset == 4 || preset == 5;
+    last_auto_fit_time_ = -1.0;
+    show_slam_frame_ = preset == 1 || preset == 2 || preset == 4;
+    show_rendered_frame_ = preset == 2 || preset == 4;
+    show_sparse_mappoints_ = preset == 1;
+    show_main_rendered_ = preset != 1;
+    show_keyframes_ = preset != 3;
+    show_trajectory_ = preset != 3;
+    tracking_vision_ = preset == 3;
+    show_display_controls_ = false;
+    fit_reconstruction_requested_ = preset != 3;
+}
+
 void VoxelImGuiViewer::run()
 {
     // Initialize glfw
@@ -153,6 +205,22 @@ void VoxelImGuiViewer::run()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.Fonts->AddFontDefault();
+    ImFontConfig frame_title_config;
+    frame_title_config.SizePixels = 22.0f;
+    ImFont* frame_title_font = nullptr;
+    for (const char* font_path : {
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"})
+    {
+        if (std::filesystem::is_regular_file(font_path))
+            frame_title_font = io.Fonts->AddFontFromFileTTF(font_path, 22.0f);
+        if (frame_title_font)
+            break;
+    }
+    if (!frame_title_font)
+        frame_title_font = io.Fonts->AddFontDefault(&frame_title_config);
+    io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;   // Enable Gamepad Controls
 
@@ -165,14 +233,6 @@ void VoxelImGuiViewer::run()
 
     // Variables for tracking
     Sophus::SE3f Tcw, TcwInit;
-    cam_pos_ = glm::vec3(viewpointX_, viewpointY_, viewpointZ_);
-    glm::vec4 cam_pos_aligned = glm::vec4(cam_pos_, 1.0f);
-    cam_target_ = glm::vec3(0.0f, 0.0f, 0.0f);
-    glm::vec3 cam_direction = cam_pos_ - cam_target_;
-    glm::vec3 cam_right = glm::normalize(glm::cross(up_, cam_direction));
-    glm::vec3 cam_up = glm::cross(cam_direction, cam_right);
-    glm::vec4 cam_up_aligned = glm::vec4(cam_up, 1.0f);
-    cam_view_ = glm::lookAt(cam_pos_, cam_target_, cam_up);
     glm::mat4 glmTwc, Twr, glmTwcInit;
     glmTwc = glm::mat4(1.0f);
     glmTwcInit = glm::mat4(1.0f);
@@ -219,6 +279,47 @@ void VoxelImGuiViewer::run()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        if (ImGui::IsKeyPressed(ImGuiKey_F1, false))
+            show_display_controls_ = !show_display_controls_;
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false))
+            applyRecordingPreset(1);
+        if (ImGui::IsKeyPressed(ImGuiKey_F3, false))
+            applyRecordingPreset(2);
+        if (ImGui::IsKeyPressed(ImGuiKey_F4, false))
+            applyRecordingPreset(3);
+        if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F, false))
+            fit_reconstruction_requested_ = true;
+
+        main_view_origin_ = ImVec2(0, 0);
+        main_view_size_ = io.DisplaySize;
+        main_view_crop_ = ImVec2(1.0f, 1.0f);
+        const float frame_panel_width = std::min(
+            static_cast<float>(padded_sub_image_width_) + 12.0f,
+            std::max(32.0f, io.DisplaySize.x * 0.4f));
+        if (recording_preset_ == 5)
+        {
+            main_view_origin_ = ImVec2(0.0f, 0.0f);
+            main_view_size_ = io.DisplaySize;
+        }
+        else if (recording_preset_)
+        {
+            const float panel_edge = (show_slam_frame_ || show_rendered_frame_)
+                ? frame_panel_width + 12.0f : 16.0f;
+            main_view_origin_ = ImVec2(std::min(panel_edge, io.DisplaySize.x * 0.65f), 16.0f);
+            main_view_size_ = ImVec2(io.DisplaySize.x - main_view_origin_.x - 16.0f,
+                                     io.DisplaySize.y - 32.0f);
+            // Crop the native camera image to the taller viewport, without stretching it.
+            const float aspect_ratio = (main_view_size_.x / main_view_size_.y) /
+                (static_cast<float>(image_width_) / image_height_);
+            main_view_crop_ = ImVec2(std::min(aspect_ratio, 1.0f),
+                                     std::min(1.0f / aspect_ratio, 1.0f));
+        }
+        const glm::mat4 view_projection = glm::scale(glm::mat4(1.0f),
+            glm::vec3(1.0f / main_view_crop_.x, 1.0f / main_view_crop_.y, 1.0f)) * cam_proj_;
+        const ImVec2 main_uv_min((1.0f - main_view_crop_.x) * 0.5f,
+                                (1.0f - main_view_crop_.y) * 0.5f);
+        const ImVec2 main_uv_max(1.0f - main_uv_min.x, 1.0f - main_uv_min.y);
+
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
@@ -244,100 +345,121 @@ void VoxelImGuiViewer::run()
         }
         if (tracking_vision_)
         {
-            glm::vec3 cam_target = glm::vec3(Ow[3][0], Ow[3][1], Ow[3][2]);
-            cam_pos_aligned = glmTwc * behind_;
-            glm::vec3 cam_pos = glm::vec3(cam_pos_aligned.x, cam_pos_aligned.y, cam_pos_aligned.z);
-            cam_direction = cam_pos - cam_target;
-            // cam_right = glm::normalize(glm::cross(up_, cam_direction));
-            // cam_up = glm::cross(cam_direction, cam_right);
-            cam_up_aligned = glmTwc * up_aligned_;
-            cam_up = glm::normalize(glm::vec3(cam_up_aligned.x, cam_up_aligned.y, cam_up_aligned.z) - cam_target);
-            cam_right = glm::normalize(glm::cross(cam_up, cam_direction));
-            cam_up = glm::cross(cam_direction, cam_right);
-            cam_view_ = glm::lookAt(cam_pos, cam_target, cam_up);
-            cam_trans_ = cam_proj_ * cam_view_;
+            navigation_center_valid_ = false;
+            orbit_view_ = false;
+            cam_view_ = cameraViewFromTcw(Tcw);
+            cam_trans_ = view_projection * cam_view_;
         }
         else
         {
             if (reset_main_to_init_ || !init_Twc_set_)
             {
-                cam_target_ = glm::vec3(OwInit[3][0], OwInit[3][1], OwInit[3][2]);
-                cam_pos_aligned = glmTwcInit * behind_;
                 glmTwc_main_ = glmTwcInit;
                 Tcw_main_ = TcwInit;
                 Twc_main_ = Tcw_main_.inverse();
                 init_Twc_set_ = true;
                 reset_main_to_init_ = false;
+                navigation_center_valid_ = false;
+                orbit_view_ = false;
             }
             else
             {
                 Tcw_main_ = trans4x4glm2Sophus(glmTwc_main_).inverse();
                 handleUserInput();
                 glmTwc_main_ = trans4x4Eigen2glm(Tcw_main_.inverse().matrix());
-                cam_target_ = glm::vec3(glmTwc_main_[3][0], glmTwc_main_[3][1], glmTwc_main_[3][2]);
-                cam_pos_aligned = glmTwc_main_ * behind_;
             }
-            cam_pos_ = glm::vec3(cam_pos_aligned.x, cam_pos_aligned.y, cam_pos_aligned.z);
-            cam_direction = cam_pos_ - cam_target_;
-            // cam_right = glm::normalize(glm::cross(up_, cam_direction));
-            // cam_up = glm::cross(cam_direction, cam_right);
-            cam_up_aligned = glmTwc_main_ * up_aligned_;
-            cam_up = glm::normalize(glm::vec3(cam_up_aligned.x, cam_up_aligned.y, cam_up_aligned.z) - cam_target_);
-            cam_right = glm::normalize(glm::cross(cam_up, cam_direction));
-            cam_up = glm::cross(cam_direction, cam_right);
-            cam_view_ = glm::lookAt(cam_pos_, cam_target_, cam_up);
-            cam_trans_ = cam_proj_ * cam_view_;
+            cam_view_ = cameraViewFromTcw(Tcw_main_);
+            cam_trans_ = view_projection * cam_view_;
+        }
+
+        // Fit before rendering so the voxel image and ORB overlays use one pose.
+        if (auto_fit_reconstruction_ && !tracking_vision_ &&
+            ImGui::GetTime() - last_auto_fit_time_ >= 1.0)
+        {
+            fit_reconstruction_requested_ = true;
+            last_auto_fit_time_ = ImGui::GetTime();
+        }
+        if (fit_reconstruction_requested_ && fitViewToReconstruction())
+        {
+            tracking_vision_ = false;
+            fit_reconstruction_requested_ = false;
+            cam_view_ = cameraViewFromTcw(Tcw_main_);
+            cam_trans_ = view_projection * cam_view_;
         }
 
         if (pSLAM_)
         {
-            //--------------Draw SLAM frame image--------------
-            cv::Mat SLAM_img_to_show;
-            cv::Mat SLAM_img_with_text = pSlamFrameDrawer_->DrawFrame(1.0f);
-            if (SLAM_image_viewer_scale_ != 1.0f)
+            constexpr float panel_gap = 8.0f;
+            const int visible_frame_panels =
+                static_cast<int>(show_slam_frame_) + static_cast<int>(show_rendered_frame_);
+            const float panel_height_limit = std::max(1.0f,
+                (io.DisplaySize.y - 16.0f - panel_gap * (visible_frame_panels - 1)) /
+                std::max(1, visible_frame_panels));
+            auto showFrame = [&](GLuint texture, const cv::Mat& frame,
+                                 const char* title, float window_y)
             {
-                int width = rendered_image_width_;
-                int height = static_cast<int>(SLAM_img_with_text.rows * SLAM_image_viewer_scale_);
-                cv::resize(SLAM_img_with_text, SLAM_img_with_text, cv::Size(width, height));
-                SLAM_img_to_show = cv::Mat(height, padded_sub_image_width_, CV_8UC3, cv::Vec3f(0, 0, 0));
-            }
-            else
-            {
-                SLAM_img_to_show = cv::Mat(image_height_, padded_sub_image_width_, CV_8UC3, cv::Vec3f(0, 0, 0));
-            }
-            cv::Rect SLAM_image_rect(0, 0, SLAM_img_with_text.cols, SLAM_img_with_text.rows);
-            SLAM_img_with_text.copyTo(SLAM_img_to_show(SLAM_image_rect));
-            // Upload SLAM frame
-            glBindTexture(GL_TEXTURE_2D, SLAM_img_texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, SLAM_img_to_show.cols, SLAM_img_to_show.rows,
-                        0, GL_BGR, GL_UNSIGNED_BYTE, (unsigned char*)SLAM_img_to_show.data);
-            // Create an ImGui window to show the SLAM frame
-            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Once);
-            ImGui::SetNextWindowSize(ImVec2(rendered_image_width_ + 12, SLAM_img_to_show.rows + 40), ImGuiCond_Once);
-            {
-                ImGui::Begin("SLAM Frame");
-                ImGui::Image((void *)(intptr_t)SLAM_img_texture,
-                            ImVec2(SLAM_img_to_show.cols, SLAM_img_to_show.rows));
+                ImGui::PushFont(frame_title_font);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 6));
+                const float content_width = std::max(1.0f, frame_panel_width - 12.0f);
+                const float title_height = ImGui::CalcTextSize(
+                    title, nullptr, false, content_width).y;
+                const float image_height_limit = std::max(1.0f,
+                    panel_height_limit - title_height - panel_gap - 12.0f);
+                const float image_scale = std::min(1.0f, std::min(
+                    content_width / frame.cols, image_height_limit / frame.rows));
+                const ImVec2 image_size(frame.cols * image_scale, frame.rows * image_scale);
+                const float panel_height = title_height + panel_gap + image_size.y + 12.0f;
+                ImGui::SetNextWindowPos(ImVec2(0, window_y), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(frame_panel_width, panel_height), ImGuiCond_Always);
+                const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+                if (ImGui::Begin(title, nullptr, flags))
+                {
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_width);
+                    ImGui::TextUnformatted(title);
+                    ImGui::PopTextWrapPos();
+                    ImGui::SetCursorPos(ImVec2(
+                        6.0f + (content_width - image_size.x) * 0.5f,
+                        6.0f + title_height + panel_gap));
+                    ImGui::Image((void*)(intptr_t)texture, image_size);
+                }
                 ImGui::End();
+                ImGui::PopStyleVar();
+                ImGui::PopFont();
+                return panel_height;
+            };
+
+            float slam_window_height = 0;
+            if (show_slam_frame_)
+            {
+                cv::Mat slam_frame = pSlamFrameDrawer_->DrawFrame(1.0f);
+                if (SLAM_image_viewer_scale_ != 1.0f)
+                    cv::resize(slam_frame, slam_frame, cv::Size(rendered_image_width_,
+                        static_cast<int>(slam_frame.rows * SLAM_image_viewer_scale_)));
+                cv::Mat padded_frame(slam_frame.rows, padded_sub_image_width_, CV_8UC3,
+                                     cv::Scalar(0, 0, 0));
+                slam_frame.copyTo(padded_frame(cv::Rect(0, 0, slam_frame.cols, slam_frame.rows)));
+                glBindTexture(GL_TEXTURE_2D, SLAM_img_texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, padded_frame.cols, padded_frame.rows,
+                            0, GL_BGR, GL_UNSIGNED_BYTE, padded_frame.data);
+                slam_window_height = showFrame(
+                    SLAM_img_texture, padded_frame, "ORB-SLAM3 frame", 0) + panel_gap;
             }
 
-            // Draw the current voxel-mapper rendering.
-            cv::Mat rendered_img = pVoxelMapper_->renderFromPose(
-                Tcw, rendered_image_width_, rendered_image_height_, false);
-            cv::Mat rendered_img_to_show = cv::Mat(rendered_image_height_, padded_sub_image_width_, CV_32FC3, cv::Vec3f(0.0f, 0.0f, 0.0f));
-            rendered_img.copyTo(rendered_img_to_show(image_rect_sub));
-            // Upload rendered frame
-            glBindTexture(GL_TEXTURE_2D, rendered_img_texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rendered_img_to_show.cols, rendered_img_to_show.rows,
-                        0, GL_RGB, GL_FLOAT, (float*)rendered_img_to_show.data);
-            // Create an ImGui window to show the rendered frame
-            ImGui::SetNextWindowPos(ImVec2(0, SLAM_img_to_show.rows + 40), ImGuiCond_Once);
-            ImGui::SetNextWindowSize(ImVec2(rendered_image_width_ + 12, rendered_img_to_show.rows + 40), ImGuiCond_Once);
+            if (show_rendered_frame_ || (show_main_rendered_ && tracking_vision_))
             {
-                ImGui::Begin("Current Rendered Frame");
-                ImGui::Image((void *)(intptr_t)rendered_img_texture,
-                            ImVec2(rendered_img_to_show.cols, rendered_img_to_show.rows));
-                ImGui::End();
+                cv::Mat rendered_img = pVoxelMapper_->renderFromPose(
+                    Tcw, rendered_image_width_, rendered_image_height_, false);
+                cv::Mat rendered_img_to_show(rendered_image_height_, padded_sub_image_width_,
+                                            CV_32FC3, cv::Scalar(0, 0, 0));
+                rendered_img.copyTo(rendered_img_to_show(image_rect_sub));
+                glBindTexture(GL_TEXTURE_2D, rendered_img_texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rendered_img_to_show.cols, rendered_img_to_show.rows,
+                            0, GL_RGB, GL_FLOAT, rendered_img_to_show.data);
+                if (show_rendered_frame_)
+                    showFrame(rendered_img_texture, rendered_img_to_show,
+                              "Current Rendered Frame", slam_window_height);
             }
         }
 
@@ -349,8 +471,11 @@ void VoxelImGuiViewer::run()
             auto drawlist = ImGui::GetBackgroundDrawList();
             if (pSLAM_ && tracking_vision_)
             {
-                drawlist->AddImage((void *)(intptr_t)rendered_img_texture, ImVec2(0, 0),
-                                   ImVec2(glfw_window_width_, glfw_window_height_));
+                drawlist->AddImage((void *)(intptr_t)rendered_img_texture, main_view_origin_,
+                    ImVec2(main_view_origin_.x + main_view_size_.x,
+                           main_view_origin_.y + main_view_size_.y),
+                    ImVec2(main_uv_min.x * rendered_image_width_ / padded_sub_image_width_, main_uv_min.y),
+                    ImVec2(main_uv_max.x * rendered_image_width_ / padded_sub_image_width_, main_uv_max.y));
             }
             else
             {
@@ -361,8 +486,11 @@ void VoxelImGuiViewer::run()
                 glBindTexture(GL_TEXTURE_2D, main_img_texture);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, main_img_to_show.cols, main_img_to_show.rows,
                      0, GL_RGB, GL_FLOAT, (float*)main_img_to_show.data);
-                drawlist->AddImage((void *)(intptr_t)main_img_texture, ImVec2(0, 0),
-                                   ImVec2(glfw_window_width_, glfw_window_height_));
+                drawlist->AddImage((void *)(intptr_t)main_img_texture, main_view_origin_,
+                    ImVec2(main_view_origin_.x + main_view_size_.x,
+                           main_view_origin_.y + main_view_size_.y),
+                    ImVec2(main_uv_min.x * rendered_image_width_main_ / padded_main_image_width_, main_uv_min.y),
+                    ImVec2(main_uv_max.x * rendered_image_width_main_ / padded_main_image_width_, main_uv_max.y));
             }
         }
         //--------------Get current parameters--------------
@@ -378,47 +506,70 @@ void VoxelImGuiViewer::run()
         do_gaus_pyramid_training_ = params_in.do_gaus_pyramid_training;
 
         //--------------Display mode panel--------------
-        ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, 0), ImGuiCond_Once);
-        ImGui::SetNextWindowSize(ImVec2(panel_width_, display_panel_height_), ImGuiCond_Once);
+        const bool mapping_complete = pVoxelMapper_->isStopped();
+        if (mapping_complete && !display_controls_auto_shown_ && !recording_preset_)
         {
+            show_display_controls_ = true;
+            display_controls_auto_shown_ = true;
+        }
+        if (show_display_controls_)
+        {
+            ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, 0), ImGuiCond_Once);
+            ImGui::SetNextWindowSize(ImVec2(panel_width_, display_panel_height_ + 180 +
+                (terminate_run_callback_ ? 32 : 0)), ImGuiCond_Once);
             ImGui::Begin("Display Mode");
+
+            int preset = recording_preset_;
+            if (ImGui::Combo("Recording layout", &preset,
+                             "Default\0ORB map\0Voxel map\0Tracking vision only\0Real-world recording\0Reconstruction only\0"))
+                applyRecordingPreset(preset);
+            ImGui::Checkbox("Auto-fit growing map", &auto_fit_reconstruction_);
 
             if (training_)
             {
                 ImGui::Checkbox("Tracking vision", &tracking_vision_);
                 ImGui::Checkbox("Show KeyFrames", &show_keyframes_);
+                ImGui::Checkbox("Show camera trajectory", &show_trajectory_);
                 ImGui::Checkbox("Show sparse MapPoints", &show_sparse_mappoints_);
             }
+            ImGui::Checkbox("Show SLAM Frame", &show_slam_frame_);
+            ImGui::Checkbox("Show Current Rendered Frame", &show_rendered_frame_);
             ImGui::Checkbox("Show main window rendered", &show_main_rendered_);
+
+            if (ImGui::Button("Fit Reconstruction"))
+                fit_reconstruction_requested_ = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Scroll: zoom. Left drag: orbit. Right/middle drag: pan.\n"
+                                  "W/S: forward/back. A/D: left/right. Q/E: up/down.");
+            if (ImGui::SliderFloat("Fit zoom", &fit_zoom_, 1.0f, 2.0f, "%.2fx"))
+                fit_reconstruction_requested_ = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("1x fits the full map. Larger values bring the scene closer\n"
+                                  "and may place distant edges outside the view.");
+            if (ImGui::Button("Straighten view"))
+                straightenView();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Align the vertical direction with the first keyframe.\n"
+                                  "This is a camera reference, not a gravity estimate.");
+            if (ImGui::Button("Center orbit on camera path"))
+                centerOrbitOnKeyframes();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Aim at the keyframe center and rotate around it.\n"
+                                  "Distant voxel artifacts do not affect this center.");
+            ImGui::TextUnformatted("Alt + left drag: roll\nCtrl: precision movement\nU / O: roll left / right");
+
+            if (terminate_run_callback_)
+            {
+                if (ImGui::Button("Terminate Run"))
+                    terminate_run_callback_();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Exit immediately. Unsaved results will be lost.");
+            }
 
             ImGui::Text("Viewer average FPS %.1f", io.Framerate);
             ImGui::End();
         }
 
-        //--------------Training options panel--------------
-        if (training_)
-        {
-            ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, display_panel_height_ + 8), ImGuiCond_Once);
-            ImGui::SetNextWindowSize(ImVec2(panel_width_, training_panel_height_), ImGuiCond_Once);
-            {
-                ImGui::Begin("Training Options");
-
-                ImGui::Text("Iteration: %d", pVoxelMapper_->getIteration());
-
-                ImGui::Checkbox("Gaussian-pyramid-based training", &do_gaus_pyramid_training_);
-                ImGui::Checkbox("Keep training after stop", &keep_training_);
-
-                ImGui::SliderFloat("Geo l.r.", &geo_lr_, 0.00001f, 0.00100f, "%.5f");
-                ImGui::SliderFloat("Sh0 l.r.", &sh0_lr_, 0.0001f, 0.0050f, "%.5f");
-                ImGui::SliderFloat("Shs l.r.", &shs_lr_, 0.01f, 0.10f, "%.5f");
-                ImGui::SliderFloat("Lambda SSIM", &lambda_ssim_, 0.0f, 0.10f, "%.2f");
-                ImGui::SliderInt("Densify int.", &densify_interval_, 1, 400);
-                ImGui::SliderInt("New kf. using", &new_kf_times_of_use_, 0, 10);
-                ImGui::SliderInt("Stable iter.", &stable_num_iter_existence_, 0, 100);
-
-                ImGui::End();
-            }
-        }
         VariableParameters params_out;
         params_out.geo_lr = geo_lr_;
         params_out.sh0_lr = sh0_lr_;
@@ -431,47 +582,43 @@ void VoxelImGuiViewer::run()
         params_out.do_gaus_pyramid_training = do_gaus_pyramid_training_;
         pVoxelMapper_->setVaribleParameters(params_out);
 
-        //--------------Camera view panel--------------
-        ImGui::SetNextWindowPos(ImVec2(glfw_window_width_ - panel_width_, (training_ ? display_panel_height_ + training_panel_height_ + 16 : display_panel_height_ + 8)), ImGuiCond_Once);
-        ImGui::SetNextWindowSize(ImVec2(panel_width_, camera_panel_height_), ImGuiCond_Once);
-        {
-            ImGui::Begin("Camera View Velocity");
-
-            ImGui::SliderFloat("Mouse Left", &mouse_left_sensitivity_, 0.01f, 1.0f, "%.2f");
-            ImGui::SliderFloat("Mouse Right", &mouse_right_sensitivity_, 0.01f, 1.0f, "%.2f");
-            ImGui::SliderFloat("Mouse Middle", &mouse_middle_sensitivity_, 0.01f, 1.0f, "%.2f");
-            ImGui::SliderFloat("Keyboard t", &keyboard_velocity_, 0.01f, 1.0f, "%.2f");
-            ImGui::SliderFloat("Keyboard R", &keyboard_anglular_velocity_, 0.01f, 1.0f, "%.2f");
-
-            ImGui::End();
-        }
-
         //--------------ImGui Rendering--------------
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         //--------------Draw main window SLAM--------------
+        const float framebuffer_scale_x = display_w / io.DisplaySize.x;
+        const float framebuffer_scale_y = display_h / io.DisplaySize.y;
+        const int map_x = std::lround(main_view_origin_.x * framebuffer_scale_x);
+        const int map_y = std::lround((io.DisplaySize.y - main_view_origin_.y - main_view_size_.y)
+                                     * framebuffer_scale_y);
+        const int map_w = std::lround(main_view_size_.x * framebuffer_scale_x);
+        const int map_h = std::lround(main_view_size_.y * framebuffer_scale_y);
+        glViewport(map_x, map_y, map_w, map_h);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(map_x, map_y, map_w, map_h);
         // Set relative viewpoint
         glPushMatrix();
         glMultMatrixf(&cam_trans_[0][0]);
         // Draw camera, KeyFrames and MapPoints
         if (pSLAM_ && show_keyframes_)
         {
-            pMapDrawer_->DrawCurrentCamera(tracking_vision_ ? glmTwc : glmTwc_main_);
+            pMapDrawer_->DrawCurrentCamera(glmTwc);
             pMapDrawer_->DrawKeyFrames(true, false, true, false);
         }
+        if (pSLAM_ && show_trajectory_)
+            pMapDrawer_->DrawKeyFrameTrajectory();
         if (pSLAM_ && show_sparse_mappoints_)
         {
             pMapDrawer_->DrawMapPoints();
         }
         // Clear relative viewpoint
         glPopMatrix();
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, display_w, display_h);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
-
-        if (!keep_training_  && pVoxelMapper_->isStopped())
-            signalStop();
     }
 
     // Cleanup
@@ -519,9 +666,19 @@ void VoxelImGuiViewer::handleUserInput()
     }
 
     Twc_main_ = Tcw_main_.inverse();
+    if (!navigation_center_valid_)
+    {
+        navigation_center_ = Twc_main_.translation() +
+            std::max(camera_watch_dist_, 1.0f) * Twc_main_.rotationMatrix().col(2);
+        navigation_center_valid_ = true;
+    }
 
     // Only respond to mouse inputs when not interacting with ImGui
-    if (!ImGui::IsAnyItemActive() && !ImGui::GetIO().WantCaptureMouse)
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool over_map = mouse.x >= main_view_origin_.x && mouse.y >= main_view_origin_.y &&
+        mouse.x < main_view_origin_.x + main_view_size_.x &&
+        mouse.y < main_view_origin_.y + main_view_size_.y;
+    if (over_map && !ImGui::IsAnyItemActive() && !ImGui::GetIO().WantCaptureMouse)
     {
         mouseWheel();
         mouseDrag();
@@ -530,64 +687,44 @@ void VoxelImGuiViewer::handleUserInput()
     // Respond to keyboard inputs
     keyboardEvent();
 
+    if (!Twc_main_.matrix().isApprox(Tcw_main_.inverse().matrix(), 1.0e-6f))
+        auto_fit_reconstruction_ = false;
     Tcw_main_ = Twc_main_.inverse();
 }
 
 void VoxelImGuiViewer::mouseWheel()
 {
-    float delta = ImGui::GetIO().MouseWheel;
-
-    if (delta == 0)
-        return;
-
-    float scale_factor = std::pow(1.1f, -delta);
-
-    // float mouse_x = ImGui::GetMousePos().x;
-    // float mouse_y = ImGui::GetMousePos().y;
-
-    // float focus3D_x = (mouse_x - main_cx_) / main_fx_;
-    // float focus3D_y = (mouse_y - main_cy_) / main_fy_;
-
-    //---Translation---
-    // Eigen::Vector3f translating = Eigen::Vector3f::Zero();
-    // translating.x() += focus3D_x * (1 - scale_factor);
-    // translating.y() += focus3D_y * (1 - scale_factor);
-    //-------------
-
-    //---Apply---
-    Eigen::Matrix3f R = Twc_main_.rotationMatrix();
-    Twc_main_.translation() *= scale_factor;
-    // Twc_main_.translation() += (R * translating);
+    const float delta = ImGui::GetIO().MouseWheel;
+    if (delta != 0)
+        Twc_main_.translation() = voxel_viewer_navigation::zoomPosition(
+            Twc_main_.translation(), navigation_center_,
+            delta * (ImGui::GetIO().KeyCtrl ? 0.2f : 1.0f));
 }
 
 void VoxelImGuiViewer::mouseDrag()
 {
-    float delta_rel_x = ImGui::GetIO().MouseDelta.x / glfw_window_width_;
-    float delta_rel_y = ImGui::GetIO().MouseDelta.y / glfw_window_height_;
-    float delta_l = delta_rel_x * delta_rel_x + delta_rel_y * delta_rel_y;
+    float delta_rel_x = ImGui::GetIO().MouseDelta.x / main_view_size_.x;
+    float delta_rel_y = ImGui::GetIO().MouseDelta.y / main_view_size_.y;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float precision = io.KeyCtrl ? 0.2f : 1.0f;
+    const bool pan = io.MouseDown[1] || io.MouseDown[2] ||
+                     (io.MouseDown[0] && io.KeyShift);
 
     //---Rotation---
     Eigen::Vector3f eulars = Eigen::Vector3f::Zero();
     // Left held
-    if (ImGui::GetIO().MouseDown[0])
+    if (io.MouseDown[0] && !pan)
     {
-        // Upward (delta_y < 0): pitch upward (Rx+)
-        eulars.x() -= M_PI * delta_rel_y;
-        // Leftward (delta_x < 0): yaw leftward (Ry-)
-        eulars.y() += M_PI * delta_rel_x;
-        // Angular Velocity
-        eulars.x() *= mouse_left_sensitivity_;
-        eulars.y() *= mouse_left_sensitivity_;
+        if (io.KeyAlt)
+            eulars.z() = M_PI * delta_rel_x * mouse_left_sensitivity_;
+        else
+        {
+            eulars.x() = -M_PI * delta_rel_y * mouse_left_sensitivity_;
+            eulars.y() = M_PI * delta_rel_x * mouse_left_sensitivity_;
+        }
+        eulars *= precision;
     }
 
-    // Right held
-    if (ImGui::GetIO().MouseDown[1])
-    {
-        // Leftward (delta_x < 0): roll counterclockwise (Rz-)
-        eulars.z() += M_PI * (delta_rel_x < 0.0f ? -delta_l : delta_l);
-        // Angular Velocity
-        eulars.z() *= mouse_right_sensitivity_;
-    }
     // To rotation matrix
     Eigen::AngleAxisf roll_angle(eulars.z(), Eigen::Vector3f::UnitZ());
     Eigen::AngleAxisf yaw_angle(eulars.y(), Eigen::Vector3f::UnitY());
@@ -596,22 +733,168 @@ void VoxelImGuiViewer::mouseDrag()
     Eigen::Matrix3f rotating = q.matrix();
     //-------------
 
-    //---Translation---
-    // Middle held
-    Eigen::Vector3f translating = Eigen::Vector3f::Zero();
-    if (ImGui::GetIO().MouseDown[2])
+    const Eigen::Matrix3f R = Twc_main_.rotationMatrix();
+    if (pan)
     {
-        translating.x() += delta_rel_x;
-        translating.y() -= delta_rel_y;
-        // Velocity
-        translating *= mouse_middle_sensitivity_;
+        const float distance = std::max(
+            (Twc_main_.translation() - navigation_center_).norm(), 0.05f);
+        const Eigen::Vector3f translating = voxel_viewer_navigation::panTranslation(
+            R, io.MouseDelta.x * precision, io.MouseDelta.y * precision, distance,
+            main_fx_ * main_view_size_.x / (image_width_ * main_view_crop_.x),
+            main_fy_ * main_view_size_.y / (image_height_ * main_view_crop_.y));
+        Twc_main_.translation() += translating;
+        navigation_center_ += translating;
     }
-    //-------------
-
-    //---Apply---
-    Eigen::Matrix3f R = Twc_main_.rotationMatrix();
-    Twc_main_.translation() += (R * translating);
+    else if (orbit_view_ && io.MouseDown[0])
+    {
+        Twc_main_.translation() = voxel_viewer_navigation::orbitPosition(
+            Twc_main_.translation(), navigation_center_, R, rotating);
+    }
     Twc_main_.setRotationMatrix(R * rotating);
+    if (!orbit_view_ && eulars.squaredNorm() > 0)
+    {
+        const float distance = (Twc_main_.translation() - navigation_center_).norm();
+        navigation_center_ = Twc_main_.translation() +
+            distance * Twc_main_.rotationMatrix().col(2);
+    }
+}
+
+void VoxelImGuiViewer::straightenView()
+{
+    if (!pMapDrawer_ || !pMapDrawer_->mpAtlas)
+        return;
+    auto* map = pMapDrawer_->mpAtlas->GetCurrentMap();
+    if (!map)
+        return;
+    ORB_SLAM3::KeyFrame* first = nullptr;
+    for (auto* keyframe : map->GetAllKeyFrames())
+        if (keyframe && !keyframe->isBad() && (!first || keyframe->mnId < first->mnId))
+            first = keyframe;
+    if (!first)
+        return;
+    Twc_main_ = Tcw_main_.inverse();
+    const Eigen::Matrix3f previous = Twc_main_.rotationMatrix();
+    const Eigen::Matrix3f reference = first->GetPoseInverse().rotationMatrix();
+    const Eigen::Matrix3f aligned = voxel_viewer_navigation::alignedRotation(
+        previous, previous.col(2), reference.col(1));
+    if (navigation_center_valid_ && orbit_view_)
+        Twc_main_.translation() = voxel_viewer_navigation::orbitPosition(
+            Twc_main_.translation(), navigation_center_, previous, previous.transpose() * aligned);
+    Twc_main_.setRotationMatrix(aligned);
+    Tcw_main_ = Twc_main_.inverse();
+    glmTwc_main_ = trans4x4Eigen2glm(Twc_main_.matrix());
+    tracking_vision_ = false;
+    auto_fit_reconstruction_ = false;
+    fit_reconstruction_requested_ = false;
+}
+
+void VoxelImGuiViewer::centerOrbitOnKeyframes()
+{
+    if (!pMapDrawer_ || !pMapDrawer_->mpAtlas)
+        return;
+    auto* map = pMapDrawer_->mpAtlas->GetCurrentMap();
+    if (!map)
+        return;
+    Eigen::Vector3f center = Eigen::Vector3f::Zero();
+    size_t count = 0;
+    for (auto* keyframe : map->GetAllKeyFrames())
+    {
+        if (!keyframe || keyframe->isBad())
+            continue;
+        const Eigen::Vector3f position = keyframe->GetCameraCenter();
+        if (!position.allFinite())
+            continue;
+        center += position;
+        ++count;
+    }
+    if (!count)
+        return;
+    center /= static_cast<float>(count);
+    Twc_main_ = Tcw_main_.inverse();
+    const Eigen::Vector3f forward = center - Twc_main_.translation();
+    if (forward.norm() < 0.05f)
+        return;
+    const Eigen::Matrix3f previous = Twc_main_.rotationMatrix();
+    Twc_main_.setRotationMatrix(voxel_viewer_navigation::alignedRotation(
+        previous, forward, previous.col(1)));
+    navigation_center_ = center;
+    navigation_center_valid_ = true;
+    orbit_view_ = true;
+    Tcw_main_ = Twc_main_.inverse();
+    glmTwc_main_ = trans4x4Eigen2glm(Twc_main_.matrix());
+    tracking_vision_ = false;
+    auto_fit_reconstruction_ = false;
+    fit_reconstruction_requested_ = false;
+}
+
+bool VoxelImGuiViewer::fitViewToReconstruction()
+{
+    Eigen::Vector3f minimum = Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
+    Eigen::Vector3f maximum = -minimum;
+    bool have_bounds = false;
+    if (show_sparse_mappoints_ && !show_main_rendered_ && pMapDrawer_)
+    {
+        ORB_SLAM3::Map* map = pMapDrawer_->mpAtlas->GetCurrentMap();
+        if (map)
+        {
+            for (ORB_SLAM3::MapPoint* point : map->GetAllMapPoints())
+            {
+                if (!point || point->isBad())
+                    continue;
+                const Eigen::Vector3f position = point->GetWorldPos();
+                if (!position.allFinite())
+                    continue;
+                minimum = minimum.cwiseMin(position);
+                maximum = maximum.cwiseMax(position);
+                have_bounds = true;
+            }
+        }
+    }
+    else
+        have_bounds = pVoxelMapper_->getCurrentVoxelBounds(minimum, maximum);
+    if (!have_bounds)
+        return false;
+
+    if ((show_trajectory_ || show_keyframes_) && pMapDrawer_ && pMapDrawer_->mpAtlas)
+    {
+        ORB_SLAM3::Map* map = pMapDrawer_->mpAtlas->GetCurrentMap();
+        if (map)
+        {
+            for (ORB_SLAM3::KeyFrame* keyframe : map->GetAllKeyFrames())
+            {
+                if (!keyframe || keyframe->isBad())
+                    continue;
+                const Eigen::Vector3f center = keyframe->GetCameraCenter();
+                minimum = minimum.cwiseMin(center);
+                maximum = maximum.cwiseMax(center);
+            }
+        }
+    }
+
+    if (!minimum.allFinite() || !maximum.allFinite())
+        return false;
+    const Eigen::Vector3f scene_center = 0.5f * (minimum + maximum);
+    if (tracking_vision_ && pSlamMapDrawer_)
+        Tcw_main_ = pSlamMapDrawer_->GetCurrentCameraPose();
+    Twc_main_ = Tcw_main_.inverse();
+    const Eigen::Matrix3f camera_to_world = Twc_main_.rotationMatrix();
+    const float fit_padding = recording_preset_ == 4 || recording_preset_ == 5
+        ? 1.02f : 1.08f;
+    const float distance = voxel_viewer_navigation::fitDistance(
+        minimum, maximum, camera_to_world,
+        main_fx_ / main_view_crop_.x, main_fy_ / main_view_crop_.y,
+        (main_cx_ - image_width_ * 0.5f) / main_view_crop_.x + image_width_ * 0.5f,
+        (main_cy_ - image_height_ * 0.5f) / main_view_crop_.y + image_height_ * 0.5f,
+        image_width_, image_height_, fit_padding);
+    const Eigen::Vector3f forward = camera_to_world.col(2).normalized();
+    Twc_main_.translation() = scene_center - distance / fit_zoom_ * forward;
+    Tcw_main_ = Twc_main_.inverse();
+    glmTwc_main_ = trans4x4Eigen2glm(Twc_main_.matrix());
+    navigation_center_ = scene_center;
+    navigation_center_valid_ = true;
+    orbit_view_ = true;
+    init_Twc_set_ = true;
+    return true;
 }
 
 void VoxelImGuiViewer::keyboardEvent()
@@ -632,13 +915,19 @@ void VoxelImGuiViewer::keyboardEvent()
     if (ImGui::IsKeyDown(ImGuiKey_S))
         translating.z() -= 1.0f;
     // A: leftward
-    if (ImGui::IsKeyDown(ImGuiKey_A))
+    if (ImGui::IsKeyDown(ImGuiKey_A) || ImGui::IsKeyDown(ImGuiKey_LeftArrow))
         translating.x() -= 1.0f;
     // D: rightward
-    if (ImGui::IsKeyDown(ImGuiKey_D))
+    if (ImGui::IsKeyDown(ImGuiKey_D) || ImGui::IsKeyDown(ImGuiKey_RightArrow))
         translating.x() += 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_Q) || ImGui::IsKeyDown(ImGuiKey_UpArrow))
+        translating.y() -= 1.0f;
+    if (ImGui::IsKeyDown(ImGuiKey_E) || ImGui::IsKeyDown(ImGuiKey_DownArrow))
+        translating.y() += 1.0f;
     // Velocity
-    translating *= keyboard_velocity_;
+    const float frame_scale = std::min(ImGui::GetIO().DeltaTime, 0.1f) * 10.0f *
+        (ImGui::GetIO().KeyCtrl ? 0.2f : 1.0f);
+    translating *= keyboard_velocity_ * frame_scale;
     //-------------
 
     //---Rotation---
@@ -662,7 +951,7 @@ void VoxelImGuiViewer::keyboardEvent()
     if (ImGui::IsKeyDown(ImGuiKey_O))
         eulars.z() += M_PI;
     // Angular Velocity
-    eulars *= keyboard_anglular_velocity_;
+    eulars *= keyboard_anglular_velocity_ * frame_scale;
     // To rotation matrix
     Eigen::AngleAxisf roll_angle(eulars.z(), Eigen::Vector3f::UnitZ());
     Eigen::AngleAxisf yaw_angle(eulars.y(), Eigen::Vector3f::UnitY());
@@ -673,6 +962,17 @@ void VoxelImGuiViewer::keyboardEvent()
 
     //---Apply---
     Eigen::Matrix3f R = Twc_main_.rotationMatrix();
-    Twc_main_.translation() += (R * translating);
+    const Eigen::Vector3f world_translation = R * translating;
+    Twc_main_.translation() += world_translation;
+    navigation_center_ += world_translation;
+    if (orbit_view_ && eulars.squaredNorm() > 0)
+        Twc_main_.translation() = voxel_viewer_navigation::orbitPosition(
+            Twc_main_.translation(), navigation_center_, R, rotating);
     Twc_main_.setRotationMatrix(R * rotating);
+    if (!orbit_view_ && eulars.squaredNorm() > 0)
+    {
+        const float distance = (Twc_main_.translation() - navigation_center_).norm();
+        navigation_center_ = Twc_main_.translation() +
+            distance * Twc_main_.rotationMatrix().col(2);
+    }
 }

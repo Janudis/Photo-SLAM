@@ -15,8 +15,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <c10/cuda/CUDACachingAllocator.h>
-
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include "include_voxel/viewer/voxel_imgui_viewer.h"
@@ -53,78 +51,6 @@ static void saveTrackingTime(const std::vector<float>& times, const std::string&
         out << std::fixed << std::setprecision(4) << t << "\n";
 }
 
-struct GpuMemoryStats
-{
-    float reserved_mb = 0.0f;
-    float allocated_mb = 0.0f;
-};
-
-static GpuMemoryStats getGpuPeakMemoryStats()
-{
-    GpuMemoryStats stats;
-    if (!torch::cuda::is_available())
-        return stats;
-
-    namespace c10Alloc = c10::cuda::CUDACachingAllocator;
-    c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
-
-    stats.reserved_mb =
-        mem_stats.reserved_bytes.front().peak /
-        (1024.0f * 1024.0f);
-    stats.allocated_mb =
-        mem_stats.allocated_bytes.front().peak /
-        (1024.0f * 1024.0f);
-    return stats;
-}
-
-static void saveGpuPeakMemoryUsage(const std::filesystem::path& path)
-{
-    const GpuMemoryStats stats = getGpuPeakMemoryStats();
-    if (!path.parent_path().empty())
-        std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path);
-    out << "Peak reserved (MB): " << stats.reserved_mb << "\n";
-    out << "Peak allocated (MB): " << stats.allocated_mb << "\n";
-}
-
-static double fileSizeMb(const std::filesystem::path& path)
-{
-    if (!std::filesystem::exists(path))
-        return 0.0;
-    return static_cast<double>(std::filesystem::file_size(path)) /
-           (1024.0 * 1024.0);
-}
-
-static void saveRuntimeMetrics(
-    const std::filesystem::path& path,
-    int frames,
-    int keyframes,
-    int voxels,
-    int iterations,
-    double total_seconds,
-    const std::filesystem::path& map_path,
-    const GpuMemoryStats& gpu_stats)
-{
-    if (!path.parent_path().empty())
-        std::filesystem::create_directories(path.parent_path());
-
-    std::ofstream out(path);
-    out << std::fixed << std::setprecision(6);
-    out << "{\n";
-    out << "  \"frames\": " << frames << ",\n";
-    out << "  \"keyframes\": " << keyframes << ",\n";
-    out << "  \"voxels\": " << voxels << ",\n";
-    out << "  \"iterations\": " << iterations << ",\n";
-    out << "  \"total_seconds\": " << total_seconds << ",\n";
-    out << "  \"fps_hz\": "
-        << (total_seconds > 0.0 ? frames / total_seconds : 0.0) << ",\n";
-    out << "  \"map_path\": \"" << map_path.string() << "\",\n";
-    out << "  \"map_size_mb\": " << fileSizeMb(map_path) << ",\n";
-    out << "  \"gpu_memory_allocated_mb\": " << gpu_stats.allocated_mb << ",\n";
-    out << "  \"gpu_memory_reserved_mb\": " << gpu_stats.reserved_mb << "\n";
-    out << "}\n";
-}
-
 int main(int argc, char** argv)
 {
     if (argc != 6 && argc != 7)
@@ -135,19 +61,31 @@ int main(int argc, char** argv)
                   << " path_to_voxel_mapper_settings"
                   << " path_to_sequence"
                   << " path_to_output_directory/"
-                  << " (optional)no_viewer"
+                  << " (optional)viewer|no_viewer"
                   << std::endl;
         return 1;
     }
 
-    const bool use_viewer = argc == 7 ? (std::string(argv[6]) != "no_viewer") : true;
+    bool use_viewer = true;
+    if (argc == 7)
+    {
+        const std::string viewer_mode(argv[6]);
+        if (viewer_mode != "viewer" && viewer_mode != "no_viewer")
+        {
+            std::cerr << "[replica_rgbd_voxel] viewer mode must be "
+                      << "'viewer' or 'no_viewer', got: " << viewer_mode
+                      << std::endl;
+            return 1;
+        }
+        use_viewer = viewer_mode == "viewer";
+    }
+    std::cout << "[INFO] Viewers: "
+              << (use_viewer ? "enabled" : "disabled") << std::endl;
 
     std::string output_directory = std::string(argv[5]);
     if (output_directory.back() != '/')
         output_directory += "/";
     std::filesystem::path output_dir(output_directory);
-    const auto total_start = std::chrono::steady_clock::now();
-
     const std::filesystem::path seq_path(argv[4]);
     const std::filesystem::path image_dir = seq_path / "results";
 
@@ -191,9 +129,6 @@ int main(int argc, char** argv)
             output_dir,
             0,
             device_type);
-    voxel_mapper->setRuntimeFrameCount(
-        static_cast<int>(rgb_files.size()));
-
     std::thread training_thread(&VoxelMapper::run, voxel_mapper.get());
 
     std::thread viewer_thread;
@@ -206,7 +141,6 @@ int main(int argc, char** argv)
 
     const int num_images = static_cast<int>(rgb_files.size());
     std::vector<float> tracking_times(num_images);
-    int processed_frames = 0;
 
     std::cout << "\n-------\n";
     std::cout << "Start processing Replica RGB-D sequence ..." << std::endl;
@@ -245,8 +179,6 @@ int main(int argc, char** argv)
         const double timestamp = static_cast<double>(i);
         const auto start = std::chrono::steady_clock::now();
         {
-            auto tracking_profile =
-                voxel_mapper->profileLaptopModule("orb_tracking");
             slam->TrackRGBD(
                 rgb,
                 depth,
@@ -259,7 +191,6 @@ int main(int argc, char** argv)
         const float track_time =
             std::chrono::duration_cast<std::chrono::duration<float>>(end - start).count();
         tracking_times[i] = track_time;
-        ++processed_frames;
 
         // // Photo-SLAM's Replica RGB-D runner feeds frames as fast as TrackRGBD returns. Uncomment this block, the replica_fps constant, the unistd include, and the
         // // timestamp=i/replica_fps line above to reproduce the earlier fixed-30Hz pacing.
@@ -276,14 +207,6 @@ int main(int argc, char** argv)
     const int final_iteration = voxel_mapper->getIteration();
     const std::filesystem::path shutdown_dir =
         output_dir / (std::to_string(final_iteration) + "_shutdown");
-    const std::filesystem::path final_map_path =
-        shutdown_dir / "ply" / "voxel_model" /
-        ("iteration_" + std::to_string(final_iteration)) / "voxel_model.ply";
-    const int keyframes =
-        voxel_mapper->scene_ ? static_cast<int>(voxel_mapper->scene_->keyframes().size()) : 0;
-    const int voxels =
-        voxel_mapper->voxel_model_ ? voxel_mapper->voxel_model_->numVoxels() : 0;
-
     saveTrackingTime(tracking_times, (output_dir / "TrackingTime.txt").string());
 
     const auto save_trajectories =
@@ -303,25 +226,6 @@ int main(int argc, char** argv)
     };
     save_trajectories(output_dir);
     save_trajectories(shutdown_dir);
-
-    const auto total_end = std::chrono::steady_clock::now();
-    const double total_wall_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(
-            total_end - total_start).count();
-    const double total_seconds = std::max(0.0, total_wall_seconds);
-    const GpuMemoryStats gpu_stats = getGpuPeakMemoryStats();
-
-    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
-    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
-    saveRuntimeMetrics(
-        shutdown_dir / "runtime_metrics.json",
-        processed_frames,
-        keyframes,
-        voxels,
-        final_iteration,
-        total_seconds,
-        final_map_path,
-        gpu_stats);
 
     if (use_viewer)
         viewer_thread.join();

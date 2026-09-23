@@ -67,11 +67,6 @@ bool TandemMvsBackend::hasPending() const
     return impl_ && impl_->pending;
 }
 
-bool TandemMvsBackend::resultReady() const
-{
-    return impl_ && impl_->pending && impl_->model.Ready();
-}
-
 void TandemMvsBackend::launch(
     const std::vector<cv::Mat>& bgr_images,
     const Eigen::Matrix3f& intrinsics,
@@ -172,6 +167,11 @@ std::optional<TandemMvsResult> TandemMvsBackend::collect(
         impl_->width,
         CV_32FC1,
         output->confidence).clone();
+    result.depth_dense = cv::Mat(
+        impl_->height,
+        impl_->width,
+        CV_32FC1,
+        output->depth_dense).clone();
     impl_->pending = false;
     return result;
 }

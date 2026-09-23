@@ -22,17 +22,15 @@ RGBD.min_depth: 0.1
 RGBD.max_depth: 10.0
 
 Mapper.inactive_geo_densify: 0 # optional Photo-SLAM inactive-geometry densification
-Mapper.inactive_geo_densify_max_pixel_dist: 1.0 # squared pixel distance
 Mapper.depth_cache: 10 # batch inactive insertion, then residual-hole detection and one batched RGB-D insertion
 Mapper.rgbd_fill_render_holes: 0 # direct alternative to TSDF-evidence completion
 Mapper.rgbd_fill_render_holes_initial_backfill: 0
 Mapper.rgbd_fill_render_holes_stride: 2 # pixel stride for each keyframe's pre-insertion hole detection
 
 Mapper.sdf_initialization_mode: "orb_prior" # nearby ORB corners use metric SDF; unsupported corners use a weak ORB-directed signed ramp
-Mapper.sdf_initialization_orb_radius_vox: 1.0 # maximum corner-to-ORB distance for signed nearest-point initialization
 
 # Hybrid RGB-D completion: residual holes update non-renderable projective TSDF
-# TSDF evidence. Only strict zero-crossing cells confirmed by multiple KFs are
+# evidence. Only strict zero-crossing cells confirmed by multiple KFs are
 # promoted into the active SVRecon map.
 Mapper.rgbd_tsdf_evidence: 1
 Mapper.rgbd_tsdf_evidence_initial_backfill: 0
@@ -59,14 +57,7 @@ GausPyramid.do: 1  # 0:false, 1 or other integer:true
 GausPyramid.num_sub_levels: 2
 GausPyramid.sub_level_times_of_use: 8
 
-Record.keyframe_record_interval: 0 # 0:never, 1:always, others:periodically
-Record.all_keyframes_record_interval: 0 # 0:never, 1:always, others:periodically
-Record.record_rendered_image: 1 # 0:false, 1 or other integer:true
-Record.record_ground_truth_image: 1 # 0:false, 1 or other integer:true
-Record.record_loss_image: 0 # 0:false, 1 or other integer:true
 Record.training_report_interval: 100 # 0:never, 1:always, others:periodically
-Record.laptop_precheck: 1
-Record.laptop_precheck_sample_interval_ms: 50
 Record.record_loop_ply: 0 # 0:false, 1 or other integer:true
 
 Record.enable_rerun: 0  # enable the reconstruction timeline below
@@ -80,19 +71,13 @@ Record.run_reconstruction_mesh_min_weight: 1e-4
 Record.run_reconstruction_mesh_weld_vertices: 1
 Record.run_reconstruction_mesh_max_vertices: 0 # 0:disable guard; >0:skip oversized Rerun snapshots instead of logging partial meshes
 Record.run_reconstruction_mesh_max_faces: 0 # 0:disable guard; >0:skip oversized Rerun snapshots instead of logging partial meshes
-Record.run_maps: 0 # write maps.rrd with final rendered-vs-GT RGB, depth, normal maps per keyframe
-Record.run_maps_stride: 1 # log every Nth keyframe into maps.rrd
 
-Record.rerun_rendered_mesh_eval: 0 # log the SVRecon progressive rendered-TSDF mesh to world/voxel_model_mesh/final
 Record.rerun_gt_mesh: 0 # log a reference GT mesh under world/gt/mesh
-Record.rerun_nvblox_mesh: 1
-Record.rerun_nvblox_mesh_path: "../../../../results/scannet_rgbd_nvblox/scene0000_00/online_orb/nvblox_color_mesh.ply"
 
-Record.save_rendered_mesh_eval: 1 # save common fixed-TSDF, SVRecon progressive-TSDF, and direct-SDF meshes
-Record.rendered_mesh_eval_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
-Record.rendered_mesh_eval_min_weight: 1.0 # HI-SLAM2 mesh extraction weight threshold
-Record.rendered_mesh_eval_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
-Record.rendered_mesh_eval_depth_max_m: 10.0 # ScanNet depth range
+Record.rendered_mesh_voxel_size_m: 0.03 # HI-SLAM2 tsdf_integrate.py default
+Record.rendered_mesh_min_weight: 1.0 # HI-SLAM2 mesh extraction weight threshold
+Record.rendered_mesh_trunc_vox: 8.0 # Open3D VoxelBlockGrid integration default
+Record.rendered_mesh_depth_max_m: 10.0 # ScanNet depth range
 Record.svrecon_mesh_init_lv: 7 # SVRecon extract_mesh.py --init_lv (progressive extraction)
 Record.svrecon_mesh_final_lv: 9 # SVRecon extract_mesh.py --final_lv; level 10 exceeds an 8 GB GPU
 Record.svrecon_mesh_trunc_lv: 10 # SVRecon extract_mesh.py --trunc_lv
@@ -140,8 +125,6 @@ Optimization.filter_near_voxels: 1
 Optimization.prune_far_voxels: 1
 Optimization.prune_near_voxels_geometric: 1
 Optimization.prune_surface_views_enable: 1
-Optimization.surface_min_views: 4
-Optimization.surface_view_window_size: 10
 Optimization.final_refinement_enable: 1
 # Subdivision
 Optimization.subdivide_from: 1200

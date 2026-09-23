@@ -92,7 +92,6 @@ public:
     torch::Tensor voxelDensityMean() const;
     torch::Tensor voxelGeoCorners() const;
     torch::Tensor voxelSdfWeightCorners() const;
-    torch::Tensor gridPtsKey() const { return this->grid_pts_key_; }
     torch::Tensor voxKey() const { return this->vox_key_; }
     torch::Tensor gridPointsWorld() const;
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -122,20 +121,9 @@ public:
     const torch::Tensor& fusedSdfGridPts() const;
     const torch::Tensor& fusedSdfWeights() const;
 
-    // ───────── Optimizer setup ─────────
-    void setGeoLearningRate(float geo_lr);
-    void setSh0LearningRate(float sh0_lr);
-    void setShsLearningRate(float shs_lr);
-    void initOptimizer(float geo_lr, float sh0_lr, float shs_lr,
-                    float beta1=0.9f, float beta2=0.999f, float eps=1e-15f);
-    void rebuildOptimizer(float geo_lr, float sh0_lr, float shs_lr,
-                        float beta1=0.9f, float beta2=0.999f, float eps=1e-15f);
+    // Optimizer setup
     void optimizerZeroGrad();
     void optimizerStep();
-    void setLearningRates(float geo_lr, float sh0_lr, float shs_lr);
-    float multiStepDecay(int iter, float base_lr,
-                        const std::vector<int>& milestones,
-                        float gamma);
     void createTrainer(float geo_lr, float sh0_lr, float shs_lr,
                        float beta1=0.9f, float beta2=0.999f, float eps=1e-15f,
                        const std::vector<int>& milestones = {},
@@ -152,7 +140,6 @@ public:
     SchedulerState schedulerState() const;
     void schedulerStep();
     void schedulerLoadState(const SchedulerState& state);
-    std::tuple<double,double,double> currentLearningRates() const;
 
     // === Adaptive octree API ===
     struct StatPkg {
@@ -174,8 +161,6 @@ public:
     void freezeVoxGeo();
     void unfreezeVoxGeo();
 
-    /// Load all voxel fields from a PLY file (structure matches savePly).
-    void loadPly(const std::filesystem::path& ply_file);
     /// Save all voxel data to a PLY file with full attributes.
     void savePly(const std::filesystem::path& result_path);
 
@@ -247,10 +232,6 @@ public:
     torch::Tensor monocularMvsVoxelMask() const {
         return this->is_monocular_mvs_voxel_;
     }
-    torch::Tensor monocularOmnidataVoxelMask() const {
-        return this->is_monocular_omnidata_voxel_;
-    }
-    torch::Tensor existSinceIter() const { return this->exist_since_iter_; } // [N] int32, voxel creation iter
     torch::Tensor existSinceKf() const { return this->exist_since_kf_; } // [N] int32, voxel creation keyframe-count
     torch::Tensor activeRenderableMask() const;
     
@@ -272,10 +253,6 @@ public:
     void setRobustSceneBounds(const bool enable) {
         robust_scene_bounds_ = enable;
     }
-    bool hasFixedGlobalSceneLayout() const { return fixed_global_scene_layout_; }
-    void setSdfInitializationOrbRadiusVox(const float radius_vox) {
-        sdf_initialization_orb_radius_vox_ = std::max(0.0f, radius_vox);
-    }
     void setTopologySdfInitializationMode(const std::string& mode);
     void setNextSdfInitializationGridSamples(
         const torch::Tensor& grid_points_world,
@@ -285,9 +262,8 @@ public:
         pending_real_insert_rr_entity_path_ = entity_path;
     }
     IncreasePcdStats lastIncreasePcdStats() const { return last_increase_pcd_stats_; }
-    void setTopologyBirthContext(const int iteration, const int kf_count) {
+    void setTopologyBirthContext(const int iteration) {
         topology_birth_iter_ = static_cast<int32_t>(iteration);
-        topology_birth_kf_ = static_cast<int32_t>(kf_count);
     }
 private:
     IncreasePcdStats last_increase_pcd_stats_;
@@ -360,7 +336,6 @@ public:
     };
     SdfInitMode pending_sdf_init_mode_ = SdfInitMode::SignedPointPrior;
     SdfInitMode topology_sdf_init_mode_ = SdfInitMode::OrbPriorOnly;
-    float sdf_initialization_orb_radius_vox_ = 2.0f;
     float positive_unknown_sdf_init_vox_ = 1.5f;
 
     torch::Tensor scene_center_;   // [3], CUDA
@@ -385,7 +360,6 @@ public:
     torch::Tensor is_rgbd_fill_render_holes_voxel_; // [N] bool provenance: true=created by RGB-D render-hole fill
     torch::Tensor is_monocular_rendered_depth_voxel_; // [N] bool provenance: rendered-depth densification
     torch::Tensor is_monocular_mvs_voxel_; // [N] bool provenance: TANDEM MVS hole filling
-    torch::Tensor is_monocular_omnidata_voxel_; // [N] bool provenance: aligned Omnidata hole filling
     torch::Tensor exist_since_iter_;                  // [N] int32 voxel creation iteration
     torch::Tensor exist_since_kf_;                    // [N] int32 voxel creation keyframe-count
     torch::Tensor global_pcd_min_;   // [3], CPU or CUDA
@@ -398,7 +372,6 @@ public:
     bool filter_near_voxels_ = true;
     std::string pending_real_insert_rr_entity_path_;
     int32_t topology_birth_iter_ = -1;
-    int32_t topology_birth_kf_ = -1;
 
 protected:
     float ss_ = 1.5f;

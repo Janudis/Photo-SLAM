@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -11,7 +12,6 @@
 #include <thread>
 #include <vector>
 
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -24,8 +24,10 @@ namespace {
 
 volatile std::sig_atomic_t g_stop_requested = 0;
 
-void handleSignal(int)
+void handleSignal(int signal)
 {
+    if (g_stop_requested)
+        std::_Exit(128 + signal);
     g_stop_requested = 1;
 }
 
@@ -183,7 +185,7 @@ rs2::pipeline_profile startCompatiblePipeline(
 std::string scalarString(const double value)
 {
     std::ostringstream stream;
-    stream << std::setprecision(10) << value;
+    stream << std::showpoint << std::setprecision(10) << value;
     return stream.str();
 }
 
@@ -219,7 +221,9 @@ std::filesystem::path writeRuntimeOrbSettings(
     const std::filesystem::path& template_path,
     const std::filesystem::path& output_directory,
     const rs2_intrinsics& intrinsics,
-    const int fps)
+    const int fps,
+    const double depth_factor = 1.0,
+    const std::string& filename = "orb_realsense_runtime.yaml")
 {
     std::ifstream input(template_path);
     if (!input.is_open()) {
@@ -248,8 +252,7 @@ std::filesystem::path writeRuntimeOrbSettings(
         {"Camera.height", std::to_string(intrinsics.height)},
         {"Camera.fps", std::to_string(fps)},
         {"Camera.RGB", "1"},
-        // Depth is converted from device units to CV_32F metres before TrackRGBD.
-        {"RGBD.DepthMapFactor", "1.0"},
+        {"RGBD.DepthMapFactor", scalarString(depth_factor)},
     };
     for (const auto& [key, value] : replacements) {
         if (!replaceYamlScalar(lines, key, value)) {
@@ -260,7 +263,7 @@ std::filesystem::path writeRuntimeOrbSettings(
 
     std::filesystem::create_directories(output_directory);
     const std::filesystem::path runtime_path =
-        output_directory / "orb_realsense_runtime.yaml";
+        output_directory / filename;
     std::ofstream output(runtime_path);
     if (!output.is_open()) {
         throw std::runtime_error(
@@ -270,12 +273,24 @@ std::filesystem::path writeRuntimeOrbSettings(
     for (const std::string& output_line : lines) {
         output << output_line << '\n';
     }
+    output.close();
+    if (!output)
+        throw std::runtime_error("Cannot finish writing settings: " + runtime_path.string());
     return runtime_path;
 }
 
 void configureSensors(const rs2::device& device)
 {
     for (rs2::sensor sensor : device.query_sensors()) {
+        // Apply after pipeline.start(), which can reset sensor options.
+        if (sensor.supports(RS2_OPTION_GLOBAL_TIME_ENABLED)) {
+            try {
+                sensor.set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, 0.0f);
+            } catch (const rs2::error& error) {
+                std::cerr << "[RealSense] Could not disable global timestamps: "
+                          << error.what() << '\n';
+            }
+        }
         try {
             if (sensor.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
                 sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f);
@@ -305,32 +320,14 @@ void saveTrackingTime(
     }
 }
 
-void saveGpuPeakMemoryUsage(const std::filesystem::path& output_path)
-{
-    if (!torch::cuda::is_available()) {
-        return;
-    }
-    namespace allocator = c10::cuda::CUDACachingAllocator;
-    const allocator::DeviceStats memory = allocator::getDeviceStats(0);
-    const float reserved_mb =
-        memory.reserved_bytes.front().peak /
-        (1024.0f * 1024.0f);
-    const float allocated_mb =
-        memory.allocated_bytes.front().peak /
-        (1024.0f * 1024.0f);
-
-    if (!output_path.parent_path().empty()) {
-        std::filesystem::create_directories(output_path.parent_path());
-    }
-    std::ofstream output(output_path);
-    output << "Peak reserved (MB): " << reserved_mb << '\n'
-           << "Peak allocated (MB): " << allocated_mb << '\n';
-}
-
 void saveTrajectories(
     const std::shared_ptr<ORB_SLAM3::System>& slam,
     const std::filesystem::path& output_directory)
 {
+    if (slam->GetNumKeyframes() == 0) {
+        std::cout << "[SLAM] No keyframes; skipping trajectory export.\n";
+        return;
+    }
     std::filesystem::create_directories(output_directory);
     slam->SaveTrajectoryTUM(
         (output_directory / "CameraTrajectory_TUM.txt").string());
@@ -352,6 +349,19 @@ std::string deviceInfo(
     return device.supports(field) ? device.get_info(field) : fallback;
 }
 
+const char* trackingStateName(int state)
+{
+    switch (state) {
+        case ORB_SLAM3::Tracking::OK: return "OK";
+        case ORB_SLAM3::Tracking::OK_KLT: return "OK_KLT";
+        case ORB_SLAM3::Tracking::RECENTLY_LOST: return "RECENTLY_LOST";
+        case ORB_SLAM3::Tracking::LOST: return "LOST";
+        case ORB_SLAM3::Tracking::NOT_INITIALIZED: return "INITIALIZING";
+        case ORB_SLAM3::Tracking::NO_IMAGES_YET: return "WAITING_FOR_IMAGES";
+        default: return "NOT_READY";
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -367,8 +377,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    const bool use_viewer =
-        argc != 6 || std::string(argv[5]) != "no_viewer";
+    const std::string mode = argc == 6 ? argv[5] : "viewer";
+    if (mode != "viewer" && mode != "no_viewer") {
+        std::cerr << "Unknown mode: " << mode << '\n';
+        return 1;
+    }
+    const bool use_viewer = mode == "viewer";
     const std::filesystem::path orb_template(argv[2]);
     const std::filesystem::path voxel_settings(argv[3]);
     const std::filesystem::path output_directory(argv[4]);
@@ -456,29 +470,22 @@ int main(int argc, char** argv)
         const torch::DeviceType device_type =
             torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
         std::cout << "[INFO] Using device: "
-                  << (device_type == torch::kCUDA ? "CUDA" : "CPU")
-                  << '\n';
-
+                  << (device_type == torch::kCUDA ? "CUDA" : "CPU") << '\n';
         auto slam = std::make_shared<ORB_SLAM3::System>(
-            argv[1],
-            runtime_orb_settings.string(),
-            ORB_SLAM3::System::RGBD,
+            argv[1], runtime_orb_settings.string(), ORB_SLAM3::System::RGBD,
             use_viewer);
         const float image_scale = slam->GetImageScale();
-
         auto mapper = std::make_shared<VoxelMapper>(
-            slam,
-            voxel_settings,
-            output_directory,
-            0,
-            device_type);
-        mapper->setRuntimeFrameCount(0);
+            slam, voxel_settings, output_directory, 0, device_type);
         std::thread mapping_thread(&VoxelMapper::run, mapper.get());
 
         std::thread viewer_thread;
         std::shared_ptr<VoxelImGuiViewer> viewer;
         if (use_viewer) {
             viewer = std::make_shared<VoxelImGuiViewer>(slam, mapper);
+            viewer->setTerminateRunCallback([] {
+                std::_Exit(130);
+            });
             viewer_thread = std::thread(&VoxelImGuiViewer::run, viewer.get());
         }
 
@@ -486,19 +493,35 @@ int main(int argc, char** argv)
         std::vector<float> tracking_times;
         tracking_times.reserve(18000);
         bool stream_failed = false;
+        const auto capture_start = std::chrono::steady_clock::now();
+        auto last_progress = std::chrono::steady_clock::now();
+        auto last_received = last_progress;
+        auto last_camera_warning = last_progress;
+        std::size_t last_progress_frames = 0;
 
         std::cout
             << "\n-------\n"
             << "Start processing the live RealSense RGB-D stream.\n"
-            << "Press Ctrl+C once to stop and export the map.\n\n";
+            << "Press Ctrl+C once to stop and export the map.\n"
+            << "Press Ctrl+C again to exit immediately.\n\n";
 
         while (!g_stop_requested &&
-               !slam->isShutDown()) {
+               (!slam || !slam->isShutDown())) {
             rs2::frameset frames;
             if (!pipeline.poll_for_frames(&frames)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_received >= std::chrono::seconds(5) &&
+                    now - last_camera_warning >= std::chrono::seconds(5)) {
+                    std::cerr << "[RealSense] Waiting for camera frames (no new frames for "
+                              << std::chrono::duration_cast<std::chrono::seconds>(
+                                     now - last_received).count() << " s).\n";
+                    last_camera_warning = now;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            const auto arrival = std::chrono::steady_clock::now();
+            last_received = arrival;
 
             try {
                 const rs2::frameset aligned = align_to_color.process(frames);
@@ -512,12 +535,14 @@ int main(int argc, char** argv)
                     cv::Size(color_frame.get_width(), color_frame.get_height()),
                     CV_8UC3,
                     const_cast<void*>(color_frame.get_data()),
-                    cv::Mat::AUTO_STEP);
+                    color_frame.get_stride_in_bytes());
                 cv::Mat depth_raw(
                     cv::Size(depth_frame.get_width(), depth_frame.get_height()),
                     CV_16UC1,
                     const_cast<void*>(depth_frame.get_data()),
-                    cv::Mat::AUTO_STEP);
+                    depth_frame.get_stride_in_bytes());
+                const double timestamp =
+                    std::chrono::duration<double>(arrival - capture_start).count();
                 color = color.clone();
                 cv::Mat depth_metres;
                 depth_raw.convertTo(depth_metres, CV_32FC1, depth_scale);
@@ -540,12 +565,10 @@ int main(int argc, char** argv)
                 mapper->waitForInputQueueSlot();
                 const auto start = std::chrono::steady_clock::now();
                 {
-                    auto tracking_profile =
-                        mapper->profileLaptopModule("orb_tracking");
                     slam->TrackRGBD(
                         color,
                         depth_metres,
-                        color_frame.get_timestamp() * 1.0e-3,
+                        timestamp,
                         std::vector<ORB_SLAM3::IMU::Point>(),
                         "realsense_" +
                             std::to_string(color_frame.get_frame_number()));
@@ -554,16 +577,35 @@ int main(int argc, char** argv)
                 tracking_times.push_back(
                     std::chrono::duration_cast<std::chrono::duration<float>>(
                         end - start).count());
-                mapper->setRuntimeFrameCount(
-                    static_cast<int>(tracking_times.size()));
+                if (end - last_progress >= std::chrono::seconds(2)) {
+                    const double seconds = std::chrono::duration<double>(end - last_progress).count();
+                    const int iteration = mapper->getIteration();
+                    std::ostringstream status;
+                    status << "[SLAM] tracking=" << trackingStateName(slam->GetTrackingState())
+                           << " frames=" << tracking_times.size()
+                           << " keyframes=" << slam->GetNumKeyframes()
+                           << " mapper_iterations=" << iteration
+                           << " processed_fps=" << std::fixed << std::setprecision(1)
+                           << (tracking_times.size() - last_progress_frames) / seconds;
+                    if (iteration == 0)
+                        status << " (waiting for voxel initialization)";
+                    std::cout << status.str() << std::endl;
+                    last_progress = end;
+                    last_progress_frames = tracking_times.size();
+                }
             } catch (const rs2::error& error) {
                 std::cerr << "[RealSense] Streaming failed: "
                           << error.what() << '\n';
                 stream_failed = true;
                 break;
+            } catch (const std::exception& error) {
+                std::cerr << "[RealSense] Capture failed: " << error.what() << '\n';
+                stream_failed = true;
+                break;
             }
         }
 
+        g_stop_requested = 1;
         try {
             pipeline.stop();
         } catch (const rs2::error& error) {
@@ -584,14 +626,16 @@ int main(int argc, char** argv)
         saveTrackingTime(
             tracking_times,
             shutdown_directory / "TrackingTime.txt");
-        saveGpuPeakMemoryUsage(
-            output_directory / "GpuPeakUsageMB.txt");
-        saveGpuPeakMemoryUsage(
-            shutdown_directory / "GpuPeakUsageMB.txt");
         saveTrajectories(slam, output_directory);
         saveTrajectories(slam, shutdown_directory);
 
+        std::cout << "[RealSense] Export complete. Results: "
+                  << shutdown_directory << std::endl;
         if (use_viewer) {
+            std::cout
+                << "[RealSense] Viewer remains open. Close its window, click "
+                   "F1 > Terminate Run, or press Ctrl+C to exit."
+                << std::endl;
             viewer_thread.join();
         }
 

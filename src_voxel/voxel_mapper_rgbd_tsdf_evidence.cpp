@@ -135,9 +135,6 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
         pkf->img_auxiliary_undist_.empty()) {
         return;
     }
-    auto evidence_profile =
-        profileLaptopModule("rgbd_tsdf_evidence_fusion");
-
     resetRgbdTsdfEvidenceIfLayoutChanged();
     if (rgbd_tsdf_layout_cell_size_ <= 0.0f ||
         rgbd_tsdf_layout_grid_dim_ <= 0) {
@@ -495,9 +492,6 @@ void VoxelMapper::promoteRgbdTsdfEvidenceCells(
         rgbd_tsdf_cell_evidence_.empty() || affected_cells.empty()) {
         return;
     }
-    auto promotion_profile =
-        profileLaptopModule("rgbd_tsdf_evidence_promotion");
-
     std::vector<sv::RgbdTsdfGridKey> promoted_cells;
     std::vector<sv::RgbdTsdfGridKey> rejected_non_surface_cells;
     std::vector<sv::RgbdTsdfGridKey> affected_rejected_non_surface_cells;

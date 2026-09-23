@@ -146,9 +146,6 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
         throw std::runtime_error(
             "TANDEM returned invalid depth/confidence for MVS TSDF evidence");
     }
-    auto fusion_profile =
-        profileLaptopModule("mvs_tsdf_evidence_fusion");
-
     cv::Mat confidence;
     if (result.confidence.type() == CV_32FC1) {
         confidence = result.confidence;
@@ -191,7 +188,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
 
     const float truncation = std::max(
         monocular_mvs_tsdf_layout_cell_size_,
-        monocular_mvs_tsdf_evidence_trunc_vox_ *
+        sv::kMonocularMvsTsdfEvidenceTruncVox *
             monocular_mvs_tsdf_layout_cell_size_);
     const Eigen::Matrix3f rotation =
         monocular_mvs_pending_c2w_.block<3, 3>(0, 0);
@@ -209,7 +206,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
         MvsFrameCellObservation,
         sv::RgbdTsdfGridKeyHash> frame_cells;
     std::vector<sv::RgbdTsdfGridKey> traversed_cells;
-    const int stride = monocular_mvs_tsdf_evidence_pixel_stride_;
+    const int stride = sv::kMonocularMvsTsdfEvidencePixelStride;
     for (int y = 0; y < height; y += stride) {
         const float* depth_row = result.depth.ptr<float>(y);
         const float* confidence_row = confidence.ptr<float>(y);
@@ -273,6 +270,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
         }
     }
     if (frame_cells.empty()) {
+        logMonocularMvsTsdfEvidenceSnapshotToRerun(getIteration());
         return;
     }
 
@@ -315,6 +313,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
         }
     }
     if (frame_cells.empty()) {
+        logMonocularMvsTsdfEvidenceSnapshotToRerun(getIteration());
         return;
     }
 
@@ -383,7 +382,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
                sample * measurement_weight) / denominator
             : sample;
         evidence.weight = std::min(
-            denominator, monocular_mvs_tsdf_evidence_max_weight_);
+            denominator, sv::kMonocularMvsTsdfEvidenceMaxWeight);
         updated_corners.insert(key);
     }
 
@@ -445,6 +444,7 @@ void VoxelMapper::integrateMonocularMvsTsdfEvidence(
         }
     }
     promoteMonocularMvsTsdfEvidenceCells(affected_cells);
+    logMonocularMvsTsdfEvidenceSnapshotToRerun(getIteration());
 }
 
 void VoxelMapper::logMonocularMvsTsdfEvidenceCellsToRerun(
@@ -491,6 +491,63 @@ void VoxelMapper::logMonocularMvsTsdfEvidenceCellsToRerun(
         0.8f);
 }
 
+void VoxelMapper::logMonocularMvsTsdfEvidenceSnapshotToRerun(
+    const int iteration)
+{
+    if (!rerun_params_.enable_rerun_ ||
+        !rerun_params_.rerun_monocular_debug_ || !voxel_model_ ||
+        !(monocular_mvs_tsdf_layout_cell_size_ > 0.0f)) {
+        return;
+    }
+
+    std::vector<sv::RgbdTsdfGridKey> cells;
+    cells.reserve(monocular_mvs_tsdf_cell_evidence_.size());
+    for (const auto& item : monocular_mvs_tsdf_cell_evidence_) {
+        cells.push_back(item.first);
+    }
+    std::sort(cells.begin(), cells.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.x != rhs.x) {
+            return lhs.x < rhs.x;
+        }
+        if (lhs.y != rhs.y) {
+            return lhs.y < rhs.y;
+        }
+        return lhs.z < rhs.z;
+    });
+
+    std::vector<std::int32_t> indices;
+    std::vector<float> colors;
+    indices.reserve(cells.size() * 3);
+    colors.reserve(cells.size() * 4);
+    for (const auto& key : cells) {
+        indices.insert(indices.end(), {key.x, key.y, key.z});
+        cv::Vec3f color(0.75f, 0.75f, 0.75f);
+        const auto evidence =
+            monocular_mvs_tsdf_cell_evidence_.find(key);
+        if (evidence != monocular_mvs_tsdf_cell_evidence_.end() &&
+            evidence->second.color_observations > 0) {
+            color = evidence->second.color_sum /
+                static_cast<float>(evidence->second.color_observations);
+        }
+        colors.insert(colors.end(), {
+            std::clamp(color[0], 0.0f, 1.0f),
+            std::clamp(color[1], 0.0f, 1.0f),
+            std::clamp(color[2], 0.0f, 1.0f),
+            0.8f});
+    }
+
+    sv::RerunVisualizerBridge::instance().visualizeDebugVoxelGridIndices(
+        "monocular_debug",
+        indices,
+        colors,
+        monocular_mvs_tsdf_layout_scene_min_,
+        monocular_mvs_tsdf_layout_cell_size_,
+        static_cast<std::int32_t>(voxel_model_->insertionOctreeLevel()),
+        iteration,
+        "world/evidence_voxels",
+        0.8f);
+}
+
 void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
     const std::unordered_set<
         sv::RgbdTsdfGridKey,
@@ -501,9 +558,6 @@ void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
         affected_cells.empty()) {
         return;
     }
-    auto promotion_profile =
-        profileLaptopModule("mvs_tsdf_evidence_promotion");
-
     const int iteration = getIteration();
     const bool log_evidence_snapshot =
         rerun_params_.enable_rerun_ &&
@@ -554,7 +608,7 @@ void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
                 monocular_mvs_tsdf_corner_evidence_.find(corner_key);
             if (corner == monocular_mvs_tsdf_corner_evidence_.end() ||
                 corner->second.weight <
-                    monocular_mvs_tsdf_evidence_promote_min_weight_ ||
+                    sv::kMonocularMvsTsdfEvidencePromoteMinWeight ||
                 !std::isfinite(corner->second.distance)) {
                 continue;
             }
@@ -570,7 +624,7 @@ void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
         }
         if (static_cast<int>(
                 cell_item->second.observed_keyframes.size()) <
-            monocular_mvs_tsdf_evidence_promote_min_views_) {
+            sv::kMonocularMvsTsdfEvidencePromoteMinViews) {
             if (log_evidence_snapshot) {
                 waiting_view_cells.push_back(key);
             }
@@ -616,7 +670,7 @@ void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
                 monocular_mvs_tsdf_corner_evidence_.find(corner_key);
             if (corner == monocular_mvs_tsdf_corner_evidence_.end() ||
                 corner->second.weight <
-                    monocular_mvs_tsdf_evidence_promote_min_weight_ ||
+                    sv::kMonocularMvsTsdfEvidencePromoteMinWeight ||
                 !std::isfinite(corner->second.distance) ||
                 !direct_corner_keys.insert(corner_key).second) {
                 continue;
@@ -731,7 +785,8 @@ void VoxelMapper::promoteMonocularMvsTsdfEvidenceCells(
     }
     if (stats.new_voxels > 0 &&
         (rerun_params_.run_whole_run_ ||
-         rerun_params_.rerun_svrecon_debug_)) {
+         rerun_params_.rerun_svrecon_debug_ ||
+         rerun_params_.rerun_monocular_debug_)) {
         rerun_state_.whole_run_live_voxels_dirty_ = true;
     }
 }

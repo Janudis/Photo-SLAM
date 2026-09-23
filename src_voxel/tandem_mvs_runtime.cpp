@@ -21,8 +21,9 @@ class DrMvsnetImpl {
 public:
   explicit DrMvsnetImpl(const char *filename) : stream(at::cuda::getStreamFromPool(false)) {
     // Try to fix CUDA errors: https://github.com/pytorch/pytorch/issues/35736
-    if (torch::cuda::is_available())std::cout << "DrMvsnet torch::cuda::is_vailable == true --> seems good" << std::endl;
-    else std::cerr << "DrMvsnet torch::cuda::is_vailable == false --> probably this will crash" << std::endl;
+    // Successful CUDA initialization is expected; only report the failure.
+    if (!torch::cuda::is_available())
+      std::cerr << "DrMvsnet torch::cuda::is_vailable == false --> probably this will crash" << std::endl;
     module = torch::jit::load(filename);
     worker_thread = boost::thread(&DrMvsnetImpl::Loop, this);
   };
@@ -312,7 +313,6 @@ void DrMvsnetImpl::CallSequential() {
   auto confidence_dense_tensor = model_output->elements()[stage].toTuple()->elements()[num_elements-1].toTensor().to(torch::kCPU);
   auto depth_dense_a = depth_dense_tensor.accessor<float, 3>();
   auto confidence_dense_a = confidence_dense_tensor.accessor<float, 3>();
-
   /* --- Outputs --- */
   if (output) {
     std::cerr << "Output should internally be nullptr. Maybe you called CallAsync more than once?" << std::endl;

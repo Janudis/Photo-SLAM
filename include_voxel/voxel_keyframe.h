@@ -21,7 +21,6 @@ enum class LearnedDepthSource : std::uint8_t
 {
     None = 0,
     TandemMvs = 1,
-    Omnidata = 2,
 };
 
 } // namespace sv
@@ -134,10 +133,10 @@ public:
     std::vector<Eigen::Vector2f> monocular_depth_anchor_pixels_;
     std::vector<float> monocular_depth_anchor_depths_;
 
-    // Accepted model depth in the ORB map gauge. MVS supplies its published
-    // confidence, while Omnidata supplies the alignment/consistency weight.
+    // Accepted TANDEM depth and confidence in the ORB map gauge.
     cv::Mat monocular_depth_prior_;
     cv::Mat monocular_depth_confidence_;
+    cv::Mat monocular_mvs_depth_dense_;
     sv::LearnedDepthSource monocular_depth_source_ =
         sv::LearnedDepthSource::None;
     int monocular_depth_prior_iteration_ = -1;

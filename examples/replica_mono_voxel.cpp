@@ -16,8 +16,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <c10/cuda/CUDACachingAllocator.h>
-
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
 #include "include_voxel/viewer/voxel_imgui_viewer.h"
@@ -71,30 +69,6 @@ static void saveTrackingTime(const std::vector<float> &vTimesTrack,
         totaltime += vTimesTrack[i];
     }
 
-    out.close();
-}
-
-// Save CUDA peak mem stats
-static void saveGpuPeakMemoryUsage(const std::filesystem::path &pathSave)
-{
-    namespace c10Alloc = c10::cuda::CUDACachingAllocator;
-    c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
-
-    float max_reserved_MB =
-        mem_stats
-            .reserved_bytes.front()
-            .peak /
-        (1024.0f * 1024.0f);
-
-    float max_alloc_MB =
-        mem_stats
-            .allocated_bytes.front()
-            .peak /
-        (1024.0f * 1024.0f);
-
-    std::ofstream out(pathSave);
-    out << "Peak reserved (MB): " << max_reserved_MB << "\n";
-    out << "Peak allocated (MB): " << max_alloc_MB << "\n";
     out.close();
 }
 
@@ -191,7 +165,6 @@ int main(int argc, char **argv)
             0,                                // sequence idx
             device_type);
 
-    pVoxelMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
     // -------------------------------------------------------------------------
@@ -258,8 +231,6 @@ int main(int argc, char **argv)
 
         // Feed to SLAM -- matches TUM call signature
         {
-            auto tracking_profile =
-                pVoxelMapper->profileLaptopModule("orb_tracking");
             pSLAM->TrackMonocular(
                 im,
                 tframe,
@@ -310,15 +281,10 @@ int main(int argc, char **argv)
         output_dir /
         (std::to_string(pVoxelMapper->getIteration()) + "_shutdown");
 
-    // GPU peak usage
-    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
-    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
-
     // Tracking time statistics
     saveTrackingTime(
         vTimesTrack,
         (output_dir / "TrackingTime.txt").string());
-
     // Preserve the trajectory beside the exact reconstruction that uses it.
     const auto save_trajectories =
         [&](const std::filesystem::path& directory)

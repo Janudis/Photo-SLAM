@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <jsoncpp/json/json.h>
 #include <limits>
 #include <mutex>
 #include <opencv2/core/cuda.hpp>
@@ -181,6 +182,7 @@ void saveKeyframeFrameIdMap(
         return;
     }
     out << "# ours_kf_id replica_frame_id\n";
+    Json::Value sources(Json::arrayValue);
     for (const auto& [kf_id, kf] : keyframes) {
         if (!kf) {
             continue;
@@ -193,7 +195,21 @@ void saveKeyframeFrameIdMap(
             source_frame_id = static_cast<int>(kf_id);
         }
         out << kf_id << " " << source_frame_id << "\n";
+        Json::Value source;
+        source["keyframe_id"] = Json::UInt64(kf_id);
+        source["image_path"] = kf->img_filename_;
+        if (std::isfinite(kf->source_timestamp_)) {
+            source["timestamp"] = kf->source_timestamp_;
+        }
+        sources.append(source);
     }
+    // TUM timestamps are not integer frame indices; never infer identity from a keyframe ID.
+    Json::Value metadata;
+    metadata["schema_version"] = 1;
+    metadata["keyframes"] = sources;
+    Json::StreamWriterBuilder writer;
+    std::ofstream source_out(path.parent_path() / "keyframe_sources.json");
+    source_out << Json::writeString(writer, metadata) << "\n";
 }
 bool depthMatToMeters(const cv::Mat& depth_in, cv::Mat& depth_meters)
 {

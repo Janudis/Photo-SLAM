@@ -403,10 +403,10 @@ torch::Tensor VoxelMapper::computeOnlineCovisibilityPruneMask(
         return prune_none;
     }
 
-    const int min_views = std::max(4, opt_params_.surface_min_views_);
+    const int min_views = sv::kSurfaceMinViews;
     const int required_cameras = std::max(
         min_views,
-        opt_params_.surface_view_window_size_);
+        sv::kSurfaceViewWindowSize);
     if (cameras.size() < static_cast<std::size_t>(required_cameras)) {
         std::cout << "[PRUNE/surface_views] skipped: cameras=" << cameras.size()
                   << " required=" << required_cameras << "\n";
@@ -453,7 +453,6 @@ void VoxelMapper::runPendingSurfaceViewPruning()
         return;
     }
 
-    auto pruning_profile = profileLaptopModule("surface_view_pruning");
     const std::vector<sv::MiniCam> cameras = surfaceViewPruningCameras();
     const int64_t voxel_count = voxel_model_->numVoxels();
     if (voxel_count <= 0) {
@@ -478,7 +477,6 @@ void VoxelMapper::runPendingSurfaceViewPruning()
 
     // Optional MVS consistency can protect a co-visible surface candidate,
     // while its independent free-space candidates remain in scheduled pruning.
-    int64_t mvs_protected = 0;
     if (opt_params_.prune_mvs_consistency_enable_) {
         sv::MonocularMvsPruneEvidence mvs_evidence =
             computeMonocularMvsPruneEvidence(
@@ -489,7 +487,6 @@ void VoxelMapper::runPendingSurfaceViewPruning()
             torch::Tensor supported =
                 mvs_evidence.supported.to(device).to(torch::kBool)
                     .reshape({voxel_count});
-            mvs_protected = (prune_mask & supported).sum().item<int64_t>();
             prune_mask = (prune_mask & (~supported)).contiguous();
         }
     }
@@ -510,15 +507,7 @@ void VoxelMapper::runPendingSurfaceViewPruning()
         }
     }
 
-    const int64_t eligible_count = eligible.sum().item<int64_t>();
     const int64_t removed_count = prune_mask.sum().item<int64_t>();
-    const int64_t supported_count =
-        (eligible &
-         (view_count.to(device).to(torch::kFloat32)
-              .reshape({voxel_count}) >=
-          static_cast<float>(std::max(4, opt_params_.surface_min_views_))))
-            .sum()
-            .item<int64_t>();
 
     if (removed_count > 0) {
         torch::Tensor prune_idx =
@@ -551,25 +540,11 @@ void VoxelMapper::runPendingSurfaceViewPruning()
 
         voxel_model_->pruning(prune_mask);
         if (rerun_params_.run_whole_run_ ||
-            rerun_params_.rerun_svrecon_debug_) {
+            rerun_params_.rerun_svrecon_debug_ ||
+            rerun_params_.rerun_monocular_debug_) {
             rerun_state_.whole_run_live_voxels_dirty_ = true;
         }
     }
-
-    std::size_t trigger_keyframe = 0;
-    if (!surface_view_pending_keyframes_.empty()) {
-        trigger_keyframe = *std::max_element(
-            surface_view_pending_keyframes_.begin(),
-            surface_view_pending_keyframes_.end());
-    }
-    std::cout << "[PRUNE/surface_views] keyframe=" << trigger_keyframe
-              << " window=" << cameras.size()
-              << " initial=" << (initial_pass ? 1 : 0)
-              << " eligible=" << eligible_count
-              << " supported=" << supported_count
-              << " mvs_protected=" << mvs_protected
-              << " removed=" << removed_count
-              << "\n";
 
     surface_view_pruning_initialized_ = true;
     surface_view_pending_keyframes_.clear();
@@ -581,8 +556,6 @@ void VoxelMapper::runFinalRefinement()
         std::cout << "[FINAL/refinement] disabled\n";
         return;
     }
-    auto final_pruning_profile = profileLaptopModule("final_pruning");
-
     const int before = voxel_model_ ? voxel_model_->numVoxels() : 0;
     if (before <= 0) {
         return;
@@ -718,7 +691,8 @@ void VoxelMapper::runFinalRefinement()
 
     if (selected > 0 &&
         (rerun_params_.run_whole_run_ ||
-         rerun_params_.rerun_svrecon_debug_)) {
+         rerun_params_.rerun_svrecon_debug_ ||
+         rerun_params_.rerun_monocular_debug_)) {
         torch::Tensor indices = prune_mask.nonzero().squeeze(1);
         torch::Tensor sizes = voxel_model_->voxSize();
         torch::Tensor levels = voxel_model_->octLevel();
@@ -760,7 +734,8 @@ void VoxelMapper::runFinalRefinement()
     if (selected > 0) {
         voxel_model_->pruning(prune_mask);
         if (rerun_params_.run_whole_run_ ||
-            rerun_params_.rerun_svrecon_debug_) {
+            rerun_params_.rerun_svrecon_debug_ ||
+            rerun_params_.rerun_monocular_debug_) {
             logWholeRunLiveVoxelsToRerun(
                 getIteration(),
                 voxel_model_->voxCenter(),

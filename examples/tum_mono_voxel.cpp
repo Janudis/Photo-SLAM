@@ -18,7 +18,6 @@
 
 #include "ORB-SLAM3/include/System.h"
 #include "include_voxel/voxel_mapper.h"
-#include <c10/cuda/CUDACachingAllocator.h>
 #include "include_voxel/viewer/voxel_imgui_viewer.h"
 
 void LoadImages(const std::filesystem::path &sequence_path,
@@ -61,20 +60,6 @@ void saveTrackingTime(const std::vector<float> &times, const std::string &path)
     std::ofstream out(path);
     for (float t : times)
         out << std::fixed << std::setprecision(8) << t << "\n";
-    out.close();
-}
-
-void saveGpuPeakMemoryUsage(std::filesystem::path pathSave)
-{
-    namespace c10Alloc = c10::cuda::CUDACachingAllocator;
-    c10Alloc::DeviceStats mem_stats = c10Alloc::getDeviceStats(0);
-
-    float max_reserved_MB = mem_stats.reserved_bytes.front().peak / (1024.0 * 1024.0);
-    float max_alloc_MB = mem_stats.allocated_bytes.front().peak / (1024.0 * 1024.0);
-
-    std::ofstream out(pathSave);
-    out << "Peak reserved (MB): " << max_reserved_MB << "\n";
-    out << "Peak allocated (MB): " << max_alloc_MB << "\n";
     out.close();
 }
 
@@ -131,7 +116,6 @@ int main(int argc, char **argv)
                                       output_dir,
                                       0,
                                       device_type);
-    pVoxelMapper->setRuntimeFrameCount(nImages);
     std::thread training_thd(&VoxelMapper::run, pVoxelMapper.get());
 
     std::thread viewer_thd;
@@ -178,8 +162,6 @@ int main(int argc, char **argv)
         auto t1 = std::chrono::steady_clock::now();
 
         {
-            auto tracking_profile =
-                pVoxelMapper->profileLaptopModule("orb_tracking");
             pSLAM->TrackMonocular(
                 im,
                 tframe,
@@ -203,8 +185,6 @@ int main(int argc, char **argv)
     const std::filesystem::path shutdown_dir =
         output_dir /
         (std::to_string(pVoxelMapper->getIteration()) + "_shutdown");
-    saveGpuPeakMemoryUsage(output_dir / "GpuPeakUsageMB.txt");
-    saveGpuPeakMemoryUsage(shutdown_dir / "GpuPeakUsageMB.txt");
     saveTrackingTime(vTimesTrack, (output_dir / "TrackingTime.txt").string());
 
     const auto save_trajectories =

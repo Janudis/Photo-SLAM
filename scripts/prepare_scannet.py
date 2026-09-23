@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a ScanNet .sens sequence for the Photo-SLAM RGB-D runner.
+"""Export a ScanNet .sens sequence for Photo-SLAM runners.
 
 The binary layout and decompression rules follow ScanNet's official
 SensReader/python/SensorData.py. Frames are streamed instead of retaining the
@@ -19,9 +19,9 @@ import numpy as np
 
 COLOR_COMPRESSION = {0: "raw", 1: "png", 2: "jpeg"}
 DEPTH_COMPRESSION = {0: "raw_ushort", 1: "zlib_ushort", 2: "occi_ushort"}
-HI_SLAM2_CROP_BORDER = 12
-HI_SLAM2_TARGET_PIXELS = 341 * 640
-HI_SLAM2_PREPARE_MARKER = ".hislam2_scannet_preprocess_v1"
+PHOTOSLAM_PREPROCESSING = "photoslam_uncropped_v1"
+PHOTOSLAM_PREPARE_MARKER = ".photoslam_scannet_preprocess_v1"
+MONOCULAR_RECENTLY_LOST_TIMEOUT_SECONDS = 6.0
 
 
 def read_exact(handle, size):
@@ -111,21 +111,27 @@ def decode_depth(data, compression, width, height):
     return depth.reshape(height, width)
 
 
-def hi_slam2_target_size(width, height):
-    scale = math.sqrt(HI_SLAM2_TARGET_PIXELS / float(width * height))
-    target_height = int(height * scale)
-    target_width = int(width * scale)
-    target_height -= target_height % 8
-    target_width -= target_width % 8
-    return target_width, target_height
-
-
-def write_orb_config(path, intrinsic, width, height, fps, depth_shift):
+def write_orb_config(
+    path, intrinsic, width, height, fps, depth_shift, *, include_depth
+):
     fx = float(intrinsic[0, 0])
     fy = float(intrinsic[1, 1])
     cx = float(intrinsic[0, 2])
     cy = float(intrinsic[1, 2])
     camera_fps = int(round(fps))
+    depth_config = ""
+    if include_depth:
+        depth_config = f'''Stereo.ThDepth: 40.0
+Stereo.b: 0.08
+RGBD.DepthMapFactor: {depth_shift:.6f}
+
+'''
+    tracking_config = ""
+    if not include_depth:
+        tracking_config = (
+            "Tracking.recentlyLostTimeout: "
+            f"{MONOCULAR_RECENTLY_LOST_TIMEOUT_SECONDS:.1f}\n\n"
+        )
     config = f'''%YAML:1.0
 
 File.version: "1.0"
@@ -146,11 +152,7 @@ Camera.RGB: 1
 Camera.width: {width}
 Camera.height: {height}
 
-Stereo.ThDepth: 40.0
-Stereo.b: 0.08
-RGBD.DepthMapFactor: {depth_shift:.6f}
-
-loopClosing: 1
+{depth_config}{tracking_config}loopClosing: 1
 
 ORBextractor.nFeatures: 1600
 ORBextractor.scaleFactor: 1.2
@@ -222,31 +224,13 @@ def export_scan(args):
 
     with sens_path.open("rb") as handle:
         header = parse_header(handle)
-        crop_border = HI_SLAM2_CROP_BORDER if args.hi_slam2_preprocess else 0
-        cropped_color_width = header["color_width"] - 2 * crop_border
-        cropped_color_height = header["color_height"] - 2 * crop_border
-        if cropped_color_width <= 0 or cropped_color_height <= 0:
-            raise ValueError("HI-SLAM2 crop border is larger than the color frame")
-
-        if args.hi_slam2_preprocess:
-            target_width, target_height = hi_slam2_target_size(
-                cropped_color_width, cropped_color_height)
-        else:
-            target_width, target_height = args.width, args.height
-
-        scale_x = target_width / float(cropped_color_width)
-        scale_y = target_height / float(cropped_color_height)
+        target_width, target_height = args.width, args.height
+        scale_x = target_width / float(header["color_width"])
+        scale_y = target_height / float(header["color_height"])
         target_intrinsic = np.array(header["intrinsic_color"], copy=True)
-        target_intrinsic[0, 2] -= crop_border
-        target_intrinsic[1, 2] -= crop_border
         target_intrinsic[0, :] *= scale_x
         target_intrinsic[1, :] *= scale_y
         target_intrinsic[2, 2] = 1.0
-
-        depth_crop_x = int(round(
-            crop_border * header["depth_width"] / float(header["color_width"])))
-        depth_crop_y = int(round(
-            crop_border * header["depth_height"] / float(header["color_height"])))
 
         write_matrix(intrinsic_dir / "intrinsic_color.txt", header["intrinsic_color"])
         write_matrix(intrinsic_dir / "extrinsic_color.txt", header["extrinsic_color"])
@@ -254,12 +238,22 @@ def export_scan(args):
         write_matrix(intrinsic_dir / "extrinsic_depth.txt", header["extrinsic_depth"])
         write_matrix(intrinsic_dir / "intrinsic_color_target.txt", target_intrinsic)
         write_orb_config(
+            output_dir / "orb_slam3_monocular.yaml",
+            target_intrinsic,
+            target_width,
+            target_height,
+            args.fps / args.frame_stride,
+            header["depth_shift"],
+            include_depth=False,
+        )
+        write_orb_config(
             output_dir / "orb_slam3_rgbd.yaml",
             target_intrinsic,
             target_width,
             target_height,
             args.fps / args.frame_stride,
             header["depth_shift"],
+            include_depth=True,
         )
 
         print(
@@ -267,8 +261,7 @@ def export_scan(args):
             f"color={header['color_width']}x{header['color_height']} "
             f"depth={header['depth_width']}x{header['depth_height']} "
             f"target={target_width}x{target_height} "
-            f"stride={args.frame_stride} "
-            f"hi_slam2_preprocess={int(args.hi_slam2_preprocess)}")
+            f"stride={args.frame_stride} preprocessing={PHOTOSLAM_PREPROCESSING}")
 
         for frame_index in range(header["num_frames"]):
             camera_to_world = read_matrix4(handle)
@@ -293,14 +286,6 @@ def export_scan(args):
                 header["depth_width"],
                 header["depth_height"],
             )
-            if crop_border:
-                color = color[
-                    crop_border:color.shape[0] - crop_border,
-                    crop_border:color.shape[1] - crop_border]
-            if depth_crop_x or depth_crop_y:
-                y_end = depth.shape[0] - depth_crop_y if depth_crop_y else depth.shape[0]
-                x_end = depth.shape[1] - depth_crop_x if depth_crop_x else depth.shape[1]
-                depth = depth[depth_crop_y:y_end, depth_crop_x:x_end]
             if color.shape[1] != target_width or color.shape[0] != target_height:
                 color = cv2.resize(
                     color, (target_width, target_height), interpolation=cv2.INTER_AREA)
@@ -355,8 +340,8 @@ def export_scan(args):
         "effective_fps": args.fps / args.frame_stride,
         "width": target_width,
         "height": target_height,
-        "hi_slam2_preprocess": args.hi_slam2_preprocess,
-        "crop_border": crop_border,
+        "preprocessing": PHOTOSLAM_PREPROCESSING,
+        "crop_border": 0,
         "depth_shift": header["depth_shift"],
         "color_compression": header["color_compression"],
         "depth_compression": header["depth_compression"],
@@ -365,9 +350,9 @@ def export_scan(args):
     }
     (output_dir / "scannet_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    if args.hi_slam2_preprocess:
-        (output_dir / HI_SLAM2_PREPARE_MARKER).write_text(
-            "HI-SLAM2 ScanNet crop/resize preprocessing v1\n", encoding="utf-8")
+    (output_dir / PHOTOSLAM_PREPARE_MARKER).write_text(
+        f"{PHOTOSLAM_PREPROCESSING}\n", encoding="utf-8")
+    (output_dir / ".hislam2_scannet_preprocess_v1").unlink(missing_ok=True)
     print(
         f"[prepare_scannet] ready: {output_dir} "
         f"({len(exported_frames)} RGB-D frames)")
@@ -379,13 +364,9 @@ def main():
     parser.add_argument("--sens", required=True, type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=536)
+    parser.add_argument("--height", type=int, default=400)
     parser.add_argument("--fps", type=float, default=30.0)
-    parser.add_argument(
-        "--hi-slam2-preprocess",
-        action="store_true",
-        help="apply HI-SLAM2's ScanNet 12-pixel crop and target-area resize")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if not args.sens.is_file():

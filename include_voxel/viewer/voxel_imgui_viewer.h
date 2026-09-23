@@ -40,6 +40,7 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include <mutex>
+#include <functional>
 
 namespace ORB_SLAM3
 {
@@ -64,6 +65,11 @@ public:
 
     void run();
 
+    void setTerminateRunCallback(const std::function<void()>& callback)
+    {
+        terminate_run_callback_ = callback;
+    }
+
     bool isStopped();
     void signalStop(const bool going_to_stop = true);
 
@@ -72,6 +78,10 @@ protected:
     void mouseWheel();
     void mouseDrag();
     void keyboardEvent();
+    bool fitViewToReconstruction();
+    void straightenView();
+    void centerOrbitOnKeyframes();
+    void applyRecordingPreset(int preset);
 
 protected:
     std::shared_ptr<ORB_SLAM3::System> pSLAM_;
@@ -86,12 +96,16 @@ protected:
     bool init_Twc_set_ = false;
     Sophus::SE3f Tcw_main_, Twc_main_;
     glm::mat4 glmTwc_main_;
+    Eigen::Vector3f navigation_center_ = Eigen::Vector3f::Zero();
+    bool navigation_center_valid_ = false;
+    bool orbit_view_ = false;
 
     // Configurations
     bool training_ = true;
+    std::function<void()> terminate_run_callback_;
 
     int glfw_window_width_, glfw_window_height_;
-    int panel_width_, display_panel_height_, training_panel_height_, camera_panel_height_;
+    int panel_width_, display_panel_height_;
 
     int image_width_, image_height_;
     float SLAM_image_viewer_scale_;
@@ -114,17 +128,28 @@ protected:
     glm::mat4 cam_trans_;
 
     float main_fx_, main_fy_, main_cx_, main_cy_;
-    float mouse_left_sensitivity_ = 0.05 * M_PI;
-    float mouse_right_sensitivity_ = 0.2 * M_PI;
-    float mouse_middle_sensitivity_ = 0.2;
+    float mouse_left_sensitivity_ = 1.0f;
     float keyboard_velocity_ = 0.2;
     float keyboard_anglular_velocity_ = 0.05;
 
     bool reset_main_to_init_ = false;
+    bool fit_reconstruction_requested_ = true;
+    bool show_display_controls_ = false;
+    bool display_controls_auto_shown_ = false;
+    bool show_slam_frame_ = false;
+    bool show_rendered_frame_ = false;
     bool tracking_vision_ = false;
-    bool show_keyframes_ = false;
+    bool show_keyframes_ = true;
+    bool show_trajectory_ = true;
     bool show_sparse_mappoints_ = false;
     bool show_main_rendered_ = true;
+    int recording_preset_ = 0;
+    bool auto_fit_reconstruction_ = false;
+    float fit_zoom_ = 1.0f;
+    double last_auto_fit_time_ = -1.0;
+    ImVec2 main_view_origin_;
+    ImVec2 main_view_size_;
+    ImVec2 main_view_crop_ = ImVec2(1.0f, 1.0f);
 
     float geo_lr_;
     float sh0_lr_;

@@ -11,12 +11,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
+
 
 cv::Mat toMvsBgr(
     const cv::Mat& mapper_image,
@@ -229,7 +233,6 @@ struct DirectCornerSample
 };
 
 } // namespace
-
 void VoxelMapper::captureMonocularMvsKeyframeMetadata(
     const std::shared_ptr<VoxelKeyframe>& pkf,
     ORB_SLAM3::KeyFrame* orb_keyframe)
@@ -290,18 +293,18 @@ void VoxelMapper::captureMonocularMvsKeyframeMetadata(
     pkf->monocular_mvs_depth_max_ = 0.0f;
     pkf->monocular_mvs_sparse_depth_count_ = 0;
     bool depth_range_ready = false;
-    if (monocular_mvs_depth_range_mode_ == "fixed") {
+    if (std::string_view(sv::kMonocularMvsDepthRangeMode) == "fixed") {
         pkf->monocular_mvs_depth_min_ = monocular_mvs_depth_min_m_;
         pkf->monocular_mvs_depth_max_ = monocular_mvs_depth_max_m_;
         depth_range_ready =
             monocular_mvs_depth_max_m_ > monocular_mvs_depth_min_m_;
     } else {
-        pkf->monocular_mvs_depth_min_ = monocular_mvs_depth_min_scene_;
+        pkf->monocular_mvs_depth_min_ = sv::kMonocularMvsDepthMinScene;
         depth_range_ready = computeTandemSparseDepthRange(
             orb_keyframe,
-            monocular_mvs_depth_min_scene_,
-            monocular_mvs_inverse_depth_quantile_,
-            monocular_mvs_depth_max_multiplier_,
+            sv::kMonocularMvsDepthMinScene,
+            sv::kMonocularMvsInverseDepthQuantile,
+            sv::kMonocularMvsDepthMaxMultiplier,
             pkf->monocular_mvs_depth_max_,
             pkf->monocular_mvs_sparse_depth_count_);
     }
@@ -315,9 +318,7 @@ bool VoxelMapper::isMonocularMvsPipelineEnabled() const
 
 void VoxelMapper::refreshMonocularMvsKeyframeMetadata()
 {
-    if ((!isMonocularMvsPipelineEnabled() &&
-         !monocular_omnidata_densify_) ||
-        !mpSLAM || !mpSLAM->getAtlas()) {
+    if (!isMonocularMvsPipelineEnabled() || !mpSLAM || !mpSLAM->getAtlas()) {
         return;
     }
     ORB_SLAM3::Map* map = mpSLAM->getAtlas()->GetCurrentMap();
@@ -342,7 +343,7 @@ VoxelMapper::selectMonocularMvsSourceKeyframes(
 {
     std::vector<std::shared_ptr<VoxelKeyframe>> selected;
     if (view_num < 2) {
-        view_num = monocular_mvs_view_num_;
+        view_num = sv::kMonocularMvsViewNum;
     }
     if (!reference || view_num < 2) {
         return selected;
@@ -478,12 +479,13 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
     const std::vector<std::shared_ptr<VoxelKeyframe>> sources =
         selectMonocularMvsSourceKeyframes(reference);
     if (sources.size() + 1 !=
-        static_cast<std::size_t>(monocular_mvs_view_num_)) {
+        static_cast<std::size_t>(sv::kMonocularMvsViewNum)) {
         return false;
     }
 
+
     std::vector<std::shared_ptr<VoxelKeyframe>> views;
-    views.reserve(static_cast<std::size_t>(monocular_mvs_view_num_));
+    views.reserve(static_cast<std::size_t>(sv::kMonocularMvsViewNum));
     views.push_back(reference);
     views.insert(views.end(), sources.begin(), sources.end());
 
@@ -493,13 +495,13 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
     camera_to_world.reserve(views.size());
     for (const auto& view : views) {
         bgr_images.push_back(toMvsBgr(
-            view->img_undist_, monocular_mvs_width_, monocular_mvs_height_));
+            view->img_undist_, sv::kMonocularMvsWidth, sv::kMonocularMvsHeight));
         camera_to_world.push_back(
             view->getPosef().inverse().matrix());
     }
 
     const Eigen::Matrix3f K = resizedIntrinsics(
-        *reference, monocular_mvs_width_, monocular_mvs_height_);
+        *reference, sv::kMonocularMvsWidth, sv::kMonocularMvsHeight);
     if (monocular_mvs_empty_cache_before_launch_) {
         c10::cuda::CUDACachingAllocator::emptyCache();
     }
@@ -509,9 +511,7 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
         camera_to_world,
         depth_min,
         depth_max,
-        monocular_mvs_discard_percentage_);
-    beginLaptopAsyncModule("mvs_inference", 1);
-
+        sv::kMonocularMvsDiscardPercentage);
     monocular_mvs_pending_reference_ = reference;
     monocular_mvs_pending_c2w_ = camera_to_world.front();
     monocular_mvs_pending_view_ids_.clear();
@@ -523,13 +523,13 @@ bool VoxelMapper::scheduleMonocularMvsDensification(
     monocular_mvs_pending_depth_min_ = depth_min;
     monocular_mvs_pending_depth_max_ = depth_max;
     monocular_mvs_pending_camera_ = reference->toMiniCam(
-        monocular_mvs_height_, monocular_mvs_width_);
+        sv::kMonocularMvsHeight, sv::kMonocularMvsWidth);
     setMiniCamSnapshot(
         monocular_mvs_pending_camera_,
         monocular_mvs_pending_c2w_,
         K,
-        monocular_mvs_width_,
-        monocular_mvs_height_,
+        sv::kMonocularMvsWidth,
+        sv::kMonocularMvsHeight,
         static_cast<int>(reference->fid_));
     cv::cvtColor(
         bgr_images.front(),
@@ -575,8 +575,6 @@ void VoxelMapper::pollMonocularMvsDensification(
     if (!result.has_value()) {
         return;
     }
-    endLaptopAsyncModule("mvs_inference");
-
     bool poses_changed =
         monocular_mvs_pending_view_ids_.size() !=
             monocular_mvs_pending_view_c2w_.size();
@@ -617,689 +615,4 @@ void VoxelMapper::pollMonocularMvsDensification(
     monocular_mvs_pending_view_c2w_.clear();
     monocular_mvs_pending_depth_min_ = 0.0f;
     monocular_mvs_pending_depth_max_ = 0.0f;
-}
-
-void VoxelMapper::integrateMonocularMvsDepth(
-    const sv::TandemMvsResult& result)
-{
-    const std::shared_ptr<VoxelKeyframe> reference =
-        monocular_mvs_pending_reference_;
-    cacheMonocularDepthPrior(
-        reference,
-        result.depth,
-        result.confidence,
-        sv::LearnedDepthSource::TandemMvs);
-    if (monocular_mvs_tsdf_evidence_) {
-        integrateMonocularMvsTsdfEvidence(result);
-    } else {
-        integrateMonocularLearnedDepth(
-            result.depth,
-            "MVS",
-            "world/monocular_mvs/created",
-            /*clear_cuda_cache_before_insertion=*/false);
-    }
-    if (reference) {
-        markSurfaceViewPruningPending({reference});
-    }
-}
-
-void VoxelMapper::cacheMonocularDepthPrior(
-    const std::shared_ptr<VoxelKeyframe>& reference,
-    const cv::Mat& depth,
-    const cv::Mat& confidence,
-    const sv::LearnedDepthSource source)
-{
-    if (!reference || depth.empty() || depth.type() != CV_32FC1) {
-        throw std::runtime_error(
-            "Cannot cache an invalid monocular depth prior");
-    }
-
-    cv::Mat confidence_float;
-    if (confidence.empty()) {
-        confidence_float = cv::Mat(
-            depth.rows, depth.cols, CV_32FC1, cv::Scalar(1.0f));
-    } else {
-        if (confidence.rows != depth.rows || confidence.cols != depth.cols ||
-            confidence.channels() != 1) {
-            throw std::runtime_error(
-                "Monocular depth confidence shape does not match depth");
-        }
-        if (confidence.type() == CV_32FC1) {
-            confidence_float = confidence.clone();
-        } else {
-            confidence.convertTo(confidence_float, CV_32FC1);
-        }
-    }
-
-    cv::Mat accepted_depth = depth.clone();
-    int64_t accepted_pixels = 0;
-    for (int y = 0; y < accepted_depth.rows; ++y) {
-        float* depth_row = accepted_depth.ptr<float>(y);
-        float* confidence_row = confidence_float.ptr<float>(y);
-        for (int x = 0; x < accepted_depth.cols; ++x) {
-            float& depth_value = depth_row[x];
-            float& confidence_value = confidence_row[x];
-            if (!std::isfinite(depth_value) || depth_value <= 1.0e-6f ||
-                !std::isfinite(confidence_value)) {
-                depth_value = 0.0f;
-                confidence_value = 0.0f;
-                continue;
-            }
-            confidence_value = std::clamp(confidence_value, 0.0f, 1.0f);
-            if (confidence_value <= 0.0f) {
-                depth_value = 0.0f;
-                continue;
-            }
-            ++accepted_pixels;
-        }
-    }
-
-    if (accepted_pixels == 0) {
-        std::cerr
-            << "[VoxelMapper] Learned depth prior has no valid pixels for "
-               "keyframe "
-            << reference->fid_ << "\n";
-        return;
-    }
-
-    reference->monocular_depth_prior_ = std::move(accepted_depth);
-    reference->monocular_depth_confidence_ = std::move(confidence_float);
-    reference->monocular_depth_source_ = source;
-    reference->monocular_depth_prior_iteration_ = getIteration();
-}
-
-sv::MonocularMvsPruneEvidence
-VoxelMapper::computeMonocularMvsPruneEvidence(
-    const torch::Tensor& centers_world_in,
-    const torch::Tensor& sizes_world_in)
-{
-    sv::MonocularMvsPruneEvidence result;
-    if (!opt_params_.prune_mvs_consistency_enable_ || !scene_ ||
-        !centers_world_in.defined() || !sizes_world_in.defined() ||
-        centers_world_in.dim() != 2 || centers_world_in.size(1) != 3 ||
-        centers_world_in.size(0) <= 0 ||
-        sizes_world_in.size(0) != centers_world_in.size(0)) {
-        return result;
-    }
-
-    torch::NoGradGuard no_grad;
-    const int64_t voxel_count = centers_world_in.size(0);
-    const torch::Device device = centers_world_in.device();
-    const auto bool_options =
-        torch::TensorOptions().dtype(torch::kBool).device(device);
-    const auto count_options =
-        torch::TensorOptions().dtype(torch::kInt32).device(device);
-    const auto long_options =
-        torch::TensorOptions().dtype(torch::kInt64).device(device);
-
-    result.supported = torch::zeros({voxel_count}, bool_options);
-    result.free_space = torch::zeros({voxel_count}, bool_options);
-
-    torch::Tensor centers_world =
-        centers_world_in.detach().to(device).to(torch::kFloat32).contiguous();
-    torch::Tensor sizes_world =
-        sizes_world_in.detach().to(device).to(torch::kFloat32)
-            .reshape({voxel_count}).contiguous();
-    torch::Tensor support_count = torch::zeros({voxel_count}, count_options);
-    torch::Tensor contradiction_count =
-        torch::zeros({voxel_count}, count_options);
-    torch::Tensor valid_projection_count = torch::zeros({}, long_options);
-
-    const auto keyframes = scene_->getAllKeyframes();
-    const cv::Mat kernel = cv::Mat::ones(3, 3, CV_8UC1);
-    constexpr int64_t kProjectionChunkSize = 262144;
-
-    for (const auto& [keyframe_id, keyframe] : keyframes) {
-        (void)keyframe_id;
-        if (!keyframe ||
-            keyframe->monocular_depth_source_ !=
-                sv::LearnedDepthSource::TandemMvs ||
-            keyframe->monocular_depth_prior_.empty() ||
-            keyframe->monocular_depth_prior_.type() != CV_32FC1) {
-            continue;
-        }
-
-        const cv::Mat& depth = keyframe->monocular_depth_prior_;
-        const cv::Mat& confidence = keyframe->monocular_depth_confidence_;
-        if (confidence.empty() || confidence.type() != CV_32FC1 ||
-            confidence.size() != depth.size()) {
-            continue;
-        }
-
-        // A 3x3 valid, locally smooth neighborhood prevents depth edges from
-        // protecting or carving a whole octree cell.
-        cv::Mat valid(depth.rows, depth.cols, CV_8UC1, cv::Scalar(0));
-        cv::Mat depth_for_min(
-            depth.rows,
-            depth.cols,
-            CV_32FC1,
-            cv::Scalar(std::numeric_limits<float>::max()));
-        cv::Mat depth_for_max(
-            depth.rows,
-            depth.cols,
-            CV_32FC1,
-            cv::Scalar(std::numeric_limits<float>::lowest()));
-        int64_t valid_pixels = 0;
-        for (int y = 0; y < depth.rows; ++y) {
-            const float* depth_row = depth.ptr<float>(y);
-            const float* confidence_row = confidence.ptr<float>(y);
-            std::uint8_t* valid_row = valid.ptr<std::uint8_t>(y);
-            float* min_row = depth_for_min.ptr<float>(y);
-            float* max_row = depth_for_max.ptr<float>(y);
-            for (int x = 0; x < depth.cols; ++x) {
-                const float d = depth_row[x];
-                const float c = confidence_row[x];
-                if (!std::isfinite(d) || d <= 1.0e-6f ||
-                    !std::isfinite(c) ||
-                    c <= opt_params_.monocular_depth_confidence_min_) {
-                    continue;
-                }
-                valid_row[x] = 255;
-                min_row[x] = d;
-                max_row[x] = d;
-                ++valid_pixels;
-            }
-        }
-        if (valid_pixels == 0) {
-            continue;
-        }
-
-        cv::Mat neighborhood_valid;
-        cv::Mat local_min;
-        cv::Mat local_max;
-        cv::erode(
-            valid,
-            neighborhood_valid,
-            kernel,
-            cv::Point(-1, -1),
-            1,
-            cv::BORDER_CONSTANT,
-            cv::Scalar(0));
-        cv::erode(
-            depth_for_min,
-            local_min,
-            kernel,
-            cv::Point(-1, -1),
-            1,
-            cv::BORDER_CONSTANT,
-            cv::Scalar(std::numeric_limits<float>::max()));
-        cv::dilate(
-            depth_for_max,
-            local_max,
-            kernel,
-            cv::Point(-1, -1),
-            1,
-            cv::BORDER_CONSTANT,
-            cv::Scalar(std::numeric_limits<float>::lowest()));
-        cv::Mat local_span = cv::Mat::zeros(depth.size(), CV_32FC1);
-        for (int y = 0; y < depth.rows; ++y) {
-            const std::uint8_t* valid_row =
-                neighborhood_valid.ptr<std::uint8_t>(y);
-            const float* min_row = local_min.ptr<float>(y);
-            const float* max_row = local_max.ptr<float>(y);
-            float* span_row = local_span.ptr<float>(y);
-            for (int x = 0; x < depth.cols; ++x) {
-                if (valid_row[x] != 0) {
-                    span_row[x] = std::max(0.0f, max_row[x] - min_row[x]);
-                }
-            }
-        }
-
-        torch::Tensor depth_map = torch::from_blob(
-            depth.data,
-            {depth.rows, depth.cols},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-                .clone()
-                .to(device)
-                .reshape({-1});
-        torch::Tensor confidence_map = torch::from_blob(
-            confidence.data,
-            {confidence.rows, confidence.cols},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-                .clone()
-                .to(device)
-                .reshape({-1});
-        torch::Tensor valid_map = torch::from_blob(
-            neighborhood_valid.data,
-            {neighborhood_valid.rows, neighborhood_valid.cols},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
-                .clone()
-                .to(device)
-                .to(torch::kBool)
-                .reshape({-1});
-        torch::Tensor span_map = torch::from_blob(
-            local_span.data,
-            {local_span.rows, local_span.cols},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-                .clone()
-                .to(device)
-                .reshape({-1});
-
-        const Eigen::Matrix4f Tcw = keyframe->getPosef().matrix();
-        Eigen::Matrix<float, 3, 4, Eigen::RowMajor> Tcw_3x4 =
-            Tcw.block<3, 4>(0, 0);
-        torch::Tensor transform = torch::from_blob(
-            Tcw_3x4.data(),
-            {3, 4},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
-                .clone()
-                .to(device);
-        torch::Tensor rotation = transform.index({
-            torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
-        torch::Tensor translation = transform.index({
-            torch::indexing::Slice(), 3});
-        const float camera_z_extent_scale =
-            0.5f * Tcw.block<1, 3>(2, 0).cwiseAbs().sum();
-        const Eigen::Matrix3f K =
-            resizedIntrinsics(*keyframe, depth.cols, depth.rows);
-
-        for (int64_t begin = 0; begin < voxel_count;
-             begin += kProjectionChunkSize) {
-            const int64_t end = std::min(
-                voxel_count, begin + kProjectionChunkSize);
-            const auto slice = torch::indexing::Slice(begin, end);
-            torch::Tensor camera_xyz =
-                torch::matmul(
-                    centers_world.index({slice}),
-                    rotation.transpose(0, 1)) +
-                translation;
-            torch::Tensor z = camera_xyz.index({torch::indexing::Slice(), 2});
-            torch::Tensor positive_z = z > 1.0e-6f;
-            torch::Tensor safe_z = torch::where(
-                positive_z, z, torch::ones_like(z));
-            torch::Tensor u_float =
-                K(0, 0) *
-                    camera_xyz.index({torch::indexing::Slice(), 0}) / safe_z +
-                K(0, 2);
-            torch::Tensor v_float =
-                K(1, 1) *
-                    camera_xyz.index({torch::indexing::Slice(), 1}) / safe_z +
-                K(1, 2);
-            torch::Tensor in_image =
-                positive_z & torch::isfinite(u_float) & torch::isfinite(v_float) &
-                (u_float >= 0.0f) &
-                (u_float <= static_cast<float>(depth.cols - 1)) &
-                (v_float >= 0.0f) &
-                (v_float <= static_cast<float>(depth.rows - 1));
-            torch::Tensor u =
-                u_float.round().clamp(0, depth.cols - 1).to(torch::kLong);
-            torch::Tensor v =
-                v_float.round().clamp(0, depth.rows - 1).to(torch::kLong);
-            torch::Tensor pixel_index = v * depth.cols + u;
-
-            torch::Tensor measured = depth_map.index_select(0, pixel_index);
-            torch::Tensor measured_confidence =
-                confidence_map.index_select(0, pixel_index);
-            torch::Tensor neighborhood_is_valid =
-                valid_map.index_select(0, pixel_index);
-            torch::Tensor local_depth_span =
-                span_map.index_select(0, pixel_index);
-            torch::Tensor voxel_size = sizes_world.index({slice});
-            torch::Tensor tolerance =
-                opt_params_.prune_mvs_depth_tolerance_vox_ * voxel_size;
-            torch::Tensor observation_valid =
-                in_image & neighborhood_is_valid & torch::isfinite(measured) &
-                (measured > 1.0e-6f) &
-                torch::isfinite(measured_confidence) &
-                (measured_confidence >
-                 opt_params_.monocular_depth_confidence_min_) &
-                (local_depth_span <= 2.0f * tolerance);
-
-            torch::Tensor z_radius =
-                camera_z_extent_scale * voxel_size;
-            torch::Tensor z_min = z - z_radius;
-            torch::Tensor z_max = z + z_radius;
-            torch::Tensor supports_surface =
-                observation_valid & (z_min <= measured + tolerance) &
-                (z_max >= measured - tolerance);
-            torch::Tensor contradicts_free_space =
-                observation_valid & (z_max < measured - tolerance);
-
-            support_count.index({slice}).add_(
-                supports_surface.to(torch::kInt32));
-            contradiction_count.index({slice}).add_(
-                contradicts_free_space.to(torch::kInt32));
-            valid_projection_count.add_(
-                observation_valid.to(torch::kInt64).sum());
-        }
-        ++result.depth_keyframes;
-    }
-
-    result.supported =
-        (support_count >= opt_params_.prune_mvs_min_supporting_views_)
-            .to(torch::kBool)
-            .contiguous();
-    result.free_space =
-        ((contradiction_count >=
-          opt_params_.prune_mvs_min_contradicting_views_) &
-         (support_count == 0))
-            .to(torch::kBool)
-            .contiguous();
-    result.valid_projections = valid_projection_count.item<int64_t>();
-    return result;
-}
-
-void VoxelMapper::integrateMonocularLearnedDepth(
-    const cv::Mat& depth_map,
-    const std::string& source_name,
-    const std::string& rerun_entity_path,
-    const bool clear_cuda_cache_before_insertion)
-{
-    const std::shared_ptr<VoxelKeyframe> reference =
-        monocular_mvs_pending_reference_;
-    const int depth_width = monocular_mvs_pending_camera_.width;
-    const int depth_height = monocular_mvs_pending_camera_.height;
-    if (!reference || depth_map.empty() ||
-        depth_map.type() != CV_32FC1 ||
-        depth_map.cols != depth_width ||
-        depth_map.rows != depth_height ||
-        depth_width <= 0 || depth_height <= 0 ||
-        !(monocular_mvs_pending_depth_min_ > 0.0f) ||
-        !(monocular_mvs_pending_depth_max_ >
-          monocular_mvs_pending_depth_min_) ||
-        monocular_mvs_pending_reference_rgb_.empty()) {
-        throw std::runtime_error(
-            source_name + " returned an invalid filtered depth map");
-    }
-    auto integration_profile = profileLaptopModule(
-        source_name == "Omnidata"
-            ? "omnidata_depth_integration"
-            : "mvs_depth_integration");
-
-    std::unordered_map<std::string, torch::Tensor> render_pkg;
-    {
-        torch::NoGradGuard no_grad;
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        render_pkg = voxel_model_->render(
-            monocular_mvs_pending_camera_,
-            depth_height,
-            depth_width,
-            torch::Tensor(),
-            "dontcare",
-            /*track_max_w=*/false,
-            std::nullopt,
-            /*output_depth=*/true,
-            /*output_normal=*/false,
-            /*output_T=*/true,
-            /*rand_bg=*/false,
-            /*use_auto_exposure=*/false,
-            sv::RenderOpts{});
-    }
-
-    torch::Tensor rendered_depth_cpu;
-    torch::Tensor rendered_alpha_cpu;
-    torch::Tensor n_contrib_cpu;
-    if (!voxel_utils::renderPkgToDepthAlphaMaps(
-            render_pkg,
-            depth_height,
-            depth_width,
-            rendered_depth_cpu,
-            rendered_alpha_cpu,
-            n_contrib_cpu)) {
-        throw std::runtime_error(
-            "SVRecon did not return depth/contributor maps for " +
-            source_name + " hole detection");
-    }
-
-    cv::Mat valid_camera_mask;
-    if (!reference->cam_.undistort_mask.empty()) {
-        cv::Mat mask_single_channel;
-        if (reference->cam_.undistort_mask.channels() == 1) {
-            mask_single_channel = reference->cam_.undistort_mask;
-        } else {
-            cv::extractChannel(
-                reference->cam_.undistort_mask,
-                mask_single_channel,
-                0);
-        }
-        cv::resize(
-            mask_single_channel,
-            valid_camera_mask,
-            cv::Size(depth_width, depth_height),
-            0.0,
-            0.0,
-            cv::INTER_NEAREST);
-    }
-
-    const auto rendered_depth = rendered_depth_cpu.accessor<float, 2>();
-    const auto contributors = n_contrib_cpu.accessor<int, 2>();
-    const Eigen::Matrix3f K = resizedIntrinsics(
-        *reference, depth_width, depth_height);
-    const Eigen::Matrix3f rotation =
-        monocular_mvs_pending_c2w_.block<3, 3>(0, 0);
-    const Eigen::Vector3f translation =
-        monocular_mvs_pending_c2w_.block<3, 1>(0, 3);
-
-    std::vector<float> surface_points;
-    std::vector<float> surface_colors;
-    surface_points.reserve(
-        static_cast<std::size_t>(depth_width) *
-        static_cast<std::size_t>(depth_height));
-    surface_colors.reserve(surface_points.capacity());
-    for (int y = 0; y < depth_height; ++y) {
-        const float* depth_row = depth_map.ptr<float>(y);
-        for (int x = 0; x < depth_width; ++x) {
-            const float depth = depth_row[x];
-            if (!std::isfinite(depth) ||
-                depth < monocular_mvs_pending_depth_min_ ||
-                depth > monocular_mvs_pending_depth_max_) {
-                continue;
-            }
-            if (!valid_camera_mask.empty()) {
-                const float mask_value =
-                    valid_camera_mask.depth() == CV_8U
-                        ? static_cast<float>(valid_camera_mask.at<uint8_t>(y, x)) /
-                              255.0f
-                        : valid_camera_mask.at<float>(y, x);
-                if (mask_value < 0.5f) {
-                    continue;
-                }
-            }
-            const float current_depth = rendered_depth[y][x];
-            const bool structural_hole =
-                contributors[y][x] <= 0 &&
-                (!std::isfinite(current_depth) || current_depth <= 1.0e-6f);
-            if (!structural_hole) {
-                continue;
-            }
-            const Eigen::Vector3f camera_point(
-                (static_cast<float>(x) - K(0, 2)) * depth / K(0, 0),
-                (static_cast<float>(y) - K(1, 2)) * depth / K(1, 1),
-                depth);
-            const Eigen::Vector3f world_point =
-                rotation * camera_point + translation;
-            if (!world_point.allFinite()) {
-                continue;
-            }
-            surface_points.insert(
-                surface_points.end(),
-                {world_point.x(), world_point.y(), world_point.z()});
-            const cv::Vec3b rgb =
-                monocular_mvs_pending_reference_rgb_.at<cv::Vec3b>(y, x);
-            surface_colors.insert(
-                surface_colors.end(),
-                {static_cast<float>(rgb[0]) / 255.0f,
-                 static_cast<float>(rgb[1]) / 255.0f,
-                 static_cast<float>(rgb[2]) / 255.0f});
-        }
-    }
-
-    if (surface_points.empty()) {
-        return;
-    }
-
-    torch::Tensor surface_point_tensor = torch::from_blob(
-        surface_points.data(),
-        {static_cast<int64_t>(surface_points.size() / 3), 3},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-    torch::Tensor surface_color_tensor = torch::from_blob(
-        surface_colors.data(),
-        {static_cast<int64_t>(surface_colors.size() / 3), 3},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-
-    torch::Tensor support_centers;
-    torch::Tensor source_indices;
-    torch::Tensor scene_center_cpu;
-    float scene_extent = 0.0f;
-    int insertion_level = 0;
-    {
-        torch::NoGradGuard no_grad;
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        std::tie(support_centers, source_indices) =
-            voxel_model_->rgbdHoleSupportCellCenters(surface_point_tensor);
-        scene_center_cpu = voxel_model_->SceneCenter()
-                               .detach().to(torch::kCPU).to(torch::kFloat32)
-                               .reshape({3}).contiguous();
-        scene_extent = voxel_model_->SceneExtent()
-                           .detach().to(torch::kCPU).to(torch::kFloat32)
-                           .item<float>();
-        insertion_level = voxel_model_->insertionOctreeLevel();
-    }
-    if (!support_centers.defined() || support_centers.numel() == 0 ||
-        insertion_level <= 0 || insertion_level >= 30 ||
-        !std::isfinite(scene_extent) || scene_extent <= 0.0f) {
-        return;
-    }
-
-    support_centers = support_centers.detach().to(torch::kCPU)
-                          .to(torch::kFloat32).reshape({-1, 3}).contiguous();
-    source_indices = source_indices.detach().to(torch::kCPU)
-                         .to(torch::kLong).reshape({-1}).contiguous();
-    torch::Tensor support_colors = surface_color_tensor.index_select(
-        0, source_indices).contiguous();
-
-    const Eigen::Vector3f scene_center(
-        scene_center_cpu[0].item<float>(),
-        scene_center_cpu[1].item<float>(),
-        scene_center_cpu[2].item<float>());
-    const Eigen::Vector3f scene_min =
-        scene_center - Eigen::Vector3f::Constant(0.5f * scene_extent);
-    const int grid_dim = 1 << insertion_level;
-    const float cell_size = scene_extent / static_cast<float>(grid_dim);
-    const float truncation = std::max(
-        1.0e-4f, sdf_params_.sdf_init_trunc_vox_ * cell_size);
-    const Eigen::Matrix4f world_to_camera =
-        monocular_mvs_pending_c2w_.inverse();
-
-    std::unordered_set<sv::RgbdTsdfGridKey, sv::RgbdTsdfGridKeyHash>
-        unique_cells;
-    std::unordered_map<
-        sv::RgbdTsdfGridKey,
-        DirectCornerSample,
-        sv::RgbdTsdfGridKeyHash> direct_samples;
-    auto centers_accessor = support_centers.accessor<float, 2>();
-    for (int64_t row = 0; row < support_centers.size(0); ++row) {
-        const Eigen::Vector3f center(
-            centers_accessor[row][0],
-            centers_accessor[row][1],
-            centers_accessor[row][2]);
-        const Eigen::Vector3f grid = (center - scene_min) / cell_size;
-        const sv::RgbdTsdfGridKey cell{
-            static_cast<int>(std::floor(grid.x())),
-            static_cast<int>(std::floor(grid.y())),
-            static_cast<int>(std::floor(grid.z()))};
-        if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
-            cell.x >= grid_dim || cell.y >= grid_dim || cell.z >= grid_dim ||
-            !unique_cells.insert(cell).second) {
-            continue;
-        }
-
-        for (int dz = 0; dz <= 1; ++dz) {
-            for (int dy = 0; dy <= 1; ++dy) {
-                for (int dx = 0; dx <= 1; ++dx) {
-                    const sv::RgbdTsdfGridKey corner{
-                        cell.x + dx, cell.y + dy, cell.z + dz};
-                    const Eigen::Vector3f world = scene_min +
-                        cell_size * Eigen::Vector3f(
-                            static_cast<float>(corner.x),
-                            static_cast<float>(corner.y),
-                            static_cast<float>(corner.z));
-                    const Eigen::Vector4f camera_h =
-                        world_to_camera * Eigen::Vector4f(
-                            world.x(), world.y(), world.z(), 1.0f);
-                    const float z = camera_h.z();
-                    if (!std::isfinite(z) || z <= 1.0e-6f) {
-                        continue;
-                    }
-                    const int x = static_cast<int>(std::lround(
-                        K(0, 0) * camera_h.x() / z + K(0, 2)));
-                    const int y = static_cast<int>(std::lround(
-                        K(1, 1) * camera_h.y() / z + K(1, 2)));
-                    if (x < 0 || x >= depth_width ||
-                        y < 0 || y >= depth_height) {
-                        continue;
-                    }
-                    const float measured = depth_map.at<float>(y, x);
-                    const float sdf = measured - z;
-                    if (!std::isfinite(measured) ||
-                        measured < monocular_mvs_pending_depth_min_ ||
-                        measured > monocular_mvs_pending_depth_max_ ||
-                        !std::isfinite(sdf) || std::abs(sdf) > truncation) {
-                        continue;
-                    }
-                    DirectCornerSample& sample = direct_samples[corner];
-                    sample.world = world;
-                    sample.sdf_sum += std::clamp(
-                        sdf, -truncation, truncation);
-                    ++sample.count;
-                }
-            }
-        }
-    }
-
-    std::vector<float> corner_points;
-    std::vector<float> corner_values;
-    corner_points.reserve(direct_samples.size() * 3);
-    corner_values.reserve(direct_samples.size());
-    for (const auto& item : direct_samples) {
-        const DirectCornerSample& sample = item.second;
-        if (sample.count <= 0) {
-            continue;
-        }
-        corner_points.insert(
-            corner_points.end(),
-            {sample.world.x(), sample.world.y(), sample.world.z()});
-        corner_values.push_back(
-            static_cast<float>(sample.sdf_sum /
-                               static_cast<double>(sample.count)));
-    }
-
-    torch::Tensor corner_point_tensor;
-    torch::Tensor corner_value_tensor;
-    if (!corner_values.empty()) {
-        corner_point_tensor = torch::from_blob(
-            corner_points.data(),
-            {static_cast<int64_t>(corner_values.size()), 3},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-        corner_value_tensor = torch::from_blob(
-            corner_values.data(),
-            {static_cast<int64_t>(corner_values.size()), 1},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-    }
-
-    sv::VoxelModel::IncreasePcdStats stats;
-    {
-        torch::NoGradGuard no_grad;
-        std::unique_lock<std::mutex> lock_render(mutex_render_);
-        if (corner_point_tensor.defined()) {
-            voxel_model_->setNextSdfInitializationGridSamples(
-                corner_point_tensor, corner_value_tensor);
-        }
-        voxel_model_->setNextRealInsertionRerunEntityPath(
-            rerun_entity_path);
-        voxel_model_->increasePcd(
-            support_centers,
-            support_colors,
-            getIteration(),
-            incrementalMappingCameras(),
-            clear_cuda_cache_before_insertion);
-        voxel_model_->setNextRealInsertionRerunEntityPath("");
-        stats = voxel_model_->lastIncreasePcdStats();
-    }
-
-    if (stats.new_voxels > 0 &&
-        (rerun_params_.run_whole_run_ ||
-         rerun_params_.rerun_svrecon_debug_)) {
-        rerun_state_.whole_run_live_voxels_dirty_ = true;
-    }
 }

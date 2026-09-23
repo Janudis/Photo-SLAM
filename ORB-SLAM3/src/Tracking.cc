@@ -48,6 +48,30 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas), mnLastRelocFrameId(0), time_recently_lost(5.0),
     mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
 {
+    if(sensor==System::MONOCULAR)
+    {
+        cv::FileStorage fTrackingSettings(strSettingPath, cv::FileStorage::READ);
+        cv::FileNode recentlyLostTimeout = fTrackingSettings["Tracking.recentlyLostTimeout"];
+        if(!recentlyLostTimeout.empty())
+        {
+            double configuredTimeout = 0.0;
+            if(recentlyLostTimeout.isReal())
+                configuredTimeout = recentlyLostTimeout.real();
+            else if(recentlyLostTimeout.isInt())
+                configuredTimeout = static_cast<int>(recentlyLostTimeout);
+
+            if(configuredTimeout > 0.0)
+            {
+                time_recently_lost = configuredTimeout;
+                std::cout << "- Recently lost timeout override: "
+                          << time_recently_lost << " seconds" << std::endl;
+            }
+            else
+                std::cerr << "Tracking.recentlyLostTimeout must be positive; using "
+                          << time_recently_lost << " seconds" << std::endl;
+        }
+    }
+
     // Load camera parameters from settings file
     if(settings){
         newParameterLoader(settings);
@@ -2087,7 +2111,7 @@ void Tracking::Track()
                         bOK = Relocalization();
                         //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
-                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>3.0f && !bOK)
+                        if(mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost && !bOK)
                         {
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);

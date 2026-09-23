@@ -3,8 +3,7 @@ project(photo-slam LANGUAGES CXX CUDA)
 
 option(PHOTOSLAM_ENABLE_RERUN "Build Rerun diagnostics" ON)
 option(PHOTOSLAM_BUILD_ORIGINAL_PHOTOSLAM
-       "Build the original Gaussian Photo-SLAM mapper and runners" ON)
-option(PHOTOSLAM_BUILD_WAYMO "Build the Waymo voxel runner" ON)
+       "Build the original Gaussian Photo-SLAM mapper and runners" OFF)
 option(PHOTOSLAM_BUILD_REALSENSE
        "Build the live RealSense RGB-D SVRecon runner" ON)
 set(PHOTOSLAM_CUDA_ARCHITECTURES "75;86" CACHE STRING
@@ -368,29 +367,50 @@ target_link_libraries(tandem_mvs_runtime
             boost_thread)
 
 add_library(voxel_core
-        include_voxel/stereo_vision.cu
-        src_voxel/laptop_precheck_profiler.cpp
+        include_voxel/monocular_densification.cu
         src_voxel/mapper_depth_registry.cpp
         src_voxel/voxel_trainer.cpp
         src_voxel/voxel_mapper.cpp
+        src_voxel/voxel_mapper_config.cpp
+        src_voxel/voxel_mapper_run.cpp
+        src_voxel/voxel_mapper_training.cpp
+        src_voxel/voxel_mapper_mapping.cpp
+        src_voxel/voxel_mapper_rgbd.cpp
+        src_voxel/voxel_mapper_io.cpp
+        src_voxel/voxel_mapper_state.cpp
+        src_voxel/voxel_mapper_topology_pruning.cpp
+        src_voxel/voxel_mapper_topology_subdivision.cpp
         src_voxel/voxel_mapper_monocular_densification.cpp
         src_voxel/voxel_mapper_tandem_mvs.cpp
+        src_voxel/voxel_mapper_tandem_mvs_evidence.cpp
+        src_voxel/voxel_mapper_tandem_mvs_integration.cpp
         src_voxel/voxel_mapper_monocular_mvs_tsdf_evidence.cpp
-        src_voxel/voxel_mapper_omnidata.cpp
         src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
         src_voxel/voxel_mapper_tsdf.cpp
         src_voxel/voxel_mapper_rerun.cpp
+        src_voxel/voxel_mapper_rerun_voxels.cpp
+        src_voxel/voxel_mapper_rerun_map.cpp
         src_voxel/voxel_mapper_utils.cpp
         src_voxel/voxel_mapper_supervision.cpp
+        src_voxel/voxel_mapper_supervision_visualization.cpp
+        src_voxel/voxel_mapper_supervision_rgbd.cpp
+        src_voxel/voxel_mapper_supervision_monocular.cpp
         evaluation/mesh_extraction.cpp
         src_voxel/voxel_parameters.cpp
         src_voxel/voxel_scene.cpp
         src_voxel/voxel_keyframe.cpp
         src_voxel/voxel_model.cpp
+        src_voxel/voxel_model_sdf.cpp
+        src_voxel/voxel_model_creation.cpp
+        src_voxel/voxel_model_insertion.cpp
+        src_voxel/voxel_model_optimization.cpp
+        src_voxel/voxel_model_regularization.cpp
+        src_voxel/voxel_model_io.cpp
         src_voxel/voxel_svrecon_rasterizer.cpp
         src_voxel/tandem_mvs_backend.cpp
-        src_voxel/omnidata_depth_backend.cpp
         src_voxel/rerun_utils.cpp
+        src_voxel/rerun_utils_mesh.cpp
+        src_voxel/rerun_utils_debug.cpp
         third_party/tinyply/tinyply.h
         third_party/tinyply/tinyply.cpp)
         
@@ -502,21 +522,6 @@ target_link_libraries(replica_mono_voxel
         ${Python3_LIBRARIES}
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
-if(PHOTOSLAM_BUILD_WAYMO)
-add_executable(waymo_mono_voxel examples/waymo_mono_voxel.cpp)
-target_include_directories(waymo_mono_voxel PRIVATE
-    ${CMAKE_SOURCE_DIR}/include_voxel
-    pybind11::embed)
-target_link_libraries(waymo_mono_voxel
-    voxel_core
-    voxel_viewer
-    ${OpenCV_LIBS}
-    ${TORCH_LIBRARIES}
-    ${TORCH_PYTHON_LIBRARY}
-    ${Python3_LIBRARIES}
-    ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so)
-endif()
-
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # TUM Monocular (original Photo-SLAM Gaussian mapper)
@@ -598,23 +603,6 @@ target_link_libraries(tum_mono_voxel
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
 
-# EuRoC cam0 monocular runner. Its CSV/grayscale loader is isolated from the
-# generic TUM/ScanNet image-list runner.
-add_executable(euroc_mono_voxel examples/euroc_mono_voxel.cpp)
-target_include_directories(euroc_mono_voxel PRIVATE
-        ${CMAKE_SOURCE_DIR}/include_voxel
-        pybind11::embed
-)
-target_link_libraries(euroc_mono_voxel
-        voxel_core
-        voxel_viewer
-        ${OpenCV_LIBS}
-        ${TORCH_LIBRARIES}
-        ${TORCH_PYTHON_LIBRARY}
-        ${Python3_LIBRARIES}
-        ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
-)
-
 # ScanNet uses the same generic timestamp/RGB/depth association runner as TUM,
 # but has a separate executable, generated camera calibration, and mapper YAML.
 add_executable(scannet_rgbd_voxel examples/tum_rgbd_voxel.cpp)
@@ -644,30 +632,8 @@ target_link_libraries(scannet_mono_voxel
         ${Python3_LIBRARIES}
         ${ORB_SLAM3_SOURCE_DIR}/lib/libORB_SLAM3.so
 )
+
 set_target_properties(voxel_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# Mesh evaluation utility (reconstruction mesh vs GT mesh)
-add_executable(mesh_eval
-        evaluation/mesh_eval.cpp
-        third_party/tinyply/tinyply.h
-        third_party/tinyply/tinyply.cpp)
-target_include_directories(mesh_eval PRIVATE
-        ${PROJECT_SOURCE_DIR}
-        ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(mesh_eval
-        ${OpenCV_LIBRARIES}
-        jsoncpp_lib)
-
-if(PHOTOSLAM_ENABLE_RERUN)
-    add_executable(maps_compare_rerun
-            evaluation/maps_compare_rerun.cpp)
-    target_include_directories(maps_compare_rerun PRIVATE
-            ${PROJECT_SOURCE_DIR}
-            ${OpenCV_INCLUDE_DIRS})
-    target_link_libraries(maps_compare_rerun
-            ${OpenCV_LIBRARIES}
-            rerun_sdk)
-endif()
 
 # # EuRoC Stereo
 # add_executable(euroc_stereo examples/euroc_stereo.cpp)

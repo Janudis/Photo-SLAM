@@ -235,11 +235,12 @@ void VoxelMapper::logReconstructionMeshToRerun(int iteration)
     const float voxel_length =
         std::max(current_sdf_voxel, std::max(1.0e-6f, sdf_params_.sdf_voxel_size_m_));
     const float sdf_trunc =
-        std::max(1.0e-6f, sdf_params_.sdf_init_trunc_vox_ * voxel_length);
+        std::max(1.0e-6f, sv::kSdfInitializationTruncVox * voxel_length);
+    const float sdf_init_max_depth = sensor_type_ == MONOCULAR
+        ? sv::kMonocularSdfInitializationMaxDepthM
+        : sv::kRgbdSdfInitializationMaxDepthM;
     const float depth_trunc =
-        (sdf_params_.sdf_init_max_depth_m_ > 0.0f)
-            ? sdf_params_.sdf_init_max_depth_m_
-            : kCommonEvalDepthTrunc;
+        sdf_init_max_depth > 0.0f ? sdf_init_max_depth : kCommonEvalDepthTrunc;
 
     SparseTsdfVolume volume(voxel_length, sdf_trunc);
 

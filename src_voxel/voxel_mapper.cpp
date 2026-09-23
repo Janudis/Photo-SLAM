@@ -104,10 +104,6 @@ VoxelMapper::VoxelMapper(std::shared_ptr<ORB_SLAM3::System> pSLAM,
             std::cout
                 << "; full-image TANDEM MVS TSDF evidence promotes "
                    "confirmed SVRecon cells";
-        } else if (monocular_mvs_densify_) {
-            std::cout
-                << "; TANDEM MVS depth closes residual render holes after "
-                   "ORB monocular map initialization";
         }
         std::cout << ".\n";
     }

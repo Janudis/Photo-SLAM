@@ -186,7 +186,7 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
     torch::Tensor selected_holes = detectRgbdRenderHolePixels(
         pkf,
         depth_tensor,
-        rgbd_tsdf_evidence_pixel_stride_,
+        sv::kRgbdTsdfEvidencePixelStride,
         /*render_on_stride_grid=*/true,
         valid_depth_pixels,
         hole_pixels,
@@ -208,7 +208,7 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
     const Sophus::SE3f Twc = Tcw.inverse();
     const float truncation = std::max(
         rgbd_tsdf_layout_cell_size_,
-        rgbd_tsdf_evidence_trunc_vox_ * rgbd_tsdf_layout_cell_size_);
+        sv::kRgbdTsdfEvidenceTruncVox * rgbd_tsdf_layout_cell_size_);
     const float max_depth = RGBD_max_depth_;
     torch::Tensor selected_indices =
         torch::nonzero(selected_holes.reshape({-1}))
@@ -362,7 +362,7 @@ void VoxelMapper::integrateRgbdTsdfEvidenceForRenderHoles(
                   denominator
             : sample;
         evidence.weight = std::min(
-            denominator, rgbd_tsdf_evidence_max_weight_);
+            denominator, sv::kRgbdTsdfEvidenceMaxWeight);
         updated_corners.insert(key);
     }
 
@@ -555,7 +555,7 @@ void VoxelMapper::promoteRgbdTsdfEvidenceCells(
             continue;
         }
         if (static_cast<int>(cell_evidence.observed_keyframes.size()) <
-            rgbd_tsdf_evidence_promote_min_views_) {
+            sv::kRgbdTsdfEvidencePromoteMinViews) {
             if (log_evidence_snapshot) {
                 waiting_view_cells.push_back(key);
             }

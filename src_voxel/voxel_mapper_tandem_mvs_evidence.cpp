@@ -247,11 +247,7 @@ void VoxelMapper::integrateMonocularMvsDepth(
         result.depth,
         result.confidence,
         sv::LearnedDepthSource::TandemMvs);
-    if (monocular_mvs_tsdf_evidence_) {
-        integrateMonocularMvsTsdfEvidence(result);
-    } else {
-        integrateMonocularMvsSurfaceDepth(result.depth);
-    }
+    integrateMonocularMvsTsdfEvidence(result);
     if (reference) {
         markSurfaceViewPruningPending({reference});
     }

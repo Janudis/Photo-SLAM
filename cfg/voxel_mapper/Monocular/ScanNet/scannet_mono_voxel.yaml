@@ -26,7 +26,6 @@ Mapper.sdf_initialization_mode: "weak_surface_prior"
 
 # TANDEM MVS consumes ORB camera poses directly, so its depth remains in the
 # same arbitrary monocular gauge. Match TANDEM's sparse inverse-depth range.
-Mapper.monocular_mvs_densify: 0
 Mapper.monocular_mvs_model_dir: "models/tandem/model.pt"
 Mapper.monocular_mvs_tsdf_evidence: 1
 
@@ -35,8 +34,6 @@ Mapper.monocular_mvs_tsdf_evidence: 1
 # consistency gates depths before the shared structural-hole insertion.
 
 Mapper.sdf_voxel_size_m: 0.05
-Mapper.sdf_init_trunc_vox: 4.0
-Mapper.sdf_init_max_depth_m: 0.0
 
 Mapper.min_num_initial_map_kfs: 10
 Mapper.new_keyframe_times_of_use: 2
@@ -64,19 +61,8 @@ Record.run_reconstruction_mesh: 0
 Record.rerun_gt_mesh: 0
 # Evaluation-only metric target, converted to the monocular map gauge from the
 # shutdown depth-scale fit. Large scenes are bounded by a sparse-grid budget.
-Record.rendered_mesh_voxel_size_m: 0.05
 Record.rendered_mesh_scale_aware: 1
 Record.rendered_mesh_max_grid_points: 2000000
-Record.rendered_mesh_min_weight: 1.0
-Record.rendered_mesh_trunc_vox: 8.0
-Record.rendered_mesh_depth_max_m: 10.0
-Record.svrecon_mesh_init_lv: 7
-Record.svrecon_mesh_final_lv: 9
-Record.svrecon_mesh_trunc_lv: 10
-Record.svrecon_mesh_trunc_vox: 5.0
-Record.svrecon_mesh_pg_prune: 0.6
-Record.svrecon_mesh_crop_border: 0.01
-Record.svrecon_mesh_alpha_thres: 0.5
 Record.svrecon_mesh_use_mean_depth: 0
 Record.svrecon_mesh_use_vert_color: 1
 

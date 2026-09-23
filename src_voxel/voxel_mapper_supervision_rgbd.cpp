@@ -601,7 +601,7 @@ torch::Tensor VoxelMapper::computeRgbdSdfLoss(
     const float min_depth = std::max(RGBD_min_depth_, near_depth);
     const float tau = std::max(
         1.0e-4f,
-        opt_params_.rgbd_sdf_trunc_vox_ * voxel_model_->fixedVoxSize());
+        sv::kRgbdSdfTruncVox * voxel_model_->fixedVoxSize());
     const float center_band = 0.4f * tau;
 
     torch::Tensor valid_depth =
@@ -612,11 +612,11 @@ torch::Tensor VoxelMapper::computeRgbdSdfLoss(
         return zero;
     }
 
-    const int free_samples = std::max(0, opt_params_.rgbd_sdf_free_samples_);
-    const int surface_samples = std::max(0, opt_params_.rgbd_sdf_surface_samples_);
+    const int free_samples = sv::kRgbdSdfFreeSamples;
+    const int surface_samples = sv::kRgbdSdfSurfaceSamples;
     const int samples_per_ray = free_samples + surface_samples;
     const int64_t requested_pixels =
-        std::max<int64_t>(0, static_cast<int64_t>(opt_params_.rgbd_sdf_ray_pixels_));
+        static_cast<int64_t>(sv::kRgbdSdfRayPixels);
     if (samples_per_ray <= 0 || requested_pixels <= 0 ||
         !std::isfinite(cam.fx) || !std::isfinite(cam.fy) ||
         std::abs(cam.fx) < 1.0e-6f || std::abs(cam.fy) < 1.0e-6f) {
@@ -630,10 +630,10 @@ torch::Tensor VoxelMapper::computeRgbdSdfLoss(
     }
     const int64_t valid_pixel_count = valid_uv.size(0);
     int64_t capped_pixels = requested_pixels;
-    if (opt_params_.rgbd_sdf_max_samples_ > 0) {
+    if (sv::kRgbdSdfMaxSamples > 0) {
         capped_pixels = std::min<int64_t>(
             capped_pixels,
-            std::max<int64_t>(1, opt_params_.rgbd_sdf_max_samples_ / samples_per_ray));
+            std::max<int64_t>(1, sv::kRgbdSdfMaxSamples / samples_per_ray));
     }
     const int64_t pixel_count =
         std::min<int64_t>(valid_pixel_count, capped_pixels);
@@ -791,12 +791,12 @@ torch::Tensor VoxelMapper::computeRgbdSdfLoss(
         masked_mse(pred_norm - target_norm, tail);
 
     torch::Tensor loss =
-        opt_params_.rgbd_sdf_w_fs_ * fs_loss +
-        opt_params_.rgbd_sdf_w_center_ * center_loss +
-        opt_params_.rgbd_sdf_w_tail_ * tail_loss;
+        sv::kRgbdSdfFreeSpaceWeight * fs_loss +
+        sv::kRgbdSdfCenterWeight * center_loss +
+        sv::kRgbdSdfTailWeight * tail_loss;
 
     if (opt_params_.rgbd_sdf_end_ <= opt_params_.rgbd_sdf_from_ ||
-        opt_params_.rgbd_sdf_end_mult_ == 1.0f) {
+        sv::kRgbdSdfEndMultiplier == 1.0f) {
         return loss;
     }
 
@@ -806,7 +806,7 @@ torch::Tensor VoxelMapper::computeRgbdSdfLoss(
                                opt_params_.rgbd_sdf_from_),
         0.0f,
         1.0f);
-    const float mult = std::pow(opt_params_.rgbd_sdf_end_mult_, ratio);
+    const float mult = std::pow(sv::kRgbdSdfEndMultiplier, ratio);
     return loss * mult;
 }
 

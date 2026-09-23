@@ -181,8 +181,11 @@ torch::Tensor VoxelMapper::computeProjectiveSdfInitForGridPoints(
         (z > RGBD_min_depth_) &
         (u >= 0.0f) & (u < static_cast<float>(W)) &
         (v >= 0.0f) & (v < static_cast<float>(H));
-    if (sdf_params_.sdf_init_max_depth_m_ > 0.0f) {
-        in_image = in_image & (z < sdf_params_.sdf_init_max_depth_m_);
+    const float max_depth = sensor_type_ == MONOCULAR
+        ? sv::kMonocularSdfInitializationMaxDepthM
+        : sv::kRgbdSdfInitializationMaxDepthM;
+    if (max_depth > 0.0f) {
+        in_image = in_image & (z < max_depth);
     }
 
     torch::Tensor depth =
@@ -213,7 +216,7 @@ torch::Tensor VoxelMapper::computeProjectiveSdfInitForGridPoints(
         depth_flat.index_select(0, (v_idx * W + u_idx).to(torch::kLong)).view({N});
 
     const float trunc_m =
-        std::max(1.0e-6f, sdf_params_.sdf_init_trunc_vox_ * sdfMetricVoxelSize());
+        std::max(1.0e-6f, sv::kSdfInitializationTruncVox * sdfMetricVoxelSize());
     torch::Tensor sdf = torch::clamp(sampled_depth - z, -trunc_m, trunc_m);
     torch::Tensor valid =
         in_image &
@@ -260,7 +263,7 @@ int64_t VoxelMapper::fuseProjectiveSdfInitFromKeyframe(
     if (targeted_hole_update && valid.any().item<bool>()) {
         const float trunc_m = std::max(
             1.0e-6f,
-            sdf_params_.sdf_init_trunc_vox_ * sdfMetricVoxelSize());
+            sv::kSdfInitializationTruncVox * sdfMetricVoxelSize());
         // Hole densification supplies local surface support, not a full-ray
         // TSDF rewrite of the ORB field. Values clamped to +/-trunc_m lie
         // outside the measured surface band and are excluded here.

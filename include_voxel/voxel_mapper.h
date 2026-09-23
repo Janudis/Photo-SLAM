@@ -236,7 +236,6 @@ protected:
     sv::MonocularMvsPruneEvidence computeMonocularMvsPruneEvidence(
         const torch::Tensor& centers_world,
         const torch::Tensor& sizes_world);
-    void integrateMonocularMvsSurfaceDepth(const cv::Mat& depth);
     torch::Tensor detectRgbdRenderHolePixels(
         const std::shared_ptr<VoxelKeyframe>& pkf,
         const torch::Tensor& depth,
@@ -495,7 +494,6 @@ protected:
         Eigen::Vector3f::Zero();
     float monocular_rendered_depth_layout_cell_size_ = 0.0f;
     int monocular_rendered_depth_layout_grid_dim_ = 0;
-    bool monocular_mvs_densify_ = false;
     std::filesystem::path monocular_mvs_model_dir_;
     float monocular_mvs_depth_min_m_ = 0.1f;
     float monocular_mvs_depth_max_m_ = 5.0f;
@@ -538,16 +536,11 @@ protected:
     // Direct RGB-D render-hole completion.
     bool rgbd_fill_render_holes_ = false;
     bool rgbd_fill_render_holes_projective_sdf_ = false;
-    int rgbd_fill_render_holes_stride_ = 2;
 
     // Non-renderable RGB-D TSDF evidence used only to promote confirmed
     // residual-hole cells into the active SVRecon octree.
     bool rgbd_tsdf_evidence_ = false;
     bool rgbd_tsdf_evidence_initial_backfill_ = true;
-    int rgbd_tsdf_evidence_pixel_stride_ = 2;
-    float rgbd_tsdf_evidence_trunc_vox_ = 3.0f;
-    float rgbd_tsdf_evidence_max_weight_ = 5.0f;
-    int rgbd_tsdf_evidence_promote_min_views_ = 2;
     std::unordered_map<
         sv::RgbdTsdfGridKey,
         sv::RgbdTsdfCornerEvidence,

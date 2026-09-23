@@ -58,7 +58,7 @@ torch::Tensor VoxelMapper::colorizeSvreconMeshVertices(
 
         auto sampled_alpha = sampleBilinear(frame_alpha, valid_uv);
         auto alpha_idx = torch::nonzero(
-                             sampled_alpha > rerun_params_.svrecon_mesh_alpha_thres_)
+                             sampled_alpha > sv::kSvreconMeshAlphaThreshold)
                              .view({-1}).to(torch::kLong);
         if (alpha_idx.numel() == 0) continue;
         valid_idx = valid_idx.index_select(0, alpha_idx);
@@ -144,6 +144,9 @@ void VoxelMapper::saveRenderedTsdfMeshPly(
         undistort_mask_,
         rerun_params_,
         mutex_render_,
+        sensor_type_ == MONOCULAR
+            ? sv::kMonocularRenderedMeshDepthMaxM
+            : sv::kRgbdRenderedMeshDepthMaxM,
         std::nullopt);
     auto keep_idx =
         torch::nonzero(surface.surface_cell_mask).view({-1}).to(torch::kLong);
@@ -226,7 +229,10 @@ torch::Tensor VoxelMapper::computeRenderedTsdfSurfacePruneMask(
             scene_->keyframes(),
             undistort_mask_,
             rerun_params_,
-            mutex_render_);
+            mutex_render_,
+            sensor_type_ == MONOCULAR
+                ? sv::kMonocularRenderedMeshDepthMaxM
+                : sv::kRgbdRenderedMeshDepthMaxM);
         stats.rendered_view_count = surface.rendered_view_count;
         stats.candidate_grid_point_count = surface.grid_xyz.size(0);
         stats.candidate_grid_cell_count = surface.voxel_keys.size(0);
@@ -468,9 +474,9 @@ void VoxelMapper::saveSvreconRenderedTsdfMeshPly(
     const int max_inside_level = std::max(
         1, voxel_model_->maxNumLevels() - voxel_model_->outsideLevel());
     const int final_inside_level = std::clamp(
-        rerun_params_.svrecon_mesh_final_lv_, 1, max_inside_level);
+        sv::kSvreconMeshFinalLevel, 1, max_inside_level);
     const int init_inside_level = std::clamp(
-        rerun_params_.svrecon_mesh_init_lv_, 1, final_inside_level);
+        sv::kSvreconMeshInitialLevel, 1, final_inside_level);
     auto [octpath, octlevel, grid_xyz, vox_key] =
         voxel_model_->buildSvreconDenseExtractionGrid(init_inside_level);
     grid_xyz = grid_xyz.detach().to(torch::kFloat32).contiguous();
@@ -487,11 +493,11 @@ void VoxelMapper::saveSvreconRenderedTsdfMeshPly(
          inside_level <= final_inside_level;
          ++inside_level) {
         const int trunc_inside_level = std::min(
-            inside_level, rerun_params_.svrecon_mesh_trunc_lv_);
+            inside_level, sv::kSvreconMeshTruncationLevel);
         const int trunc_level = std::min(
             voxel_model_->maxNumLevels(),
             voxel_model_->outsideLevel() + trunc_inside_level);
-        trunc_dist = rerun_params_.svrecon_mesh_trunc_vox_ *
+        trunc_dist = sv::kSvreconMeshTruncationVox *
             std::ldexp(scene_extent, -trunc_level);
         std::cout << "[SVRecon mesh/rendered-TSDF] level=" << inside_level
                   << " voxels=" << vox_key.size(0)
@@ -500,15 +506,15 @@ void VoxelMapper::saveSvreconRenderedTsdfMeshPly(
             grid_xyz,
             views,
             trunc_dist,
-            rerun_params_.svrecon_mesh_crop_border_,
-            rerun_params_.svrecon_mesh_alpha_thres_);
+            sv::kSvreconMeshCropBorder,
+            sv::kSvreconMeshAlphaThreshold);
 
         if (inside_level >= final_inside_level) break;
         auto vox_tsdf = grid_tsdf.index({vox_key}).reshape({vox_key.size(0), 8});
         auto prune_mask =
             torch::isnan(vox_tsdf).any(1) |
-            (std::get<0>(vox_tsdf.max(1)) < -rerun_params_.svrecon_mesh_pg_prune_) |
-            (std::get<0>(vox_tsdf.min(1)) > rerun_params_.svrecon_mesh_pg_prune_);
+            (std::get<0>(vox_tsdf.max(1)) < -sv::kSvreconMeshProgressivePrune) |
+            (std::get<0>(vox_tsdf.min(1)) > sv::kSvreconMeshProgressivePrune);
         auto keep_idx = torch::nonzero(~prune_mask).view({-1}).to(torch::kLong);
         if (keep_idx.numel() == 0) {
             throw std::runtime_error(

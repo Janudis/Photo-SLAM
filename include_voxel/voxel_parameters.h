@@ -169,15 +169,6 @@ public:
     float lambda_rgbd_sdf_ = 0.0f;
     int   rgbd_sdf_from_ = 0;
     int   rgbd_sdf_end_ = 15000;
-    float rgbd_sdf_end_mult_ = 0.1f;
-    float rgbd_sdf_trunc_vox_ = 4.0f;
-    int   rgbd_sdf_max_samples_ = 40000;
-    int   rgbd_sdf_ray_pixels_ = 1024;
-    int   rgbd_sdf_free_samples_ = 4;
-    int   rgbd_sdf_surface_samples_ = 8;
-    float rgbd_sdf_w_fs_ = 5.0f;
-    float rgbd_sdf_w_center_ = 20.0f;
-    float rgbd_sdf_w_tail_ = 1.0f;
     float lambda_ascending_;
     int   ascending_from_;
     float lambda_rectify_;

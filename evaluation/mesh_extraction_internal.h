@@ -648,6 +648,7 @@ RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
     const std::map<sv::camera_id_t, torch::Tensor>& undistort_masks,
     const VoxelRerunParameters& params,
     std::mutex& render_mutex,
+    float depth_max,
     std::optional<float> model_to_metric_scale = std::nullopt)
 {
     if (!voxel_model) {
@@ -660,8 +661,7 @@ RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
     }
 
     torch::NoGradGuard no_grad;
-    const float requested_metric_voxel_size =
-        std::max(1.0e-6f, params.rendered_mesh_voxel_size_m_);
+    const float requested_metric_voxel_size = sv::kRenderedMeshVoxelSizeM;
     const bool scale_aware =
         params.rendered_mesh_scale_aware_ &&
         model_to_metric_scale.has_value() &&
@@ -669,12 +669,9 @@ RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
         *model_to_metric_scale > 1.0e-6f;
     const float metric_scale = scale_aware ? *model_to_metric_scale : 1.0f;
     float voxel_length = requested_metric_voxel_size / metric_scale;
-    const float min_keyframe_weight =
-        std::max(0.0f, params.rendered_mesh_min_weight_);
-    const float depth_max =
-        std::max(1.0e-6f, params.rendered_mesh_depth_max_m_);
-    const float alpha_threshold =
-        std::clamp(params.svrecon_mesh_alpha_thres_, 0.0f, 1.0f);
+    const float min_keyframe_weight = sv::kRenderedMeshMinWeight;
+    depth_max = std::max(1.0e-6f, depth_max);
+    const float alpha_threshold = sv::kSvreconMeshAlphaThreshold;
     std::unique_lock<std::mutex> render_lock(render_mutex);
     bool froze_geo = false;
     auto unfreeze_geo = [&]() {
@@ -819,7 +816,7 @@ RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
         for (int attempt = 0; attempt < 8; ++attempt) {
             const float sdf_trunc = std::max(
                 voxel_length,
-                params.rendered_mesh_trunc_vox_ * voxel_length);
+                sv::kRenderedMeshTruncVox * voxel_length);
             support_grid = std::make_unique<SparseRenderedTsdfGrid>(
                 voxel_length, sdf_trunc);
             for (const auto& allocation_view : allocation_views) {
@@ -857,7 +854,7 @@ RenderedTsdfSurfaceData buildRenderedTsdfSurfaceData(
 
         const float sdf_trunc = std::max(
             voxel_length,
-            params.rendered_mesh_trunc_vox_ * voxel_length);
+            sv::kRenderedMeshTruncVox * voxel_length);
 
         auto grid = support_grid->buildGrid(
             voxel_model->geoGridPts().device());

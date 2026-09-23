@@ -313,7 +313,7 @@ void VoxelMapper::captureMonocularMvsKeyframeMetadata(
 
 bool VoxelMapper::isMonocularMvsPipelineEnabled() const
 {
-    return monocular_mvs_densify_ || monocular_mvs_tsdf_evidence_;
+    return monocular_mvs_tsdf_evidence_;
 }
 
 void VoxelMapper::refreshMonocularMvsKeyframeMetadata()

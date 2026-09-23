@@ -167,7 +167,7 @@ void VoxelMapper::fillRgbdRenderHolesSdf(
     torch::Tensor hole_mask = detectRgbdRenderHolePixels(
         pkf,
         depth,
-        rgbd_fill_render_holes_stride_,
+        sv::kRgbdFillRenderHolesStride,
         /*render_on_stride_grid=*/false,
         valid_depth_pixels,
         hole_pixels,

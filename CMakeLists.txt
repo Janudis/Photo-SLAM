@@ -383,7 +383,6 @@ add_library(voxel_core
         src_voxel/voxel_mapper_monocular_densification.cpp
         src_voxel/voxel_mapper_tandem_mvs.cpp
         src_voxel/voxel_mapper_tandem_mvs_evidence.cpp
-        src_voxel/voxel_mapper_tandem_mvs_integration.cpp
         src_voxel/voxel_mapper_monocular_mvs_tsdf_evidence.cpp
         src_voxel/voxel_mapper_rgbd_tsdf_evidence.cpp
         src_voxel/voxel_mapper_tsdf.cpp

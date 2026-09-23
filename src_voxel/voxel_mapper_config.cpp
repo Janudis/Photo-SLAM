@@ -82,10 +82,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
 
     inactive_geo_densify_ =
         (settings_file["Mapper.inactive_geo_densify"].operator int()) != 0;
-    if (!settings_file["Mapper.monocular_mvs_densify"].empty()) {
-        monocular_mvs_densify_ =
-            (settings_file["Mapper.monocular_mvs_densify"].operator int()) != 0;
-    }
     if (!settings_file["Mapper.monocular_mvs_model_dir"].empty()) {
         monocular_mvs_model_dir_ =
             settings_file["Mapper.monocular_mvs_model_dir"].operator std::string();
@@ -114,7 +110,7 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         if (monocular_mvs_model_dir_.empty()) {
             throw std::runtime_error(
                 "Mapper.monocular_mvs_model_dir is required when "
-                "TANDEM MVS densification or TSDF evidence is enabled");
+                "TANDEM MVS TSDF evidence is enabled");
         }
     }
     if (!settings_file["Mapper.allocate_orb_voxels"].empty()) {
@@ -164,10 +160,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
         rgbd_fill_render_holes_projective_sdf_ =
             (settings_file["Mapper.rgbd_fill_render_holes_projective_sdf"].operator int()) != 0;
     }
-    if (!settings_file["Mapper.rgbd_fill_render_holes_stride"].empty()) {
-        rgbd_fill_render_holes_stride_ =
-            std::max(1, settings_file["Mapper.rgbd_fill_render_holes_stride"].operator int());
-    }
     if (!settings_file["Mapper.rgbd_tsdf_evidence"].empty()) {
         rgbd_tsdf_evidence_ =
             (settings_file["Mapper.rgbd_tsdf_evidence"].operator int()) != 0;
@@ -175,26 +167,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     if (!settings_file["Mapper.rgbd_tsdf_evidence_initial_backfill"].empty()) {
         rgbd_tsdf_evidence_initial_backfill_ =
             (settings_file["Mapper.rgbd_tsdf_evidence_initial_backfill"].operator int()) != 0;
-    }
-    if (!settings_file["Mapper.rgbd_tsdf_evidence_pixel_stride"].empty()) {
-        rgbd_tsdf_evidence_pixel_stride_ = std::max(
-            1,
-            settings_file["Mapper.rgbd_tsdf_evidence_pixel_stride"].operator int());
-    }
-    if (!settings_file["Mapper.rgbd_tsdf_evidence_trunc_vox"].empty()) {
-        rgbd_tsdf_evidence_trunc_vox_ = std::max(
-            0.5f,
-            settings_file["Mapper.rgbd_tsdf_evidence_trunc_vox"].operator float());
-    }
-    if (!settings_file["Mapper.rgbd_tsdf_evidence_max_weight"].empty()) {
-        rgbd_tsdf_evidence_max_weight_ = std::max(
-            1.0e-4f,
-            settings_file["Mapper.rgbd_tsdf_evidence_max_weight"].operator float());
-    }
-    if (!settings_file["Mapper.rgbd_tsdf_evidence_promote_min_views"].empty()) {
-        rgbd_tsdf_evidence_promote_min_views_ = std::max(
-            1,
-            settings_file["Mapper.rgbd_tsdf_evidence_promote_min_views"].operator int());
     }
     if (rgbd_tsdf_evidence_) {
         if (rgbd_fill_render_holes_ || sdf_initialization_rgbd_projective_) {
@@ -210,14 +182,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     if (!settings_file["Mapper.sdf_voxel_size_m"].empty()) {
         sdf_params_.sdf_voxel_size_m_ =
             std::max(1.0e-4f, settings_file["Mapper.sdf_voxel_size_m"].operator float());
-    }
-    if (!settings_file["Mapper.sdf_init_trunc_vox"].empty()) {
-        sdf_params_.sdf_init_trunc_vox_ =
-            std::max(1.0e-3f, settings_file["Mapper.sdf_init_trunc_vox"].operator float());
-    }
-    if (!settings_file["Mapper.sdf_init_max_depth_m"].empty()) {
-        sdf_params_.sdf_init_max_depth_m_ =
-            std::max(0.0f, settings_file["Mapper.sdf_init_max_depth_m"].operator float());
     }
 
     pipe_params_.convert_SHs_ =
@@ -438,33 +402,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     if (!settings_file["Optimization.rgbd_sdf_end"].empty()) {
         opt_params_.rgbd_sdf_end_ = settings_file["Optimization.rgbd_sdf_end"].operator int();
     }
-    if (!settings_file["Optimization.rgbd_sdf_end_mult"].empty()) {
-        opt_params_.rgbd_sdf_end_mult_ = settings_file["Optimization.rgbd_sdf_end_mult"].operator float();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_trunc_vox"].empty()) {
-        opt_params_.rgbd_sdf_trunc_vox_ = settings_file["Optimization.rgbd_sdf_trunc_vox"].operator float();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_max_samples"].empty()) {
-        opt_params_.rgbd_sdf_max_samples_ = settings_file["Optimization.rgbd_sdf_max_samples"].operator int();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_ray_pixels"].empty()) {
-        opt_params_.rgbd_sdf_ray_pixels_ = settings_file["Optimization.rgbd_sdf_ray_pixels"].operator int();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_free_samples"].empty()) {
-        opt_params_.rgbd_sdf_free_samples_ = settings_file["Optimization.rgbd_sdf_free_samples"].operator int();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_surface_samples"].empty()) {
-        opt_params_.rgbd_sdf_surface_samples_ = settings_file["Optimization.rgbd_sdf_surface_samples"].operator int();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_w_fs"].empty()) {
-        opt_params_.rgbd_sdf_w_fs_ = settings_file["Optimization.rgbd_sdf_w_fs"].operator float();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_w_center"].empty()) {
-        opt_params_.rgbd_sdf_w_center_ = settings_file["Optimization.rgbd_sdf_w_center"].operator float();
-    }
-    if (!settings_file["Optimization.rgbd_sdf_w_tail"].empty()) {
-        opt_params_.rgbd_sdf_w_tail_ = settings_file["Optimization.rgbd_sdf_w_tail"].operator float();
-    }
     /* ───────── LOGGING PARAMETERS ───────── */
     training_report_interval_ =
         settings_file["Record.training_report_interval"].operator int();
@@ -495,12 +432,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
     rerun_params_.save_progressive_rendered_tsdf_mesh_ =
         !settings_file["Record.save_progressive_rendered_tsdf_mesh"].empty() &&
         (settings_file["Record.save_progressive_rendered_tsdf_mesh"].operator int()) != 0;
-    rerun_params_.rendered_mesh_voxel_size_m_ =
-        settings_file["Record.rendered_mesh_voxel_size_m"].empty()
-            ? 0.05f
-            : std::max(
-                  1.0e-6f,
-                  settings_file["Record.rendered_mesh_voxel_size_m"].operator float());
     rerun_params_.rendered_mesh_scale_aware_ =
         !settings_file["Record.rendered_mesh_scale_aware"].empty() &&
         (settings_file["Record.rendered_mesh_scale_aware"].operator int()) != 0;
@@ -510,58 +441,6 @@ void VoxelMapper::readConfigFromFile(const std::filesystem::path& cfg_path)
             : static_cast<std::size_t>(std::max(
                   0,
                   settings_file["Record.rendered_mesh_max_grid_points"].operator int()));
-    rerun_params_.rendered_mesh_min_weight_ =
-        settings_file["Record.rendered_mesh_min_weight"].empty()
-            ? 2.0f
-            : std::max(
-                  0.0f,
-                  settings_file["Record.rendered_mesh_min_weight"].operator float());
-    rerun_params_.rendered_mesh_trunc_vox_ =
-        settings_file["Record.rendered_mesh_trunc_vox"].empty()
-            ? 8.0f
-            : std::max(
-                  1.0f,
-                  settings_file["Record.rendered_mesh_trunc_vox"].operator float());
-    rerun_params_.rendered_mesh_depth_max_m_ =
-        settings_file["Record.rendered_mesh_depth_max_m"].empty()
-            ? 5.0f
-            : std::max(
-                  1.0e-6f,
-                  settings_file["Record.rendered_mesh_depth_max_m"].operator float());
-    rerun_params_.svrecon_mesh_init_lv_ =
-        settings_file["Record.svrecon_mesh_init_lv"].empty()
-            ? 7
-            : std::max(1, settings_file["Record.svrecon_mesh_init_lv"].operator int());
-    rerun_params_.svrecon_mesh_final_lv_ =
-        settings_file["Record.svrecon_mesh_final_lv"].empty()
-            ? 10
-            : std::max(1, settings_file["Record.svrecon_mesh_final_lv"].operator int());
-    rerun_params_.svrecon_mesh_trunc_lv_ =
-        settings_file["Record.svrecon_mesh_trunc_lv"].empty()
-            ? 10
-            : std::max(1, settings_file["Record.svrecon_mesh_trunc_lv"].operator int());
-    rerun_params_.svrecon_mesh_trunc_vox_ =
-        settings_file["Record.svrecon_mesh_trunc_vox"].empty()
-            ? 5.0f
-            : std::max(1.0e-6f, settings_file["Record.svrecon_mesh_trunc_vox"].operator float());
-    rerun_params_.svrecon_mesh_pg_prune_ =
-        settings_file["Record.svrecon_mesh_pg_prune"].empty()
-            ? 0.6f
-            : std::max(0.0f, settings_file["Record.svrecon_mesh_pg_prune"].operator float());
-    rerun_params_.svrecon_mesh_crop_border_ =
-        settings_file["Record.svrecon_mesh_crop_border"].empty()
-            ? 0.01f
-            : std::clamp(
-                  settings_file["Record.svrecon_mesh_crop_border"].operator float(),
-                  0.0f,
-                  0.99f);
-    rerun_params_.svrecon_mesh_alpha_thres_ =
-        settings_file["Record.svrecon_mesh_alpha_thres"].empty()
-            ? 0.5f
-            : std::clamp(
-                  settings_file["Record.svrecon_mesh_alpha_thres"].operator float(),
-                  0.0f,
-                  1.0f);
     rerun_params_.svrecon_mesh_use_mean_depth_ =
         !settings_file["Record.svrecon_mesh_use_mean_depth"].empty() &&
         (settings_file["Record.svrecon_mesh_use_mean_depth"].operator int()) != 0;

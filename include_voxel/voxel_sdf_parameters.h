@@ -12,8 +12,6 @@
 struct VoxelSdfParameters
 {
     float sdf_voxel_size_m_ = 0.05f;
-    float sdf_init_trunc_vox_ = 4.0f;
-    float sdf_init_max_depth_m_ = 4.0f;
 };
 
 struct VoxelSdfState

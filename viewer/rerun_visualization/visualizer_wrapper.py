@@ -1,4 +1,4 @@
-# scripts/python_rerun_bridge/visualizer_wrapper.py
+# viewer/rerun_visualization/visualizer_wrapper.py
 
 from typing import Dict, Deque, Optional
 from collections import deque

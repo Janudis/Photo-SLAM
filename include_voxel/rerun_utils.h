@@ -17,7 +17,7 @@ namespace sv {
  * Thin C++ → Python bridge to the Python RerunVisualizer.
  *
  * Internally this calls:
- *   scripts/python_rerun_bridge/visualizer_wrapper.RerunVisualizer
+ *   viewer/rerun_visualization/visualizer_wrapper.RerunVisualizer
  *
  * It does NOT assume ownership of the Python interpreter; we just acquire
  * the GIL and import the module.
@@ -255,7 +255,7 @@ private:
     std::mutex deferred_debug_mutex_;
     std::vector<std::function<void()>> deferred_debug_calls_;
 
-    // Python object: instance of python_rerun_bridge.visualizer_wrapper.RerunVisualizer
+    // Python object: instance of rerun_visualization.visualizer_wrapper.RerunVisualizer
     struct PyImpl;
     PyImpl* impl_ = nullptr;
 };

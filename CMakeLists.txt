@@ -109,23 +109,23 @@ set(SVRECON_NAMESPACE_REMAP
     ADAM_STEP=SVRECON_ADAM_STEP)
 
 add_library(svrecon_cuda_core STATIC
-    third_party/SVRecon/cuda/src/raster_state.cu
-    third_party/SVRecon/cuda/src/preprocess.cu
-    third_party/SVRecon/cuda/src/forward.cu
-    third_party/SVRecon/cuda/src/backward.cu
-    third_party/SVRecon/cuda/src/geo_params_gather.cu
-    third_party/SVRecon/cuda/src/sh_compute.cu
-    third_party/SVRecon/cuda/src/tv_compute.cu
-    third_party/SVRecon/cuda/src/vg_compute.cu
-    third_party/SVRecon/cuda/src/ge_compute.cu
-    third_party/SVRecon/cuda/src/ls_compute.cu
-    third_party/SVRecon/cuda/src/pl_compute.cu
-    third_party/SVRecon/cuda/src/utils.cu
-    third_party/SVRecon/cuda/src/adam_step.cu)
+    cuda_rasterizer/raster_state.cu
+    cuda_rasterizer/preprocess.cu
+    cuda_rasterizer/forward.cu
+    cuda_rasterizer/backward.cu
+    cuda_rasterizer/geo_params_gather.cu
+    cuda_rasterizer/sh_compute.cu
+    cuda_rasterizer/tv_compute.cu
+    cuda_rasterizer/vg_compute.cu
+    cuda_rasterizer/ge_compute.cu
+    cuda_rasterizer/ls_compute.cu
+    cuda_rasterizer/pl_compute.cu
+    cuda_rasterizer/utils.cu
+    cuda_rasterizer/adam_step.cu)
 set_target_properties(svrecon_cuda_core PROPERTIES CUDA_ARCHITECTURES "${PHOTOSLAM_CUDA_ARCHITECTURES}")
 target_compile_definitions(svrecon_cuda_core PRIVATE ${SVRECON_NAMESPACE_REMAP})
 target_include_directories(svrecon_cuda_core PUBLIC
-    ${PROJECT_SOURCE_DIR}/third_party/SVRecon/cuda
+    ${PROJECT_SOURCE_DIR}/cuda_rasterizer
     ${TORCH_INCLUDE_DIRS}
     ${Python3_INCLUDE_DIRS})
 target_link_libraries(svrecon_cuda_core PUBLIC "${TORCH_LIBRARIES}")

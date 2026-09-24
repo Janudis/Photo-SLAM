@@ -21,13 +21,13 @@
 #define UTILS SVRECON_UTILS
 #define ADAM_STEP SVRECON_ADAM_STEP
 
-#include "third_party/SVRecon/cuda/src/backward.h"
-#include "third_party/SVRecon/cuda/src/config.h"
-#include "third_party/SVRecon/cuda/src/forward.h"
-#include "third_party/SVRecon/cuda/src/geo_params_gather.h"
-#include "third_party/SVRecon/cuda/src/preprocess.h"
-#include "third_party/SVRecon/cuda/src/raster_state.h"
-#include "third_party/SVRecon/cuda/src/sh_compute.h"
+#include "cuda_rasterizer/backward.h"
+#include "cuda_rasterizer/config.h"
+#include "cuda_rasterizer/forward.h"
+#include "cuda_rasterizer/geo_params_gather.h"
+#include "cuda_rasterizer/preprocess.h"
+#include "cuda_rasterizer/raster_state.h"
+#include "cuda_rasterizer/sh_compute.h"
 
 namespace sv {
 namespace {

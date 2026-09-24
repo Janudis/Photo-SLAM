@@ -96,8 +96,8 @@ for _path in (os.path.join(_user_site, "rerun_sdk"), _user_site):
         sys.path.remove(_path)
     sys.path.insert(0, _path)
 )PY");
-        py::module_::import("sys").attr("path").attr("insert")(0, "scripts_voxel");
-        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts_voxel");
+        py::module_::import("sys").attr("path").attr("insert")(0, "scripts");
+        py::module_::import("sys").attr("path").attr("insert")(0, "../scripts");
     };
 
     if (!initialized_by_mapper && Py_IsInitialized() == 0) {

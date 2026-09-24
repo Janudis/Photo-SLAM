@@ -17,7 +17,7 @@ namespace sv {
  * Thin C++ → Python bridge to the Python RerunVisualizer.
  *
  * Internally this calls:
- *   scripts_voxel/python_rerun_bridge/visualizer_wrapper.RerunVisualizer
+ *   scripts/python_rerun_bridge/visualizer_wrapper.RerunVisualizer
  *
  * It does NOT assume ownership of the Python interpreter; we just acquire
  * the GIL and import the module.

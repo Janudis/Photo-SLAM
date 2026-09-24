@@ -72,7 +72,6 @@ __pycache__/
 /cfg/nvblox_mapper/
 /include_nvblox/
 /src_nvblox/
-/cuda_rasterizer/
 /include/
 /src/
 /docker/ubuntu-jammy-blackwell/
@@ -86,7 +85,6 @@ __pycache__/
 /cfg/ORB_SLAM3/Monocular/Waymo/
 /cfg/voxel_mapper/Monocular/EuRoC/
 /cfg/voxel_mapper/Monocular/Waymo/
-/scripts_voxel/eval/
 /run_euroc_voxel.sh
 /run_waymo_voxel.sh
 /examples/euroc_mono_voxel.cpp

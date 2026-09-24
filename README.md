@@ -25,28 +25,28 @@ Set `LIBTORCH_ROOT` if LibTorch is not installed in a standard CMake search path
 Replica supports RGB-D by default and monocular or monocular+MVS through the mapper configuration:
 
 ```bash
-REPLICA_ROOT=/path/to/Replica ./run_replica_voxel.sh office0
-REPLICA_SENSOR_MODE=monocular REPLICA_ROOT=/path/to/Replica ./run_replica_voxel.sh office0
+REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
+REPLICA_SENSOR_MODE=monocular REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
 ```
 
 TUM supports both sensor modes:
 
 ```bash
-TUM_DATA_ROOT=/path/to/TUM ./run_tum_voxel.sh rgbd_dataset_freiburg1_desk
-TUM_SENSOR_MODE=rgbd TUM_DATA_ROOT=/path/to/TUM ./run_tum_voxel.sh rgbd_dataset_freiburg1_desk
+TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
+TUM_SENSOR_MODE=rgbd TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
 ```
 
 ScanNet inputs are prepared from a `.sens` stream on first use:
 
 ```bash
-SCANNET_ROOT=/path/to/ScanNet ./run_scannet_voxel.sh scene0000_00
-SCANNET_SENSOR_MODE=rgbd SCANNET_ROOT=/path/to/ScanNet ./run_scannet_voxel.sh scene0000_00
+SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
+SCANNET_SENSOR_MODE=rgbd SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
 ```
 
 Run the live RealSense demo with:
 
 ```bash
-./run_realsense_rgbd_voxel.sh
+./scripts/run_realsense_rgbd_voxel.sh
 ```
 
 Set `VOXEL_VIEWER=0` for a headless dataset run, or pass `no_viewer` to the RealSense launcher. Results, trajectories, voxel models, and extracted meshes are written below `results/` unless an output environment variable overrides the location.

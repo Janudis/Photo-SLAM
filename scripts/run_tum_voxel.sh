@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
 tum_data_root="${TUM_DATA_ROOT:-/media/dimitris/v4rl_rog_2t/Dimitris/Datasets_indoor/TUM}"
 sequence_name="${1:-${TUM_SEQUENCE:-rgbd_dataset_freiburg1_desk}}"
 

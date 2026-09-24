@@ -2,13 +2,16 @@
 
 set -euo pipefail
 
-root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
 
 BIN="$root_dir/bin/realsense_rgbd_voxel"
 VOC="$root_dir/ORB-SLAM3/Vocabulary/ORBvoc.txt"
 ORB_CFG="$root_dir/cfg/ORB_SLAM3/RGB-D/RealCamera/realsense_d455f_rgbd_640x360.yaml"
 VOX_CFG="$root_dir/cfg/voxel_mapper/RGB-D/RealCamera/realsense_rgbd_voxel.yaml"
 RESULTS_ROOT="${PHOTOSLAM_RESULTS_ROOT:-$root_dir/results}"
+
+export PYTHONPATH="$root_dir:${PYTHONPATH:-}"
 
 if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "no_viewer" ) ]]; then
     echo "Usage: $0 [no_viewer]" >&2

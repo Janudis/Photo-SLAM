@@ -61,7 +61,7 @@ void RerunVisualizerBridge::init(const std::string& app_id, bool spawn_viewer) {
 
     // Import our Python visualizer
     py::module_ mod = py::module_::import(
-        "scripts_voxel.python_rerun_bridge.visualizer_wrapper"
+        "python_rerun_bridge.visualizer_wrapper"
     );
     py::object cls = mod.attr("RerunVisualizer");
     py::object vis = cls(app_id, spawn_viewer);

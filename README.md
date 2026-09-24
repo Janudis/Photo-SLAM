@@ -1,7 +1,5 @@
 # SVR-SLAM Demo
 
-This branch contains the runtime code for monocular, monocular with MVS, and RGB-D voxel-splat SLAM demos. It targets CUDA desktops and Jetson Orin systems with an optional Intel RealSense input.
-
 ## Dependencies
 
 - CUDA and cuDNN
@@ -11,10 +9,9 @@ This branch contains the runtime code for monocular, monocular with MVS, and RGB
 - Intel RealSense SDK for the live RGB-D runner
 - Python Rerun SDK when `PHOTOSLAM_ENABLE_RERUN=ON`
 
-Initialize the retained submodules before building:
+## Build
 
 ```bash
-git submodule update --init --recursive third_party/SVRecon
 ./build.sh
 ```
 
@@ -22,31 +19,47 @@ Set `LIBTORCH_ROOT` if LibTorch is not installed in a standard CMake search path
 
 ## Demos
 
-Replica supports RGB-D by default and monocular or monocular+MVS through the mapper configuration:
+For monocular runs, set `Mapper.monocular_mvs_tsdf_evidence` to `0` for RGB or `1` for RGB+MVS in the corresponding mapper configuration.
+
+### Replica
 
 ```bash
-REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
+# RGB
 REPLICA_SENSOR_MODE=monocular REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
+
+# RGB + MVS
+REPLICA_SENSOR_MODE=monocular REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
+
+# RGB-D
+REPLICA_SENSOR_MODE=rgbd REPLICA_ROOT=/path/to/Replica ./scripts/run_replica_voxel.sh office0
 ```
 
-TUM supports both sensor modes:
+### TUM RGB-D
 
 ```bash
-TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
+# RGB
+TUM_SENSOR_MODE=monocular TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
+
+# RGB + MVS
+TUM_SENSOR_MODE=monocular TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
+
+# RGB-D
 TUM_SENSOR_MODE=rgbd TUM_DATA_ROOT=/path/to/TUM ./scripts/run_tum_voxel.sh rgbd_dataset_freiburg1_desk
 ```
 
-ScanNet inputs are prepared from a `.sens` stream on first use:
+### ScanNet
+
+ScanNet inputs are prepared from a `.sens` stream on first use.
 
 ```bash
-SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
+# RGB
+SCANNET_SENSOR_MODE=monocular SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
+
+# RGB + MVS
+SCANNET_SENSOR_MODE=monocular SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
+
+# RGB-D
 SCANNET_SENSOR_MODE=rgbd SCANNET_ROOT=/path/to/ScanNet ./scripts/run_scannet_voxel.sh scene0000_00
-```
-
-Run the live RealSense demo with:
-
-```bash
-./scripts/run_realsense_rgbd_voxel.sh
 ```
 
 Set `VOXEL_VIEWER=0` for a headless dataset run, or pass `no_viewer` to the RealSense launcher. Results, trajectories, voxel models, and extracted meshes are written below `results/` unless an output environment variable overrides the location.
@@ -61,6 +74,14 @@ PHOTOSLAM_DATA_ROOT=/path/to/datasets \
 PHOTOSLAM_RESULTS_ROOT=/path/to/results \
 docker/ubuntu-jammy-jetson/create_container.sh
 docker/ubuntu-jammy-jetson/run_container.sh
+```
+
+- RGB: run a monocular dataset command above with MVS disabled.
+- RGB + MVS: run a monocular dataset command above with MVS enabled.
+- RGB-D with Intel RealSense:
+
+```bash
+./scripts/run_realsense_rgbd_voxel.sh
 ```
 
 The implementation retains Photo-SLAM and ORB-SLAM3 licensing terms. See `LICENSE`, `LICENSE.md`, and the dependency repositories for details.
